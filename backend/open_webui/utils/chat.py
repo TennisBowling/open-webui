@@ -1112,6 +1112,71 @@ def _structural_block_indices(content_blocks):
     ]
 
 
+def _fill_region_gaps(
+    gaps,
+    first_gap,
+    last_gap,
+    region_text,
+    original_text_segments,
+    first_orig_seg,
+):
+    """Distribute ``region_text`` (a stretch of filter output between two
+    surviving markers — or filter boundaries) across the gap indices
+    ``[first_gap .. last_gap]`` inclusive, using the corresponding
+    original text segments as positional anchors when markers in the
+    middle were elided by the filter.
+
+    Strategy: walk the original segments belonging to this region in
+    order. For every segment EXCEPT the last, look for the NEXT
+    segment's text as a substring in ``region_text`` starting at the
+    current cursor; everything up to that match becomes the current
+    gap, then the cursor advances to the match start (the matched text
+    is NOT consumed — it belongs to the next slot). If a needed anchor
+    isn't findable (filter rewrote the surrounding text), fall back to
+    emitting "" for the current gap so the run accumulates into the
+    next slot — this preserves the historical "accumulate into next
+    surviving gap" behavior and keeps the unconditional invariants
+    intact (no text is dropped: the trailing slot always gets
+    region_text[cursor:]).
+    """
+    n_slots = last_gap - first_gap + 1
+    if n_slots <= 0:
+        return
+    if n_slots == 1:
+        gaps[first_gap] = region_text
+        return
+    cursor = 0
+    for k in range(n_slots - 1):
+        # Look for the NEXT segment's text as an anchor.
+        next_seg_idx = first_orig_seg + k + 1
+        anchor = (
+            original_text_segments[next_seg_idx]
+            if next_seg_idx < len(original_text_segments)
+            else ""
+        )
+        # Use a stripped anchor for the search to be resilient to
+        # whitespace fluctuations introduced by the filter. The
+        # leading/trailing newlines around <details> markers in the
+        # original serialization frequently don't survive a round-trip
+        # through arbitrary filter code.
+        anchor_search = anchor.strip("\n")
+        if anchor_search:
+            pos = region_text.find(anchor_search, cursor)
+        else:
+            pos = -1
+        if pos < 0:
+            # Can't anchor — leave this slot empty; text reflows into
+            # the next slot (or the trailing slot). Filter text is
+            # never lost because the final slot always receives
+            # region_text[cursor:].
+            gaps[first_gap + k] = ""
+        else:
+            gaps[first_gap + k] = region_text[cursor:pos]
+            cursor = pos
+    # Trailing slot: rest of the region.
+    gaps[last_gap] = region_text[cursor:]
+
+
 def _apply_outlet_text_to_blocks(
     content_blocks, original_serialized, filter_serialized
 ):
@@ -1148,7 +1213,19 @@ def _apply_outlet_text_to_blocks(
         return [dict(b) for b in content_blocks]
 
     struct_indices = _structural_block_indices(content_blocks)
-    original_markers = [m.group(0) for m in _DETAILS_RE.finditer(original_serialized)]
+    # Tokenize original_serialized into the alternating sequence of
+    # original text-segments (between markers) and marker spans. We need
+    # both the marker strings AND the text between them — the inter-marker
+    # text acts as a positional anchor when reconstructing slot text for
+    # elided markers (see below).
+    original_markers = []  # list[str]
+    original_text_segments = []  # length = len(original_markers) + 1
+    _last = 0
+    for _m in _DETAILS_RE.finditer(original_serialized):
+        original_text_segments.append(original_serialized[_last : _m.start()])
+        original_markers.append(_m.group(0))
+        _last = _m.end()
+    original_text_segments.append(original_serialized[_last:])
 
     # Pair original markers with structural blocks positionally. If counts
     # mismatch (shouldn't normally — serialize_content_blocks emits one
@@ -1171,28 +1248,62 @@ def _apply_outlet_text_to_blocks(
     # Extra structural blocks beyond `paired` get no marker.
     found_spans.extend([None] * (len(struct_indices) - paired))
 
-    # Build gap list. We want exactly len(struct_indices) + 1 gaps, one
-    # before each structural slot and one trailing. For each FOUND span,
-    # carve text from filter_serialized; for each elided slot, emit "" so
-    # the surrounding text accumulates into the next surviving gap.
-    gaps = []
-    last_end = 0
-    for span in found_spans:
-        if span is None:
-            gaps.append("")  # placeholder; text will appear in next survivor
-        else:
-            gaps.append(filter_serialized[last_end : span[0]])
-            last_end = span[1]
-    # Trailing gap.
-    gaps.append(filter_serialized[last_end:])
+    # We want exactly len(struct_indices) + 1 gaps (one before each
+    # structural slot, one trailing). Build them by walking the filter
+    # output between surviving markers and splitting each "region" by
+    # using ORIGINAL text-segments around elided markers as substring
+    # anchors. This preserves the filter's intended text positioning
+    # around elided markers (e.g. text that originally preceded an
+    # elided <details> stays in the slot BEFORE the surviving
+    # structural, not after it).
+    gaps = [""] * (len(struct_indices) + 1)
 
-    # Special case: ALL markers elided (or no markers at all). The above
-    # logic places all of filter_serialized into the trailing gap; that's
-    # fine, but it's nicer UX to attribute that text to the FIRST text
-    # slot (so it appears before structural blocks the model produced).
-    if found_spans and all(s is None for s in found_spans):
-        gaps = [""] * (len(struct_indices) + 1)
-        gaps[0] = filter_serialized
+    # Group consecutive slots into "regions" delimited by surviving
+    # markers (or the start/end of the filter output). Each region knows
+    # the slice of filter_serialized it spans, and the contiguous run of
+    # gap indices it must populate.
+    region_start = 0  # position in filter_serialized
+    region_gap_start = 0  # index into `gaps`
+    for slot_i, span in enumerate(found_spans):
+        if span is None:
+            continue
+        # Region covers gaps [region_gap_start .. slot_i] inclusive
+        # (slot_i is the gap immediately before this surviving struct).
+        _fill_region_gaps(
+            gaps,
+            region_gap_start,
+            slot_i,
+            filter_serialized[region_start : span[0]],
+            original_text_segments,
+            region_gap_start,  # original-text-segment index of first gap in region
+        )
+        region_start = span[1]
+        region_gap_start = slot_i + 1
+    # Trailing region: from last surviving marker (or start) to end of
+    # filter_serialized, covering gaps [region_gap_start .. last].
+    _fill_region_gaps(
+        gaps,
+        region_gap_start,
+        len(gaps) - 1,
+        filter_serialized[region_start:],
+        original_text_segments,
+        region_gap_start,
+    )
+
+    # UX nicety: when NO markers survived AND the anchor-based split
+    # found no anchors at all (filter completely rewrote everything),
+    # the trailing slot is the only one with text. Hoisting that text
+    # to the FIRST slot makes it visible BEFORE the surviving
+    # structural blocks the model produced — matches the pre-fix
+    # behavior for the "filter replaces everything" case.
+    if (
+        found_spans
+        and all(s is None for s in found_spans)
+        and all(not g for g in gaps[:-1])
+        and gaps[-1]
+    ):
+        gaps[0] = gaps[-1]
+        gaps[-1] = ""
 
     # Reconstruct content_blocks slot-by-slot.
     new_blocks = []

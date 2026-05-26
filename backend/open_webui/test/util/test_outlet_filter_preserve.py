@@ -309,3 +309,200 @@ def test_filter_blanks_one_text_block_other_preserved():
     assert result[0]["content"] == ""
     assert result[1] == blocks[1]
     assert result[2]["content"] == "kept"
+
+
+# -- Elided-marker text POSITIONING (the fix this PR adds) -------------------
+
+
+def _text_block_positions(result):
+    """Return list of (index_in_result, content) for text blocks."""
+    return [(i, b["content"]) for i, b in enumerate(result) if b.get("type") == "text"]
+
+
+def test_elided_marker_preserves_text_position_around_surviving_struct():
+    """When the filter elides a <details> marker but keeps the
+    surrounding text intact, the text that was BEFORE the elided
+    marker in the original must remain in the slot BEFORE the
+    surviving structural that was previously AFTER it — not collapsed
+    into the slot AFTER it. This is the precise UX wart B12 leaves
+    behind and what this PR fixes."""
+    blocks = [
+        {"type": "text", "content": "before"},
+        {"type": "reasoning", "content": "r1", "duration": 1},
+        {"type": "text", "content": "middle"},
+        {
+            "type": "tool_calls",
+            "content": [
+                {"id": "c1", "function": {"name": "t", "arguments": {"a": 1}}}
+            ],
+            "results": [{"tool_call_id": "c1", "content": "ok"}],
+        },
+        {"type": "text", "content": "after"},
+    ]
+    orig = _serialize(blocks)
+    # Filter elides ONLY the reasoning marker; keeps tool_calls marker
+    # and surrounding text intact.
+    filt = re.sub(
+        r'<details type="reasoning".*?</details>\n?', "", orig, flags=re.DOTALL
+    )
+    result = _apply_outlet_text_to_blocks(blocks, orig, filt)
+
+    # Find positions of structurals + assert "before" lives BEFORE the
+    # reasoning block in the result (which itself sits BEFORE
+    # tool_calls).
+    reasoning_idx = next(i for i, b in enumerate(result) if b.get("type") == "reasoning")
+    tool_idx = next(i for i, b in enumerate(result) if b.get("type") == "tool_calls")
+    assert reasoning_idx < tool_idx, "Structural order must be preserved"
+
+    # "before" must appear in a text block at an index < reasoning_idx.
+    before_locations = [
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "before" in b["content"]
+    ]
+    assert before_locations, "'before' text dropped"
+    assert min(before_locations) < reasoning_idx, (
+        f"'before' must be positioned BEFORE the surviving reasoning block, "
+        f"got at index {before_locations} vs reasoning at {reasoning_idx}; "
+        f"result={result}"
+    )
+
+    # "middle" must appear between reasoning and tool_calls.
+    middle_locations = [
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "middle" in b["content"]
+    ]
+    assert middle_locations, "'middle' text dropped"
+    assert any(reasoning_idx < i < tool_idx for i in middle_locations), (
+        f"'middle' must be between reasoning and tool_calls; result={result}"
+    )
+
+    # "after" must appear after tool_calls.
+    after_locations = [
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "after" in b["content"]
+    ]
+    assert after_locations, "'after' text dropped"
+    assert max(after_locations) > tool_idx, (
+        f"'after' must be after tool_calls; result={result}"
+    )
+
+
+def test_elided_marker_with_intact_surrounding_text_three_text_slots():
+    """Simpler version: one structural in the middle is the SECOND of
+    two structurals; the first is elided. Text positioning around the
+    SURVIVOR must reflect original semantics."""
+    blocks = [
+        {"type": "text", "content": "ALPHA"},
+        {"type": "reasoning", "content": "r", "duration": 1},  # elided by filter
+        {"type": "text", "content": "BETA"},
+        {
+            "type": "tool_calls",
+            "content": [
+                {"id": "c", "function": {"name": "t", "arguments": {}}}
+            ],
+            "results": [{"tool_call_id": "c", "content": "ok"}],
+        },
+        {"type": "text", "content": "GAMMA"},
+    ]
+    orig = _serialize(blocks)
+    filt = re.sub(
+        r'<details type="reasoning".*?</details>\n?', "", orig, flags=re.DOTALL
+    )
+    result = _apply_outlet_text_to_blocks(blocks, orig, filt)
+    # Structural blocks preserved byte-identical.
+    assert any(b == blocks[1] for b in result)  # reasoning
+    assert any(b == blocks[3] for b in result)  # tool_calls
+    # ALPHA before reasoning; BETA between reasoning and tool_calls;
+    # GAMMA after tool_calls.
+    reasoning_idx = next(i for i, b in enumerate(result) if b.get("type") == "reasoning")
+    tool_idx = next(i for i, b in enumerate(result) if b.get("type") == "tool_calls")
+    alpha_idx = next(
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "ALPHA" in b["content"]
+    )
+    beta_idx = next(
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "BETA" in b["content"]
+    )
+    gamma_idx = next(
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "GAMMA" in b["content"]
+    )
+    assert alpha_idx < reasoning_idx < beta_idx < tool_idx < gamma_idx
+
+
+def test_elided_marker_with_partially_rewritten_text_invariants_hold():
+    """Filter elides a marker AND rewrites the surrounding text so
+    substring anchors no longer match. Invariants still hold:
+    structural preserved + filter text present somewhere."""
+    blocks = [
+        {"type": "text", "content": "before"},
+        {"type": "reasoning", "content": "r", "duration": 1},
+        {"type": "text", "content": "after"},
+    ]
+    orig = _serialize(blocks)
+    # Drop reasoning marker AND rewrite both surrounding texts so
+    # neither "before" nor "after" appears in filter output.
+    filt = re.sub(
+        r'<details type="reasoning".*?</details>\n?', "", orig, flags=re.DOTALL
+    )
+    filt = filt.replace("before", "FOO").replace("after", "BAR")
+    result = _apply_outlet_text_to_blocks(blocks, orig, filt)
+    # Reasoning preserved byte-identical.
+    reasoning_blocks = [b for b in result if b.get("type") == "reasoning"]
+    assert len(reasoning_blocks) == 1
+    assert reasoning_blocks[0] == blocks[1]
+    # Filter text present somewhere.
+    text_content = "".join(b["content"] for b in result if b.get("type") == "text")
+    assert "FOO" in text_content
+    assert "BAR" in text_content
+
+
+def test_multiple_elided_markers_in_sequence_positions_respected():
+    """Two structurals in a row, BOTH elided by the filter. A third
+    structural survives. Text positioning around the survivor still
+    holds; the elided pair's structural blocks are preserved."""
+    blocks = [
+        {"type": "text", "content": "P0"},
+        {"type": "reasoning", "content": "r1", "duration": 1},  # elided
+        {"type": "text", "content": "P1"},
+        {"type": "reasoning", "content": "r2", "duration": 2},  # elided
+        {"type": "text", "content": "P2"},
+        {
+            "type": "tool_calls",
+            "content": [
+                {"id": "c", "function": {"name": "t", "arguments": {}}}
+            ],
+            "results": [{"tool_call_id": "c", "content": "ok"}],
+        },
+        {"type": "text", "content": "P3"},
+    ]
+    orig = _serialize(blocks)
+    filt = re.sub(
+        r'<details type="reasoning".*?</details>\n?', "", orig, flags=re.DOTALL
+    )
+    result = _apply_outlet_text_to_blocks(blocks, orig, filt)
+
+    # All structural blocks preserved, in order.
+    struct_types_in_order = [
+        b for b in result if b.get("type") in ("reasoning", "tool_calls")
+    ]
+    assert struct_types_in_order == [blocks[1], blocks[3], blocks[5]]
+
+    # P3 must be after tool_calls.
+    tool_idx = next(i for i, b in enumerate(result) if b.get("type") == "tool_calls")
+    p3_idx = next(
+        i for i, b in enumerate(result)
+        if b.get("type") == "text" and "P3" in b["content"]
+    )
+    assert p3_idx > tool_idx
+
+    # P0/P1/P2 all appear somewhere before tool_calls (their relative
+    # positioning across two elided markers is best-effort; the strong
+    # guarantee is they land in the pre-tool_calls region, not after).
+    pre_tool_text = "".join(
+        b["content"] for b in result[:tool_idx] if b.get("type") == "text"
+    )
+    assert "P0" in pre_tool_text
+    assert "P1" in pre_tool_text
+    assert "P2" in pre_tool_text
