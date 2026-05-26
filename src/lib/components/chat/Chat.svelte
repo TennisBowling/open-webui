@@ -82,7 +82,6 @@
 		getTaskIdsByChatId,
 		getStreamSnapshot
 	} from '$lib/apis';
-	import { generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import type { ReasoningEffort } from '$lib/apis';
 	import {
 		BASE_REASONING_EFFORTS,

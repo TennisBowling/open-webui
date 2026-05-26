@@ -602,7 +602,7 @@
 					if (type === 'chat:delta:batch') {
 						const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
 						const hasSubagentUpdate = batch.some(
-							(b: any) => b?.data?.type === 'chat:subagent:update'
+							(b) => b?.data?.type === 'chat:subagent:update'
 						);
 						if (hasSubagentUpdate) {
 							// Bypass dedup — replay every batch as-is.
