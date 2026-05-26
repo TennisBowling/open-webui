@@ -67,25 +67,35 @@
 
 	export let onSelect = (e) => {};
 
-	export let messagesCount: number | null = 20;
+	export let messagesCount: number | null = 7;
 	let messagesLoading = false;
 
 	$: if (chatId) {
-		messagesCount = 20;
+		messagesCount = 7;
 	}
 
 	// Merge a paginated message page back into history.messages, preserving any
 	// child stubs that were seeded from sibling_stubs and not part of this page.
-	const mergePaginatedMessages = (page: any) => {
-		const incoming = page?.messages ?? [];
-		if (!incoming.length) return false;
+	// GET /chats/{id}/messages returns a raw array; accept {messages: [...]} too
+	// for resilience. Returns the count of stubs/missing entries that were
+	// hydrated into real messages.
+	const mergePaginatedMessages = (page: any): number => {
+		const incoming = Array.isArray(page)
+			? page
+			: Array.isArray(page?.messages)
+				? page.messages
+				: [];
+		if (!incoming.length) return 0;
 		const h: any = history;
+		let hydrated = 0;
 		for (const msg of incoming) {
 			if (!msg?.id) continue;
 			const existing = h.messages?.[msg.id];
+			const wasStubOrMissing = !existing || existing._stub;
 			h.messages[msg.id] = { ...(existing ?? {}), ...msg, _stub: false };
+			if (wasStubOrMissing) hydrated += 1;
 		}
-		return true;
+		return hydrated;
 	};
 
 	// Hydrate the branch ending at `leafId` if any ancestor is still a stub.
@@ -108,7 +118,7 @@
 			leaf: leafId,
 			limit: 7
 		}).catch(() => null);
-		if (mergePaginatedMessages(page)) {
+		if (mergePaginatedMessages(page) > 0) {
 			history = history;
 			await tick();
 		}
@@ -137,6 +147,7 @@
 			}
 		}
 
+		let hydratedCount = 0;
 		const leafId = (history as any)?.currentId ?? null;
 		if (chatId && leafId && oldestId) {
 			const page = await getChatMessagesBranch(localStorage.token, chatId, {
@@ -144,12 +155,19 @@
 				before: oldestId,
 				limit: 20
 			}).catch(() => null);
-			if (mergePaginatedMessages(page)) {
+			hydratedCount = mergePaginatedMessages(page);
+			if (hydratedCount > 0) {
 				history = history;
 			}
 		}
 
-		messagesCount += 20;
+		// Grow the render window by however many real messages we actually loaded
+		// so the walk below picks them up — adding a fixed +20 would either
+		// overshoot (re-including stubs) or undershoot if the server returned
+		// fewer than requested.
+		if (messagesCount !== null) {
+			messagesCount += hydratedCount;
+		}
 
 		await tick();
 
@@ -164,7 +182,14 @@
 		let _messages = [];
 
 		let message = history.messages[history.currentId];
-		while (message && (messagesCount !== null ? _messages.length <= messagesCount : true)) {
+		// Walk parent_id back toward the root, but stop as soon as we hit a
+		// stub: stubs have no content and would render as empty Message blocks.
+		// The user can trigger pagination (load more) to hydrate older ancestors.
+		while (
+			message &&
+			!message._stub &&
+			(messagesCount !== null ? _messages.length <= messagesCount : true)
+		) {
 			_messages.unshift(message);
 			message = message.parentId !== null ? history.messages[message.parentId] : null;
 		}

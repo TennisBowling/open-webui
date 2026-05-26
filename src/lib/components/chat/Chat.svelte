@@ -2700,7 +2700,14 @@
 					_stub: true
 				};
 			}
-			for (const msg of branchPage?.messages ?? []) {
+			// GET /chats/{id}/messages returns a raw array, not {messages: [...]}.
+			// Accept both shapes so we're resilient to API drift.
+			const branchMessages = Array.isArray(branchPage)
+				? branchPage
+				: Array.isArray(branchPage?.messages)
+					? branchPage.messages
+					: [];
+			for (const msg of branchMessages) {
 				if (!msg?.id) continue;
 				messagesMap[msg.id] = { ...(messagesMap[msg.id] ?? {}), ...msg, _stub: false };
 			}
@@ -2734,7 +2741,7 @@
 						leaf: leafId,
 						limit: 7
 					}).catch(() => null)
-				: { messages: [] };
+				: [];
 			return stitchPaginatedChat(meta, branchPage);
 		};
 
