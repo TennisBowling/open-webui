@@ -4746,14 +4746,14 @@
 						: false,
 				web_search:
 					$config?.features?.enable_web_search &&
-					($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+					($user?.role === 'admin' || $user?.permissions?.features?.web_search !== false)
 						? webSearchEnabled
 						: false,
 				study_mode: $config?.features?.enable_study_mode ? studyModeEnabled : false,
 				data_viz: $config?.features?.enable_data_viz ? dataVizEnabled : false,
 				subagents:
 					$config?.features?.enable_subagents &&
-					($user?.role === 'admin' || $user?.permissions?.features?.subagents)
+					($user?.role === 'admin' || $user?.permissions?.features?.subagents !== false)
 						? subagentsEnabled
 						: false
 			};
