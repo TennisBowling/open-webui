@@ -11,7 +11,11 @@
 	const dispatch = createEventDispatcher();
 
 	import { toast } from 'svelte-sonner';
-	import { updateChatById } from '$lib/apis/chats';
+	import {
+		getChatMessagesBranch,
+		getChatMessagesSiblings,
+		updateChatById
+	} from '$lib/apis/chats';
 	import { copyToClipboard, extractCurlyBraceWords } from '$lib/utils';
 
 	import Message from './Messages/Message.svelte';
@@ -68,6 +72,46 @@
 		messagesCount = 20;
 	}
 
+	// Merge a paginated message page back into history.messages, preserving any
+	// child stubs that were seeded from sibling_stubs and not part of this page.
+	const mergePaginatedMessages = (page: any) => {
+		const incoming = page?.messages ?? [];
+		if (!incoming.length) return false;
+		const h: any = history;
+		for (const msg of incoming) {
+			if (!msg?.id) continue;
+			const existing = h.messages?.[msg.id];
+			h.messages[msg.id] = { ...(existing ?? {}), ...msg, _stub: false };
+		}
+		return true;
+	};
+
+	// Hydrate the branch ending at `leafId` if any ancestor is still a stub.
+	// Used by branch-switch handlers when the user picks a sibling that wasn't
+	// included in the initial loadChat page.
+	const hydrateBranchIfNeeded = async (leafId: string | null) => {
+		const h: any = history;
+		if (!leafId || !chatId || !h?.messages) return;
+		let cursor = h.messages[leafId];
+		let needsFetch = false;
+		while (cursor) {
+			if (cursor._stub) {
+				needsFetch = true;
+				break;
+			}
+			cursor = cursor.parentId ? h.messages[cursor.parentId] : null;
+		}
+		if (!needsFetch) return;
+		const page = await getChatMessagesBranch(localStorage.token, chatId, {
+			leaf: leafId,
+			limit: 7
+		}).catch(() => null);
+		if (mergePaginatedMessages(page)) {
+			history = history;
+			await tick();
+		}
+	};
+
 	const loadMoreMessages = async () => {
 		const element = document.getElementById('messages-container');
 		let previousScrollHeight = 0;
@@ -79,6 +123,30 @@
 		}
 
 		messagesLoading = true;
+
+		// Find the oldest currently-rendered non-stub message to paginate before.
+		let oldestId: string | null = null;
+		if (messages.length) {
+			for (const m of messages) {
+				if (m && !m._stub) {
+					oldestId = m.id;
+					break;
+				}
+			}
+		}
+
+		const leafId = (history as any)?.currentId ?? null;
+		if (chatId && leafId && oldestId) {
+			const page = await getChatMessagesBranch(localStorage.token, chatId, {
+				leaf: leafId,
+				before: oldestId,
+				limit: 20
+			}).catch(() => null);
+			if (mergePaginatedMessages(page)) {
+				history = history;
+			}
+		}
+
 		messagesCount += 20;
 
 		await tick();
@@ -152,6 +220,7 @@
 				messageChildrenIds = history.messages[messageId].childrenIds;
 			}
 
+			await hydrateBranchIfNeeded(messageId);
 			history.currentId = messageId;
 		}
 
@@ -183,6 +252,7 @@
 					messageChildrenIds = history.messages[messageId].childrenIds;
 				}
 
+				await hydrateBranchIfNeeded(messageId);
 				history.currentId = messageId;
 			}
 		} else {
@@ -199,6 +269,7 @@
 					messageChildrenIds = history.messages[messageId].childrenIds;
 				}
 
+				await hydrateBranchIfNeeded(messageId);
 				history.currentId = messageId;
 			}
 		}
@@ -233,6 +304,7 @@
 					messageChildrenIds = history.messages[messageId].childrenIds;
 				}
 
+				await hydrateBranchIfNeeded(messageId);
 				history.currentId = messageId;
 			}
 		} else {
@@ -250,6 +322,7 @@
 					messageChildrenIds = history.messages[messageId].childrenIds;
 				}
 
+				await hydrateBranchIfNeeded(messageId);
 				history.currentId = messageId;
 			}
 		}

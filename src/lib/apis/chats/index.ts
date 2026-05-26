@@ -718,6 +718,118 @@ export const getChatById = async (token: string, id: string) => {
 	return res;
 };
 
+// Slim metadata variant of GET /chats/{id} — returns only ids/title/params/models/files/queue
+// plus `history: {currentId, sibling_stubs: [{id, parentId, childrenIds, role}]}`.
+// Used by loadChat to avoid downloading every message body on chat open; paginated
+// branch messages are fetched separately via getChatMessagesBranch.
+export const getChatMeta = async (token: string, id: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}?meta_only=true`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` }),
+			...sessionHeader()
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail ?? err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+// Branch-aware ancestor pagination. Walks parent_id from `leaf` toward the root,
+// returning up to `limit` messages. `before` slices ancestors strictly older than
+// the given message_id (used to load more on scroll up).
+export const getChatMessagesBranch = async (
+	token: string,
+	id: string,
+	{ leaf, before, limit = 7 }: { leaf?: string; before?: string; limit?: number } = {}
+) => {
+	let error = null;
+
+	const params = new URLSearchParams();
+	if (leaf) params.set('leaf', leaf);
+	if (before) params.set('before', before);
+	if (limit !== undefined) params.set('limit', String(limit));
+
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/chats/${id}/messages${params.toString() ? `?${params.toString()}` : ''}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` }),
+				...sessionHeader()
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail ?? err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+// Sibling-branch lazy load — hits GET /chats/{id}/messages/{message_id}/siblings.
+// Returns full-content messages sharing the given message's parent_id (used when
+// the user clicks a branch-switch arrow and the target branch wasn't paginated in).
+export const getChatMessagesSiblings = async (token: string, id: string, message_id: string) => {
+	let error = null;
+
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/chats/${id}/messages/${message_id}/siblings`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` }),
+				...sessionHeader()
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail ?? err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const getChatByShareId = async (token: string, share_id: string) => {
 	let error = null;
 
