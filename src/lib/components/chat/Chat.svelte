@@ -30,7 +30,6 @@
 		socket,
 		showControls,
 		showCallOverlay,
-		currentChatPage,
 		temporaryChatEnabled,
 		mobile,
 		showOverview,
@@ -63,12 +62,11 @@
 		createNewChat,
 		getAllTags,
 		getChatById,
-		getChatList,
-		getPinnedChatList,
 		getTagsById,
 		updateChatById,
 		updateChatFolderIdById
 	} from '$lib/apis/chats';
+	import { decorate, upsertSorted } from '$lib/utils/sidebarSync';
 	import { chatCompletion, generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation, updateUserSettings } from '$lib/apis/users';
@@ -1512,8 +1510,6 @@
 
 		if (type === 'chat:title') {
 			chatTitle.set(data);
-			currentChatPage.set(1);
-			await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			return;
 		}
 
@@ -2833,9 +2829,6 @@
 						files: chatFiles,
 						queue: queue
 					});
-
-					currentChatPage.set(1);
-					await chats.set(await getChatList(localStorage.token, $currentChatPage));
 				}
 			}
 		} finally {
@@ -2911,9 +2904,6 @@
 						files: chatFiles,
 						queue: queue
 					});
-
-					currentChatPage.set(1);
-					await chats.set(await getChatList(localStorage.token, $currentChatPage));
 				}
 			}
 		} finally {
@@ -3967,8 +3957,6 @@
 				})
 			);
 
-			currentChatPage.set(1);
-			chats.set(await getChatList(localStorage.token, $currentChatPage));
 		} finally {
 			chatStreamDebug('[chat-stream] sendMessage finally — clearing controller');
 			generating = false;
@@ -5673,12 +5661,25 @@
 
 			await tick();
 
-			// Refresh the sidebar list in the background — this is purely cosmetic
-			// and was previously gating the entire send pipeline on a network round-trip.
-			currentChatPage.set(1);
-			getChatList(localStorage.token, $currentChatPage)
-				.then((list) => chats.set(list))
-				.catch((err) => console.error('getChatList refresh failed:', err));
+			// Optimistic sidebar patch — backend's chat:created broadcast skips this
+			// originating session via X-Session-Id, so we patch locally to surface the
+			// new chat in the sidebar immediately without a refetch.
+			if (chat?.id && chat?.folder_id == null && !chat?.archived) {
+				const row = decorate({
+					id: chat.id,
+					title: chat.title,
+					updated_at: chat.updated_at,
+					created_at: chat.created_at,
+					pinned: chat.pinned,
+					archived: chat.archived,
+					folder_id: chat.folder_id
+				});
+				if (row.pinned) {
+					pinnedChats.update((arr) => upsertSorted(arr, row));
+				} else {
+					chats.update((arr) => upsertSorted(arr, row));
+				}
+			}
 
 			selectedFolder.set(null);
 		} else {
@@ -5866,11 +5867,7 @@
 					files: chatFiles,
 					queue: queue
 				});
-				currentChatPage.set(1);
-				// Refresh sidebar list in background — purely cosmetic, never gates the LLM request.
-				getChatList(localStorage.token, $currentChatPage)
-					.then((list) => chats.set(list))
-					.catch((err) => console.error('getChatList refresh failed:', err));
+
 			}
 		}
 	};
@@ -5912,10 +5909,6 @@
 			);
 
 			if (res) {
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
-				await pinnedChats.set(await getPinnedChatList(localStorage.token));
-
 				toast.success($i18n.t('Chat moved successfully'));
 			}
 		} else {
@@ -5968,7 +5961,22 @@
 
 			temporaryChatEnabled.set(false);
 			chatId.set(savedChat.id);
-			chats.set(await getChatList(localStorage.token, $currentChatPage));
+			if (savedChat?.id && savedChat?.folder_id == null && !savedChat?.archived) {
+				const row = decorate({
+					id: savedChat.id,
+					title: savedChat.title,
+					updated_at: savedChat.updated_at,
+					created_at: savedChat.created_at,
+					pinned: savedChat.pinned,
+					archived: savedChat.archived,
+					folder_id: savedChat.folder_id
+				});
+				if (row.pinned) {
+					pinnedChats.update((arr) => upsertSorted(arr, row));
+				} else {
+					chats.update((arr) => upsertSorted(arr, row));
+				}
+			}
 
 			await goto(`/c/${savedChat.id}`);
 			toast.success($i18n.t('Conversation saved successfully'));

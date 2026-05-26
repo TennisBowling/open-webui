@@ -6,6 +6,10 @@
 // Patching in place preserves the user's pagination + scroll position, which
 // is why we avoid the `currentChatPage.set(1); chats.set(getChatList(...))`
 // pattern that the legacy `chat:title` handler used.
+//
+// `chat:updated` events are NOT skip_sid'd — they originate from background
+// streaming tasks (chat:done tail), not frontend-originated mutations, so the
+// originating tab also receives them and updates its `updated_at` in place.
 
 import { get } from 'svelte/store';
 import {
@@ -46,7 +50,7 @@ type ChatRow = {
 	[k: string]: any;
 };
 
-const decorate = (row: ChatRow): ChatRow => ({
+export const decorate = (row: ChatRow): ChatRow => ({
 	...row,
 	time_range: getTimeRange(row.updated_at)
 });
@@ -54,7 +58,7 @@ const decorate = (row: ChatRow): ChatRow => ({
 const removeById = (arr: any[] | null, id: string) =>
 	arr ? arr.filter((c) => c.id !== id) : arr;
 
-const upsertSorted = (arr: any[] | null, row: ChatRow): ChatRow[] => {
+export const upsertSorted = (arr: any[] | null, row: ChatRow): ChatRow[] => {
 	const base = (arr ?? []).filter((c) => c.id !== row.id);
 	base.unshift(row);
 	// Keep the list ordered by updated_at desc; the sidebar then groups by time_range.
@@ -276,6 +280,20 @@ export const applySidebarEvent = async (
 			return;
 		}
 
+		case 'chat:updated': {
+			if (!data?.id) return;
+			const ts = data.updated_at;
+			if (ts == null) return;
+			const patch = (c: any) =>
+				c.id === data.id ? { ...c, updated_at: ts, time_range: getTimeRange(ts) } : c;
+			chats.update((arr) =>
+				arr ? [...arr].map(patch).sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)) : arr
+			);
+			pinnedChats.update((arr) => arr.map(patch));
+			invalidateChatsCaches();
+			return;
+		}
+
 		default:
 			return;
 	}
@@ -286,6 +304,7 @@ export const SIDEBAR_EVENT_TYPES = new Set([
 	'chat:deleted',
 	'chat:renamed',
 	'chat:title',
+	'chat:updated',
 	'chat:pinned',
 	'chat:archived',
 	'chat:folder',
