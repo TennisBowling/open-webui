@@ -1392,6 +1392,25 @@
 		);
 	};
 
+	const normalizeStreamingContentBlocks = (blocks: any[] = []) => {
+		for (let i = 1; i < blocks.length; i++) {
+			const prev = blocks[i - 1];
+			const cur = blocks[i];
+			if (!prev || !cur || prev.type !== cur.type || !['text', 'reasoning'].includes(cur.type)) {
+				continue;
+			}
+			const prevText = prev.content || '';
+			const curText = cur.content || '';
+			if (curText.includes(prevText)) {
+				prev.content = curText;
+			} else if (!prevText.includes(curText)) {
+				prev.content = `${prevText}${curText}`;
+			}
+			blocks.splice(i, 1);
+			i -= 1;
+		}
+	};
+
 	// Stream v2: apply one chat:delta op into a subagent's content_blocks
 	// mirror. Mirrors the parent-message applyDeltaOp logic.
 	const applySubagentDeltaOp = (mirror: { content_blocks: any[] }, op: string, payload: any) => {
@@ -1475,6 +1494,7 @@
 		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
 			// Handled by caller (sets fields on the run object).
 		}
+		normalizeStreamingContentBlocks(mirror.content_blocks);
 	};
 
 	const mergeSubagentPendingIntoRun = (existing: any, pending: PendingSubagentUpdate) => {
@@ -3739,6 +3759,7 @@
 		} else {
 			console.warn('[chat:delta] unknown op', op, payload);
 		}
+		normalizeStreamingContentBlocks(mirror.content_blocks);
 	};
 
 	const writeMirrorToMessage = (mirror: StreamMirror, message: any) => {
