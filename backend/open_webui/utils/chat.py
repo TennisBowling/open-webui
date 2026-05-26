@@ -356,6 +356,149 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
         return Exception(f"Error: {e}")
 
 
+async def run_outlet_filters_on_completed_stream(
+    request: Request,
+    user: Any,
+    metadata: dict,
+    model: dict,
+    model_id: str,
+    filter_ids: list,
+    content_blocks: list,
+    event_emitter,
+    event_caller,
+    serialize_content_blocks,
+):
+    # B12: outlet filters used to run from POST /api/chat/completed; now run
+    # server-side at end of process_chat_response. Mirrors the synthetic
+    # message list assembly the frontend used to send: a final assistant turn
+    # carrying the serialized content. If a filter mutates that content, we
+    # persist the mutation and emit a catch-up event so the frontend mirror
+    # matches what's in the DB.
+    if not request.app.state.MODELS:
+        await get_all_models(request, user=user)
+
+    if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+        models = {request.state.model["id"]: request.state.model}
+    else:
+        models = request.app.state.MODELS
+
+    if model_id not in models:
+        return
+
+    content = serialize_content_blocks(content_blocks, force=True)
+    assistant_message = {
+        "id": metadata.get("message_id"),
+        "role": "assistant",
+        "content": content,
+    }
+
+    data = {
+        "model": model_id,
+        "messages": [assistant_message],
+        "chat_id": metadata.get("chat_id"),
+        "session_id": metadata.get("session_id"),
+        "id": metadata.get("message_id"),
+        "filter_ids": filter_ids or [],
+    }
+
+    try:
+        data = await process_pipeline_outlet_filter(request, data, user, models)
+    except Exception as e:
+        log.exception(f"Pipeline outlet filter failed: {e}")
+        return
+
+    extra_params = {
+        "__event_emitter__": event_emitter,
+        "__event_call__": event_caller,
+        "__user__": user.model_dump() if isinstance(user, UserModel) else {},
+        "__metadata__": metadata,
+        "__request__": request,
+        "__model__": model,
+    }
+
+    try:
+        filter_functions = [
+            Functions.get_function_by_id(filter_id)
+            for filter_id in get_sorted_filter_ids(
+                request, model, filter_ids or []
+            )
+        ]
+        result, _ = await process_filter_functions(
+            request=request,
+            filter_functions=filter_functions,
+            filter_type="outlet",
+            form_data=data,
+            extra_params=extra_params,
+        )
+        if isinstance(result, dict):
+            data = result
+    except Exception as e:
+        log.exception(f"Outlet filter functions failed: {e}")
+        return
+
+    final_messages = data.get("messages") or []
+    final_content = None
+    for m in reversed(final_messages):
+        if m.get("role") == "assistant":
+            final_content = m.get("content")
+            break
+
+    if final_content is None or final_content == content:
+        return
+
+    # Outlet filter mutated the assistant content. Persist canonical content
+    # and collapse content_blocks to a single text block carrying the new
+    # content — outlet filters operate on the flat string, so structural
+    # block fidelity (reasoning/tool_calls) cannot be preserved through the
+    # mutation. Matches the v1 behavior where the frontend stuffed the
+    # mutated content back into the message via updateChatById.
+    try:
+        Chats.upsert_message_to_chat_by_id_and_message_id(
+            metadata["chat_id"],
+            metadata["message_id"],
+            {
+                "content": final_content,
+                "content_blocks": [{"type": "text", "content": final_content}],
+            },
+        )
+    except Exception as e:
+        log.exception(f"Outlet filter persist failed: {e}")
+
+    try:
+        from open_webui.env import STREAM_PROTOCOL_VERSION
+
+        if STREAM_PROTOCOL_VERSION == "v2":
+            await event_emitter(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": metadata.get("message_id"),
+                        "op": "replace",
+                        "payload": {
+                            "block_idx": 0,
+                            "content_blocks": [
+                                {"type": "text", "content": final_content}
+                            ],
+                        },
+                    },
+                }
+            )
+        else:
+            await event_emitter(
+                {
+                    "type": "chat:message",
+                    "data": {
+                        "content": final_content,
+                        "content_blocks": [
+                            {"type": "text", "content": final_content}
+                        ],
+                    },
+                }
+            )
+    except Exception as e:
+        log.exception(f"Outlet filter catch-up emit failed: {e}")
+
+
 async def chat_action(request: Request, action_id: str, form_data: dict, user: Any):
     if "." in action_id:
         action_id, sub_action_id = action_id.split(".")
