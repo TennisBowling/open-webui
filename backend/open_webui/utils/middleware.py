@@ -6,6 +6,7 @@ import base64
 import textwrap
 
 import asyncio
+import hashlib
 from aiocache import cached
 from contextvars import ContextVar
 from typing import Any, Optional
@@ -49,6 +50,14 @@ from open_webui.socket.main import (
     get_event_emitter,
     get_active_status_by_user_id,
     process_token_usage,
+    is_primary_session,
+    stream_version_init,
+    stream_version_incr,
+    stream_version_get,
+    set_tool_result,
+    clear_stream_state,
+    emit_to_primary,
+    broadcast_sidebar_event,
 )
 from open_webui.tasks import (
     get_pending_model_switch,
@@ -140,6 +149,7 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_QUERIES_CACHE,
+    STREAM_PROTOCOL_VERSION,
 )
 from open_webui.constants import TASKS
 
@@ -161,6 +171,357 @@ DEFAULT_REASONING_TAGS = [
 ]
 DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
+
+
+# ---------------------------------------------------------------------------
+# Stream v2 delta translator
+# ---------------------------------------------------------------------------
+#
+# The v1 emitter ships the entire `content_blocks` array on every flush (O(N²)
+# bytes per turn). v2 ships only what changed since the last emit. To avoid
+# rewriting the 1300-line stream loop, we install a translator that diffs the
+# incoming content_blocks against a per-message mirror and emits the matching
+# `chat:delta` ops. Anything not a content_blocks-bearing `chat:completion`
+# event passes through unchanged (status, sources, citations, errors, ...).
+#
+# Wire Contract #1 (see plan Phase 0) — ops emitted:
+#   text_append, block_open, block_close, tool_call_add, replace, sources,
+#   selected_model_id. tool_call:result is emitted separately at exec time.
+
+def _strip_tool_results(content_blocks):
+    """Mirror state stores block shapes but never the heavy tool result bodies
+    — those go via tool_call:result. Returned copy is safe to diff against."""
+    out = []
+    for block in content_blocks or []:
+        if block.get("type") == "tool_calls" and "results" in block:
+            slim = {k: v for k, v in block.items() if k != "results"}
+            slim["results"] = [
+                {"tool_call_id": r.get("tool_call_id")}
+                for r in (block.get("results") or [])
+            ]
+            out.append(slim)
+        else:
+            out.append(block)
+    return out
+
+
+def _emit_delta_for_blocks(
+    raw_emit, message_id, mirror, new_blocks, extra_payload=None
+):
+    """Compute & emit the deltas needed to move the client mirror from
+    `mirror['blocks']` to `new_blocks`. Returns a list of awaitables."""
+    new_blocks = _strip_tool_results(new_blocks)
+    old_blocks = mirror.get("blocks") or []
+    ops = []
+
+    common = min(len(old_blocks), len(new_blocks))
+    structural_rewrite = False
+    for i in range(common):
+        if old_blocks[i].get("type") != new_blocks[i].get("type"):
+            structural_rewrite = True
+            break
+
+    if structural_rewrite:
+        ops.append(
+            {
+                "op": "replace",
+                "block_idx": 0,
+                "content_blocks": new_blocks,
+            }
+        )
+        mirror["blocks"] = [dict(b) for b in new_blocks]
+    else:
+        # Per-block diff for the prefix; new blocks beyond `common` are opened.
+        for i in range(common):
+            old_b = old_blocks[i]
+            new_b = new_blocks[i]
+            btype = new_b.get("type")
+            if btype == "text":
+                old_text = old_b.get("content", "") or ""
+                new_text = new_b.get("content", "") or ""
+                if new_text == old_text:
+                    continue
+                if new_text.startswith(old_text):
+                    appended = new_text[len(old_text):]
+                    if appended:
+                        ops.append(
+                            {
+                                "op": "text_append",
+                                "block_idx": i,
+                                "text": appended,
+                            }
+                        )
+                else:
+                    ops.append(
+                        {
+                            "op": "replace",
+                            "block_idx": i,
+                            "content_blocks": [new_b],
+                        }
+                    )
+                old_b["content"] = new_text
+            elif btype == "reasoning":
+                old_text = old_b.get("content", "") or ""
+                new_text = new_b.get("content", "") or ""
+                if new_text != old_text and new_text.startswith(old_text):
+                    appended = new_text[len(old_text):]
+                    if appended:
+                        ops.append(
+                            {
+                                "op": "text_append",
+                                "block_idx": i,
+                                "text": appended,
+                            }
+                        )
+                elif new_text != old_text:
+                    ops.append(
+                        {
+                            "op": "replace",
+                            "block_idx": i,
+                            "content_blocks": [new_b],
+                        }
+                    )
+                old_b["content"] = new_text
+                # close detection: ended_at gained
+                if new_b.get("ended_at") and not old_b.get("ended_at"):
+                    ops.append(
+                        {
+                            "op": "block_close",
+                            "block_idx": i,
+                            "duration": new_b.get("duration"),
+                        }
+                    )
+                    old_b["ended_at"] = new_b["ended_at"]
+                    old_b["duration"] = new_b.get("duration")
+            elif btype == "tool_calls":
+                # tool_calls block: if the underlying tool_call list grew or
+                # results landed, send a replace for the whole slim block.
+                if old_b != new_b:
+                    ops.append(
+                        {
+                            "op": "replace",
+                            "block_idx": i,
+                            "content_blocks": [new_b],
+                        }
+                    )
+                    old_blocks[i] = dict(new_b)
+            else:
+                if old_b != new_b:
+                    ops.append(
+                        {
+                            "op": "replace",
+                            "block_idx": i,
+                            "content_blocks": [new_b],
+                        }
+                    )
+                    old_blocks[i] = dict(new_b)
+
+        if len(new_blocks) > common:
+            for i in range(common, len(new_blocks)):
+                new_b = new_blocks[i]
+                ops.append(
+                    {
+                        "op": "block_open",
+                        "block_idx": i,
+                        "type": new_b.get("type"),
+                        "attrs": {
+                            k: v
+                            for k, v in new_b.items()
+                            if k not in ("type", "content", "results")
+                        },
+                    }
+                )
+                if new_b.get("type") in ("text", "reasoning"):
+                    text = new_b.get("content", "") or ""
+                    if text:
+                        ops.append(
+                            {
+                                "op": "text_append",
+                                "block_idx": i,
+                                "text": text,
+                            }
+                        )
+                old_blocks.append(dict(new_b))
+        elif len(new_blocks) < len(old_blocks):
+            # truncation — fall back to replace
+            ops.append(
+                {
+                    "op": "replace",
+                    "block_idx": 0,
+                    "content_blocks": new_blocks,
+                }
+            )
+            mirror["blocks"] = [dict(b) for b in new_blocks]
+
+    awaitables = []
+    for op in ops:
+        version = stream_version_incr(message_id)
+        payload = {
+            "type": "chat:delta",
+            "data": {
+                "message_id": message_id,
+                "version": version,
+                "op": op["op"],
+                "payload": {k: v for k, v in op.items() if k != "op"},
+            },
+        }
+        awaitables.append(raw_emit(payload))
+
+    if extra_payload:
+        version = stream_version_incr(message_id)
+        payload = {
+            "type": "chat:delta",
+            "data": {
+                "message_id": message_id,
+                "version": version,
+                "op": extra_payload["op"],
+                "payload": extra_payload.get("payload", {}),
+            },
+        }
+        awaitables.append(raw_emit(payload))
+
+    return awaitables
+
+
+def _wrap_event_emitter_v2(inner_emitter, metadata):
+    """Returns an async event_emitter that translates `chat:completion` flushes
+    into compact `chat:delta` ops, leaves non-streaming events untouched, and
+    funnels stream events to the user's primary session only (B8 election)."""
+    message_id = metadata.get("message_id")
+    user_id = metadata.get("user_id")
+    chat_id = metadata.get("chat_id")
+    session_id = metadata.get("session_id")
+    mirror = {"blocks": [], "tool_results_sent": set()}
+
+    if message_id:
+        stream_version_init(message_id)
+
+    async def _emit_raw_primary(payload):
+        # Send a fully-formed `events` envelope to the primary session only.
+        # Fallback: if no primary registered, fan to all (handled inside
+        # emit_to_primary). DB persistence is already handled by the inner
+        # emitter for v1-shaped payloads; v2 deltas are not persisted on a
+        # per-emit basis (the per-chunk upsert at the call site covers the
+        # canonical content).
+        if not user_id:
+            await inner_emitter(payload["data"] if "data" in payload else payload)
+            return
+        envelope = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "data": payload,
+        }
+        await emit_to_primary(user_id, envelope)
+
+    async def __v2_emitter__(event_data):
+        etype = (event_data or {}).get("type")
+
+        # Pass-through events: anything not `chat:completion` flows through
+        # the inner emitter unchanged (status, source, citation, message,
+        # replace, embeds, files, data_viz, model-switch:applied, errors,
+        # chat:tasks:cancel, chat:subagent:*, chat:message:error, ...).
+        # Inner emitter also handles its DB side-effects.
+        if etype != "chat:completion":
+            await inner_emitter(event_data)
+            return
+
+        data = event_data.get("data") or {}
+        # selected_model_id flush: emit as chat:delta selected_model_id.
+        # Some end-of-stream payloads carry both selected_model_id AND
+        # content_blocks (see process_chat_response final `data` dict). Only
+        # short-circuit when content_blocks is absent — otherwise fall through
+        # so the content diff still ships.
+        if "selected_model_id" in data and "content_blocks" not in data and message_id:
+            version = stream_version_incr(message_id)
+            await _emit_raw_primary(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": message_id,
+                        "version": version,
+                        "op": "selected_model_id",
+                        "payload": {"model_id": data["selected_model_id"]},
+                    },
+                }
+            )
+            return
+
+        # Usage-only flush
+        if set(data.keys()) <= {"usage"} and "usage" in data and message_id:
+            version = stream_version_incr(message_id)
+            await _emit_raw_primary(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": message_id,
+                        "version": version,
+                        "op": "usage",
+                        "payload": {"usage": data["usage"]},
+                    },
+                }
+            )
+            return
+
+        # Error mid-stream
+        if "error" in data and message_id:
+            version = stream_version_incr(message_id)
+            await _emit_raw_primary(
+                {
+                    "type": "chat:message:error",
+                    "data": {
+                        "message_id": message_id,
+                        "version": version,
+                        "error": data["error"],
+                    },
+                }
+            )
+            return
+
+        # Content-bearing flush
+        if "content_blocks" in data and message_id:
+            awaitables = _emit_delta_for_blocks(
+                _emit_raw_primary, message_id, mirror, data["content_blocks"]
+            )
+            if awaitables:
+                await asyncio.gather(*awaitables)
+            if "selected_model_id" in data:
+                version = stream_version_incr(message_id)
+                await _emit_raw_primary(
+                    {
+                        "type": "chat:delta",
+                        "data": {
+                            "message_id": message_id,
+                            "version": version,
+                            "op": "selected_model_id",
+                            "payload": {"model_id": data["selected_model_id"]},
+                        },
+                    }
+                )
+            # Sources arrive in the same payload occasionally
+            if data.get("sources"):
+                version = stream_version_incr(message_id)
+                await _emit_raw_primary(
+                    {
+                        "type": "chat:delta",
+                        "data": {
+                            "message_id": message_id,
+                            "version": version,
+                            "op": "sources",
+                            "payload": {"sources": data["sources"]},
+                        },
+                    }
+                )
+            return
+
+        # Anything else with content_blocks absent — pass through.
+        await inner_emitter(event_data)
+
+    # Expose the mirror so the outer pipeline can emit tool_call:result events
+    # and the final chat:done envelope coherently.
+    __v2_emitter__._v2_mirror = mirror  # type: ignore[attr-defined]
+    __v2_emitter__._inner = inner_emitter  # type: ignore[attr-defined]
+    __v2_emitter__._emit_raw_primary = _emit_raw_primary  # type: ignore[attr-defined]
+    return __v2_emitter__
 
 
 def process_tool_result(
@@ -1668,6 +2029,11 @@ async def process_chat_response(
         )
         event_caller = metadata.get("event_caller_override") or get_event_call(metadata)
 
+        if STREAM_PROTOCOL_VERSION == "v2" and not metadata.get(
+            "event_emitter_override"
+        ):
+            event_emitter = _wrap_event_emitter_v2(event_emitter, metadata)
+
     model_id = form_data.get("model", "")
 
     # Non-streaming response
@@ -3167,6 +3533,46 @@ async def process_chat_response(
                         }
                     )
 
+                    if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                        msg_id = metadata["message_id"]
+                        v2_mirror = getattr(event_emitter, "_v2_mirror", None)
+                        emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
+                        if v2_mirror is not None and emit_raw is not None:
+                            sent = v2_mirror.setdefault("tool_results_sent", set())
+                            for r in results:
+                                if not r:
+                                    continue
+                                tc_id = r.get("tool_call_id")
+                                if not tc_id or tc_id in sent:
+                                    continue
+                                set_tool_result(msg_id, tc_id, r)
+                                sent.add(tc_id)
+                                await emit_raw(
+                                    {
+                                        "type": "tool_call:result",
+                                        "data": {
+                                            "message_id": msg_id,
+                                            "tool_call_id": tc_id,
+                                            "result": r.get("content"),
+                                            **(
+                                                {"files": r["files"]}
+                                                if r.get("files")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"embeds": r["embeds"]}
+                                                if r.get("embeds")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"subagent_id": r["subagent_id"]}
+                                                if r.get("subagent_id")
+                                                else {}
+                                            ),
+                                        },
+                                    }
+                                )
+
                     await event_emitter(
                         {
                             "type": "chat:completion",
@@ -3710,12 +4116,59 @@ async def process_chat_response(
                     }
                 )
 
-                await event_emitter(
-                    {
-                        "type": "chat:completion",
-                        "data": {"done": True},
+                if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                    msg_id = metadata["message_id"]
+                    emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
+                    final_blocks = data.get("content_blocks") or content_blocks
+                    final_content = data.get("content") or ""
+                    final_hash = hashlib.sha256(
+                        (final_content or "").encode("utf-8", "replace")
+                    ).hexdigest()
+                    version = stream_version_incr(msg_id)
+                    done_payload = {
+                        "type": "chat:done",
+                        "data": {
+                            "message_id": msg_id,
+                            "version": version,
+                            "final_content_hash": final_hash,
+                            **({"usage": response_usage} if response_usage else {}),
+                        },
                     }
-                )
+                    if emit_raw is not None:
+                        await emit_raw(done_payload)
+                    else:
+                        await event_emitter(done_payload)
+
+                    chat_obj = None
+                    try:
+                        chat_obj = Chats.get_chat_by_id(metadata["chat_id"])
+                    except Exception:
+                        chat_obj = None
+                    if user and chat_obj is not None:
+                        try:
+                            await broadcast_sidebar_event(
+                                user.id,
+                                {
+                                    "type": "chat:updated",
+                                    "data": {
+                                        "id": metadata["chat_id"],
+                                        "updated_at": getattr(
+                                            chat_obj, "updated_at", None
+                                        ),
+                                    },
+                                },
+                            )
+                        except Exception as e:
+                            log.debug(f"chat:updated broadcast failed: {e}")
+
+                    clear_stream_state(msg_id)
+                else:
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {"done": True},
+                        }
+                    )
 
                 # B12: outlet filters run server-side at the tail of the
                 # stream. The frontend used to POST /api/chat/completed for
@@ -3742,6 +4195,9 @@ async def process_chat_response(
             except asyncio.CancelledError:
                 log.warning("Task was cancelled!")
                 await event_emitter({"type": "chat:tasks:cancel"})
+
+                if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                    clear_stream_state(metadata["message_id"])
 
                 if not ENABLE_REALTIME_CHAT_SAVE:
                     # Save message in the database

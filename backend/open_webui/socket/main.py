@@ -135,6 +135,28 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
     )
 
+    # Stream v2 state: per-message version counter + tool result cache. Both
+    # are keyed by message_id. Cleared on chat:done / error / cancel. Snapshot
+    # endpoint (B1) reads from here.
+    STREAM_VERSION = RedisDict(
+        f"{REDIS_KEY_PREFIX}:stream_version",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+    TOOL_RESULTS = RedisDict(
+        f"{REDIS_KEY_PREFIX}:tool_results",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+    PRIMARY_SESSION_PER_USER = RedisDict(
+        f"{REDIS_KEY_PREFIX}:primary_session_per_user",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+
     clean_up_lock = RedisLock(
         redis_url=WEBSOCKET_REDIS_URL,
         lock_name=f"{REDIS_KEY_PREFIX}:usage_cleanup_lock",
@@ -153,6 +175,10 @@ else:
     # Token usage tracking data structures (in-memory)
     TOKEN_GROUPS = {}
     TOKEN_USAGE = {}
+
+    STREAM_VERSION = {}
+    TOOL_RESULTS = {}
+    PRIMARY_SESSION_PER_USER = {}
 
     aquire_func = release_func = renew_func = lambda: True
 
@@ -1131,6 +1157,94 @@ async def broadcast_sidebar_event(user_id, event_data, skip_sid=None):
             )
             for sid in session_ids
         ]
+    )
+
+
+def is_primary_session(user_id, sid) -> bool:
+    """B8 helper. Defensive fallback: if no primary is recorded for the user,
+    treat every session as primary (so v2 emission still reaches the client
+    before B8 lands)."""
+    try:
+        primary = PRIMARY_SESSION_PER_USER.get(user_id)
+    except Exception:
+        primary = None
+    if not primary:
+        return True
+    return primary == sid
+
+
+def stream_version_init(message_id) -> int:
+    try:
+        STREAM_VERSION[message_id] = 0
+    except Exception:
+        pass
+    return 0
+
+
+def stream_version_incr(message_id) -> int:
+    try:
+        current = STREAM_VERSION.get(message_id, 0) or 0
+    except Exception:
+        current = 0
+    nxt = int(current) + 1
+    try:
+        STREAM_VERSION[message_id] = nxt
+    except Exception:
+        pass
+    return nxt
+
+
+def stream_version_get(message_id) -> int:
+    try:
+        return int(STREAM_VERSION.get(message_id, 0) or 0)
+    except Exception:
+        return 0
+
+
+def set_tool_result(message_id, tool_call_id, result) -> None:
+    try:
+        existing = TOOL_RESULTS.get(message_id, {}) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing[tool_call_id] = result
+        TOOL_RESULTS[message_id] = existing
+    except Exception:
+        pass
+
+
+def get_tool_results(message_id) -> dict:
+    try:
+        existing = TOOL_RESULTS.get(message_id, {}) or {}
+        return existing if isinstance(existing, dict) else {}
+    except Exception:
+        return {}
+
+
+def clear_stream_state(message_id) -> None:
+    for store in (STREAM_VERSION, TOOL_RESULTS):
+        try:
+            if message_id in store:
+                del store[message_id]
+        except Exception:
+            pass
+
+
+async def emit_to_primary(user_id, payload):
+    """Emit a single events payload to the user's primary session only. Falls
+    back to all sessions if no primary is registered (defensive — keeps v2
+    working before B8 ships the election logic)."""
+    try:
+        primary = PRIMARY_SESSION_PER_USER.get(user_id)
+    except Exception:
+        primary = None
+    if primary:
+        await sio.emit("events", payload, to=primary)
+        return
+    session_ids = USER_POOL.get(user_id, []) or []
+    if not session_ids:
+        return
+    await asyncio.gather(
+        *[sio.emit("events", payload, to=sid) for sid in session_ids]
     )
 
 
