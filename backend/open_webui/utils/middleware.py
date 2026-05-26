@@ -36,6 +36,44 @@ current_tool_call_id_var: ContextVar[Optional[str]] = ContextVar(
 )
 
 
+def _merge_streamed_string(existing: str | None, chunk: str | None) -> str:
+    """Merge provider tool-call string deltas defensively.
+
+    OpenAI-style streams usually send true deltas, but some compatible
+    providers resend cumulative/full fields (notably function.name). Blind
+    append turns `web_search` + `web_search` into `web_searchweb_search`.
+    """
+    if not chunk:
+        return existing or ""
+    existing = existing or ""
+    if not existing:
+        return chunk
+    if chunk == existing:
+        return existing
+    if chunk.startswith(existing):
+        return chunk
+    if existing.endswith(chunk):
+        return existing
+
+    max_overlap = min(len(existing), len(chunk))
+    for overlap in range(max_overlap, 0, -1):
+        if existing.endswith(chunk[:overlap]):
+            return existing + chunk[overlap:]
+    return existing + chunk
+
+
+def _dedupe_repeated_tool_name(name: str | None) -> str:
+    if not name:
+        return ""
+    # Covers web_searchweb_search, subagent_launchsubagent_launch, etc.
+    for unit_len in range(1, (len(name) // 2) + 1):
+        if len(name) % unit_len == 0:
+            unit = name[:unit_len]
+            if unit and unit * (len(name) // unit_len) == name:
+                return unit
+    return name
+
+
 from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse
 from starlette.responses import Response, StreamingResponse, JSONResponse
@@ -3146,6 +3184,13 @@ async def process_chat_response(
                                                     delta_tool_call[
                                                         "function"
                                                     ].setdefault("arguments", "")
+                                                    delta_tool_call["function"][
+                                                        "name"
+                                                    ] = _dedupe_repeated_tool_name(
+                                                        delta_tool_call["function"].get(
+                                                            "name", ""
+                                                        )
+                                                    )
                                                     response_tool_calls.append(
                                                         delta_tool_call
                                                     )
@@ -3161,16 +3206,25 @@ async def process_chat_response(
                                                     )
 
                                                     if delta_name:
-                                                        current_response_tool_call[
+                                                        fn = current_response_tool_call[
                                                             "function"
-                                                        ]["name"] += delta_name
+                                                        ]
+                                                        fn["name"] = _dedupe_repeated_tool_name(
+                                                            _merge_streamed_string(
+                                                                fn.get("name", ""), delta_name
+                                                            )
+                                                        )
 
                                                     if delta_arguments:
-                                                        current_response_tool_call[
+                                                        fn = current_response_tool_call[
                                                             "function"
-                                                        ][
+                                                        ]
+                                                        fn[
                                                             "arguments"
-                                                        ] += delta_arguments
+                                                        ] = _merge_streamed_string(
+                                                            fn.get("arguments", ""),
+                                                            delta_arguments,
+                                                        )
 
                                     value = delta.get("content")
 

@@ -22,6 +22,31 @@ bugs the current design replaces.
 from typing import Optional
 
 
+def _dedupe_repeated_tool_name(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    for unit_len in range(1, (len(name) // 2) + 1):
+        if len(name) % unit_len == 0:
+            unit = name[:unit_len]
+            if unit and unit * (len(name) // unit_len) == name:
+                return unit
+    return name
+
+
+def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    normalized = []
+    for tool_call in tool_calls or []:
+        if not isinstance(tool_call, dict):
+            normalized.append(tool_call)
+            continue
+        tc = dict(tool_call)
+        fn = dict(tc.get("function") or {})
+        fn["name"] = _dedupe_repeated_tool_name(fn.get("name"))
+        tc["function"] = fn
+        normalized.append(tc)
+    return normalized
+
+
 def _format_code_interpreter(block: dict) -> str:
     attrs = block.get("attributes") or {}
     lang = attrs.get("lang", "")
@@ -117,7 +142,7 @@ def _expand_assistant(
 
         text = _assistant_content_from_blocks(pending_blocks)
 
-        tool_calls = (
+        tool_calls = _normalize_tool_calls(
             tool_calls_block.get("content") or []
             if tool_calls_block is not None
             else []
