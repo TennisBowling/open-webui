@@ -3464,7 +3464,7 @@
 
 		let snap: any = null;
 		try {
-			snap = await getStreamSnapshot(localStorage.token, messageId);
+			snap = await getStreamSnapshot(localStorage.token, messageId, chatId);
 		} catch (err) {
 			console.error('[chat:delta] snapshot fetch failed', messageId, err);
 			mirror.snapshotting = false;
