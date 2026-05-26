@@ -1453,6 +1453,7 @@ async def _flush_delta_buffer(user_id) -> None:
     envelope = {
         "chat_id": head.get("chat_id"),
         "message_id": head.get("message_id"),
+        "session_id": head.get("session_id"),
         "data": {
             "type": "chat:delta:batch",
             "batch": buf,
