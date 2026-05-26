@@ -1157,6 +1157,62 @@ export const deleteSharedChatById = async (token: string, id: string) => {
 	return res;
 };
 
+export type PatchChatOp =
+	| { op: 'set_param'; key: string; value: unknown }
+	| { op: 'set_meta'; key: string; value: unknown }
+	| { op: 'set_models'; models: string[] }
+	| { op: 'set_files'; files: unknown[] }
+	| { op: 'set_queue'; queue: unknown[] }
+	| { op: 'set_tags'; tags: unknown[] }
+	| { op: 'set_history_current_id'; current_id: string }
+	| {
+			op: 'append_message';
+			message_id: string;
+			parent_id: string | null;
+			role: string;
+			content: unknown;
+			[k: string]: unknown;
+	  }
+	| {
+			op: 'update_message_content';
+			message_id: string;
+			content: unknown;
+			files?: unknown[];
+			[k: string]: unknown;
+	  }
+	| { op: 'set_message_annotation'; message_id: string; annotation: unknown }
+	| { op: 'delete_message'; message_id: string };
+
+export const patchChat = async (token: string, id: string, ops: PatchChatOp[]) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}`, {
+		method: 'PATCH',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` }),
+			...sessionHeader()
+		},
+		body: JSON.stringify({ ops })
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const updateChatById = async (token: string, id: string, chat: object) => {
 	let error = null;
 

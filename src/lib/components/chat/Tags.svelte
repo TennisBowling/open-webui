@@ -6,7 +6,7 @@
 		getChatList,
 		getChatListByTagName,
 		getTagsById,
-		updateChatById
+		patchChat
 	} from '$lib/apis/chats';
 	import {
 		tags as _tags,
@@ -41,9 +41,7 @@
 		}
 
 		tags = await getTags();
-		await updateChatById(localStorage.token, chatId, {
-			tags: tags
-		});
+		await patchChat(localStorage.token, chatId, [{ op: 'set_tags', tags }]);
 
 		await _tags.set(await getAllTags(localStorage.token));
 		dispatch('add', {
@@ -54,9 +52,7 @@
 	const deleteTag = async (tagName) => {
 		const res = await deleteTagById(localStorage.token, chatId, tagName);
 		tags = await getTags();
-		await updateChatById(localStorage.token, chatId, {
-			tags: tags
-		});
+		await patchChat(localStorage.token, chatId, [{ op: 'set_tags', tags }]);
 
 		await _tags.set(await getAllTags(localStorage.token));
 		dispatch('delete', {
