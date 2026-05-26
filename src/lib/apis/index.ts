@@ -381,10 +381,19 @@ export const getTaskIdsByChatId = async (token: string, chat_id: string) => {
 	return res;
 };
 
-export const getStreamSnapshot = async (token: string, message_id: string) => {
+export const getStreamSnapshot = async (
+	token: string,
+	message_id: string,
+	chat_id?: string | null
+) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/streams/${message_id}/snapshot`, {
+	const params = new URLSearchParams();
+	if (chat_id) params.set('chat_id', chat_id);
+	const qs = params.toString();
+	const url = `${WEBUI_BASE_URL}/api/v1/streams/${message_id}/snapshot${qs ? `?${qs}` : ''}`;
+
+	const res = await fetch(url, {
 		method: 'GET',
 		headers: {
 			Accept: 'application/json',
