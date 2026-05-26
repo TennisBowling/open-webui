@@ -1399,10 +1399,20 @@
 		if (op === 'text_append') {
 			const idx = payload.block_idx;
 			const block = mirror.content_blocks[idx];
+			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
-				block.content = (block.content || '') + (payload.text || '');
+				block.content = (block.content || '') + text;
 			} else if (idx === mirror.content_blocks.length) {
-				mirror.content_blocks.push({ type: 'text', content: payload.text || '' });
+				const prev = mirror.content_blocks[idx - 1];
+				if (
+					prev &&
+					(prev.type === 'text' || prev.type === 'reasoning') &&
+					text.startsWith(prev.content || '')
+				) {
+					prev.content = text;
+				} else {
+					mirror.content_blocks.push({ type: 'text', content: text });
+				}
 			}
 		} else if (op === 'block_open') {
 			const block: any = { type: payload.type, content: '' };
@@ -3618,10 +3628,23 @@
 		if (op === 'text_append') {
 			const idx = payload.block_idx;
 			const block = mirror.content_blocks[idx];
+			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
-				block.content = (block.content || '') + (payload.text || '');
+				block.content = (block.content || '') + text;
 			} else if (idx === mirror.content_blocks.length) {
-				mirror.content_blocks.push({ type: 'text', content: payload.text || '' });
+				const prev = mirror.content_blocks[idx - 1];
+				// Defensive: if an out-of-order replace/open made the server send a
+				// full prefix as the next append, update the existing tail block
+				// instead of creating duplicate progressively-longer text blocks.
+				if (
+					prev &&
+					(prev.type === 'text' || prev.type === 'reasoning') &&
+					text.startsWith(prev.content || '')
+				) {
+					prev.content = text;
+				} else {
+					mirror.content_blocks.push({ type: 'text', content: text });
+				}
 			}
 		} else if (op === 'block_open') {
 			const block: any = { type: payload.type, content: '' };
