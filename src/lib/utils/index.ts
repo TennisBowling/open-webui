@@ -933,7 +933,7 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 				// tool_calls Collapsible. Must mirror what the backend's
 				// `serialize_content_blocks` does — otherwise this client-side
 				// projection clobbers the backend's HTML on reactive re-render.
-				if (name === 'subagent_launch' || name === 'subagent_continue') {
+				if (name === 'subagent_launch' || name === 'subagent_continue' || name === 'subagent_agent_launch') {
 					const saId = (result as any)?.subagent_id ?? '';
 					const doneFlag = result !== undefined ? 'true' : 'false';
 					out += `<details type="subagent_launch" done="${doneFlag}" tool_call_id="${escapeHtmlAttr(id)}" id="${escapeHtmlAttr(saId)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}">\n<summary>Subagent</summary>\n</details>\n`;

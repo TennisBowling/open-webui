@@ -23,6 +23,7 @@
 	import { settings } from '$lib/stores';
 	import HtmlToken from './HTMLToken.svelte';
 	import DataVizWidget from '$lib/components/chat/Messages/DataVizWidget.svelte';
+	import SubagentBlock from './SubagentBlock.svelte';
 
 	const parseToolCallArguments = (raw: unknown): Record<string, any> => {
 		if (raw == null) return {};
@@ -333,6 +334,8 @@
 			{messageId}
 			{dataVizOverrides}
 		/>
+	{:else if token.type === 'details' && token?.attributes?.type === 'subagent_launch'}
+		<SubagentBlock attributes={token.attributes} />
 	{:else if token.type === 'details'}
 		<Collapsible
 			title={token.summary}
