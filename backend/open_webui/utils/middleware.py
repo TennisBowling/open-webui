@@ -3339,13 +3339,20 @@ async def process_chat_response(
                                                 metadata["message_id"],
                                                 update_data,
                                             )
-                                        else:
-                                            data = {
-                                                "content": serialize_content_blocks(
-                                                    content_blocks
-                                                ),
-                                                "content_blocks": content_blocks,
-                                            }
+
+                                        # Regardless of realtime DB writes, the
+                                        # stream event must carry content_blocks
+                                        # so the v2 wrapper can translate this
+                                        # chunk into chat:delta ops. The v2
+                                        # serializer intentionally returns an
+                                        # empty content string on the hot path;
+                                        # frontends render from content_blocks.
+                                        data = {
+                                            "content": serialize_content_blocks(
+                                                content_blocks
+                                            ),
+                                            "content_blocks": content_blocks,
+                                        }
 
                                 if delta:
                                     delta_count += 1
