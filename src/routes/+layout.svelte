@@ -63,6 +63,11 @@
 
 	const bc = new BroadcastChannel('active-tab-channel');
 
+	const SUPPORTS_BROADCAST_CHANNEL = typeof BroadcastChannel !== 'undefined';
+	let eventsBc = null;
+	let primarySessionId = null;
+	let suppressBroadcast = false;
+
 	let loaded = false;
 	let tokenTimer = null;
 
@@ -129,7 +134,13 @@
 			console.log('connected', _socket.id);
 			if (localStorage.getItem('token')) {
 				// Emit user-join event with auth token
-				_socket.emit('user-join', { auth: { token: localStorage.token } });
+				_socket.emit('user-join', { auth: { token: localStorage.token } }, (ack) => {
+					if (ack && typeof ack === 'object' && 'primary_session_id' in ack) {
+						primarySessionId = ack.primary_session_id ?? null;
+					} else {
+						primarySessionId = null;
+					}
+				});
 			} else {
 				console.warn('No token found in localStorage, user-join event not emitted');
 			}
@@ -298,6 +309,25 @@
 	};
 
 	const chatEventHandler = async (event, cb) => {
+		// Re-broadcast to sibling tabs of the same user so the backend can emit
+		// stream events to a single elected primary session per user. The
+		// non-primary tabs receive the same payload via BroadcastChannel and
+		// run it through this handler with suppressBroadcast set, preventing
+		// an infinite re-broadcast loop.
+		if (
+			!suppressBroadcast &&
+			eventsBc &&
+			primarySessionId &&
+			$socket?.id &&
+			$socket.id === primarySessionId
+		) {
+			try {
+				eventsBc.postMessage(event);
+			} catch (err) {
+				console.error('owui-events broadcast failed', err);
+			}
+		}
+
 		const visibleChatId = getVisibleChatId();
 		const isCurrentChatEvent = Boolean(event.chat_id) && visibleChatId === event.chat_id;
 		const windowFocused = await isWindowFocused();
@@ -572,6 +602,25 @@
 				isLastActiveTab.set(false); // Another tab became active
 			}
 		};
+
+		if (SUPPORTS_BROADCAST_CHANNEL) {
+			eventsBc = new BroadcastChannel('owui-events');
+			eventsBc.onmessage = async (msg) => {
+				const payload = msg?.data;
+				if (!payload) return;
+				// Non-primary tabs receive deduped stream events here. Replay
+				// them through the same handler the socket would invoke, with
+				// the re-broadcast guard set so we don't echo back.
+				suppressBroadcast = true;
+				try {
+					await chatEventHandler(payload, () => {});
+				} catch (err) {
+					console.error('owui-events replay failed', err);
+				} finally {
+					suppressBroadcast = false;
+				}
+			};
+		}
 
 		// Set yourself as the last active tab when this tab is focused
 		const handleVisibilityChange = () => {
