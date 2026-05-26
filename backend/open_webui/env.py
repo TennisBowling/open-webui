@@ -585,11 +585,9 @@ else:
 
 # Stream protocol selector. v1 emits full content_blocks every flush; v2 emits
 # only deltas (text_append, block_open/close, tool_call:result, chat:done).
-# Default stays v1 until the frontend v2 consumer (F4) ships and the
-# coordinator flips this.
-STREAM_PROTOCOL_VERSION = os.environ.get("STREAM_PROTOCOL_VERSION", "v1").strip() or "v1"
+STREAM_PROTOCOL_VERSION = os.environ.get("STREAM_PROTOCOL_VERSION", "v2").strip() or "v2"
 if STREAM_PROTOCOL_VERSION not in ("v1", "v2"):
-    STREAM_PROTOCOL_VERSION = "v1"
+    STREAM_PROTOCOL_VERSION = "v2"
 
 # Under v2 we coalesce more aggressively by default. v1 keeps its existing
 # default (1) so behaviour is unchanged for callers not opted into v2.
