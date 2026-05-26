@@ -123,6 +123,30 @@ if WEBSOCKET_MANAGER == "redis":
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
     )
 
+    # Stream v2 snapshot-supporting state (B1/B8/B9). Keyed by message_id.
+    # Populated by the v2 stream emitter; TOOL_RESULTS holds per-message
+    # tool-call result bodies so subsequent deltas can reference them by
+    # tool_call_id only. Until B9 lands these stay empty and the snapshot
+    # endpoint falls back to the persisted chat_message row.
+    STREAM_VERSION = RedisDict(
+        f"{REDIS_KEY_PREFIX}:stream_version",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+    TOOL_RESULTS = RedisDict(
+        f"{REDIS_KEY_PREFIX}:tool_results",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+    STREAM_STATE = RedisDict(
+        f"{REDIS_KEY_PREFIX}:stream_state",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+
     # Token usage tracking data structures
     TOKEN_GROUPS = RedisDict(
         "open-webui:token_groups",
@@ -149,6 +173,9 @@ else:
     SESSION_POOL = {}
     USER_POOL = {}
     USAGE_POOL = {}
+    STREAM_VERSION = {}
+    TOOL_RESULTS = {}
+    STREAM_STATE = {}
 
     # Token usage tracking data structures (in-memory)
     TOKEN_GROUPS = {}
