@@ -1511,6 +1511,53 @@ async def chat_completion(
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
+    # B10: detect v2 body shape (carries `leaf_message_id`, no `messages`).
+    # Server walks the chat tree to assemble the canonical conversation. v1 body
+    # (with `messages`) falls through to the existing pipeline unchanged.
+    if (
+        "leaf_message_id" in form_data
+        and "messages" not in form_data
+        and form_data.get("chat_id")
+        and not str(form_data.get("chat_id", "")).startswith("local:")
+    ):
+        try:
+            from open_webui.utils.chat import assemble_conversation_from_leaf
+
+            # Auth: caller must own the chat we're about to walk.
+            if user and user.role != "admin":
+                owned = Chats.get_chat_by_id_and_user_id(form_data["chat_id"], user.id)
+                if owned is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=ERROR_MESSAGES.DEFAULT(),
+                    )
+
+            leaf_id = form_data.pop("leaf_message_id", None)
+            new_user_message = form_data.pop("new_user_message", None)
+            assemble_model = None
+            assemble_model_id = form_data.get("model")
+            if assemble_model_id and assemble_model_id in request.app.state.MODELS:
+                assemble_model = request.app.state.MODELS[assemble_model_id]
+            elif isinstance(form_data.get("model_item"), dict) and form_data["model_item"]:
+                assemble_model = form_data["model_item"]
+
+            assembled = assemble_conversation_from_leaf(
+                form_data["chat_id"],
+                leaf_id,
+                new_user_message=new_user_message,
+                model=assemble_model,
+                system_prompt=(form_data.get("params") or {}).get("system"),
+            )
+            form_data["messages"] = assembled
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception(f"v2 conversation assembly failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to assemble conversation: {e}",
+            )
+
     model_id = form_data.get("model", None)
     model_item = form_data.pop("model_item", {})
     tasks = form_data.pop("background_tasks", None)
