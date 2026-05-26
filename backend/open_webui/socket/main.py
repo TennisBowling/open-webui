@@ -231,12 +231,40 @@ def get_user_id_from_session_pool(sid):
 
 def _elect_primary_session(user_id, sid):
     """Set sid as the user's primary session if no live primary is currently
-    recorded. Returns the resulting primary sid for this user."""
+    recorded. Returns the resulting primary sid for this user.
+
+    Atomic against concurrent callers when backed by Redis: a single
+    HSETNX claims the slot, and if it's already claimed we only attempt
+    to replace it via compare_and_swap when the recorded session has
+    actually disappeared from SESSION_POOL. This closes the race where
+    two workers (or a connect + disconnect on different workers) could
+    both read `current = None` and both write themselves as primary."""
+    # Fast path: try to atomically claim the slot if nothing is recorded.
+    setnx = getattr(PRIMARY_SESSION_PER_USER, "setnx", None)
+    if setnx is not None:
+        if setnx(user_id, sid):
+            return sid
+    else:
+        # In-memory fallback (single worker, no real race).
+        if user_id not in PRIMARY_SESSION_PER_USER:
+            PRIMARY_SESSION_PER_USER[user_id] = sid
+            return sid
+
     current = PRIMARY_SESSION_PER_USER.get(user_id)
-    if not current or current not in SESSION_POOL:
-        PRIMARY_SESSION_PER_USER[user_id] = sid
-        return sid
-    return current
+    if current and current in SESSION_POOL:
+        return current
+
+    # Recorded primary is stale (session gone). Try to atomically swap
+    # it for ourselves; if another caller swapped first we accept their
+    # winner rather than overwriting it.
+    cas = getattr(PRIMARY_SESSION_PER_USER, "compare_and_swap", None)
+    if cas is not None:
+        if cas(user_id, current, sid):
+            return sid
+        return PRIMARY_SESSION_PER_USER.get(user_id) or sid
+
+    PRIMARY_SESSION_PER_USER[user_id] = sid
+    return sid
 
 
 def is_primary_session(user_id, sid) -> bool:
@@ -969,15 +997,24 @@ async def disconnect(sid):
 
         if len(USER_POOL[user_id]) == 0:
             del USER_POOL[user_id]
-            if PRIMARY_SESSION_PER_USER.get(user_id) == sid:
+            cad = getattr(PRIMARY_SESSION_PER_USER, "compare_and_delete", None)
+            if cad is not None:
+                cad(user_id, sid)
+            elif PRIMARY_SESSION_PER_USER.get(user_id) == sid:
                 del PRIMARY_SESSION_PER_USER[user_id]
         elif PRIMARY_SESSION_PER_USER.get(user_id) == sid:
             # Primary disappeared but other sessions of this user remain.
             # Immediately elect a replacement so server-side primary-only
             # emits (e.g. token-usage:update) don't fall back to fan-out and
             # defeat the dedup design. Pick the first remaining sid for
-            # determinism.
-            PRIMARY_SESSION_PER_USER[user_id] = USER_POOL[user_id][0]
+            # determinism. Use CAS so a concurrent connect on another worker
+            # that already promoted itself isn't overwritten.
+            replacement = USER_POOL[user_id][0]
+            cas = getattr(PRIMARY_SESSION_PER_USER, "compare_and_swap", None)
+            if cas is not None:
+                cas(user_id, sid, replacement)
+            else:
+                PRIMARY_SESSION_PER_USER[user_id] = replacement
 
         await YDOC_MANAGER.remove_user_from_all_documents(sid)
     else:

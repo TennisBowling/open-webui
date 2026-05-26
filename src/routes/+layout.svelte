@@ -70,6 +70,11 @@
 
 	const SUPPORTS_BROADCAST_CHANNEL = typeof BroadcastChannel !== 'undefined';
 	let eventsBc = null;
+	// LRU-ish dedup window for events replayed via the owui-events
+	// BroadcastChannel. Bounds memory while remaining large enough to
+	// cover a streaming response's worth of incremental updates.
+	const seenBroadcastEvents = new Set();
+	const seenBroadcastOrder = [];
 	let primarySessionId = null;
 	let suppressBroadcast = false;
 
@@ -535,6 +540,40 @@
 			eventsBc.onmessage = async (msg) => {
 				const payload = msg?.data;
 				if (!payload) return;
+				// Defensive dedup: if the backend briefly has two primary
+				// sessions during the election race (e.g. old primary
+				// disconnecting at the same instant a new tab connects),
+				// the same event can arrive on this channel twice. Drop
+				// repeats so non-primary tabs don't double-apply stream
+				// updates. Identifier covers message id, event type, and
+				// the per-message version when present.
+				try {
+					const dataPart = payload?.data ?? {};
+					const messageId = payload?.message_id ?? '';
+					const chatId = payload?.chat_id ?? '';
+					const type = dataPart?.type ?? '';
+					const version = dataPart?.version ?? payload?.version ?? '';
+					// Only dedup when we have at least a message/chat id to
+					// scope by — otherwise distinct events with no
+					// identifying fields would all collapse onto one entry.
+					if (messageId || chatId) {
+						const id = [messageId, chatId, type, version].join('|');
+						if (seenBroadcastEvents.has(id)) {
+							return;
+						}
+						seenBroadcastEvents.add(id);
+						seenBroadcastOrder.push(id);
+						if (seenBroadcastOrder.length > 200) {
+							const evicted = seenBroadcastOrder.shift();
+							if (evicted !== undefined) {
+								seenBroadcastEvents.delete(evicted);
+							}
+						}
+					}
+				} catch (err) {
+					// Identifier construction must never break replay.
+					console.error('owui-events dedup id failed', err);
+				}
 				// Non-primary tabs receive deduped stream events here. Replay
 				// them through the same handler the socket would invoke, with
 				// the re-broadcast guard set so we don't echo back.
