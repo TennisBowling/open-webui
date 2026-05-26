@@ -511,6 +511,73 @@ def _row_to_message_dict(row) -> dict:
     return msg
 
 
+_SLIM_TOOL_RESULT_THRESHOLD_BYTES = 1024
+
+
+def _project_message_slim(
+    msg: dict, is_current_leaf: bool = False, is_current_branch: bool = True
+) -> dict:
+    """Return a copy of ``msg`` with bandwidth-heavy fields stripped.
+
+    - drops ``originalContent`` (frontend re-derives from ``content`` if needed)
+    - drops ``reasoning_details_per_round`` for non-leaf messages
+    - replaces ``tool_calls[*].results[*].content`` larger than
+      ``_SLIM_TOOL_RESULT_THRESHOLD_BYTES`` with a ``{tool_call_id, truncated,
+      size}`` stub for non-current-branch turns; frontend hydrates on expand
+      via the per-message endpoint.
+    """
+    if not isinstance(msg, dict):
+        return msg
+    out = dict(msg)
+    out.pop("originalContent", None)
+    if not is_current_leaf:
+        out.pop("reasoning_details_per_round", None)
+
+    if not is_current_branch:
+        tool_calls = out.get("tool_calls")
+        if isinstance(tool_calls, list):
+            new_tcs = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    new_tcs.append(tc)
+                    continue
+                results = tc.get("results")
+                if not isinstance(results, list):
+                    new_tcs.append(tc)
+                    continue
+                new_results = []
+                for r in results:
+                    if not isinstance(r, dict):
+                        new_results.append(r)
+                        continue
+                    content = r.get("content")
+                    try:
+                        content_str = (
+                            content
+                            if isinstance(content, str)
+                            else json.dumps(content, default=str)
+                        )
+                        size = len(content_str.encode("utf-8"))
+                    except Exception:
+                        size = 0
+                    if size > _SLIM_TOOL_RESULT_THRESHOLD_BYTES:
+                        new_results.append(
+                            {
+                                "tool_call_id": r.get("tool_call_id")
+                                or tc.get("id"),
+                                "truncated": True,
+                                "size": size,
+                            }
+                        )
+                    else:
+                        new_results.append(r)
+                new_tc = dict(tc)
+                new_tc["results"] = new_results
+                new_tcs.append(new_tc)
+            out["tool_calls"] = new_tcs
+    return out
+
+
 def _chat_messages_from_table(db, chat_id: str) -> dict:
     """Reconstruct ``{message_id: message_dict}`` from chat_message rows for
     the given chat. Ordered by ``sequence`` so the dict iteration order
@@ -1890,6 +1957,137 @@ class ChatTable:
             if isinstance(chat_dict.get("messages"), list):
                 return chat_dict["messages"][skip : skip + limit]
             return []
+
+    def get_chat_meta_by_id_and_user_id(
+        self, id: str, user_id: str
+    ) -> Optional[dict]:
+        """Return chat metadata + sibling stubs only (no message content).
+
+        Sibling stubs: ``[{id, parentId, childrenIds, role}]`` for every
+        message in the chat — IDs only, used to render branch navigation
+        without shipping the full message bodies. ``childrenIds`` is derived
+        from ``parent_id`` when not stored directly on the message.
+        """
+        chat = self.get_chat_by_id_and_user_id(id, user_id)
+        if chat is None:
+            return None
+        chat_dict = chat.chat if isinstance(chat.chat, dict) else {}
+        history = chat_dict.get("history") or {}
+        messages_map = history.get("messages") if isinstance(history, dict) else None
+
+        sibling_stubs: list[dict] = []
+        if isinstance(messages_map, dict):
+            children_index: dict[str, list[str]] = {}
+            for mid, m in messages_map.items():
+                if not isinstance(m, dict):
+                    continue
+                pid = m.get("parentId")
+                if pid is not None:
+                    children_index.setdefault(pid, []).append(mid)
+            for mid, m in messages_map.items():
+                if not isinstance(m, dict):
+                    continue
+                stored_children = m.get("childrenIds")
+                children = (
+                    stored_children
+                    if isinstance(stored_children, list) and stored_children
+                    else children_index.get(mid, [])
+                )
+                sibling_stubs.append(
+                    {
+                        "id": mid,
+                        "parentId": m.get("parentId"),
+                        "childrenIds": children,
+                        "role": m.get("role"),
+                    }
+                )
+
+        return {
+            "id": chat.id,
+            "title": chat.title,
+            "updated_at": chat.updated_at,
+            "created_at": chat.created_at,
+            "params": chat_dict.get("params") or {},
+            "models": chat_dict.get("models") or [],
+            "files": chat_dict.get("files") or [],
+            "queue": chat_dict.get("queue") or [],
+            "history": {
+                "currentId": history.get("currentId") if isinstance(history, dict) else None,
+                "sibling_stubs": sibling_stubs,
+            },
+        }
+
+    def get_chat_messages_branch(
+        self,
+        chat_id: str,
+        leaf_message_id: str,
+        before_message_id: Optional[str] = None,
+        limit: int = 7,
+    ) -> list[dict]:
+        """Return the last ``limit`` ancestors on the branch ending at
+        ``leaf_message_id``, oldest-first.
+
+        Walks ``parent_id`` from leaf to root using the in-memory messages
+        map (works for both migrated and legacy chats). If
+        ``before_message_id`` is given, returns the ``limit`` ancestors
+        immediately older than that anchor (exclusive) — used for upward
+        scroll pagination.
+        """
+        messages_map = self.get_messages_map_by_chat_id(chat_id) or {}
+        if not messages_map:
+            return []
+
+        chain: list[dict] = []
+        seen: set[str] = set()
+        cursor = leaf_message_id
+        while cursor and cursor in messages_map and cursor not in seen:
+            seen.add(cursor)
+            msg = messages_map[cursor]
+            if isinstance(msg, dict):
+                m = dict(msg)
+                m.setdefault("id", cursor)
+                chain.append(m)
+                parent = msg.get("parentId")
+            else:
+                parent = None
+            cursor = parent
+
+        chain.reverse()
+
+        if before_message_id:
+            try:
+                idx = next(
+                    i for i, m in enumerate(chain) if m.get("id") == before_message_id
+                )
+            except StopIteration:
+                idx = len(chain)
+            start = max(0, idx - max(1, int(limit)))
+            return chain[start:idx]
+
+        if limit and limit > 0:
+            return chain[-int(limit):]
+        return chain
+
+    def get_message_siblings(
+        self, chat_id: str, message_id: str
+    ) -> list[dict]:
+        """Return the messages that share a parent with ``message_id``
+        (including ``message_id`` itself), full content.
+        """
+        messages_map = self.get_messages_map_by_chat_id(chat_id) or {}
+        target = messages_map.get(message_id)
+        if not isinstance(target, dict):
+            return []
+        parent_id = target.get("parentId")
+        sibs: list[dict] = []
+        for mid, m in messages_map.items():
+            if not isinstance(m, dict):
+                continue
+            if m.get("parentId") == parent_id:
+                copy_m = dict(m)
+                copy_m.setdefault("id", mid)
+                sibs.append(copy_m)
+        return sibs
 
     def _project_title_ids(self, rows) -> list[ChatTitleIdResponse]:
         return [

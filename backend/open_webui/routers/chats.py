@@ -11,6 +11,7 @@ from open_webui.models.chats import (
     ChatSearchResponse,
     Chats,
     ChatTitleIdResponse,
+    _project_message_slim,
 )
 from open_webui.models.tags import TagModel, Tags
 from open_webui.models.folders import Folders
@@ -526,14 +527,25 @@ async def get_user_chat_list_by_tag_name(
 ############################
 
 
-@router.get("/{id}", response_model=Optional[ChatResponse])
-async def get_chat_by_id(id: str, user=Depends(get_verified_user)):
+@router.get("/{id}")
+async def get_chat_by_id(
+    id: str,
+    meta_only: bool = False,
+    user=Depends(get_verified_user),
+):
+    if meta_only:
+        meta = Chats.get_chat_meta_by_id_and_user_id(id, user.id)
+        if meta is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+        return meta
+
     chat = Chats.get_chat_by_id_and_user_id(id, user.id)
 
     if chat:
-        # Skip the model_dump() → re-validate hop. FastAPI's response_model
-        # serialization will coerce the ChatModel directly.
-        return chat
+        return ChatResponse(**chat.model_dump())
 
     else:
         raise HTTPException(
@@ -585,15 +597,36 @@ async def update_chat_by_id(
 async def get_chat_messages_paginated(
     id: str,
     skip: int = 0,
-    limit: int = 100,
+    limit: Optional[int] = None,
+    leaf: Optional[str] = None,
+    before: Optional[str] = None,
+    current_leaf: Optional[str] = None,
+    slim: bool = True,
     user=Depends(get_verified_user),
 ):
     """Paginated message list for a single chat.
+
+    Two modes:
+
+    1. ``?leaf=<msg_id>`` (optionally with ``before=<msg_id>`` and ``limit``) —
+       branch-aware ancestor pagination. Walks ``parent_id`` from leaf to root
+       and returns the last ``limit`` ancestors (oldest-first), or the
+       ``limit`` ancestors immediately older than ``before`` for upward scroll.
+       Default ``limit`` is 7 when ``leaf`` is set.
+
+    2. ``?skip=&limit=`` — legacy offset/limit pagination over the full
+       chat_message table, used by existing callers (admin, export). Default
+       ``limit`` is 100.
 
     Reads directly from the chat_message table for migrated chats so we
     don't have to ship the entire 100+ MB JSON blob over the wire just to
     render a window of messages. Falls back to JSON slicing for unmigrated
     chats so the response shape is identical regardless of storage path.
+
+    ``slim=true`` (default) strips bandwidth-heavy per-message fields
+    (``originalContent``, ``reasoning_details_per_round`` for non-leaf,
+    oversized ``tool_calls`` results for non-current-branch turns). Callers
+    that need the full bodies (admin/export/share) pass ``slim=false``.
     """
     # Lightweight ownership check — avoids hydrating the whole message tree
     # (which would defeat the entire point of paginating).
@@ -602,7 +635,58 @@ async def get_chat_messages_paginated(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    return Chats.get_chat_messages_paginated(id, skip=skip, limit=limit)
+
+    if leaf is not None:
+        branch_limit = limit if limit and limit > 0 else 7
+        messages = Chats.get_chat_messages_branch(
+            id, leaf, before_message_id=before, limit=branch_limit
+        )
+    else:
+        offset_limit = limit if limit and limit > 0 else 100
+        messages = Chats.get_chat_messages_paginated(
+            id, skip=skip, limit=offset_limit
+        )
+
+    if not slim:
+        return messages
+
+    leaf_for_projection = current_leaf or leaf
+    return [
+        _project_message_slim(
+            m,
+            is_current_leaf=(
+                leaf_for_projection is not None
+                and m.get("id") == leaf_for_projection
+            ),
+            is_current_branch=True,
+        )
+        for m in messages
+        if isinstance(m, dict)
+    ]
+
+
+############################
+# GetChatMessageSiblings
+############################
+
+
+@router.get("/{id}/messages/{message_id}/siblings")
+async def get_chat_message_siblings(
+    id: str,
+    message_id: str,
+    user=Depends(get_verified_user),
+):
+    """Return the messages that share a parent with ``message_id`` (including
+    ``message_id`` itself), with full content. Used by the frontend's
+    branch-switch lazy-load path: when the user clicks the prev/next arrow,
+    we fetch the sibling branch's leaf message and its peers in one call.
+    """
+    if not Chats.user_owns_chat(id, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    return Chats.get_message_siblings(id, message_id)
 
 
 ############################
