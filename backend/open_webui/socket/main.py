@@ -539,22 +539,21 @@ async def process_token_usage(
 
 
 async def push_token_usage_update(user_id: str, groups: dict):
-    session_ids = [sid for sid in USER_POOL.get(user_id, []) if sid]
-    if not session_ids:
+    # Emit to the primary session only; other tabs of the same user pick it up
+    # via BroadcastChannel (F9). If no primary is currently elected (e.g. the
+    # previous primary just disconnected and nobody is online), skip silently —
+    # the next mount will fetch initial state.
+    primary_sid = get_primary_session(user_id)
+    if not primary_sid:
         return
-    await asyncio.gather(
-        *[
-            sio.emit(
-                "events",
-                {
-                    "chat_id": None,
-                    "message_id": None,
-                    "data": {"type": "token-usage:update", "data": {"groups": groups}},
-                },
-                to=sid,
-            )
-            for sid in session_ids
-        ]
+    await sio.emit(
+        "events",
+        {
+            "chat_id": None,
+            "message_id": None,
+            "data": {"type": "token-usage:update", "data": {"groups": groups}},
+        },
+        to=primary_sid,
     )
 
 
@@ -940,8 +939,12 @@ async def disconnect(sid):
             if PRIMARY_SESSION_PER_USER.get(user_id) == sid:
                 del PRIMARY_SESSION_PER_USER[user_id]
         elif PRIMARY_SESSION_PER_USER.get(user_id) == sid:
-            # primary disappeared; clear so the next user-join re-elects.
-            del PRIMARY_SESSION_PER_USER[user_id]
+            # Primary disappeared but other sessions of this user remain.
+            # Immediately elect a replacement so server-side primary-only
+            # emits (e.g. token-usage:update) don't fall back to fan-out and
+            # defeat the dedup design. Pick the first remaining sid for
+            # determinism.
+            PRIMARY_SESSION_PER_USER[user_id] = USER_POOL[user_id][0]
 
         await YDOC_MANAGER.remove_user_from_all_documents(sid)
     else:
