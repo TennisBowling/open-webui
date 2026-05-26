@@ -63,6 +63,8 @@
 		createNewChat,
 		getAllTags,
 		getChatById,
+		getChatMeta,
+		getChatMessagesBranch,
 		getTagsById,
 		updateChatById,
 		updateChatFolderIdById
@@ -2659,6 +2661,63 @@
 
 		let _chat, _taskRes;
 
+		// Stitches the paginated `?meta_only=true` response + a branch-message page
+		// back into the legacy `{id, title, chat: {...}}` shape that downstream code
+		// (subagent hydration, message rendering, save handler) reads. sibling_stubs
+		// fill in id-only placeholders for every message in the chat so branch arrows
+		// and parent/child traversal keep working; full bodies are lazy-loaded on demand.
+		const stitchPaginatedChat = (meta: any, branchPage: any) => {
+			if (!meta) return null;
+			const messagesMap: Record<string, any> = {};
+			for (const stub of meta?.history?.sibling_stubs ?? []) {
+				if (!stub?.id) continue;
+				messagesMap[stub.id] = {
+					id: stub.id,
+					parentId: stub.parentId ?? null,
+					childrenIds: Array.isArray(stub.childrenIds) ? stub.childrenIds : [],
+					role: stub.role,
+					content: '',
+					_stub: true
+				};
+			}
+			for (const msg of branchPage?.messages ?? []) {
+				if (!msg?.id) continue;
+				messagesMap[msg.id] = { ...(messagesMap[msg.id] ?? {}), ...msg, _stub: false };
+			}
+			return {
+				...meta,
+				chat: {
+					id: meta.id,
+					title: meta.title,
+					params: meta.params ?? {},
+					models: meta.models ?? [],
+					files: meta.files ?? [],
+					queue: meta.queue ?? [],
+					history: {
+						currentId: meta?.history?.currentId ?? null,
+						messages: messagesMap
+					},
+					messages: Object.values(messagesMap)
+				}
+			};
+		};
+
+		const loadPaginatedChat = async () => {
+			const meta = await getChatMeta(localStorage.token, currentChatId).catch(async (error) => {
+				await goto('/');
+				return null;
+			});
+			if (!meta) return null;
+			const leafId = meta?.history?.currentId;
+			const branchPage = leafId
+				? await getChatMessagesBranch(localStorage.token, currentChatId, {
+						leaf: leafId,
+						limit: 7
+					}).catch(() => null)
+				: { messages: [] };
+			return stitchPaginatedChat(meta, branchPage);
+		};
+
 		if (preloadedDataPromise) {
 			const resolved = await preloadedDataPromise;
 			preloadedDataPromise = null;
@@ -2667,10 +2726,7 @@
 				_taskRes = resolved.taskRes;
 			} else {
 				[_chat, _taskRes] = await Promise.all([
-					getChatById(localStorage.token, currentChatId).catch(async (error) => {
-						await goto('/');
-						return null;
-					}),
+					loadPaginatedChat(),
 					getTaskIdsByChatId(localStorage.token, currentChatId).catch((error) => {
 						return null;
 					})
@@ -2682,10 +2738,7 @@
 			preloadedData = null;
 		} else {
 			[_chat, _taskRes] = await Promise.all([
-				getChatById(localStorage.token, currentChatId).catch(async (error) => {
-					await goto('/');
-					return null;
-				}),
+				loadPaginatedChat(),
 				getTaskIdsByChatId(localStorage.token, currentChatId).catch((error) => {
 					return null;
 				})
