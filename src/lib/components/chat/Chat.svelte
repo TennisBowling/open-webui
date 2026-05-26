@@ -6565,6 +6565,13 @@
 			);
 
 			if (res) {
+				chats.update((arr) =>
+					arr ? arr.map((c) => (c.id === chatId ? { ...c, folder_id: folderId } : c)) : arr
+				);
+				pinnedChats.update((arr) =>
+					arr.map((c) => (c.id === chatId ? { ...c, folder_id: folderId } : c))
+				);
+
 				toast.success($i18n.t('Chat moved successfully'));
 			}
 		} else {
