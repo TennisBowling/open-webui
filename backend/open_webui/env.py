@@ -604,13 +604,9 @@ STREAM_DELTA_BATCH_ENABLED = (
 # expire after the TTL. Default 48h.
 STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "172800"))
 
-# Under v2 we coalesce more aggressively by default. v1 keeps its existing
-# default (1) so behaviour is unchanged for callers not opted into v2.
-if STREAM_PROTOCOL_VERSION == "v2" and (
-    os.environ.get("CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE", "") == ""
-    or CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE == 1
-):
-    CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE = 10
+# Keep the default parent-chat delta flush size at 1 so v2 still feels like
+# token streaming. High-throughput inner/subagent streams can opt into larger
+# batches via metadata.params.stream_delta_chunk_size.
 
 
 CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES = os.environ.get(

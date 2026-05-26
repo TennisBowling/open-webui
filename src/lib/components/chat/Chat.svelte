@@ -3742,7 +3742,7 @@
 					target.details.push({ ...detail });
 				}
 			}
-		} else if (op === 'sources' || op === 'selected_model_id') {
+		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
 			// Carried on the message, not on a content block — handled by the caller.
 		} else if (op === 'replace') {
 			if (typeof payload.block_idx === 'number' && Array.isArray(payload.content_blocks)) {
