@@ -3943,6 +3943,12 @@
 			});
 			await requestStreamSnapshot(message.id, chatId);
 		}
+		// Final authoritative reconciliation. Live deltas optimize perceived
+		// streaming, but the server's final row is the source of truth and avoids
+		// any duplicated prefix artifacts from provider/full-prefix delta quirks.
+		if (chatId) {
+			await requestStreamSnapshot(message.id, chatId);
+		}
 		writeMirrorToMessage(mirror, message);
 		if (data?.usage) message.usage = data.usage;
 		message = { ...message };
