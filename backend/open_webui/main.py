@@ -101,6 +101,7 @@ from open_webui.routers import (
     subagents,
     flex_auto_flip,
     streams,
+    bootstrap,
 )
 
 from open_webui.routers.retrieval import (
@@ -1373,6 +1374,7 @@ app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
 app.include_router(channels.router, prefix="/api/v1/channels", tags=["channels"])
 app.include_router(chats.router, prefix="/api/v1/chats", tags=["chats"])
 app.include_router(streams.router, prefix="/api/v1/streams", tags=["streams"])
+app.include_router(bootstrap.router, prefix="/api/bootstrap", tags=["bootstrap"])
 app.include_router(notes.router, prefix="/api/v1/notes", tags=["notes"])
 
 
