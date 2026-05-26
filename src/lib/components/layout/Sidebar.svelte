@@ -43,6 +43,7 @@
 		importChat
 	} from '$lib/apis/chats';
 	import { createNewFolder, getFolders, updateFolderParentIdById } from '$lib/apis/folders';
+	import { consumeBootstrap } from '$lib/utils/bootstrap';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import {
 		clearLocalStorageCache,
@@ -188,6 +189,17 @@
 	};
 
 	const initFolders = async () => {
+		const bootstrapFolders = consumeBootstrap<any[]>('folders');
+		if (Array.isArray(bootstrapFolders)) {
+			applyFolderList(bootstrapFolders);
+			writeLocalStorageCache(
+				SIDEBAR_FOLDERS_CACHE_KEY,
+				getSidebarCacheKey('folders'),
+				bootstrapFolders,
+				SIDEBAR_CACHE_TTL
+			);
+			return;
+		}
 		clearLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY);
 		const folderList = await getFolders(localStorage.token).catch((error) => {
 			toast.error(`${error}`);
@@ -254,6 +266,17 @@
 		}
 
 		channelsRefreshPromise = (async () => {
+			const bootstrapChannels = consumeBootstrap<any[]>('channels');
+			if (Array.isArray(bootstrapChannels)) {
+				await channels.set(bootstrapChannels);
+				writeLocalStorageCache(
+					SIDEBAR_CHANNELS_CACHE_KEY,
+					getSidebarCacheKey('channels'),
+					bootstrapChannels,
+					SIDEBAR_CACHE_TTL
+				);
+				return;
+			}
 			clearLocalStorageCache(SIDEBAR_CHANNELS_CACHE_KEY);
 			const channelList = await getChannels(localStorage.token);
 			await channels.set(channelList);
@@ -291,7 +314,10 @@
 			await Promise.all([
 				(async () => {
 					console.log('Init tags');
-					const _tags = await getAllTags(localStorage.token);
+					const bootstrapTags = consumeBootstrap<any[]>('tags');
+					const _tags = Array.isArray(bootstrapTags)
+						? bootstrapTags
+						: await getAllTags(localStorage.token);
 					tags.set(_tags);
 					writeLocalStorageCache(
 						SIDEBAR_TAGS_CACHE_KEY,
@@ -302,7 +328,10 @@
 				})(),
 				(async () => {
 					console.log('Init pinned chats');
-					const _pinnedChats = await getPinnedChatList(localStorage.token);
+					const bootstrapPinned = consumeBootstrap<any[]>('pinned');
+					const _pinnedChats = Array.isArray(bootstrapPinned)
+						? bootstrapPinned
+						: await getPinnedChatList(localStorage.token);
 					pinnedChats.set(_pinnedChats);
 					writeLocalStorageCache(
 						SIDEBAR_PINNED_CHATS_CACHE_KEY,
@@ -313,7 +342,10 @@
 				})(),
 				(async () => {
 					console.log('Init chat list');
-					const _chats = await getChatList(localStorage.token, firstPage);
+					const bootstrapChats = consumeBootstrap<any[]>('chats');
+					const _chats = Array.isArray(bootstrapChats)
+						? bootstrapChats
+						: await getChatList(localStorage.token, firstPage);
 					await chats.set(_chats);
 					writeLocalStorageCache(
 						SIDEBAR_CHATS_CACHE_KEY,
