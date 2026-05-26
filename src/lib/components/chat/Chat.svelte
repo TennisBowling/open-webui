@@ -4438,8 +4438,7 @@
 				model: model.id,
 				...(useV2Body
 					? {
-							leaf_message_id: responseMessage.parentId,
-							response_message_id: responseMessageId
+							leaf_message_id: responseMessage.parentId
 						}
 					: { messages: messages }),
 				params: {
