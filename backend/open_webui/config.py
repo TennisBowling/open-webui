@@ -1364,6 +1364,10 @@ USER_PERMISSIONS_FEATURES_NOTES = (
     os.environ.get("USER_PERMISSIONS_FEATURES_NOTES", "True").lower() == "true"
 )
 
+USER_PERMISSIONS_FEATURES_SUBAGENTS = (
+    os.environ.get("USER_PERMISSIONS_FEATURES_SUBAGENTS", "True").lower() == "true"
+)
+
 
 DEFAULT_USER_PERMISSIONS = {
     "workspace": {
@@ -1404,6 +1408,7 @@ DEFAULT_USER_PERMISSIONS = {
         "image_generation": USER_PERMISSIONS_FEATURES_IMAGE_GENERATION,
         "code_interpreter": USER_PERMISSIONS_FEATURES_CODE_INTERPRETER,
         "notes": USER_PERMISSIONS_FEATURES_NOTES,
+        "subagents": USER_PERMISSIONS_FEATURES_SUBAGENTS,
     },
 }
 

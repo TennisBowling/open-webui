@@ -186,6 +186,7 @@ class FeaturesPermissions(BaseModel):
     image_generation: bool = True
     code_interpreter: bool = True
     notes: bool = True
+    subagents: bool = True
 
 
 class UserPermissions(BaseModel):

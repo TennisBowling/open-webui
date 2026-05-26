@@ -44,7 +44,8 @@
 			web_search: true,
 			image_generation: true,
 			code_interpreter: true,
-			notes: true
+			notes: true,
+			subagents: true
 		}
 	};
 
@@ -597,6 +598,22 @@
 				<Switch bind:state={permissions.features.notes} />
 			</div>
 			{#if defaultPermissions?.features?.notes && !permissions.features.notes}
+				<div>
+					<div class="text-xs text-gray-500">
+						{$i18n.t('This is a default user permission and will remain enabled.')}
+					</div>
+				</div>
+			{/if}
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-medium">
+					{$i18n.t('Subagents')}
+				</div>
+				<Switch bind:state={permissions.features.subagents} />
+			</div>
+			{#if defaultPermissions?.features?.subagents && !permissions.features.subagents}
 				<div>
 					<div class="text-xs text-gray-500">
 						{$i18n.t('This is a default user permission and will remain enabled.')}
