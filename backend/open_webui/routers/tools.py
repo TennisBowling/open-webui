@@ -26,6 +26,7 @@ from open_webui.utils.tools import get_tool_specs
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access, has_permission
 from open_webui.utils.tools import get_tool_servers
+from open_webui.utils.cache import etag_response
 
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.config import CACHE_DIR, BYPASS_ADMIN_ACCESS_CONTROL
@@ -143,16 +144,18 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
 
     if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
         # Admin can see all tools
-        return tools
+        result = tools
     else:
         user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
-        tools = [
+        result = [
             tool
             for tool in tools
             if tool.user_id == user.id
             or has_access(user.id, "read", tool.access_control, user_group_ids)
         ]
-        return tools
+
+    content = [item.model_dump() for item in result]
+    return etag_response(content, request)
 
 
 ############################

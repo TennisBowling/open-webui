@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.cache import etag_response
 
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ def _folder_payload(folder) -> dict:
 
 
 @router.get("/", response_model=list[FolderNameIdResponse])
-async def get_folders(user=Depends(get_verified_user)):
+async def get_folders(request: Request, user=Depends(get_verified_user)):
     folders = Folders.get_folders_by_user_id(user.id)
 
     # Verify folder data integrity
@@ -100,7 +101,8 @@ async def get_folders(user=Depends(get_verified_user)):
 
         folder_list.append(FolderNameIdResponse(**folder.model_dump()))
 
-    return folder_list
+    content = [item.model_dump() for item in folder_list]
+    return etag_response(content, request)
 
 
 ############################
