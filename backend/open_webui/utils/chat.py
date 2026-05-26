@@ -429,9 +429,10 @@ def assemble_conversation_from_leaf(
 
             # Detect migrated vs legacy: migrated chats keep messages in the
             # chat_message table where childrenIds is *derived* from parent_id
-            # on read (see get_chat_branches), so there is nothing to link on
-            # the parent row. Legacy chats keep the tree inside the JSON blob
-            # and need an explicit childrenIds append on the parent.
+            # on read (see Chats.get_chat_meta_by_id_and_user_id in
+            # models/chats.py), so there is nothing to link on the parent row.
+            # Legacy chats keep the tree inside the JSON blob and need an
+            # explicit childrenIds append on the parent.
             chat_row = Chats.get_chat_by_id(chat_id)
             migrated = bool(
                 chat_row is not None
