@@ -116,8 +116,8 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
     )
-    USAGE_POOL = RedisDict(
-        f"{REDIS_KEY_PREFIX}:usage_pool",
+    PRIMARY_SESSION_PER_USER = RedisDict(
+        f"{REDIS_KEY_PREFIX}:primary_session_per_user",
         redis_url=WEBSOCKET_REDIS_URL,
         redis_sentinels=redis_sentinels,
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
@@ -148,7 +148,7 @@ if WEBSOCKET_MANAGER == "redis":
 else:
     SESSION_POOL = {}
     USER_POOL = {}
-    USAGE_POOL = {}
+    PRIMARY_SESSION_PER_USER = {}
 
     # Token usage tracking data structures (in-memory)
     TOKEN_GROUPS = {}
@@ -164,55 +164,9 @@ YDOC_MANAGER = YdocManager(
 
 
 async def periodic_usage_pool_cleanup():
-    max_retries = 2
-    retry_delay = random.uniform(
-        WEBSOCKET_REDIS_LOCK_TIMEOUT / 2, WEBSOCKET_REDIS_LOCK_TIMEOUT
-    )
-    for attempt in range(max_retries + 1):
-        if aquire_func():
-            break
-        else:
-            if attempt < max_retries:
-                log.debug(
-                    f"Cleanup lock already exists. Retry {attempt + 1} after {retry_delay}s..."
-                )
-                await asyncio.sleep(retry_delay)
-            else:
-                log.warning(
-                    "Failed to acquire cleanup lock after retries. Skipping cleanup."
-                )
-                return
-
-    log.debug("Running periodic_cleanup")
-    try:
-        while True:
-            if not renew_func():
-                log.error(f"Unable to renew cleanup lock. Exiting usage pool cleanup.")
-                raise Exception("Unable to renew usage pool cleanup lock.")
-
-            now = int(time.time())
-            send_usage = False
-            for model_id, connections in list(USAGE_POOL.items()):
-                # Creating a list of sids to remove if they have timed out
-                expired_sids = [
-                    sid
-                    for sid, details in connections.items()
-                    if now - details["updated_at"] > TIMEOUT_DURATION
-                ]
-
-                for sid in expired_sids:
-                    del connections[sid]
-
-                if not connections:
-                    log.debug(f"Cleaning up model {model_id} from usage pool")
-                    del USAGE_POOL[model_id]
-                else:
-                    USAGE_POOL[model_id] = connections
-
-                send_usage = True
-            await asyncio.sleep(TIMEOUT_DURATION)
-    finally:
-        release_func()
+    """Deprecated no-op retained for backward-compat with callers that still
+    schedule it at startup. USAGE_POOL was removed; nothing to clean."""
+    return
 
 
 app = socketio.ASGIApp(
@@ -222,9 +176,7 @@ app = socketio.ASGIApp(
 
 
 def get_models_in_use():
-    # List models that are currently in use
-    models_in_use = list(USAGE_POOL.keys())
-    return models_in_use
+    return []
 
 
 def get_active_user_ids():
@@ -242,6 +194,24 @@ def get_user_id_from_session_pool(sid):
     if user:
         return user["id"]
     return None
+
+
+def _elect_primary_session(user_id, sid):
+    """Set sid as the user's primary session if no live primary is currently
+    recorded. Returns the resulting primary sid for this user."""
+    current = PRIMARY_SESSION_PER_USER.get(user_id)
+    if not current or current not in SESSION_POOL:
+        PRIMARY_SESSION_PER_USER[user_id] = sid
+        return sid
+    return current
+
+
+def is_primary_session(user_id, sid) -> bool:
+    return PRIMARY_SESSION_PER_USER.get(user_id) == sid
+
+
+def get_primary_session(user_id):
+    return PRIMARY_SESSION_PER_USER.get(user_id)
 
 
 def get_session_ids_from_room(room):
@@ -303,22 +273,13 @@ async def usage(sid, data):
     if sid in SESSION_POOL:
         model_id = data["model"]
         usage_data = data.get("usage", {})
-        
+
         # Get user_id from session pool and chat_id from data
         user = SESSION_POOL.get(sid)
         user_id = user.get("id") if user else None
         chat_id = data.get("chat_id")
-        
+
         log.info(f"📊 [socket:usage] Received from frontend: model={model_id}, chat_id={chat_id}, user_id={user_id}")
-
-        # Record the timestamp for the last update
-        current_time = int(time.time())
-
-        # Store the new usage data and task
-        USAGE_POOL[model_id] = {
-            **(USAGE_POOL[model_id] if model_id in USAGE_POOL else {}),
-            sid: {"updated_at": current_time},
-        }
 
         # Process token usage tracking with chat_id and user_id for analytics
         await process_token_usage(model_id, usage_data, chat_id=chat_id, user_id=user_id)
@@ -567,6 +528,35 @@ async def process_token_usage(
     except Exception as e:
         log.error(f"📊 [process_token_usage] ERROR updating analytics: {e}", exc_info=True)
 
+    # Push refreshed token-usage groups to every active session of this user
+    # so the frontend doesn't have to poll. Wire Contract #6.
+    if user_id:
+        try:
+            groups = token_groups.get_token_groups()
+            await push_token_usage_update(user_id, groups)
+        except Exception as e:
+            log.error(f"📊 [process_token_usage] ERROR pushing token-usage:update: {e}", exc_info=True)
+
+
+async def push_token_usage_update(user_id: str, groups: dict):
+    session_ids = [sid for sid in USER_POOL.get(user_id, []) if sid]
+    if not session_ids:
+        return
+    await asyncio.gather(
+        *[
+            sio.emit(
+                "events",
+                {
+                    "chat_id": None,
+                    "message_id": None,
+                    "data": {"type": "token-usage:update", "data": {"groups": groups}},
+                },
+                to=sid,
+            )
+            for sid in session_ids
+        ]
+    )
+
 
 @sio.event
 async def connect(sid, environ, auth):
@@ -585,6 +575,8 @@ async def connect(sid, environ, auth):
                 USER_POOL[user.id] = USER_POOL[user.id] + [sid]
             else:
                 USER_POOL[user.id] = [sid]
+
+            _elect_primary_session(user.id, sid)
 
 
 @sio.on("user-join")
@@ -608,12 +600,14 @@ async def user_join(sid, data):
     else:
         USER_POOL[user.id] = [sid]
 
+    primary_sid = _elect_primary_session(user.id, sid)
+
     # Join all the channels
     channels = Channels.get_channels_by_user_id(user.id)
     log.debug(f"{channels=}")
     for channel in channels:
         await sio.enter_room(sid, f"channel:{channel.id}")
-    return {"id": user.id, "name": user.name}
+    return {"id": user.id, "name": user.name, "primary_session_id": primary_sid}
 
 
 @sio.on("join-channels")
@@ -943,6 +937,11 @@ async def disconnect(sid):
 
         if len(USER_POOL[user_id]) == 0:
             del USER_POOL[user_id]
+            if PRIMARY_SESSION_PER_USER.get(user_id) == sid:
+                del PRIMARY_SESSION_PER_USER[user_id]
+        elif PRIMARY_SESSION_PER_USER.get(user_id) == sid:
+            # primary disappeared; clear so the next user-join re-elects.
+            del PRIMARY_SESSION_PER_USER[user_id]
 
         await YDOC_MANAGER.remove_user_from_all_documents(sid)
     else:
