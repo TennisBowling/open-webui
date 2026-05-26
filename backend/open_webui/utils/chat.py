@@ -418,9 +418,10 @@ def assemble_conversation_from_leaf(
     if new_user_message and new_user_message.get("id"):
         new_id = new_user_message["id"]
         if new_id not in messages_map:
+            parent_id = new_user_message.get("parentId") or leaf_message_id
             persisted = {
                 "id": new_id,
-                "parentId": new_user_message.get("parentId") or leaf_message_id,
+                "parentId": parent_id,
                 "childrenIds": [],
                 "role": new_user_message.get("role") or "user",
                 "content": new_user_message.get("content") or "",
@@ -436,6 +437,52 @@ def assemble_conversation_from_leaf(
                 log.debug(
                     f"assemble_conversation_from_leaf: failed to persist new_user_message: {e}"
                 )
+
+            # Mirror the frontend's tree linkage (Chat.svelte ~L3399-3405):
+            # append the new id to the parent's childrenIds and update
+            # history.currentId so subsequent reads of the chat tree are
+            # consistent.
+            if parent_id:
+                parent_msg = messages_map.get(parent_id)
+                if isinstance(parent_msg, dict):
+                    existing_children = list(parent_msg.get("childrenIds") or [])
+                    if new_id not in existing_children:
+                        existing_children.append(new_id)
+                        parent_update = {
+                            **parent_msg,
+                            "childrenIds": existing_children,
+                        }
+                        try:
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                chat_id, parent_id, parent_update
+                            )
+                        except Exception as e:
+                            log.debug(
+                                f"assemble_conversation_from_leaf: failed to link new id into parent.childrenIds: {e}"
+                            )
+
+            # Update chat.history.currentId so the next snapshot read sees
+            # the new leaf. We do a focused read-modify-write of just the
+            # history.currentId field to minimise conflicts with concurrent
+            # realtime saves coming from the frontend.
+            try:
+                chat_row = Chats.get_chat_by_id(chat_id)
+                if chat_row is not None:
+                    chat_body = dict(chat_row.chat or {})
+                    history = dict(chat_body.get("history") or {})
+                    history["currentId"] = new_id
+                    # Don't clobber the messages dict if it's present — leave
+                    # it as-is so update_chat_by_id's peel/sync path can do
+                    # the right thing for migrated chats.
+                    if "messages" not in history:
+                        history["messages"] = {}
+                    chat_body["history"] = history
+                    Chats.update_chat_by_id(chat_id, chat_body)
+            except Exception as e:
+                log.debug(
+                    f"assemble_conversation_from_leaf: failed to update history.currentId: {e}"
+                )
+
             chain.append(persisted)
 
     expanded = expand_messages_for_tool_resumption(chain)
