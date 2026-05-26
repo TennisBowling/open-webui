@@ -2812,6 +2812,58 @@ async def process_chat_response(
                     )
                     last_delta_data = None
 
+                    # ── Native v2 fast-path bookkeeping ────────────────────
+                    # Under STREAM_PROTOCOL_VERSION=="v2" we emit `chat:delta`
+                    # `text_append` ops directly at flush time, sidestepping the
+                    # translator's O(N) full-content_blocks diff. We only take
+                    # the fast path when the *only* change since the last flush
+                    # is an append to the tail block (text or reasoning) — i.e.
+                    # no block boundary moved, no other block was mutated. Any
+                    # other shape change (new block, reasoning closed, tool
+                    # calls, code interpreter, replace) falls back to the
+                    # translator so its diff engine handles it correctly.
+                    #
+                    # We mirror the translator's mirror state when we emit
+                    # natively so that subsequent translator-mediated flushes
+                    # compute correct diffs.
+                    _v2_native = STREAM_PROTOCOL_VERSION == "v2" and getattr(
+                        event_emitter, "_v2_mirror", None
+                    ) is not None and metadata.get("message_id")
+                    _v2_mirror = getattr(event_emitter, "_v2_mirror", None) if _v2_native else None
+                    _v2_emit_raw = getattr(event_emitter, "_emit_raw_primary", None) if _v2_native else None
+                    _v2_message_id = metadata.get("message_id") if _v2_native else None
+
+                    def _v2_try_native_append():
+                        """Return (block_idx, appended_text) if the tail block
+                        is a pure append since the last mirror snapshot AND no
+                        earlier block changed; otherwise None to force a
+                        translator-mediated full diff."""
+                        if not _v2_native or not content_blocks:
+                            return None
+                        mirror_blocks = _v2_mirror.get("blocks") or []
+                        tail_idx = len(content_blocks) - 1
+                        tail = content_blocks[tail_idx]
+                        if tail.get("type") not in ("text", "reasoning"):
+                            return None
+                        # ended_at is set when reasoning closes — that's a
+                        # structural change, defer to the translator.
+                        if tail.get("type") == "reasoning" and tail.get("ended_at"):
+                            return None
+                        # New tail block (mirror hasn't seen it yet) — defer.
+                        if tail_idx != len(mirror_blocks) - 1:
+                            return None
+                        old_tail = mirror_blocks[tail_idx]
+                        if old_tail.get("type") != tail.get("type"):
+                            return None
+                        old_text = old_tail.get("content", "") or ""
+                        new_text = tail.get("content", "") or ""
+                        if not new_text.startswith(old_text):
+                            return None
+                        appended = new_text[len(old_text):]
+                        if not appended:
+                            return None
+                        return tail_idx, appended, new_text
+
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
                         nonlocal last_delta_data
@@ -2820,12 +2872,38 @@ async def process_chat_response(
                             if event_emitter is None:
                                 log.error(f"❌ FLUSH ERROR: event_emitter is None! Cannot emit events!")
                             else:
-                                await event_emitter(
-                                    {
-                                        "type": "chat:completion",
-                                        "data": last_delta_data,
-                                    }
+                                native = (
+                                    _v2_try_native_append()
+                                    if _v2_native and "content_blocks" in (last_delta_data or {})
+                                    else None
                                 )
+                                if native is not None:
+                                    block_idx, appended, new_text = native
+                                    version = stream_version_incr(_v2_message_id)
+                                    payload = {
+                                        "type": "chat:delta",
+                                        "data": {
+                                            "message_id": _v2_message_id,
+                                            "version": version,
+                                            "op": "text_append",
+                                            "payload": {
+                                                "block_idx": block_idx,
+                                                "text": appended,
+                                            },
+                                        },
+                                    }
+                                    await _v2_emit_raw(payload)
+                                    # Sync the translator's mirror so any
+                                    # subsequent translator-mediated flush
+                                    # diffs correctly.
+                                    _v2_mirror["blocks"][block_idx]["content"] = new_text
+                                else:
+                                    await event_emitter(
+                                        {
+                                            "type": "chat:completion",
+                                            "data": last_delta_data,
+                                        }
+                                    )
                             delta_count = 0
                             last_delta_data = None
 
