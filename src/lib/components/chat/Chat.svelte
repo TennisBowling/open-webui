@@ -1546,13 +1546,23 @@
 			const blocks = Array.isArray(cur.content_blocks) ? cur.content_blocks.slice() : [];
 			for (const tr of pending.toolResults) {
 				if (!tr?.tool_call_id) continue;
+				const resultEntry = {
+					tool_call_id: tr.tool_call_id,
+					content: tr.result ?? '',
+					...(Array.isArray(tr.files) && tr.files.length > 0 ? { files: tr.files } : {}),
+					...(Array.isArray(tr.embeds) && tr.embeds.length > 0 ? { embeds: tr.embeds } : {}),
+					...(tr.subagent_id ? { subagent_id: tr.subagent_id } : {})
+				};
 				for (const block of blocks) {
 					if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+					block.results = Array.isArray(block.results) ? block.results : [];
+					const existingIdx = block.results.findIndex(
+						(r: any) => r?.tool_call_id === tr.tool_call_id
+					);
+					if (existingIdx >= 0) block.results[existingIdx] = resultEntry;
+					else block.results.push(resultEntry);
 					for (const tc of block.content) {
-						if (
-							tc?.id === tr.tool_call_id ||
-							tc?.tool_call_id === tr.tool_call_id
-						) {
+						if (tc?.id === tr.tool_call_id || tc?.tool_call_id === tr.tool_call_id) {
 							tc.result = tr.result;
 						}
 					}
@@ -3884,6 +3894,7 @@
 			result?: any;
 			files?: any[];
 			embeds?: any[];
+			subagent_id?: string;
 		},
 		message: any
 	) => {
@@ -3897,9 +3908,23 @@
 			message.embeds = [...(message.embeds ?? []), ...data.embeds];
 		}
 		// Inline the tool result into the matching tool_calls block so the
-		// renderer keeps working unchanged (it reads results off content_blocks).
+		// renderer keeps working unchanged. blocksToDisplayMarkdown reads
+		// block.results[], while some live components also look at tc.result.
+		const resultEntry = {
+			tool_call_id: data.tool_call_id,
+			content: data.result ?? '',
+			...(Array.isArray(data.files) && data.files.length > 0 ? { files: data.files } : {}),
+			...(Array.isArray(data.embeds) && data.embeds.length > 0 ? { embeds: data.embeds } : {}),
+			...(data.subagent_id ? { subagent_id: data.subagent_id } : {})
+		};
 		for (const block of mirror.content_blocks) {
 			if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+			block.results = Array.isArray(block.results) ? block.results : [];
+			const existingIdx = block.results.findIndex(
+				(r: any) => r?.tool_call_id === data.tool_call_id
+			);
+			if (existingIdx >= 0) block.results[existingIdx] = resultEntry;
+			else block.results.push(resultEntry);
 			for (const tc of block.content) {
 				if (tc?.id === data.tool_call_id || tc?.tool_call_id === data.tool_call_id) {
 					tc.result = data.result;
