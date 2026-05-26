@@ -3438,6 +3438,8 @@
 			}
 		} else if (op === 'sources' || op === 'selected_model_id') {
 			// Carried on the message, not on a content block — handled by the caller.
+		} else if (op === 'usage') {
+			// Handled by the caller; no content_blocks change.
 		} else if (op === 'replace') {
 			if (typeof payload.block_idx === 'number' && Array.isArray(payload.content_blocks)) {
 				mirror.content_blocks = payload.content_blocks.slice();
@@ -3555,6 +3557,8 @@
 		} else if (op === 'selected_model_id' && payload.model_id) {
 			message.selectedModelId = payload.model_id;
 			message.arena = true;
+		} else if (op === 'usage' && payload.usage) {
+			message.usage = payload.usage;
 		}
 
 		writeMirrorToMessage(mirror, message);
