@@ -997,34 +997,37 @@ async def run_outlet_filters_on_completed_stream(
         return
 
     # Outlet filter mutated the assistant content. Merge the mutation back
-    # into content_blocks WHILE PRESERVING structural blocks (reasoning,
-    # tool_calls, subagent_launch, code_interpreter) byte-identical. The
-    # serialized projection interleaves text-block contents with top-level
-    # <details type="..."> markers; we split both the original and the
-    # filter output on those markers and require an exact 1:1 structural
-    # match. If anything is ambiguous, fail safe by leaving content_blocks
-    # untouched — losing the filter text edit is strictly better than
-    # silently destroying reasoning/tool_call data the user cannot recover.
-    merged_blocks = _merge_outlet_filter_into_content_blocks(
+    # into content_blocks under TWO unconditional invariants (no fail-safe):
+    #   1. Structural blocks (reasoning, tool_calls, subagent_launch,
+    #      code_interpreter, ...) are preserved BYTE-IDENTICAL regardless
+    #      of what the filter did to their serialized <details ...> markers
+    #      — including filters that elide or reformat those markers.
+    #   2. The filter's text changes are ALWAYS applied — never silently
+    #      dropped. Losing a filter edit was previously considered "safe";
+    #      it is not — it produces a silent divergence between what the
+    #      filter intended and what the user sees.
+    # See _apply_outlet_text_to_blocks for the algorithm.
+    merged_blocks = _apply_outlet_text_to_blocks(
         content_blocks, content, final_content
     )
-    if merged_blocks is None:
-        log.warning(
-            "Outlet filter mutated structural markers or produced an "
-            "ambiguous diff; skipping content_blocks update for message %s",
-            metadata.get("message_id"),
-        )
-        return
 
     if merged_blocks == content_blocks:
         return
+
+    # Recompute the serialized projection from the merged blocks so the
+    # legacy `content` column matches the canonical `content_blocks`. The
+    # filter's `final_content` may not round-trip through
+    # serialize_content_blocks verbatim (text normalisation, struct marker
+    # reformatting) — using the post-merge projection keeps both columns
+    # consistent.
+    merged_serialized = serialize_content_blocks(merged_blocks, force=True)
 
     try:
         Chats.upsert_message_to_chat_by_id_and_message_id(
             metadata["chat_id"],
             metadata["message_id"],
             {
-                "content": final_content,
+                "content": merged_serialized,
                 "content_blocks": merged_blocks,
             },
         )
@@ -1035,31 +1038,30 @@ async def run_outlet_filters_on_completed_stream(
         from open_webui.env import STREAM_PROTOCOL_VERSION
 
         if STREAM_PROTOCOL_VERSION == "v2":
-            changed_indices = [
-                i
-                for i, (old_b, new_b) in enumerate(zip(content_blocks, merged_blocks))
-                if old_b != new_b
-            ]
-            for idx in changed_indices:
-                await event_emitter(
-                    {
-                        "type": "chat:delta",
-                        "data": {
-                            "message_id": metadata.get("message_id"),
-                            "op": "replace",
-                            "payload": {
-                                "block_idx": idx,
-                                "content_blocks": [merged_blocks[idx]],
-                            },
+            # The merge is non-incremental and may have added/removed text
+            # blocks; emit a single `replace` covering the full block list
+            # (B9 wire contract #1 — `replace` with block_idx=0 and a
+            # complete content_blocks payload). F4's applyDeltaOp replaces
+            # mirror.content_blocks entirely when given the full list.
+            await event_emitter(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": metadata.get("message_id"),
+                        "op": "replace",
+                        "payload": {
+                            "block_idx": 0,
+                            "content_blocks": merged_blocks,
                         },
-                    }
-                )
+                    },
+                }
+            )
         else:
             await event_emitter(
                 {
                     "type": "chat:message",
                     "data": {
-                        "content": final_content,
+                        "content": merged_serialized,
                         "content_blocks": merged_blocks,
                     },
                 }
@@ -1074,7 +1076,16 @@ _DETAILS_RE = re.compile(
 )
 
 
+# Block types treated as text-bearing: their `content` participates in the
+# serialized text projection. Everything else is structural (immutable across
+# an outlet-filter merge).
+_TEXT_BLOCK_TYPES = frozenset({"text"})
+
+
 def _split_serialized(s):
+    """Tokenize a serialized projection into a sequence of
+    ('text'|'details', str) pairs. Kept for any external callers.
+    """
     segments = []
     last = 0
     for m in _DETAILS_RE.finditer(s):
@@ -1087,73 +1098,150 @@ def _split_serialized(s):
     return segments
 
 
-def _text_runs_between_details(segments):
-    runs = []
-    buf = []
-    for kind, seg in segments:
-        if kind == "text":
-            buf.append(seg)
+def _structural_block_indices(content_blocks):
+    """Indices of blocks that are NOT plain text. Anything not in
+    _TEXT_BLOCK_TYPES is treated as structural and preserved verbatim —
+    including unknown block types we don't recognize (better to keep an
+    opaque block than to lose data).
+    """
+    return [
+        i
+        for i, b in enumerate(content_blocks)
+        if b.get("type") not in _TEXT_BLOCK_TYPES
+    ]
+
+
+def _apply_outlet_text_to_blocks(
+    content_blocks, original_serialized, filter_serialized
+):
+    """Always-applies, always-preserves merge of an outlet filter's
+    textual edit back into ``content_blocks``.
+
+    Invariants (unconditional, no fail-safe):
+      1. Every structural (non-text) block is preserved BYTE-IDENTICAL in
+         the returned list, in the same relative order.
+      2. The filter's textual output is FULLY reflected in the returned
+         list — never silently dropped, even if the filter elided or
+         reformatted some/all structural ``<details>`` markers.
+
+    Algorithm:
+      * Tokenize original_serialized to recover the ordered list of
+        top-level ``<details ...>`` markers.
+      * For each marker (paired positionally with a structural block),
+        locate the *exact* marker substring inside filter_serialized using
+        a rolling cursor (so matches are in order). Missing markers are
+        "elided by the filter" — their structural block still survives.
+      * Slice filter_serialized at the found marker positions into text
+        "gaps" between structural slots; gaps for elided markers fold
+        naturally into the adjacent surviving gap.
+      * Reconstruct content_blocks: structural blocks copied as-is; for
+        each gap, write its text into the first original text block in
+        that slot (blanking any sibling text blocks that would otherwise
+        ambiguously share the run); materialize NEW text blocks for gaps
+        that have no original text block to host them.
+
+    Never returns None.
+    """
+    # Identity short-circuit.
+    if original_serialized == filter_serialized:
+        return [dict(b) for b in content_blocks]
+
+    struct_indices = _structural_block_indices(content_blocks)
+    original_markers = [m.group(0) for m in _DETAILS_RE.finditer(original_serialized)]
+
+    # Pair original markers with structural blocks positionally. If counts
+    # mismatch (shouldn't normally — serialize_content_blocks emits one
+    # marker per structural block — but be defensive), we still preserve
+    # every structural block; markers without a structural slot are
+    # ignored, structural slots without a marker get None (elided).
+    paired = min(len(original_markers), len(struct_indices))
+
+    # Locate each paired marker in filter_serialized via rolling cursor.
+    found_spans = []  # list[Optional[tuple[int, int]]] aligned with struct_indices
+    cursor = 0
+    for i in range(paired):
+        marker = original_markers[i]
+        pos = filter_serialized.find(marker, cursor)
+        if pos < 0:
+            found_spans.append(None)
         else:
-            runs.append("".join(buf))
-            buf = []
-    runs.append("".join(buf))
-    return runs
+            found_spans.append((pos, pos + len(marker)))
+            cursor = pos + len(marker)
+    # Extra structural blocks beyond `paired` get no marker.
+    found_spans.extend([None] * (len(struct_indices) - paired))
+
+    # Build gap list. We want exactly len(struct_indices) + 1 gaps, one
+    # before each structural slot and one trailing. For each FOUND span,
+    # carve text from filter_serialized; for each elided slot, emit "" so
+    # the surrounding text accumulates into the next surviving gap.
+    gaps = []
+    last_end = 0
+    for span in found_spans:
+        if span is None:
+            gaps.append("")  # placeholder; text will appear in next survivor
+        else:
+            gaps.append(filter_serialized[last_end : span[0]])
+            last_end = span[1]
+    # Trailing gap.
+    gaps.append(filter_serialized[last_end:])
+
+    # Special case: ALL markers elided (or no markers at all). The above
+    # logic places all of filter_serialized into the trailing gap; that's
+    # fine, but it's nicer UX to attribute that text to the FIRST text
+    # slot (so it appears before structural blocks the model produced).
+    if found_spans and all(s is None for s in found_spans):
+        gaps = [""] * (len(struct_indices) + 1)
+        gaps[0] = filter_serialized
+
+    # Reconstruct content_blocks slot-by-slot.
+    new_blocks = []
+    slot = 0  # current gap index
+    text_idxs_in_slot = []  # original indices of text blocks before next struct
+
+    def _flush_slot():
+        nonlocal text_idxs_in_slot, slot
+        gap_text = gaps[slot].strip("\n")
+        if text_idxs_in_slot:
+            # Re-attribute: ALL gap text into the first text block; blank
+            # any siblings. Consecutive text blocks share a single run in
+            # the serialized form, so a faithful split back across them
+            # isn't possible — collapsing into the first preserves the
+            # filter's text verbatim while keeping block identity.
+            first = text_idxs_in_slot[0]
+            new_blocks.append({**content_blocks[first], "content": gap_text})
+            for extra in text_idxs_in_slot[1:]:
+                new_blocks.append({**content_blocks[extra], "content": ""})
+        elif gap_text:
+            # No original text block in this slot; materialize a new one.
+            new_blocks.append({"type": "text", "content": gap_text})
+        text_idxs_in_slot = []
+        slot += 1
+
+    for i, block in enumerate(content_blocks):
+        if block.get("type") in _TEXT_BLOCK_TYPES:
+            text_idxs_in_slot.append(i)
+        else:
+            _flush_slot()
+            # Structural block preserved byte-identical (same dict object).
+            new_blocks.append(block)
+
+    # Trailing slot.
+    _flush_slot()
+
+    return new_blocks
 
 
 def _merge_outlet_filter_into_content_blocks(
     content_blocks, original_serialized, filter_serialized
 ):
-    # Returns updated content_blocks list on success, or None to signal
-    # "ambiguous — caller should fail safe and leave blocks alone".
-    original_segments = _split_serialized(original_serialized)
-    filter_segments = _split_serialized(filter_serialized)
-
-    orig_details = [seg for kind, seg in original_segments if kind == "details"]
-    filt_details = [seg for kind, seg in filter_segments if kind == "details"]
-
-    if orig_details != filt_details:
-        return None
-
-    orig_runs = _text_runs_between_details(original_segments)
-    filt_runs = _text_runs_between_details(filter_segments)
-
-    if len(orig_runs) != len(filt_runs):
-        return None
-
-    # Each non-empty text block in content_blocks produces exactly one text
-    # contribution into the current run; structural blocks advance the run.
-    # If multiple text blocks share one run we cannot safely re-attribute.
-    text_blocks_in_run = [[]]
-    for i, block in enumerate(content_blocks):
-        btype = block.get("type")
-        if btype == "text":
-            text_blocks_in_run[-1].append(i)
-        elif btype in ("tool_calls", "reasoning", "code_interpreter"):
-            text_blocks_in_run.append([])
-        else:
-            return None
-
-    if len(text_blocks_in_run) != len(filt_runs):
-        return None
-
-    new_blocks = [dict(b) for b in content_blocks]
-
-    for run_i, idx_list in enumerate(text_blocks_in_run):
-        orig_run = orig_runs[run_i]
-        new_run = filt_runs[run_i]
-        if orig_run == new_run:
-            continue
-        if len(idx_list) > 1:
-            return None
-        if len(idx_list) == 0:
-            return None
-        block_i = idx_list[0]
-        new_blocks[block_i] = {
-            **new_blocks[block_i],
-            "content": new_run.strip("\n"),
-        }
-
-    return new_blocks
+    """Back-compat wrapper. The previous version could return None to
+    signal "ambiguous — leave blocks alone"; that fail-safe is GONE.
+    Always returns a list, always preserves structural blocks, always
+    applies the filter's text edit.
+    """
+    return _apply_outlet_text_to_blocks(
+        content_blocks, original_serialized, filter_serialized
+    )
 
 
 async def chat_action(request: Request, action_id: str, form_data: dict, user: Any):
