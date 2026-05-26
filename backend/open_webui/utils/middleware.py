@@ -483,8 +483,12 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
             awaitables = _emit_delta_for_blocks(
                 _emit_raw_primary, message_id, mirror, data["content_blocks"]
             )
-            if awaitables:
-                await asyncio.gather(*awaitables)
+            # These ops are versioned and order-dependent. Emitting them via
+            # gather lets block_open/text_append races clobber text on the
+            # client (text_append creates the block, late block_open resets it).
+            # Keep wire order deterministic.
+            for awaitable in awaitables:
+                await awaitable
             if "selected_model_id" in data:
                 version = stream_version_incr(message_id)
                 await _emit_raw_primary(

@@ -645,8 +645,9 @@ def _build_forwarding_emitter(
             awaitables = _emit_delta_for_blocks(
                 _emit_parent_raw, inner_message_id, v2_mirror, content_blocks
             )
-            if awaitables:
-                await asyncio.gather(*awaitables)
+            # Preserve order for dependent block_open/text_append ops.
+            for awaitable in awaitables:
+                await awaitable
 
         # Selected model / sources / usage piggybacks on the final completion
         # event. Mirror B9: emit as separate chat:delta ops.

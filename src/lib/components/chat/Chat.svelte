@@ -1413,6 +1413,15 @@
 				block.content = [];
 			}
 			if (typeof payload.block_idx === 'number') {
+				const existing = mirror.content_blocks[payload.block_idx];
+				if (
+					existing?.type === payload.type &&
+					(payload.type === 'text' || payload.type === 'reasoning') &&
+					typeof existing.content === 'string' &&
+					existing.content
+				) {
+					block.content = existing.content;
+				}
 				mirror.content_blocks[payload.block_idx] = block;
 			} else {
 				mirror.content_blocks.push(block);
@@ -3595,6 +3604,17 @@
 				block.content = [];
 			}
 			if (typeof payload.block_idx === 'number') {
+				const existing = mirror.content_blocks[payload.block_idx];
+				if (
+					existing?.type === payload.type &&
+					(payload.type === 'text' || payload.type === 'reasoning') &&
+					typeof existing.content === 'string' &&
+					existing.content
+				) {
+					// Defensive against out-of-order socket delivery from older servers:
+					// text_append may have created this block before block_open arrives.
+					block.content = existing.content;
+				}
 				mirror.content_blocks[payload.block_idx] = block;
 			} else {
 				mirror.content_blocks.push(block);
