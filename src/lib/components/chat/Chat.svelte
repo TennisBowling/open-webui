@@ -3844,12 +3844,6 @@
 		const op = delta.op || '';
 		const version = typeof delta.version === 'number' ? delta.version : 0;
 		const mirror = getOrCreateStreamMirror(message.id);
-		chatStreamDebug('[chat:delta] recv', {
-			messageId: message.id,
-			op,
-			version,
-			mirrorVersion: mirror.version
-		});
 
 		if (mirror.snapshotting) {
 			mirror.pending_deltas.push({ op, version, payload: delta.payload });
@@ -3857,12 +3851,6 @@
 		}
 
 		if (version > mirror.version + 1) {
-			chatStreamDebug('[chat:delta] gap — requesting snapshot', {
-				messageId: message.id,
-				op,
-				version,
-				mirrorVersion: mirror.version
-			});
 			mirror.pending_deltas.push({ op, version, payload: delta.payload });
 			requestStreamSnapshot(message.id, chatId);
 			return;
@@ -3929,18 +3917,8 @@
 		chatId: string | null
 	) => {
 		const mirror = getOrCreateStreamMirror(message.id);
-		chatStreamDebug('[chat:done] recv', {
-			messageId: message.id,
-			version: data?.version,
-			mirrorVersion: mirror.version
-		});
 		if (typeof data?.version === 'number' && data.version > mirror.version + 1) {
 			// Final version is ahead — snapshot to converge before finalizing.
-			chatStreamDebug('[chat:done] gap — requesting snapshot', {
-				messageId: message.id,
-				version: data.version,
-				mirrorVersion: mirror.version
-			});
 			await requestStreamSnapshot(message.id, chatId);
 		}
 		// Final authoritative reconciliation. Live deltas optimize perceived
