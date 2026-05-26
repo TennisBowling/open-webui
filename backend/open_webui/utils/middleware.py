@@ -4149,12 +4149,26 @@ async def process_chat_response(
                         (final_content or "").encode("utf-8", "replace")
                     ).hexdigest()
                     version = stream_version_incr(msg_id)
+                    chat_obj = None
+                    try:
+                        chat_obj = Chats.get_chat_by_id(metadata["chat_id"])
+                    except Exception:
+                        chat_obj = None
+                    chat_updated_at = (
+                        getattr(chat_obj, "updated_at", None) if chat_obj else None
+                    )
+
                     done_payload = {
                         "type": "chat:done",
                         "data": {
                             "message_id": msg_id,
                             "version": version,
                             "final_content_hash": final_hash,
+                            **(
+                                {"updated_at": chat_updated_at}
+                                if chat_updated_at is not None
+                                else {}
+                            ),
                             **({"usage": response_usage} if response_usage else {}),
                         },
                     }
@@ -4163,11 +4177,6 @@ async def process_chat_response(
                     else:
                         await event_emitter(done_payload)
 
-                    chat_obj = None
-                    try:
-                        chat_obj = Chats.get_chat_by_id(metadata["chat_id"])
-                    except Exception:
-                        chat_obj = None
                     if user and chat_obj is not None:
                         try:
                             await broadcast_sidebar_event(
@@ -4176,11 +4185,10 @@ async def process_chat_response(
                                     "type": "chat:updated",
                                     "data": {
                                         "id": metadata["chat_id"],
-                                        "updated_at": getattr(
-                                            chat_obj, "updated_at", None
-                                        ),
+                                        "updated_at": chat_updated_at,
                                     },
                                 },
+                                skip_sid=metadata.get("session_id"),
                             )
                         except Exception as e:
                             log.debug(f"chat:updated broadcast failed: {e}")

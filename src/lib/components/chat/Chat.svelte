@@ -54,7 +54,8 @@
 		getPromptVariables,
 		processDetails,
 		removeDetails,
-		removeAllDetails
+		removeAllDetails,
+		getTimeRange
 	} from '$lib/utils';
 	import { loadToolServers } from '$lib/utils/toolServers';
 
@@ -3753,7 +3754,7 @@
 	};
 
 	const chatDoneHandler = async (
-		data: { message_id?: string; version?: number; usage?: any },
+		data: { message_id?: string; version?: number; usage?: any; updated_at?: number },
 		message: any,
 		chatId: string | null
 	) => {
@@ -3794,6 +3795,14 @@
 			chatTokenStatsRefreshTrigger.update((n) => n + 1);
 		}
 		if (chatId) {
+			// `chat:updated` socket broadcasts skip the originating tab, so we
+			// patch the sidebar locally using the `updated_at` shipped with the
+			// chat:done payload. Falls back to a wall-clock approximation if
+			// the backend didn't include it (legacy / pre-fix servers).
+			const ts =
+				typeof data?.updated_at === 'number' ? data.updated_at : Math.floor(Date.now() / 1000);
+			patchSidebarUpdatedAt(chatId, ts);
+
 			await chatCompletedHandler(
 				chatId,
 				message.model,
@@ -6473,6 +6482,18 @@
 		};
 	};
 
+	// Update the sidebar's `updated_at` for a chat in place and reorder. Used
+	// by the originating tab when it won't receive its own `chat:updated`
+	// socket event (skip_sid'd PATCH responses and stream-done events).
+	const patchSidebarUpdatedAt = (id: string, updatedAt: number) => {
+		const patch = (c: any) =>
+			c.id === id ? { ...c, updated_at: updatedAt, time_range: getTimeRange(updatedAt) } : c;
+		chats.update((arr) =>
+			arr ? [...arr].map(patch).sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)) : arr
+		);
+		pinnedChats.update((arr) => (arr ? arr.map(patch) : arr));
+	};
+
 	const saveChatHandler = async (
 		_chatId,
 		history,
@@ -6531,8 +6552,16 @@
 			return;
 		}
 
-		await patchChat(localStorage.token, _chatId, opList);
+		const res = await patchChat(localStorage.token, _chatId, opList);
 		resetSaveSnapshot(_chatId);
+
+		// `chat:updated` socket events are skip_sid'd, so this tab won't receive
+		// the broadcast for its own PATCH. Patch the sidebar locally so the row
+		// reorders with the freshly-bumped `updated_at`.
+		const updatedAt = res?.updated_at;
+		if (updatedAt != null) {
+			patchSidebarUpdatedAt(_chatId, updatedAt);
+		}
 	};
 
 	const MAX_DRAFT_LENGTH = 5000;
