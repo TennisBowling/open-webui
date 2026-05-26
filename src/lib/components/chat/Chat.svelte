@@ -1452,7 +1452,15 @@
 			}
 		} else if (op === 'replace') {
 			if (Array.isArray(payload.content_blocks)) {
-				mirror.content_blocks = payload.content_blocks.slice();
+				if (typeof payload.block_idx === 'number' && payload.block_idx > 0) {
+					mirror.content_blocks.splice(
+						payload.block_idx,
+						payload.content_blocks.length,
+						...payload.content_blocks
+					);
+				} else {
+					mirror.content_blocks = payload.content_blocks.slice();
+				}
 			}
 		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
 			// Handled by caller (sets fields on the run object).
@@ -3693,7 +3701,15 @@
 			// Carried on the message, not on a content block — handled by the caller.
 		} else if (op === 'replace') {
 			if (typeof payload.block_idx === 'number' && Array.isArray(payload.content_blocks)) {
-				mirror.content_blocks = payload.content_blocks.slice();
+				if (payload.block_idx > 0) {
+					mirror.content_blocks.splice(
+						payload.block_idx,
+						payload.content_blocks.length,
+						...payload.content_blocks
+					);
+				} else {
+					mirror.content_blocks = payload.content_blocks.slice();
+				}
 			} else if (Array.isArray(payload.content_blocks)) {
 				mirror.content_blocks = payload.content_blocks.slice();
 			}
