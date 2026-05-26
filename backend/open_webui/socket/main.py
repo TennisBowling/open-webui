@@ -1355,7 +1355,7 @@ async def _emit_to_primary_raw(user_id, payload):
 # Per-user FIFO of pending envelopes. Drained at the end of the current
 # asyncio tick via loop.call_soon. Within a tick, multiple synchronous
 # emit_to_primary calls accumulate; across ticks each tick flushes once.
-_BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result"})
+_BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result", "chat:subagent:update"})
 _pending_delta_buffer: Dict[str, list] = {}
 _pending_delta_scheduled: Set[str] = set()
 
