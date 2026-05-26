@@ -67,6 +67,7 @@ from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_te
 from open_webui.socket.main import (
     stream_version_init,
     stream_version_incr,
+    emit_to_primary,
 )
 from open_webui.utils.middleware import (
     _emit_delta_for_blocks,
@@ -450,20 +451,43 @@ def _upsert_subagent_run(
 async def _emit_subagent_cancel(
     parent_event_emitter: Optional[Callable[[dict], Awaitable[None]]],
     subagent_meta: dict,
+    *,
+    user_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
 ) -> None:
-    """Best-effort live cancellation update for a parent-visible subagent row."""
+    """Best-effort live cancellation update for a parent-visible subagent row.
+
+    Under v2 we route through ``emit_to_primary`` so the envelope is delivered
+    to the elected primary session only (and gets per-tick batched alongside
+    other ``chat:subagent:update`` events). Under v1 we fall back to the
+    direct parent_event_emitter fan-out so existing behavior is preserved."""
+    inner_event = {"type": "chat:tasks:cancel"}
+    payload_data = {
+        "type": "chat:subagent:update",
+        "data": {
+            **subagent_meta,
+            "inner_event": inner_event,
+        },
+    }
+    if (
+        STREAM_PROTOCOL_VERSION == "v2"
+        and user_id
+    ):
+        envelope = {
+            "chat_id": parent_chat_id,
+            "message_id": parent_message_id,
+            "data": payload_data,
+        }
+        try:
+            await emit_to_primary(user_id, envelope)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"subagent cancel emit_to_primary failed; falling back: {e}")
     if parent_event_emitter is None:
         return
     try:
-        await parent_event_emitter(
-            {
-                "type": "chat:subagent:update",
-                "data": {
-                    **subagent_meta,
-                    "inner_event": {"type": "chat:tasks:cancel"},
-                },
-            }
-        )
+        await parent_event_emitter(payload_data)
     except Exception as e:  # noqa: BLE001
         log.debug(f"subagent cancel emit failed: {e}")
 
@@ -472,6 +496,9 @@ def _build_forwarding_emitter(
     subagent_socket_info: dict,
     parent_event_emitter: Callable[[dict], Awaitable[None]],
     subagent_meta: dict,
+    *,
+    parent_chat_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
 ) -> Callable[[dict], Awaitable[None]]:
     """Wrap the inner event_emitter and throttle parent-facing live updates.
 
@@ -504,6 +531,16 @@ def _build_forwarding_emitter(
 
     v2_enabled = STREAM_PROTOCOL_VERSION == "v2"
     inner_message_id = subagent_socket_info.get("message_id") if isinstance(subagent_socket_info, dict) else None
+    # User/parent identifiers for the primary-only emit path (v2). The
+    # parent_event_emitter path remains as a fallback so any failure in the
+    # primary emit (or v1 mode) still reaches sibling sessions via fan-out.
+    user_id_for_primary = (
+        subagent_socket_info.get("user_id") if isinstance(subagent_socket_info, dict) else None
+    )
+    parent_chat_id_for_primary = parent_chat_id
+    parent_message_id_for_primary = parent_message_id or (
+        subagent_meta.get("parent_message_id") if isinstance(subagent_meta, dict) else None
+    )
     # Per-subagent mirror — independent of the parent's v2 mirror. Tracks the
     # slim (results-stripped) block shape so we can diff fresh content_blocks
     # into compact chat:delta ops, and remembers which tool_call_ids have
@@ -526,16 +563,34 @@ def _build_forwarding_emitter(
         )
 
     async def _emit_parent(inner_event: dict) -> None:
+        payload_data = {
+            "type": "chat:subagent:update",
+            "data": {
+                **subagent_meta,
+                "inner_event": inner_event,
+            },
+        }
+        # Under v2 ship via emit_to_primary so the envelope goes to the
+        # elected primary session only (and joins the per-tick batch with
+        # chat:delta / tool_call:result emits). Sibling tabs receive the
+        # event via the primary tab's BroadcastChannel relay. Under v1 we
+        # use the original fan-out emitter so every session keeps getting
+        # its own copy directly from the server.
+        if v2_enabled and user_id_for_primary:
+            envelope = {
+                "chat_id": parent_chat_id_for_primary,
+                "message_id": parent_message_id_for_primary,
+                "data": payload_data,
+            }
+            try:
+                await emit_to_primary(user_id_for_primary, envelope)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.debug(
+                    f"subagent emit_to_primary failed; falling back to fan-out: {e}"
+                )
         try:
-            await parent_event_emitter(
-                {
-                    "type": "chat:subagent:update",
-                    "data": {
-                        **subagent_meta,
-                        "inner_event": inner_event,
-                    },
-                }
-            )
+            await parent_event_emitter(payload_data)
         except Exception as e:  # noqa: BLE001
             log.debug(f"forwarding to parent UI failed: {e}")
 
@@ -986,6 +1041,8 @@ async def _run_inner_chat(
         subagent_socket_info=subagent_socket_info,
         parent_event_emitter=parent_event_emitter,
         subagent_meta=subagent_meta,
+        parent_chat_id=parent_metadata.get("chat_id"),
+        parent_message_id=parent_metadata.get("message_id"),
     )
     subagent_event_caller = get_event_call(subagent_socket_info)
 
@@ -1324,7 +1381,13 @@ async def run_subagent_launch(
                     "ended_at": int(time.time()),
                 },
             )
-            await _emit_subagent_cancel(parent_event_emitter, subagent_meta)
+            await _emit_subagent_cancel(
+                parent_event_emitter,
+                subagent_meta,
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
+            )
             raise
         except Exception as e:  # noqa: BLE001
             last_error = str(e)
@@ -1561,7 +1624,13 @@ async def run_subagent_continue(
                     "ended_at": int(time.time()),
                 },
             )
-            await _emit_subagent_cancel(parent_event_emitter, subagent_meta)
+            await _emit_subagent_cancel(
+                parent_event_emitter,
+                subagent_meta,
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
+            )
             raise
         except Exception as e:  # noqa: BLE001
             last_error = str(e)
@@ -1942,7 +2011,13 @@ async def rerun_subagent_turn(
                     "ended_at": int(time.time()),
                 },
             )
-            await _emit_subagent_cancel(parent_event_emitter, subagent_meta)
+            await _emit_subagent_cancel(
+                parent_event_emitter,
+                subagent_meta,
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=write_msg_id,
+            )
             raise
         except Exception as e:  # noqa: BLE001
             last_error = str(e)

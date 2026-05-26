@@ -591,9 +591,31 @@
 					// For batched envelopes the outer type doesn't carry a
 					// version; derive a scoped key from the inner batch's
 					// first+last versions (plus length) so distinct batches
-					// don't collide on the same message id.
+					// don't collide on the same message id. chat:subagent:update
+					// inner events don't have a top-level version field — the
+					// inner_event nested inside MAY have one for chat:delta /
+					// chat:done, but for status/error events there is none and
+					// distinct batches could collide. Skip dedup entirely when
+					// the batch contains a chat:subagent:update entry: the
+					// server-side 0.5s throttle already coalesces these and
+					// queueSubagentUpdate is idempotent for repeated state.
 					if (type === 'chat:delta:batch') {
 						const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
+						const hasSubagentUpdate = batch.some(
+							(b: any) => b?.data?.type === 'chat:subagent:update'
+						);
+						if (hasSubagentUpdate) {
+							// Bypass dedup — replay every batch as-is.
+							suppressBroadcast = true;
+							try {
+								await chatEventHandler(payload, () => {});
+							} catch (err) {
+								console.error('owui-events replay failed', err);
+							} finally {
+								suppressBroadcast = false;
+							}
+							return;
+						}
 						const first = batch[0]?.data?.version ?? '';
 						const last = batch[batch.length - 1]?.data?.version ?? '';
 						version = `b:${batch.length}:${first}:${last}`;
@@ -601,7 +623,14 @@
 					// Only dedup when we have at least a message/chat id to
 					// scope by — otherwise distinct events with no
 					// identifying fields would all collapse onto one entry.
-					if (messageId || chatId) {
+					// Skip chat:subagent:update entirely — these envelopes
+					// don't carry a per-emit version (the throttle key is
+					// subagent_id, set server-side) and queueSubagentUpdate
+					// is idempotent for repeated state, so a rare duplicate
+					// during the primary-election race is harmless.
+					if (type === 'chat:subagent:update') {
+						// fall through to replay without recording dedup id
+					} else if (messageId || chatId) {
 						const id = [messageId, chatId, type, version].join('|');
 						if (seenBroadcastEvents.has(id)) {
 							return;
