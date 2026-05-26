@@ -56,13 +56,11 @@
 	let contentContainerElement;
 	let floatingButtonsElement;
 
-	// Cached per-block markdown projections. The invariant we exploit: the
-	// backend never mutates older blocks — once a new block is appended,
-	// the previous-last block is frozen. So we only ever recompute the
-	// projection for the *current* last block. Earlier projections are
-	// referentially identical strings across reactive updates, which means
-	// the nested `<Markdown>` component sees prop equality and skips its
-	// internal marked.parse + {@html} wipe entirely.
+	// Cached per-block markdown projections. Text/reasoning blocks only need the
+	// current tail block re-projected while streaming, but tool_calls blocks can
+	// receive results after a later text/reasoning block has opened. Re-project
+	// those mutable tool blocks every update so live web_search/web_fetch and
+	// subagent placeholders appear without requiring a reload.
 	/** @type {string[]} */
 	let blockProjections = [];
 	$: {
@@ -72,19 +70,17 @@
 			if (blockProjections.length !== 0) blockProjections = [];
 		} else {
 			/** @type {string[]} */
-			const next = blockProjections.slice(
-				0,
-				Math.min(blocks.length - 1, Math.max(0, blockProjections.length - 1))
-			);
-			// Backfill projections for any newly-finalized blocks (we may have
-			// jumped multiple blocks in one update — e.g. tool_calls round
-			// completed and a fresh text block was appended in the same tick).
-			for (let i = next.length; i < blocks.length - 1; i++) {
-				next.push(blocksToDisplayMarkdown([blocks[i]]));
+			const next = [];
+			for (let i = 0; i < blocks.length; i++) {
+				const block = blocks[i];
+				const isLast = i === blocks.length - 1;
+				const mutableAfterOpen = block?.type === 'tool_calls';
+				if (isLast || mutableAfterOpen || blockProjections[i] == null) {
+					next[i] = blocksToDisplayMarkdown([block]);
+				} else {
+					next[i] = blockProjections[i];
+				}
 			}
-			// The last block is always (re)projected; it's the only one that
-			// can be growing during streaming.
-			next[blocks.length - 1] = blocksToDisplayMarkdown([blocks[blocks.length - 1]]);
 			blockProjections = next;
 		}
 	}
