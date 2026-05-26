@@ -19,6 +19,17 @@
 
 	type Tab = 'result' | 'request' | 'raw';
 
+	const normalizeLiveResultRaw = (raw: unknown) => {
+		if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+			const obj = raw as Record<string, unknown>;
+			if ('content' in obj) return obj.content;
+			if ('result' in obj) return obj.result;
+		}
+		return raw;
+	};
+
+	$: normalizedResultRaw = normalizeLiveResultRaw(resultRaw);
+
 	const tabs: Tab[] = ['result', 'request', 'raw'];
 
 	let activeTab: Tab = 'result';
@@ -27,7 +38,7 @@
 	// chrome. Decode request/raw text only when that tab is visible; the rich
 	// Result tab parses its own data lazily inside the specialized component.
 	$: requestText = activeTab === 'request' ? formatToolValue(argsRaw) : '';
-	$: resultText = activeTab === 'raw' ? decodeToolResultText(resultRaw) : '';
+	$: resultText = activeTab === 'raw' ? decodeToolResultText(normalizedResultRaw) : '';
 
 	const labelForTab = (tab: Tab) => {
 		if (tab === 'result') return $i18n.t('Result');
@@ -37,7 +48,7 @@
 
 	const getActiveText = () => {
 		if (activeTab === 'request') return formatToolValue(argsRaw);
-		return decodeToolResultText(resultRaw);
+		return decodeToolResultText(normalizedResultRaw);
 	};
 
 	const copyActive = async () => {
@@ -87,9 +98,9 @@
 					{$i18n.t('The tool is still running. The result will appear here when it finishes.')}
 				</div>
 			{:else if name === 'web_search'}
-				<WebSearchResult id={`${id}-web-search`} {resultRaw} {argsRaw} />
+				<WebSearchResult id={`${id}-web-search`} resultRaw={normalizedResultRaw} {argsRaw} />
 			{:else if name === 'web_fetch'}
-				<WebFetchResult id={`${id}-web-fetch`} {resultRaw} />
+				<WebFetchResult id={`${id}-web-fetch`} resultRaw={normalizedResultRaw} />
 			{/if}
 		{:else if activeTab === 'request'}
 			<div class="max-h-[48vh] overflow-y-auto rounded-xl bg-gray-950 p-3 text-xs text-gray-100">
