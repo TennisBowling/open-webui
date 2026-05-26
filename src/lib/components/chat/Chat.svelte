@@ -76,7 +76,8 @@
 		chatAction,
 		generateMoACompletion,
 		stopTask,
-		getTaskIdsByChatId
+		getTaskIdsByChatId,
+		getStreamSnapshot
 	} from '$lib/apis';
 	import type { ReasoningEffort } from '$lib/apis';
 	import {
@@ -357,6 +358,42 @@
 	};
 	const streamFlushes = new Map<string, StreamFlushState>();
 	const streamTTSPartCounts = new Map<string, number>();
+
+	// Stream protocol v2: per-message mirror of the backend's
+	// `STREAM_VERSION[message_id]` + `content_blocks` + `TOOL_RESULTS` state.
+	// Used by chatDeltaHandler to apply ops in-order and recover from gaps
+	// via the snapshot endpoint (Phase 0 wire contracts #1 + #2 in the plan).
+	type StreamDelta = {
+		op: string;
+		version: number;
+		payload: any;
+	};
+	type StreamMirror = {
+		content_blocks: any[];
+		version: number;
+		tool_results: Map<string, any>;
+		pending_deltas: StreamDelta[];
+		snapshotting: boolean;
+	};
+	const streamMirrors = new Map<string, StreamMirror>();
+
+	const getOrCreateStreamMirror = (messageId: string): StreamMirror => {
+		let mirror = streamMirrors.get(messageId);
+		if (!mirror) {
+			const existing = history?.messages?.[messageId];
+			mirror = {
+				content_blocks: Array.isArray(existing?.content_blocks)
+					? existing.content_blocks
+					: [],
+				version: 0,
+				tool_results: new Map(),
+				pending_deltas: [],
+				snapshotting: false
+			};
+			streamMirrors.set(messageId, mirror);
+		}
+		return mirror;
+	};
 
 	const emitPendingTTSParts = (message: any, { done = false }: { done?: boolean } = {}) => {
 		if (!message?.content) {
@@ -1809,6 +1846,20 @@
 				return;
 			}
 
+			if (type === 'chat:done' && visibleChatId && !$temporaryChatEnabled) {
+				chatStreamDebug('[chat-stream] no-message chat:done', {
+					eventMessageId: event.message_id,
+					hasInFlight
+				});
+				if (!hasInFlight) {
+					taskIds = null;
+					generating = false;
+					generationController = null;
+					await loadChat();
+				}
+				return;
+			}
+
 			console.warn('Unable to resolve live chat message for current chat event', event);
 			return;
 		}
@@ -1835,6 +1886,21 @@
 			// spread objects. Do NOT fall through to the store-back at the end of this
 			// function — it holds a reference to the pre-spread message object which
 			// would overwrite the done=true state set inside chatCompletionEventHandler.
+			return;
+		} else if (type === 'chat:delta') {
+			// Stream protocol v2: backend emits per-op deltas instead of resending
+			// the full content_blocks every tick. See plan Phase 0 wire contract #1.
+			chatDeltaHandler(data, message, event.chat_id);
+			return;
+		} else if (type === 'tool_call:result') {
+			// Stream protocol v2: tool results are emitted once, by id; subsequent
+			// deltas reference the tool_call_id without resending the body.
+			toolCallResultHandler(data, message);
+			return;
+		} else if (type === 'chat:done') {
+			// Stream protocol v2 terminal event. Mirrors the v1 `chat:completion`
+			// `done:true` finalize path.
+			await chatDoneHandler(data, message, event.chat_id);
 			return;
 		} else if (type === 'chat:tasks:cancel') {
 			chatStreamDebug('[chat-stream] resolved chat:tasks:cancel — clearing controller', {
@@ -2057,6 +2123,21 @@
 									await loadChat();
 								} else {
 									console.log('Task is still running on the backend. Resuming stream...');
+									// v2: catch up via snapshot instead of waiting for the next
+									// delta to expose a version gap. We snapshot every pending
+									// response message (any message that's still `generating`,
+									// i.e. !done) on the current branch.
+									if (($config as any)?.features?.stream_protocol_version === 'v2') {
+										const pending: string[] = [];
+										for (const m of Object.values(history.messages ?? {}) as any[]) {
+											if (m && m.role === 'assistant' && m.done === false) {
+												pending.push(m.id);
+											}
+										}
+										for (const mid of pending) {
+											requestStreamSnapshot(mid, visibleChatId);
+										}
+									}
 								}
 							} catch (e) {
 								console.error('Failed to check task status on reconnect', e);
@@ -3305,6 +3386,293 @@
 		} else if (shouldFlushStreamingUpdate) {
 			history.messages[message.id] = message;
 			scheduleStreamingMessageFlush(message.id, { runTTS: shouldRunTTS, ownerId: message.id });
+		}
+	};
+
+	// Apply one v2 delta op against a StreamMirror's content_blocks array.
+	// Mirrors the backend's serialize/append logic in middleware.py — the two
+	// must stay in lockstep, exactly like the reasoning_details merger does.
+	const applyDeltaOp = (mirror: StreamMirror, op: string, payload: any) => {
+		if (!payload) payload = {};
+		if (op === 'text_append') {
+			const idx = payload.block_idx;
+			const block = mirror.content_blocks[idx];
+			if (block && (block.type === 'text' || block.type === 'reasoning')) {
+				block.content = (block.content || '') + (payload.text || '');
+			} else if (idx === mirror.content_blocks.length) {
+				mirror.content_blocks.push({ type: 'text', content: payload.text || '' });
+			}
+		} else if (op === 'block_open') {
+			const block: any = { type: payload.type, content: '' };
+			if (payload.attrs && typeof payload.attrs === 'object') {
+				Object.assign(block, payload.attrs);
+			}
+			if (payload.type === 'tool_calls' && !Array.isArray(block.content)) {
+				block.content = [];
+			}
+			if (typeof payload.block_idx === 'number') {
+				mirror.content_blocks[payload.block_idx] = block;
+			} else {
+				mirror.content_blocks.push(block);
+			}
+		} else if (op === 'block_close') {
+			const block = mirror.content_blocks[payload.block_idx];
+			if (block) {
+				if (payload.duration != null) block.duration = payload.duration;
+				if (payload.output != null) block.output = payload.output;
+				if (payload.ended != null) block.ended = payload.ended;
+				if (Array.isArray(payload.results)) block.results = payload.results;
+			}
+		} else if (op === 'tool_call_add') {
+			const block = mirror.content_blocks[payload.block_idx];
+			if (block && block.type === 'tool_calls') {
+				if (!Array.isArray(block.content)) block.content = [];
+				block.content.push(payload.tool_call);
+			}
+		} else if (op === 'tool_call_args_append') {
+			for (const block of mirror.content_blocks) {
+				if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+				for (const tc of block.content) {
+					if (tc?.id === payload.tool_call_id || tc?.tool_call_id === payload.tool_call_id) {
+						const fn = tc.function || (tc.function = {});
+						fn.arguments = (fn.arguments || '') + (payload.args_delta || '');
+					}
+				}
+			}
+		} else if (op === 'reasoning_detail_merge') {
+			// Stays in lockstep with the backend merger in middleware.py and the
+			// v1 path above (chatCompletionEventHandler reasoning_details merge).
+			// See backend/open_webui/utils/REASONING_DETAILS.md.
+			const detail = payload.detail || {};
+			const target = mirror.content_blocks.find(
+				(b) => b?.type === 'reasoning' && Array.isArray(b.details)
+			);
+			if (target) {
+				const existing = target.details.find((d: any) =>
+					detail.id != null
+						? d.id === detail.id && d.type === detail.type
+						: d.type === detail.type && (d.index ?? 0) === (detail.index ?? 0)
+				);
+				if (existing) {
+					if (detail.text) existing.text = (existing.text || '') + detail.text;
+					if (detail.data) existing.data = (existing.data || '') + detail.data;
+					if (detail.summary) existing.summary = (existing.summary || '') + detail.summary;
+					if (detail.id) existing.id = detail.id;
+					if (detail.signature) existing.signature = detail.signature;
+					if (detail.format) existing.format = detail.format;
+					if (detail.index != null) existing.index = detail.index;
+				} else {
+					target.details.push({ ...detail });
+				}
+			}
+		} else if (op === 'sources' || op === 'selected_model_id') {
+			// Carried on the message, not on a content block — handled by the caller.
+		} else if (op === 'replace') {
+			if (typeof payload.block_idx === 'number' && Array.isArray(payload.content_blocks)) {
+				mirror.content_blocks = payload.content_blocks.slice();
+			} else if (Array.isArray(payload.content_blocks)) {
+				mirror.content_blocks = payload.content_blocks.slice();
+			}
+		} else {
+			console.warn('[chat:delta] unknown op', op, payload);
+		}
+	};
+
+	const writeMirrorToMessage = (mirror: StreamMirror, message: any) => {
+		// Hand the live array to the renderer; downstream code already treats
+		// content_blocks as the canonical replay form (ResponseMessage.svelte).
+		message.content_blocks = mirror.content_blocks;
+	};
+
+	const requestStreamSnapshot = async (messageId: string, chatId: string | null) => {
+		const mirror = getOrCreateStreamMirror(messageId);
+		if (mirror.snapshotting) return;
+		mirror.snapshotting = true;
+
+		let snap: any = null;
+		try {
+			snap = await getStreamSnapshot(localStorage.token, messageId);
+		} catch (err) {
+			console.error('[chat:delta] snapshot fetch failed', messageId, err);
+			mirror.snapshotting = false;
+			return;
+		}
+
+		if (!snap) {
+			mirror.snapshotting = false;
+			return;
+		}
+
+		const message = history.messages[messageId];
+		if (!message) {
+			mirror.snapshotting = false;
+			return;
+		}
+
+		mirror.content_blocks = Array.isArray(snap.content_blocks)
+			? snap.content_blocks.slice()
+			: [];
+		mirror.version = typeof snap.version === 'number' ? snap.version : 0;
+		mirror.tool_results = new Map();
+		if (snap.tool_results && typeof snap.tool_results === 'object') {
+			for (const [k, v] of Object.entries(snap.tool_results)) {
+				mirror.tool_results.set(k, v);
+			}
+		}
+
+		const buffered = mirror.pending_deltas;
+		mirror.pending_deltas = [];
+		mirror.snapshotting = false;
+
+		writeMirrorToMessage(mirror, message);
+		if (snap.usage) message.usage = snap.usage;
+		if (snap.status === 'error' && snap.error) message.error = snap.error;
+		if (snap.status === 'done') message.done = true;
+
+		for (const d of buffered) {
+			if (d.version <= mirror.version) continue;
+			if (d.version > mirror.version + 1) {
+				// Still gapped after snapshot — re-buffer and refetch.
+				mirror.pending_deltas.push(d);
+				continue;
+			}
+			applyDeltaOp(mirror, d.op, d.payload);
+			mirror.version = d.version;
+		}
+
+		writeMirrorToMessage(mirror, message);
+		history.messages[messageId] = message;
+		scheduleStreamingMessageFlush(messageId, { runTTS: false, ownerId: messageId });
+
+		if (mirror.pending_deltas.length > 0) {
+			// Still gapped — kick off another snapshot. This is rare.
+			requestStreamSnapshot(messageId, chatId);
+		}
+	};
+
+	const chatDeltaHandler = (
+		delta: { message_id?: string; version?: number; op?: string; payload?: any },
+		message: any,
+		chatId: string | null
+	) => {
+		const op = delta.op || '';
+		const version = typeof delta.version === 'number' ? delta.version : 0;
+		const mirror = getOrCreateStreamMirror(message.id);
+
+		if (mirror.snapshotting) {
+			mirror.pending_deltas.push({ op, version, payload: delta.payload });
+			return;
+		}
+
+		if (version > mirror.version + 1) {
+			mirror.pending_deltas.push({ op, version, payload: delta.payload });
+			requestStreamSnapshot(message.id, chatId);
+			return;
+		}
+
+		if (version !== 0 && version <= mirror.version) {
+			// Stale/duplicate replay (e.g. snapshot already covered it).
+			return;
+		}
+
+		applyDeltaOp(mirror, op, delta.payload);
+		if (version !== 0) mirror.version = version;
+
+		const payload = delta.payload || {};
+		if (op === 'sources' && Array.isArray(payload.sources)) {
+			message.sources = payload.sources;
+		} else if (op === 'selected_model_id' && payload.model_id) {
+			message.selectedModelId = payload.model_id;
+			message.arena = true;
+		}
+
+		writeMirrorToMessage(mirror, message);
+		history.messages[message.id] = message;
+		scheduleStreamingMessageFlush(message.id, { runTTS: false, ownerId: message.id });
+	};
+
+	const toolCallResultHandler = (
+		data: {
+			message_id?: string;
+			tool_call_id?: string;
+			result?: any;
+			files?: any[];
+			embeds?: any[];
+		},
+		message: any
+	) => {
+		if (!data?.tool_call_id) return;
+		const mirror = getOrCreateStreamMirror(message.id);
+		mirror.tool_results.set(data.tool_call_id, data.result);
+		if (Array.isArray(data.files) && data.files.length > 0) {
+			message.files = [...(message.files ?? []), ...data.files];
+		}
+		if (Array.isArray(data.embeds) && data.embeds.length > 0) {
+			message.embeds = [...(message.embeds ?? []), ...data.embeds];
+		}
+		// Inline the tool result into the matching tool_calls block so the
+		// renderer keeps working unchanged (it reads results off content_blocks).
+		for (const block of mirror.content_blocks) {
+			if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+			for (const tc of block.content) {
+				if (tc?.id === data.tool_call_id || tc?.tool_call_id === data.tool_call_id) {
+					tc.result = data.result;
+				}
+			}
+		}
+		writeMirrorToMessage(mirror, message);
+		history.messages[message.id] = message;
+		scheduleStreamingMessageFlush(message.id, { runTTS: false, ownerId: message.id });
+	};
+
+	const chatDoneHandler = async (
+		data: { message_id?: string; version?: number; usage?: any },
+		message: any,
+		chatId: string | null
+	) => {
+		const mirror = getOrCreateStreamMirror(message.id);
+		if (typeof data?.version === 'number' && data.version > mirror.version + 1) {
+			// Final version is ahead — snapshot to converge before finalizing.
+			await requestStreamSnapshot(message.id, chatId);
+		}
+		writeMirrorToMessage(mirror, message);
+		if (data?.usage) message.usage = data.usage;
+		message = { ...message };
+		emitPendingTTSParts(message, { done: true });
+		cancelStreamingMessageFlush(message.id);
+		message.done = true;
+		streamMirrors.delete(message.id);
+
+		if ($settings?.responseAutoCopy) {
+			copyToClipboard(message.content || '');
+		}
+		if ($settings?.responseAutoPlayback && !$showCallOverlay) {
+			await tick();
+			document.getElementById(`speak-button-${message.id}`)?.click();
+		}
+
+		eventTarget.dispatchEvent(
+			new CustomEvent('chat:finish', {
+				detail: { id: message.id, content: message.content }
+			})
+		);
+
+		history.messages[message.id] = message;
+		history = { ...history };
+
+		await tick();
+		if (autoScroll) scrollToBottom();
+
+		if (message.usage) {
+			chatTokenStatsRefreshTrigger.update((n) => n + 1);
+		}
+		if (chatId) {
+			await chatCompletedHandler(
+				chatId,
+				message.model,
+				message.id,
+				createMessagesList(history, message.id)
+			);
 		}
 	};
 
