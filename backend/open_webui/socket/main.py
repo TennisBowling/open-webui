@@ -1219,13 +1219,14 @@ def is_primary_session(user_id, sid) -> bool:
 
 
 async def _touch_stream_state_ttl():
-    """Refresh TTL on the stream-state Redis hashes. Called after writes
-    so steady streams keep state alive while idle keys expire.
+    """Refresh TTL on the stream-state Redis hashes. Called ONCE per stream
+    at stream_version_init (not on every delta) — with a 48h default TTL,
+    any reasonable stream completes within the window from start. The TTL
+    only serves to reap orphans from crashed/killed workers.
 
     Note: TTL is on the WHOLE hash (one key per RedisDict), not per
-    message_id field. That's fine here — these hashes are short-lived per
-    stream and cleared explicitly on chat:done/error/cancel; the TTL only
-    serves to reap orphans from crashed/killed workers."""
+    message_id field. That's fine here — these hashes are cleared explicitly
+    on chat:done/error/cancel."""
     if REDIS is None:
         return
     for key_suffix in ("stream_version", "tool_results", "stream_state"):
@@ -1238,8 +1239,10 @@ async def _touch_stream_state_ttl():
 
 
 def _schedule_stream_state_ttl_refresh() -> None:
-    """Fire-and-forget TTL refresh from synchronous helpers. Skipped when no
-    event loop is running (e.g. module import or sync test context)."""
+    """Fire-and-forget TTL refresh from synchronous helpers. Invoked once per
+    stream at stream_version_init (including per-subagent inner streams).
+    Skipped when no event loop is running (e.g. module import or sync test
+    context)."""
     if REDIS is None:
         return
     try:
@@ -1271,7 +1274,6 @@ def stream_version_incr(message_id) -> int:
         STREAM_VERSION[message_id] = nxt
     except Exception:
         pass
-    _schedule_stream_state_ttl_refresh()
     return nxt
 
 
@@ -1291,7 +1293,6 @@ def set_tool_result(message_id, tool_call_id, result) -> None:
         TOOL_RESULTS[message_id] = existing
     except Exception:
         pass
-    _schedule_stream_state_ttl_refresh()
 
 
 def get_tool_results(message_id) -> dict:

@@ -590,9 +590,10 @@ if STREAM_PROTOCOL_VERSION not in ("v1", "v2"):
     STREAM_PROTOCOL_VERSION = "v2"
 
 # TTL (seconds) applied to the per-stream Redis hashes (stream_version,
-# tool_results, stream_state). Refreshed after every write, so steady streams
-# keep state alive while orphan entries from crashed/killed workers expire.
-STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "3600"))
+# tool_results, stream_state). Set once at stream_version_init so any reasonable
+# stream completes within the window; orphan entries from crashed/killed workers
+# expire after the TTL. Default 48h.
+STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "172800"))
 
 # Under v2 we coalesce more aggressively by default. v1 keeps its existing
 # default (1) so behaviour is unchanged for callers not opted into v2.
