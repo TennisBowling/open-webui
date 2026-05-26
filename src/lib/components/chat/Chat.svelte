@@ -1420,7 +1420,8 @@
 			const block = mirror.content_blocks[idx];
 			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
-				block.content = (block.content || '') + text;
+				const current = block.content || '';
+				block.content = text.includes(current) && text.length > current.length ? text : current + text;
 			} else if (idx === mirror.content_blocks.length) {
 				const prev = mirror.content_blocks[idx - 1];
 				if (
@@ -3650,7 +3651,8 @@
 			const block = mirror.content_blocks[idx];
 			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
-				block.content = (block.content || '') + text;
+				const current = block.content || '';
+				block.content = text.includes(current) && text.length > current.length ? text : current + text;
 			} else if (idx === mirror.content_blocks.length) {
 				const prev = mirror.content_blocks[idx - 1];
 				// Defensive: if an out-of-order replace/open made the server send a
