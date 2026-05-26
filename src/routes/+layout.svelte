@@ -575,6 +575,12 @@
 			eventsBc.onmessage = async (msg) => {
 				const payload = msg?.data;
 				if (!payload) return;
+				// The v2 server now sends primary-routed stream events to both the
+				// elected primary and the originating socket. The primary still relays
+				// over BroadcastChannel for sibling tabs, but the originating tab must
+				// ignore that replay or cross-channel ordering can create artificial
+				// version gaps and force snapshot catch-up.
+				if (payload?.session_id && $socket?.id && payload.session_id === $socket.id) return;
 				// Defensive dedup: if the backend briefly has two primary
 				// sessions during the election race (e.g. old primary
 				// disconnecting at the same instant a new tab connects),
@@ -587,7 +593,7 @@
 					const messageId = payload?.message_id ?? '';
 					const chatId = payload?.chat_id ?? '';
 					const type = dataPart?.type ?? '';
-					let version = dataPart?.version ?? payload?.version ?? '';
+					let version = dataPart?.data?.version ?? dataPart?.version ?? payload?.version ?? '';
 					// For batched envelopes the outer type doesn't carry a
 					// version; derive a scoped key from the inner batch's
 					// first+last versions (plus length) so distinct batches
@@ -616,8 +622,11 @@
 							}
 							return;
 						}
-						const first = batch[0]?.data?.version ?? '';
-						const last = batch[batch.length - 1]?.data?.version ?? '';
+						const first = batch[0]?.data?.data?.version ?? batch[0]?.data?.version ?? '';
+						const last =
+							batch[batch.length - 1]?.data?.data?.version ??
+							batch[batch.length - 1]?.data?.version ??
+							'';
 						version = `b:${batch.length}:${first}:${last}`;
 					}
 					// Only dedup when we have at least a message/chat id to
