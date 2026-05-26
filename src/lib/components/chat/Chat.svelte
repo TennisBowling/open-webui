@@ -2810,6 +2810,45 @@
 			return values.filter((id): id is string => typeof id === 'string' && id.length > 0);
 		};
 
+		// Repair rows created by the broken new-chat stream-v2 path: the final
+		// stream upsert could create an assistant row before the placeholder row
+		// was appended, leaving it with role="" and no parentId. That made reloads
+		// render a blank conversation even though content_blocks were saved.
+		{
+			const messages = loadedHistory?.messages as Record<string, any> | undefined;
+			if (messages && typeof messages === 'object') {
+				const ordered = Object.values(messages) as any[];
+				for (const message of ordered) {
+					if (!Array.isArray(message.childrenIds)) message.childrenIds = [];
+					if (
+						(!message.role || message.role === '') &&
+						(message.model || message.selectedModelId || Array.isArray(message.content_blocks))
+					) {
+						message.role = 'assistant';
+					}
+				}
+				for (const message of ordered) {
+					if (message.role !== 'assistant' || message.parentId) continue;
+					const messageIdx = ordered.indexOf(message);
+					const messageTs = typeof message.timestamp === 'number' ? message.timestamp : null;
+					const parent =
+						ordered
+							.slice(0, messageIdx >= 0 ? messageIdx : ordered.length)
+							.reverse()
+							.find(
+								(m) =>
+									m?.role === 'user' &&
+									(messageTs === null || typeof m.timestamp !== 'number' || m.timestamp <= messageTs)
+							) ?? ordered.slice().reverse().find((m) => m?.role === 'user');
+					if (parent?.id) {
+						message.parentId = parent.id;
+						parent.childrenIds = Array.isArray(parent.childrenIds) ? parent.childrenIds : [];
+						if (!parent.childrenIds.includes(message.id)) parent.childrenIds.push(message.id);
+					}
+				}
+			}
+		}
+
 		let loadedModels = normalizeModelIds(chatContent?.models);
 		if (loadedModels.length === 0) {
 			const historyMessages = Object.values(loadedHistory?.messages ?? {}) as any[];
@@ -4066,8 +4105,10 @@
 
 		// Build append_message ops for the user message + each freshly-created
 		// response message so the backend has a parented chain to attach stream
-		// deltas to via realtime save. Skipped for new chats — initChatHandler's
-		// createNewChat call already persisted the full history.
+		// deltas to via realtime save. For a brand-new root chat, createNewChat
+		// already persisted the user message, but it did NOT know about the
+		// assistant placeholder created above; append the assistant rows here or
+		// the first stream upsert will create orphan rows with role=""/no parent.
 		const initialOps: PatchChatOp[] = [];
 		const isNewChatRootSend = newChat && _history.messages[parentId]?.parentId === null;
 		if (!isNewChatRootSend) {
@@ -4084,24 +4125,24 @@
 					timestamp: userMsg.timestamp
 				});
 			}
-			for (const respId of Object.values(responseMessageIds)) {
-				const m = _history.messages[respId];
-				if (!m) continue;
-				initialOps.push({
-					op: 'append_message',
-					message_id: m.id,
-					parent_id: m.parentId ?? null,
-					role: 'assistant',
-					content: m.content ?? '',
-					model: m.model,
-					modelName: m.modelName,
-					modelIdx: m.modelIdx,
-					timestamp: m.timestamp
-				});
-			}
-			if (_history.currentId) {
-				initialOps.push({ op: 'set_history_current_id', current_id: _history.currentId });
-			}
+		}
+		for (const respId of Object.values(responseMessageIds)) {
+			const m = _history.messages[respId];
+			if (!m) continue;
+			initialOps.push({
+				op: 'append_message',
+				message_id: m.id,
+				parent_id: m.parentId ?? null,
+				role: 'assistant',
+				content: m.content ?? '',
+				model: m.model,
+				modelName: m.modelName,
+				modelIdx: m.modelIdx,
+				timestamp: m.timestamp
+			});
+		}
+		if (_history.currentId) {
+			initialOps.push({ op: 'set_history_current_id', current_id: _history.currentId });
 		}
 
 		const initialSavePromise = saveChatHandler(
