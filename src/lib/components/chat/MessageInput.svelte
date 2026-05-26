@@ -98,9 +98,9 @@
 	export let generating = false;
 
 	export let atSelectedModel: Model | undefined = undefined;
-	export let selectedModels: [''];
+	export let selectedModels: string[] = [''];
 
-	let selectedModelIds = [];
+	let selectedModelIds: string[] = [];
 	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
 
 	export let history;
@@ -727,9 +727,17 @@
 	);
 
 	let toggleFilters = [];
-	$: toggleFilters = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
-		.map((id) => ($models.find((model) => model.id === id) || {})?.filters ?? [])
-		.reduce((acc, filters) => acc.filter((f1) => filters.some((f2) => f2.id === f1.id)));
+	$: {
+		const filterLists = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
+			.filter(Boolean)
+			.map((id) => ($models.find((model) => model.id === id) || {})?.filters ?? []);
+		toggleFilters =
+			filterLists.length > 0
+				? filterLists.reduce((acc, filters) =>
+						acc.filter((f1) => filters.some((f2) => f2.id === f1.id))
+					)
+				: [];
+	}
 
 	let showToolsButton = false;
 	let directToolServersConfigured = false;

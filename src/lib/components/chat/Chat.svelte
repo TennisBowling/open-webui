@@ -2798,22 +2798,40 @@
 			return null;
 		}
 
-		selectedModels =
-			(chatContent?.models ?? undefined) !== undefined
-				? chatContent.models
-				: [chatContent.models ?? ''];
+		// Build history before model selection so corrupted/legacy chats with
+		// `chat.models: []` can still infer a usable model from their messages.
+		const loadedHistory =
+			(chatContent?.history ?? undefined) !== undefined
+				? chatContent.history
+				: convertMessagesToHistory(chatContent.messages);
+
+		const normalizeModelIds = (value: unknown): string[] => {
+			const values = Array.isArray(value) ? value : value ? [value] : [];
+			return values.filter((id): id is string => typeof id === 'string' && id.length > 0);
+		};
+
+		let loadedModels = normalizeModelIds(chatContent?.models);
+		if (loadedModels.length === 0) {
+			const historyMessages = Object.values(loadedHistory?.messages ?? {}) as any[];
+			const currentMessage = loadedHistory?.currentId
+				? (loadedHistory.messages as Record<string, any>)?.[loadedHistory.currentId]
+				: null;
+			const candidates = [currentMessage, ...historyMessages.slice().reverse()].filter(Boolean);
+			for (const message of candidates) {
+				loadedModels = normalizeModelIds(message?.models);
+				if (loadedModels.length === 0) {
+					loadedModels = normalizeModelIds(message?.selectedModelId ?? message?.model);
+				}
+				if (loadedModels.length > 0) break;
+			}
+		}
+		selectedModels = loadedModels.length > 0 ? loadedModels : [''];
 
 		if (!($user?.role === 'admin' || ($user?.permissions?.chat?.multiple_models ?? true))) {
 			selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
 		}
 
 		oldSelectedModelIds = selectedModels;
-
-		// Build history and pre-process done states BEFORE assigning to avoid multiple reactive triggers
-		const loadedHistory =
-			(chatContent?.history ?? undefined) !== undefined
-				? chatContent.history
-				: convertMessagesToHistory(chatContent.messages);
 
 		if (loadedHistory.currentId) {
 			for (const message of Object.values(loadedHistory.messages)) {

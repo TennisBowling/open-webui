@@ -541,6 +541,9 @@ def _build_forwarding_emitter(
     parent_message_id_for_primary = parent_message_id or (
         subagent_meta.get("parent_message_id") if isinstance(subagent_meta, dict) else None
     )
+    session_id_for_primary = (
+        subagent_socket_info.get("session_id") if isinstance(subagent_socket_info, dict) else None
+    )
     # Per-subagent mirror — independent of the parent's v2 mirror. Tracks the
     # slim (results-stripped) block shape so we can diff fresh content_blocks
     # into compact chat:delta ops, and remembers which tool_call_ids have
@@ -580,6 +583,7 @@ def _build_forwarding_emitter(
             envelope = {
                 "chat_id": parent_chat_id_for_primary,
                 "message_id": parent_message_id_for_primary,
+                "session_id": session_id_for_primary,
                 "data": payload_data,
             }
             try:

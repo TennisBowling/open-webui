@@ -409,6 +409,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
         envelope = {
             "chat_id": chat_id,
             "message_id": message_id,
+            "session_id": session_id,
             "data": payload,
         }
         await emit_to_primary(user_id, envelope)

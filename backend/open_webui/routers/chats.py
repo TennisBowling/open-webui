@@ -1250,6 +1250,7 @@ class PatchOp(BaseModel):
         "set_models",
         "set_files",
         "set_queue",
+        "set_tags",
         "set_history_current_id",
         "append_message",
         "update_message_content",
@@ -1263,6 +1264,10 @@ class PatchOp(BaseModel):
     role: Optional[str] = None
     content: Any = None
     files: Any = None
+    models: Optional[list] = None
+    queue: Optional[list] = None
+    tags: Optional[list] = None
+    current_id: Optional[str] = None
     model: Optional[str] = None
     annotation: Any = None
     extra: Optional[dict] = None
@@ -1372,20 +1377,32 @@ async def patch_chat_by_id(
                 body_dirty = True
 
         elif op.op == "set_models":
-            chat_body["models"] = op.value if isinstance(op.value, list) else []
+            models = op.models if isinstance(op.models, list) else op.value
+            chat_body["models"] = models if isinstance(models, list) else []
             body_dirty = True
 
         elif op.op == "set_files":
-            chat_body["files"] = op.value if isinstance(op.value, list) else []
+            files = op.files if isinstance(op.files, list) else op.value
+            chat_body["files"] = files if isinstance(files, list) else []
             body_dirty = True
 
         elif op.op == "set_queue":
-            chat_body["queue"] = op.value if isinstance(op.value, list) else []
+            queue = op.queue if isinstance(op.queue, list) else op.value
+            chat_body["queue"] = queue if isinstance(queue, list) else []
+            body_dirty = True
+
+        elif op.op == "set_tags":
+            tags = op.tags if isinstance(op.tags, list) else op.value
+            chat_body["tags"] = tags if isinstance(tags, list) else []
             body_dirty = True
 
         elif op.op == "set_history_current_id":
             history = chat_body.get("history") or {"messages": {}, "currentId": None}
-            target_id = op.value if op.value is not None else op.message_id
+            target_id = (
+                op.current_id
+                if op.current_id is not None
+                else op.value if op.value is not None else op.message_id
+            )
             history["currentId"] = target_id
             chat_body["history"] = history
             body_dirty = True
@@ -1409,6 +1426,28 @@ async def patch_chat_by_id(
                 new_msg["files"] = op.files
             if op.model is not None:
                 new_msg["model"] = op.model
+
+            reserved = {
+                "op",
+                "key",
+                "value",
+                "message_id",
+                "parent_id",
+                "role",
+                "content",
+                "files",
+                "models",
+                "queue",
+                "tags",
+                "current_id",
+                "model",
+                "annotation",
+                "extra",
+            }
+            extra_fields = getattr(op, "model_extra", {}) or {}
+            for k, v in extra_fields.items():
+                if k not in reserved:
+                    new_msg.setdefault(k, v)
             if isinstance(op.extra, dict):
                 for k, v in op.extra.items():
                     new_msg.setdefault(k, v)
@@ -1452,8 +1491,13 @@ async def patch_chat_by_id(
                     "annotation",
                     "content",
                     "files",
+                    "models",
+                    "queue",
+                    "tags",
+                    "current_id",
                     "extra",
-                }
+                },
+                exclude_none=True,
             )
             partial: dict = dict(base)
             if isinstance(op.extra, dict):

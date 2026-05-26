@@ -1340,9 +1340,31 @@ async def _emit_to_primary_raw(user_id, payload):
         primary = PRIMARY_SESSION_PER_USER.get(user_id)
     except Exception:
         primary = None
+
+    # Stream-v2 chat responses are initiated by one concrete browser session,
+    # but are normally routed through the elected primary session so that the
+    # primary tab can BroadcastChannel-relay to sibling tabs. If the submitting
+    # tab is not primary (or the primary entry is stale), primary-only delivery
+    # makes that tab wait forever. When an envelope carries the originating
+    # session_id, deliver to both the primary and the origin. Versioned v2
+    # deltas are idempotent on the client, so a same-browser BroadcastChannel
+    # replay plus this direct emit will not double-append content.
+    origin_sid = None
+    try:
+        origin_sid = payload.get("session_id") if isinstance(payload, dict) else None
+    except Exception:
+        origin_sid = None
+
+    targets = []
     if primary:
-        await sio.emit("events", payload, to=primary)
+        targets.append(primary)
+    if origin_sid and origin_sid not in targets:
+        targets.append(origin_sid)
+
+    if targets:
+        await asyncio.gather(*[sio.emit("events", payload, to=sid) for sid in targets])
         return
+
     session_ids = USER_POOL.get(user_id, []) or []
     if not session_ids:
         return
