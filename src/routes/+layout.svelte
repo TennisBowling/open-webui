@@ -25,7 +25,8 @@
 		isApp,
 		appInfo,
 		toolServers,
-		playingNotificationSound
+		playingNotificationSound,
+		tokenUsageGroups
 	} from '$lib/stores';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
@@ -346,6 +347,13 @@
 			} catch (err) {
 				console.error('applySidebarEvent failed', type, err);
 			}
+		}
+
+		// Push-based replacement for the old 3 s / 30 s `fetchTokenUsage`
+		// polling loop (Wire Contract #6 in the network-reduction plan).
+		if (type === 'token-usage:update') {
+			tokenUsageGroups.set(data?.groups || {});
+			return;
 		}
 
 		if (!isCurrentChatEvent || !windowFocused) {

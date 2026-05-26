@@ -44,7 +44,8 @@
 		showEmbeds,
 		chatTokenStatsRefreshTrigger,
 		subagentLiveStates,
-		isLastActiveTab
+		isLastActiveTab,
+		tokenUsageGroups as tokenUsageGroupsStore
 	} from '$lib/stores';
 	import {
 		convertMessagesToHistory,
@@ -554,9 +555,10 @@
 	// Falling-edge tracker for auto-send-on-complete.
 	let _wasGenerating = false;
 
-	// Token usage tracking
-	let tokenUsageGroups = {};
-	let usagePollingInterval = null;
+	// Token usage tracking — backend pushes `token-usage:update` socket events;
+	// the local mirror reads the store so existing references continue to work.
+	let tokenUsageGroups: Record<string, any> = {};
+	$: tokenUsageGroups = $tokenUsageGroupsStore;
 	let resetTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map(); // Per-group reset timeouts
 	let resetTrigger = 0; // Increment to force Svelte reactivity when reset times pass
 
@@ -783,7 +785,7 @@
 
 			if (response.ok) {
 				const data = await response.json();
-				tokenUsageGroups = data.groups || {};
+				tokenUsageGroupsStore.set(data.groups || {});
 
 				// Schedule per-group timeouts based on returned next_reset_at values
 				scheduleGroupResetChecks();
@@ -811,31 +813,14 @@
 			});
 	})();
 
-	const FAST_POLL_MS = 3000;
-	const SLOW_POLL_MS = 30000;
-
-	const startUsagePolling = (intervalMs = FAST_POLL_MS) => {
-		if (usagePollingInterval) clearInterval(usagePollingInterval);
-		usagePollingInterval = setInterval(fetchTokenUsage, intervalMs);
-	};
-
-	const stopUsagePolling = () => {
-		if (usagePollingInterval) {
-			clearInterval(usagePollingInterval);
-			usagePollingInterval = null;
-		}
-		// Clear all per-group reset timeouts
-		clearAllResetTimeouts();
-	};
-
 	$: if (chatIdProp) {
 		navigateHandler();
 	}
 
 	onMount(() => {
-		// Fetch immediately, then poll slowly to keep rate limits fresh
+		// Initial fetch only; backend pushes `token-usage:update` socket
+		// events for subsequent changes.
 		fetchTokenUsage();
-		startUsagePolling(SLOW_POLL_MS);
 		// Tick once a minute so the off-peak window check re-evaluates as the
 		// hour boundary crosses (1pm/5am PST).
 		_nowTickInterval = setInterval(() => {
@@ -844,7 +829,7 @@
 	});
 
 	onDestroy(() => {
-		stopUsagePolling();
+		clearAllResetTimeouts();
 		stopResumeTaskPolling();
 		if (_nowTickInterval) {
 			clearInterval(_nowTickInterval);
@@ -3003,16 +2988,6 @@
 		}
 	};
 
-	const getChatEventEmitter = async (modelId: string, chatId: string = '') => {
-		return setInterval(() => {
-			$socket?.emit('usage', {
-				action: 'chat',
-				model: modelId,
-				chat_id: chatId
-			});
-		}, 1000);
-	};
-
 	const createMessagePair = async (userPrompt) => {
 		messageInput?.setText('');
 		if (selectedModels.length === 0) {
@@ -3159,15 +3134,6 @@
 			// handler which would finalize the message as completed and
 			// prevent the automatic retry mechanism from triggering.
 			return;
-		}
-
-		// Emit usage event for token tracking if usage data is available
-		if (usage && selected_model_id && $socket) {
-			$socket.emit('usage', {
-				model: selected_model_id,
-				usage: usage,
-				chat_id: chatId
-			});
 		}
 
 		if (sources && !message?.sources) {
@@ -3868,8 +3834,6 @@
 							}
 						}
 
-						const chatEventEmitter = await getChatEventEmitter(model.id, _chatId);
-						startUsagePolling(FAST_POLL_MS);
 						scrollToBottom();
 
 						const MAX_RETRIES = 5;
@@ -4032,8 +3996,6 @@
 							}
 						}
 
-						if (chatEventEmitter) clearInterval(chatEventEmitter);
-						startUsagePolling(SLOW_POLL_MS);
 					} else {
 						toast.error($i18n.t(`Model {{modelId}} not found`, { modelId }));
 					}
@@ -5582,15 +5544,7 @@
 
 		const messages = createMessagesList(history, responseMessageId);
 		const _chatId = getVisibleChatId();
-		const chatEventEmitter = await getChatEventEmitter(targetModelId, _chatId);
-		startUsagePolling(FAST_POLL_MS);
-
 		await sendMessageSocket(model, messages, history, responseMessageId, _chatId);
-
-		if (chatEventEmitter) {
-			clearInterval(chatEventEmitter);
-		}
-		startUsagePolling(SLOW_POLL_MS);
 
 		return true;
 	};
@@ -5641,7 +5595,6 @@
 				.at(0);
 
 			if (model) {
-				startUsagePolling(FAST_POLL_MS);
 				await sendMessageSocket(
 					model,
 					createMessagesList(history, responseMessage.id),
@@ -5649,7 +5602,6 @@
 					responseMessage.id,
 					_chatId
 				);
-				startUsagePolling(SLOW_POLL_MS);
 			}
 		}
 	};

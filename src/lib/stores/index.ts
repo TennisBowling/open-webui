@@ -67,6 +67,10 @@ export const chatTokenStats: Writable<ChatTokenStatsData | null> = writable(null
 // Trigger to refresh chat token stats (increment to force refresh)
 export const chatTokenStatsRefreshTrigger = writable(0);
 
+// Per-user token usage groups. Seeded by initial fetch on mount and refreshed
+// by `token-usage:update` socket pushes (no polling).
+export const tokenUsageGroups: Writable<Record<string, any>> = writable({});
+
 // Live state for in-flight + completed subagent runs in the visible chat.
 //
 // Keyed by tool_call_id (the parent model's tool call id). One entry per
