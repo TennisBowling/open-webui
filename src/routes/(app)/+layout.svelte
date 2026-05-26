@@ -14,6 +14,7 @@
 	import { getTools } from '$lib/apis/tools';
 	import { getBanners } from '$lib/apis/configs';
 	import { getUserSettings } from '$lib/apis/users';
+	import { consumeBootstrap } from '$lib/utils/bootstrap';
 
 	import { WEBUI_VERSION } from '$lib/constants';
 	import type { Banner } from '$lib/types';
@@ -193,6 +194,22 @@
 		const directConnections = getModelRequestDirectConnections();
 		const cacheKey = getModelsCacheKey(directConnections);
 
+		// Bootstrap-delivered models do not include direct-connection fanout; skip when configured.
+		const bootstrapModels = consumeBootstrap<any[]>('models');
+		if (bootstrapModels && !directConnections) {
+			models.set(bootstrapModels);
+			try {
+				localStorage.setItem(
+					MODELS_CACHE_KEY,
+					JSON.stringify({ cacheKey, models: bootstrapModels })
+				);
+			} catch (e) {
+				console.error('Failed to cache models', e);
+			}
+			modelsLoaded.set(true);
+			return;
+		}
+
 		try {
 			const modelData = await getModels(localStorage.token, directConnections);
 
@@ -216,6 +233,17 @@
 	};
 
 	const setBanners = async () => {
+		const bootstrapBanners = consumeBootstrap<Banner[]>('banners');
+		if (Array.isArray(bootstrapBanners)) {
+			banners.set(bootstrapBanners);
+			writeLocalStorageCache(
+				STARTUP_BANNERS_CACHE_KEY,
+				getUserCacheKey('banners'),
+				bootstrapBanners,
+				BANNERS_CACHE_TTL
+			);
+			return;
+		}
 		try {
 			const bannersData = await getBanners(localStorage.token);
 			banners.set(bannersData);
@@ -251,6 +279,17 @@
 	};
 
 	const setTools = async () => {
+		const bootstrapTools = consumeBootstrap<any[]>('tools');
+		if (Array.isArray(bootstrapTools)) {
+			tools.set(bootstrapTools);
+			writeLocalStorageCache(
+				STARTUP_TOOLS_CACHE_KEY,
+				getUserCacheKey('tools'),
+				bootstrapTools,
+				TOOLS_CACHE_TTL
+			);
+			return;
+		}
 		try {
 			const toolsData = await getTools(localStorage.token);
 			tools.set(toolsData);
@@ -296,16 +335,28 @@
 		loaded = true;
 
 		// Background: fetch fresh settings + everything else in parallel
+		const userSettingsTask = (async () => {
+			const bootstrapSettings = consumeBootstrap<any>('settings');
+			if (bootstrapSettings?.ui) {
+				settings.set(bootstrapSettings.ui);
+				localStorage.setItem('settings', JSON.stringify(bootstrapSettings));
+				scheduleToolServersLoad();
+				return;
+			}
+			try {
+				const userSettings = await getUserSettings(localStorage.token);
+				if (userSettings?.ui) {
+					settings.set(userSettings.ui);
+					localStorage.setItem('settings', JSON.stringify(userSettings));
+					scheduleToolServersLoad();
+				}
+			} catch (e) {
+				console.error('Failed to fetch user settings', e);
+			}
+		})();
+
 		Promise.all([
-			getUserSettings(localStorage.token)
-				.then((userSettings) => {
-					if (userSettings?.ui) {
-						settings.set(userSettings.ui);
-						localStorage.setItem('settings', JSON.stringify(userSettings));
-						scheduleToolServersLoad();
-					}
-				})
-				.catch((e) => console.error('Failed to fetch user settings', e)),
+			userSettingsTask,
 			checkLocalDBChats(),
 			setBanners(),
 			setTools(),

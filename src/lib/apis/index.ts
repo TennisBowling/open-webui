@@ -1476,6 +1476,89 @@ export const getUsage = async (token: string = '') => {
 	return res;
 };
 
+export type BootstrapInclude =
+	| 'config'
+	| 'user'
+	| 'settings'
+	| 'models'
+	| 'banners'
+	| 'tools'
+	| 'folders'
+	| 'tags'
+	| 'pinned'
+	| 'chats'
+	| 'channels';
+
+export type BootstrapResponse = {
+	components: Partial<Record<BootstrapInclude, any>>;
+	components_etags: Partial<Record<BootstrapInclude, string>>;
+	bundle_etag: string;
+	status: 200 | 304;
+};
+
+export const getBootstrap = async (
+	token: string,
+	{
+		include,
+		ifNoneMatch
+	}: {
+		include: BootstrapInclude[];
+		ifNoneMatch?: string | null;
+	}
+): Promise<BootstrapResponse | null> => {
+	const params = new URLSearchParams({ include: include.join(',') });
+	const headers: Record<string, string> = {
+		Accept: 'application/json',
+		'Content-Type': 'application/json'
+	};
+	if (token) headers.authorization = `Bearer ${token}`;
+	if (ifNoneMatch) headers['If-None-Match'] = ifNoneMatch;
+
+	let res: Response;
+	try {
+		res = await fetch(`${WEBUI_BASE_URL}/api/bootstrap?${params.toString()}`, {
+			method: 'GET',
+			credentials: 'include',
+			headers
+		});
+	} catch (err) {
+		console.error('getBootstrap network error', err);
+		return null;
+	}
+
+	if (res.status === 304) {
+		return {
+			components: {},
+			components_etags: {},
+			bundle_etag: ifNoneMatch ?? '',
+			status: 304
+		};
+	}
+
+	// 404/405: backend bootstrap endpoint not deployed yet — callers fall back to per-component GETs.
+	if (res.status === 404 || res.status === 405) {
+		return null;
+	}
+
+	if (!res.ok) {
+		try {
+			const err = await res.json();
+			console.error('getBootstrap error', err);
+		} catch {
+			console.error('getBootstrap http error', res.status);
+		}
+		return null;
+	}
+
+	const body = await res.json();
+	return {
+		components: body?.components ?? {},
+		components_etags: body?.components_etags ?? {},
+		bundle_etag: body?.bundle_etag ?? '',
+		status: 200
+	};
+};
+
 export const getBackendConfig = async () => {
 	let error = null;
 

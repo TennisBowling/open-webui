@@ -32,8 +32,13 @@
 	import { page } from '$app/stores';
 	import { Toaster, toast } from 'svelte-sonner';
 
-	import { executeToolServer, getBackendConfig } from '$lib/apis';
+	import { executeToolServer, getBackendConfig, getBootstrap } from '$lib/apis';
 	import { getSessionUser, userSignOut } from '$lib/apis/auths';
+	import {
+		BOOTSTRAP_BUNDLE_ETAG_KEY,
+		BOOTSTRAP_BUNDLE_BODY_KEY,
+		setBootstrapComponents
+	} from '$lib/utils/bootstrap';
 
 	import '../tailwind.css';
 	import '../app.css';
@@ -621,14 +626,86 @@
 		// Run initialization queries in parallel if we have a token
 		try {
 			if (localStorage.token) {
-				const [_config, _sessionUser, _languages] = await Promise.all([
-					getBackendConfig(),
-					getSessionUser(localStorage.token).catch((error) => {
-						toast.error(`${error}`);
+				const cachedUserId = (() => {
+					try {
+						return JSON.parse(localStorage.getItem('sessionUser') ?? 'null')?.id ?? null;
+					} catch {
 						return null;
-					}),
+					}
+				})();
+				const bundleEtagKey = BOOTSTRAP_BUNDLE_ETAG_KEY(cachedUserId);
+				const bundleBodyKey = BOOTSTRAP_BUNDLE_BODY_KEY(cachedUserId);
+				const cachedBundleEtag = localStorage.getItem(bundleEtagKey);
+
+				const bootstrapPromise = getBootstrap(localStorage.token, {
+					include: [
+						'config',
+						'user',
+						'settings',
+						'models',
+						'banners',
+						'tools',
+						'folders',
+						'tags',
+						'pinned',
+						'chats',
+						'channels'
+					],
+					ifNoneMatch: cachedBundleEtag
+				}).catch((error) => {
+					console.error('getBootstrap failed', error);
+					return null;
+				});
+
+				const [bootstrap, _languages] = await Promise.all([
+					bootstrapPromise,
 					!localStorage.locale ? getLanguages() : Promise.resolve(null)
 				]);
+
+				let _config = null;
+				let _sessionUser = null;
+
+				if (bootstrap && bootstrap.status === 304) {
+					try {
+						const cachedBundle = JSON.parse(localStorage.getItem(bundleBodyKey) ?? 'null');
+						if (cachedBundle?.components) {
+							setBootstrapComponents(cachedBundle.components);
+							_config = cachedBundle.components.config ?? null;
+							_sessionUser = cachedBundle.components.user ?? null;
+						}
+					} catch (e) {
+						console.error('Failed to read cached bootstrap bundle', e);
+					}
+				} else if (bootstrap && bootstrap.status === 200) {
+					setBootstrapComponents(bootstrap.components);
+					_config = bootstrap.components.config ?? null;
+					_sessionUser = bootstrap.components.user ?? null;
+					try {
+						localStorage.setItem(
+							bundleBodyKey,
+							JSON.stringify({ components: bootstrap.components })
+						);
+						if (bootstrap.bundle_etag) {
+							localStorage.setItem(bundleEtagKey, bootstrap.bundle_etag);
+						}
+					} catch (e) {
+						console.error('Failed to persist bootstrap bundle', e);
+					}
+				}
+
+				// Fallback when /api/bootstrap is unavailable (backend not yet upgraded).
+				if (!bootstrap) {
+					const [fallbackConfig, fallbackUser] = await Promise.all([
+						getBackendConfig(),
+						getSessionUser(localStorage.token).catch((error) => {
+							toast.error(`${error}`);
+							return null;
+						})
+					]);
+					_config = fallbackConfig;
+					_sessionUser = fallbackUser;
+				}
+
 				backendConfig = _config;
 
 				if (_config) {
