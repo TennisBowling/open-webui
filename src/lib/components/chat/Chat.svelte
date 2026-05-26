@@ -77,9 +77,9 @@
 		chatAction,
 		generateMoACompletion,
 		stopTask,
-		getTaskIdsByChatId,
-		preprocessVision
+		getTaskIdsByChatId
 	} from '$lib/apis';
+	import { generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import type { ReasoningEffort } from '$lib/apis';
 	import {
 		BASE_REASONING_EFFORTS,
@@ -3582,16 +3582,30 @@
 										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
 
 									try {
-										const preRes = await preprocessVision(localStorage.token, {
-											chat_id: _chatId,
-											message_id: parentId,
-											model_id: model.id,
-											preprocessor_model_id: preprocessorModel.id,
-											mode: 'image',
-											prompt: visionPrompt
-										});
-
-										const visionResponse = preRes?.content ?? '';
+										const visionMessages = [
+											{ role: 'system', content: visionPrompt.replace('{query}', userMessage.content) },
+											{
+												role: 'user',
+												content: [
+													{ type: 'text', text: userMessage.content },
+													...userImages.map((f) => ({
+														type: 'image_url',
+														image_url: { url: f.url }
+													}))
+												]
+											}
+										];
+										const visionRes = await generateOpenAIChatCompletion(
+											localStorage.token,
+											{
+												model: preprocessorModel.id,
+												messages: visionMessages,
+												stream: false,
+												params: { max_tokens: 2048 }
+											},
+											`${WEBUI_BASE_URL}/api`
+										);
+										const visionResponse = visionRes?.choices?.[0]?.message?.content ?? '';
 
 										responseMessage = _history.messages[responseMessageId];
 										responseMessage.statusHistory.push({
@@ -3674,17 +3688,37 @@
 										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
 
 									try {
-										const preRes = await preprocessVision(localStorage.token, {
-											chat_id: _chatId,
-											message_id: parentId,
-											model_id: model.id,
-											preprocessor_model_id: preprocessorModel.id,
-											mode: 'pdf',
-											prompt: visionPrompt
-										});
-
-										const visionResponse = preRes?.content ?? '';
-										const pages = preRes?.pages ?? userPdfs.length;
+										const visionMessages = [
+											{ role: 'system', content: visionPrompt.replace('{query}', userMessage.content) },
+											{
+												role: 'user',
+												content: [
+													{
+														type: 'text',
+														text: `I have uploaded ${userPdfs.length} PDF document(s). Please analyze them:\n\n${userMessage.content}`
+													},
+													...userPdfs.map((f) => ({
+														type: 'file',
+														file: {
+															filename: f.name || f.file?.filename || 'document.pdf',
+															file_data: f.url || `${WEBUI_API_BASE_URL}/files/${f.id}/content`
+														}
+													}))
+												]
+											}
+										];
+										const visionRes = await generateOpenAIChatCompletion(
+											localStorage.token,
+											{
+												model: preprocessorModel.id,
+												messages: visionMessages,
+												stream: false,
+												params: { max_tokens: 4096 }
+											},
+											`${WEBUI_BASE_URL}/api`
+										);
+										const visionResponse = visionRes?.choices?.[0]?.message?.content ?? '';
+										const pages = userPdfs.length;
 
 										responseMessage = _history.messages[responseMessageId];
 										responseMessage.statusHistory.push({
