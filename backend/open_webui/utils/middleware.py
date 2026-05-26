@@ -91,7 +91,10 @@ from open_webui.models.users import UserModel
 from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 
-from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.chat import (
+    generate_chat_completion,
+    run_outlet_filters_on_completed_stream,
+)
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -3713,6 +3716,27 @@ async def process_chat_response(
                         "data": {"done": True},
                     }
                 )
+
+                # B12: outlet filters run server-side at the tail of the
+                # stream. The frontend used to POST /api/chat/completed for
+                # this; that route is now a no-op shim. If a filter mutates
+                # content, the helper persists it and emits a catch-up event
+                # so the frontend mirror updates.
+                try:
+                    await run_outlet_filters_on_completed_stream(
+                        request=request,
+                        user=user,
+                        metadata=metadata,
+                        model=model,
+                        model_id=model_id,
+                        filter_ids=metadata.get("filter_ids", []),
+                        content_blocks=content_blocks,
+                        event_emitter=event_emitter,
+                        event_caller=event_caller,
+                        serialize_content_blocks=serialize_content_blocks,
+                    )
+                except Exception as e:
+                    log.exception(f"Outlet filter run failed: {e}")
 
                 await background_tasks_handler()
             except asyncio.CancelledError:

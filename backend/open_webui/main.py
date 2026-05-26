@@ -1700,19 +1700,11 @@ generate_chat_completion = chat_completion
 async def chat_completed(
     request: Request, form_data: dict, user=Depends(get_verified_user)
 ):
-    try:
-        model_item = form_data.pop("model_item", {})
-
-        if model_item.get("direct", False):
-            request.state.direct = True
-            request.state.model = model_item
-
-        return await chat_completed_handler(request, form_data, user)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+    # B12: outlet filters now run server-side at the tail of
+    # process_chat_response. This route is kept as a no-op shim so v1
+    # frontends that still POST here don't 404; they receive their messages
+    # back unchanged.
+    return {"messages": form_data.get("messages", [])}
 
 
 @app.post("/api/chat/actions/{action_id}")
