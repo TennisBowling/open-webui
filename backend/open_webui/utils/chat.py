@@ -1,5 +1,6 @@
 import time
 import logging
+import re
 import sys
 
 from aiocache import cached
@@ -446,19 +447,36 @@ async def run_outlet_filters_on_completed_stream(
     if final_content is None or final_content == content:
         return
 
-    # Outlet filter mutated the assistant content. Persist canonical content
-    # and collapse content_blocks to a single text block carrying the new
-    # content — outlet filters operate on the flat string, so structural
-    # block fidelity (reasoning/tool_calls) cannot be preserved through the
-    # mutation. Matches the v1 behavior where the frontend stuffed the
-    # mutated content back into the message via updateChatById.
+    # Outlet filter mutated the assistant content. Merge the mutation back
+    # into content_blocks WHILE PRESERVING structural blocks (reasoning,
+    # tool_calls, subagent_launch, code_interpreter) byte-identical. The
+    # serialized projection interleaves text-block contents with top-level
+    # <details type="..."> markers; we split both the original and the
+    # filter output on those markers and require an exact 1:1 structural
+    # match. If anything is ambiguous, fail safe by leaving content_blocks
+    # untouched — losing the filter text edit is strictly better than
+    # silently destroying reasoning/tool_call data the user cannot recover.
+    merged_blocks = _merge_outlet_filter_into_content_blocks(
+        content_blocks, content, final_content
+    )
+    if merged_blocks is None:
+        log.warning(
+            "Outlet filter mutated structural markers or produced an "
+            "ambiguous diff; skipping content_blocks update for message %s",
+            metadata.get("message_id"),
+        )
+        return
+
+    if merged_blocks == content_blocks:
+        return
+
     try:
         Chats.upsert_message_to_chat_by_id_and_message_id(
             metadata["chat_id"],
             metadata["message_id"],
             {
                 "content": final_content,
-                "content_blocks": [{"type": "text", "content": final_content}],
+                "content_blocks": merged_blocks,
             },
         )
     except Exception as e:
@@ -468,35 +486,125 @@ async def run_outlet_filters_on_completed_stream(
         from open_webui.env import STREAM_PROTOCOL_VERSION
 
         if STREAM_PROTOCOL_VERSION == "v2":
-            await event_emitter(
-                {
-                    "type": "chat:delta",
-                    "data": {
-                        "message_id": metadata.get("message_id"),
-                        "op": "replace",
-                        "payload": {
-                            "block_idx": 0,
-                            "content_blocks": [
-                                {"type": "text", "content": final_content}
-                            ],
+            changed_indices = [
+                i
+                for i, (old_b, new_b) in enumerate(zip(content_blocks, merged_blocks))
+                if old_b != new_b
+            ]
+            for idx in changed_indices:
+                await event_emitter(
+                    {
+                        "type": "chat:delta",
+                        "data": {
+                            "message_id": metadata.get("message_id"),
+                            "op": "replace",
+                            "payload": {
+                                "block_idx": idx,
+                                "content_blocks": [merged_blocks[idx]],
+                            },
                         },
-                    },
-                }
-            )
+                    }
+                )
         else:
             await event_emitter(
                 {
                     "type": "chat:message",
                     "data": {
                         "content": final_content,
-                        "content_blocks": [
-                            {"type": "text", "content": final_content}
-                        ],
+                        "content_blocks": merged_blocks,
                     },
                 }
             )
     except Exception as e:
         log.exception(f"Outlet filter catch-up emit failed: {e}")
+
+
+_DETAILS_RE = re.compile(
+    r'<details\s+type="[^"]+"[^>]*>.*?</details>',
+    re.DOTALL,
+)
+
+
+def _split_serialized(s):
+    segments = []
+    last = 0
+    for m in _DETAILS_RE.finditer(s):
+        if m.start() > last:
+            segments.append(("text", s[last : m.start()]))
+        segments.append(("details", m.group(0)))
+        last = m.end()
+    if last < len(s):
+        segments.append(("text", s[last:]))
+    return segments
+
+
+def _text_runs_between_details(segments):
+    runs = []
+    buf = []
+    for kind, seg in segments:
+        if kind == "text":
+            buf.append(seg)
+        else:
+            runs.append("".join(buf))
+            buf = []
+    runs.append("".join(buf))
+    return runs
+
+
+def _merge_outlet_filter_into_content_blocks(
+    content_blocks, original_serialized, filter_serialized
+):
+    # Returns updated content_blocks list on success, or None to signal
+    # "ambiguous — caller should fail safe and leave blocks alone".
+    original_segments = _split_serialized(original_serialized)
+    filter_segments = _split_serialized(filter_serialized)
+
+    orig_details = [seg for kind, seg in original_segments if kind == "details"]
+    filt_details = [seg for kind, seg in filter_segments if kind == "details"]
+
+    if orig_details != filt_details:
+        return None
+
+    orig_runs = _text_runs_between_details(original_segments)
+    filt_runs = _text_runs_between_details(filter_segments)
+
+    if len(orig_runs) != len(filt_runs):
+        return None
+
+    # Each non-empty text block in content_blocks produces exactly one text
+    # contribution into the current run; structural blocks advance the run.
+    # If multiple text blocks share one run we cannot safely re-attribute.
+    text_blocks_in_run = [[]]
+    for i, block in enumerate(content_blocks):
+        btype = block.get("type")
+        if btype == "text":
+            text_blocks_in_run[-1].append(i)
+        elif btype in ("tool_calls", "reasoning", "code_interpreter"):
+            text_blocks_in_run.append([])
+        else:
+            return None
+
+    if len(text_blocks_in_run) != len(filt_runs):
+        return None
+
+    new_blocks = [dict(b) for b in content_blocks]
+
+    for run_i, idx_list in enumerate(text_blocks_in_run):
+        orig_run = orig_runs[run_i]
+        new_run = filt_runs[run_i]
+        if orig_run == new_run:
+            continue
+        if len(idx_list) > 1:
+            return None
+        if len(idx_list) == 0:
+            return None
+        block_i = idx_list[0]
+        new_blocks[block_i] = {
+            **new_blocks[block_i],
+            "content": new_run.strip("\n"),
+        }
+
+    return new_blocks
 
 
 async def chat_action(request: Request, action_id: str, form_data: dict, user: Any):
