@@ -338,6 +338,41 @@
 			}
 		}
 
+		// Stream v2 batching: the backend coalesces consecutive chat:delta /
+		// tool_call:result emits per asyncio tick into a single envelope to
+		// reduce socket I/O at high concurrency. Unpack inline so downstream
+		// handlers (and stores) see each inner event as if it had arrived
+		// individually. Re-broadcast (above) forwards the outer batch so
+		// non-primary tabs unpack the same way here.
+		if (event?.data?.type === 'chat:delta:batch') {
+			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
+			const prevSuppress = suppressBroadcast;
+			// Don't re-broadcast each inner event individually — the outer
+			// batch was already forwarded above (or this IS a replay from
+			// the BroadcastChannel and suppress is already on).
+			suppressBroadcast = true;
+			try {
+				for (const inner of batch) {
+					if (!inner || typeof inner !== 'object') continue;
+					try {
+						await chatEventHandler(
+							{
+								chat_id: inner.chat_id ?? event.chat_id,
+								message_id: inner.message_id ?? event.message_id,
+								data: inner.data
+							},
+							cb
+						);
+					} catch (err) {
+						console.error('chat:delta:batch inner dispatch failed', err);
+					}
+				}
+			} finally {
+				suppressBroadcast = prevSuppress;
+			}
+			return;
+		}
+
 		const visibleChatId = getVisibleChatId();
 		const isCurrentChatEvent = Boolean(event.chat_id) && visibleChatId === event.chat_id;
 		const windowFocused = await isWindowFocused();
@@ -552,7 +587,17 @@
 					const messageId = payload?.message_id ?? '';
 					const chatId = payload?.chat_id ?? '';
 					const type = dataPart?.type ?? '';
-					const version = dataPart?.version ?? payload?.version ?? '';
+					let version = dataPart?.version ?? payload?.version ?? '';
+					// For batched envelopes the outer type doesn't carry a
+					// version; derive a scoped key from the inner batch's
+					// first+last versions (plus length) so distinct batches
+					// don't collide on the same message id.
+					if (type === 'chat:delta:batch') {
+						const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
+						const first = batch[0]?.data?.version ?? '';
+						const last = batch[batch.length - 1]?.data?.version ?? '';
+						version = `b:${batch.length}:${first}:${last}`;
+					}
 					// Only dedup when we have at least a message/chat id to
 					// scope by — otherwise distinct events with no
 					// identifying fields would all collapse onto one entry.
