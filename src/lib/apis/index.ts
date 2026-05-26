@@ -284,6 +284,49 @@ type ChatActionForm = {
 	chat_id: string;
 };
 
+export const preprocessVision = async (
+	token: string,
+	body: {
+		chat_id: string;
+		message_id: string;
+		model_id: string;
+		preprocessor_model_id: string;
+		mode?: 'image' | 'pdf';
+		prompt?: string;
+	}
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/chat/preprocess/vision`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify(body)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			if (err && typeof err === 'object' && 'detail' in err) {
+				error = (err as any).detail;
+			} else {
+				error = err;
+			}
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const chatAction = async (token: string, action_id: string, body: ChatActionForm) => {
 	let error = null;
 

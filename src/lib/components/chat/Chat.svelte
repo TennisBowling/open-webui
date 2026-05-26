@@ -54,8 +54,7 @@
 		getPromptVariables,
 		processDetails,
 		removeDetails,
-		removeAllDetails,
-		renderPdfToImageDataUrls
+		removeAllDetails
 	} from '$lib/utils';
 	import { loadToolServers } from '$lib/utils/toolServers';
 
@@ -69,7 +68,7 @@
 		updateChatById,
 		updateChatFolderIdById
 	} from '$lib/apis/chats';
-	import { chatCompletion, generateOpenAIChatCompletion } from '$lib/apis/openai';
+	import { chatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation, updateUserSettings } from '$lib/apis/users';
 	import {
@@ -78,7 +77,8 @@
 		chatAction,
 		generateMoACompletion,
 		stopTask,
-		getTaskIdsByChatId
+		getTaskIdsByChatId,
+		preprocessVision
 	} from '$lib/apis';
 	import type { ReasoningEffort } from '$lib/apis';
 	import {
@@ -3577,61 +3577,40 @@
 									history.messages[responseMessageId] = responseMessage;
 									history = { ...history };
 
-									const userContent = userMessage.content;
-
-									const visionPrompt = (
+									const visionPrompt =
 										model.info.meta.vision_preprocessor_prompt ||
-										'Perform OCR on this image and describe its contents in the context of the user query: {query}'
-									).replace('{query}', userContent);
-									const visionMessages = [
-										{ role: 'system', content: visionPrompt },
-										{
-											role: 'user',
-											content: [
-												{ type: 'text', text: userContent },
-												...userImages.map((f) => ({
-													type: 'image_url',
-													image_url: { url: f.url }
-												}))
-											]
-										}
-									];
+										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
 
 									try {
-										const visionRes = await generateOpenAIChatCompletion(
-											localStorage.token,
-											{
-												model: preprocessorModel.id,
-												messages: visionMessages,
-												stream: false,
-												params: { max_tokens: 2048 }
-											},
-											`${WEBUI_BASE_URL}/api`
-										);
+										const preRes = await preprocessVision(localStorage.token, {
+											chat_id: _chatId,
+											message_id: parentId,
+											model_id: model.id,
+											preprocessor_model_id: preprocessorModel.id,
+											mode: 'image',
+											prompt: visionPrompt
+										});
 
-										const visionResponse = visionRes.choices[0].message.content;
+										const visionResponse = preRes?.content ?? '';
 
 										responseMessage = _history.messages[responseMessageId];
 										responseMessage.statusHistory.push({
 											done: true,
 											action: '🖼️',
 											description: 'Vision analysis complete',
-											vision_prompt: visionPrompt,
+											vision_prompt: visionPrompt.replace('{query}', userMessage.content),
 											vision_response: visionResponse
 										});
 										_history.messages[responseMessageId] = responseMessage;
 										history.messages[responseMessageId] = responseMessage;
 
-										// Prepend FULL analysis to user content
 										userMessage.content = `[Vision Analysis:\n${visionResponse}\n]\n\n${userMessage.content}`;
 										userMessage.vision_processed = true;
 
 										_history.messages[parentId] = userMessage;
 										history.messages[parentId] = userMessage;
 										history = { ...history };
-
-										await saveChatHandler(_chatId, _history);
-									} catch (visionError) {
+									} catch (visionError: any) {
 										console.error('Vision preprocessing failed:', visionError);
 										toast.error('Vision preprocessing failed. Sending without analysis.');
 
@@ -3644,7 +3623,7 @@
 										_history.messages[responseMessageId] = responseMessage;
 										history.messages[responseMessageId] = responseMessage;
 
-										userMessage.vision_processed = false; // Don't strip if failed
+										userMessage.vision_processed = false;
 										_history.messages[parentId] = userMessage;
 										history.messages[parentId] = userMessage;
 										history = { ...history };
@@ -3690,105 +3669,57 @@
 									history.messages[responseMessageId] = responseMessage;
 									history = { ...history };
 
+									const visionPrompt =
+										model.info.meta.vision_preprocessor_prompt ||
+										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
+
 									try {
-										// Convert all PDFs to images
-										let allPdfImages = [];
-										for (const pdfFile of userPdfs) {
-											const pdfUrl =
-												pdfFile.url || `${WEBUI_API_BASE_URL}/files/${pdfFile.id}/content`;
-											try {
-												const pdfImages = await renderPdfToImageDataUrls(pdfUrl);
-												allPdfImages.push(
-													...pdfImages.map((url, idx) => ({
-														url,
-														filename: `${pdfFile.name || pdfFile.file?.filename || 'document'}_page_${idx + 1}`
-													}))
-												);
-											} catch (pdfError) {
-												console.error(`Failed to render PDF ${pdfFile.name}:`, pdfError);
-												throw new Error(`Failed to render PDF: ${pdfFile.name || 'unknown'}`);
-											}
-										}
+										const preRes = await preprocessVision(localStorage.token, {
+											chat_id: _chatId,
+											message_id: parentId,
+											model_id: model.id,
+											preprocessor_model_id: preprocessorModel.id,
+											mode: 'pdf',
+											prompt: visionPrompt
+										});
 
-										if (allPdfImages.length === 0) {
-											throw new Error('No pages could be extracted from PDF(s)');
-										}
-
-										const userContent = userMessage.content;
-										const visionPrompt = (
-											model.info.meta.vision_preprocessor_prompt ||
-											'Perform OCR on this image and describe its contents in the context of the user query: {query}'
-										).replace('{query}', userContent);
-
-										const visionMessages = [
-											{ role: 'system', content: visionPrompt },
-											{
-												role: 'user',
-												content: [
-													{
-														type: 'text',
-														text: `I have uploaded ${allPdfImages.length} page(s) from PDF document(s). Please analyze them:\n\n${userContent}`
-													},
-													...allPdfImages.map((img) => ({
-														type: 'image_url',
-														image_url: { url: img.url }
-													}))
-												]
-											}
-										];
-
-										const visionRes = await generateOpenAIChatCompletion(
-											localStorage.token,
-											{
-												model: preprocessorModel.id,
-												messages: visionMessages,
-												stream: false,
-												params: { max_tokens: 4096 }
-											},
-											`${WEBUI_BASE_URL}/api`
-										);
-
-										const visionResponse = visionRes.choices[0].message.content;
+										const visionResponse = preRes?.content ?? '';
+										const pages = preRes?.pages ?? userPdfs.length;
 
 										responseMessage = _history.messages[responseMessageId];
 										responseMessage.statusHistory.push({
 											done: true,
 											action: '📄',
-											description: `PDF analysis complete (${allPdfImages.length} pages)`,
-											vision_prompt: visionPrompt,
+											description: `PDF analysis complete (${pages} pages)`,
+											vision_prompt: visionPrompt.replace('{query}', userMessage.content),
 											vision_response: visionResponse
 										});
 										_history.messages[responseMessageId] = responseMessage;
 										history.messages[responseMessageId] = responseMessage;
 
-										// Prepend PDF analysis to user content
-										userMessage.content = `[PDF Analysis (${allPdfImages.length} pages):\n${visionResponse}\n]\n\n${userMessage.content}`;
+										userMessage.content = `[PDF Analysis (${pages} pages):\n${visionResponse}\n]\n\n${userMessage.content}`;
 										userMessage.pdf_processed = true;
 
 										_history.messages[parentId] = userMessage;
 										history.messages[parentId] = userMessage;
 										history = { ...history };
-
-										await saveChatHandler(_chatId, _history);
-									} catch (pdfError) {
+									} catch (pdfError: any) {
 										console.error('PDF preprocessing failed:', pdfError);
 
-										// Block message and show error
 										responseMessage = _history.messages[responseMessageId];
 										responseMessage.statusHistory.push({
 											done: true,
 											action: '📄❌',
-											description: `PDF preprocessing failed: ${pdfError.message}`
+											description: `PDF preprocessing failed: ${pdfError?.message ?? pdfError}`
 										});
 										responseMessage.error = {
-											content: `PDF preprocessing failed: ${pdfError.message}\n\nThe selected model does not support vision natively, and PDF preprocessing could not be completed.`
+											content: `PDF preprocessing failed: ${pdfError?.message ?? pdfError}\n\nThe selected model does not support vision natively, and PDF preprocessing could not be completed.`
 										};
 										responseMessage.done = true;
 										_history.messages[responseMessageId] = responseMessage;
 										history.messages[responseMessageId] = responseMessage;
 										history = { ...history };
 
-										await saveChatHandler(_chatId, _history);
 										return; // Stop processing this model
 									}
 								}
@@ -4080,7 +4011,18 @@
 			params?.stream_response ??
 			true;
 
-		let messages = [
+		// v2 body shape: backend assembles the conversation by walking
+		// chat_message rows from leaf_message_id. Temporary chats aren't
+		// persisted, so they keep the v1 messages-array body. The v1 build
+		// below also stays as the fallback when the backend hasn't flipped
+		// STREAM_PROTOCOL_VERSION to v2 yet.
+		const isTempChat = $temporaryChatEnabled || _chatId?.startsWith('local:');
+		const useV2Body =
+			($config as any)?.features?.stream_protocol_version === 'v2' && !isTempChat;
+
+		let messages: any[] = [];
+		if (!useV2Body) {
+			messages = [
 			params?.system || $settings.system
 				? {
 						role: 'system',
@@ -4409,6 +4351,7 @@
 				message?.tool_calls?.length ||
 				(Array.isArray(message?.content_blocks) && message.content_blocks.length > 0)
 		);
+		} // end if (!useV2Body)
 
 		const toolIds = [];
 		const toolServerIds = [];
@@ -4445,12 +4388,26 @@
 			}
 		}
 
+		const isFirstTurn =
+			useV2Body
+				? (_messages.length === 1 ||
+					(_messages.length === 2 && _messages[0]?.role === 'system'))
+				: messages.length == 1 ||
+					(messages.length == 2 &&
+						messages.at(0)?.role === 'system' &&
+						messages.at(1)?.role === 'user');
+
 		const [res, controller] = await chatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
 				model: model.id,
-				messages: messages,
+				...(useV2Body
+					? {
+							leaf_message_id: responseMessage.parentId,
+							response_message_id: responseMessageId
+						}
+					: { messages: messages }),
 				params: {
 					...$settings?.params,
 					...params,
@@ -4483,10 +4440,7 @@
 
 				background_tasks: {
 					...(!$temporaryChatEnabled &&
-					(messages.length == 1 ||
-						(messages.length == 2 &&
-							messages.at(0)?.role === 'system' &&
-							messages.at(1)?.role === 'user')) &&
+					isFirstTurn &&
 					(selectedModels[0] === model.id || atSelectedModel !== undefined)
 						? {
 								title_generation: $settings?.title?.auto ?? true,
