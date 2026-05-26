@@ -2341,8 +2341,20 @@ async def process_chat_response(
                 # When `ENABLE_REALTIME_CHAT_SAVE=True`, every per-chunk call
                 # falls through and computes normally so the per-chunk DB write
                 # at L2836 stores a coherent content column.
+                #
+                # 3) Under STREAM_PROTOCOL_VERSION="v2" (B9): the wire
+                #    translator (`_wrap_event_emitter_v2`) drops the `content`
+                #    string entirely and ships `chat:delta` ops derived from
+                #    `content_blocks`. Per-chunk DB writes under v2 also skip
+                #    the `content` column (see hot-path upsert below). The
+                #    `content` column converges at end-of-stream via the
+                #    `force=True` call in the success/cancel finalisers, so
+                #    legacy clients, exports, and search indexing still get a
+                #    populated row once streaming completes.
                 if not force:
                     if metadata.get("subagent_inner"):
+                        return ""
+                    if STREAM_PROTOCOL_VERSION == "v2":
                         return ""
                     if not ENABLE_REALTIME_CHAT_SAVE:
                         return ""
@@ -3203,13 +3215,25 @@ async def process_chat_response(
                                                 break
 
                                         if ENABLE_REALTIME_CHAT_SAVE:
-                                            # Save message in the database
+                                            # Save message in the database.
+                                            # Under v2, skip the `content`
+                                            # column write per-chunk —
+                                            # serialize_content_blocks would
+                                            # return "" (B9 short-circuit) and
+                                            # writing an empty string per chunk
+                                            # would clobber the column.
+                                            # End-of-stream `force=True` save
+                                            # populates the canonical content
+                                            # row.
                                             update_data = {
-                                                "content": serialize_content_blocks(
-                                                    content_blocks
-                                                ),
                                                 "content_blocks": content_blocks,
                                             }
+                                            if STREAM_PROTOCOL_VERSION != "v2":
+                                                update_data["content"] = (
+                                                    serialize_content_blocks(
+                                                        content_blocks
+                                                    )
+                                                )
 
                                             # Per-round reasoning lets multi-turn replays attach
                                             # the right round's reasoning to each tool_calls
