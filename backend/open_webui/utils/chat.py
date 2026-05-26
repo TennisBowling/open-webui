@@ -7,8 +7,6 @@ from typing import Any, Optional
 import random
 import json
 import inspect
-import uuid
-import asyncio
 
 from fastapi import Request, status
 from starlette.responses import Response, StreamingResponse, JSONResponse
@@ -17,7 +15,6 @@ from starlette.responses import Response, StreamingResponse, JSONResponse
 from open_webui.models.users import UserModel
 
 from open_webui.socket.main import (
-    sio,
     get_event_call,
     get_event_emitter,
 )
@@ -63,103 +60,6 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
-async def generate_direct_chat_completion(
-    request: Request,
-    form_data: dict,
-    user: Any,
-    models: dict,
-):
-    metadata = form_data.pop("metadata", {})
-
-    user_id = metadata.get("user_id")
-    session_id = metadata.get("session_id")
-    request_id = str(uuid.uuid4())  # Generate a unique request ID
-
-    event_caller = get_event_call(metadata)
-
-    channel = f"{user_id}:{session_id}:{request_id}"
-
-    if form_data.get("stream"):
-        q = asyncio.Queue()
-
-        async def message_listener(sid, data):
-            """
-            Handle received socket messages and push them into the queue.
-            """
-            await q.put(data)
-
-        # Register the listener
-        sio.on(channel, message_listener)
-
-        # Start processing chat completion in background
-        res = await event_caller(
-            {
-                "type": "request:chat:completion",
-                "data": {
-                    "form_data": form_data,
-                    "model": models[form_data["model"]],
-                    "channel": channel,
-                    "session_id": session_id,
-                },
-            }
-        )
-
-        if res.get("status", False):
-            # Define a generator to stream responses
-            async def event_generator():
-                nonlocal q
-                try:
-                    while True:
-                        data = await q.get()  # Wait for new messages
-
-                        if isinstance(data, dict):
-                            if "done" in data and data["done"]:
-                                break  # Stop streaming when 'done' is received
-
-                            yield f"data: {json.dumps(data)}\n\n"
-                        elif isinstance(data, str):
-                            if "data:" in data:
-                                yield f"{data}\n\n"
-                            else:
-                                yield f"data: {data}\n\n"
-                except Exception as e:
-                    log.error(f"Error in event generator: {e}", exc_info=True)
-                    pass
-
-            # Define a background task to run the event generator
-            async def background():
-                try:
-                    del sio.handlers["/"][channel]
-                except Exception as e:
-                    log.warning(f"Error cleaning up channel: {e}")
-                    pass
-
-            # Return the streaming response
-            return StreamingResponse(
-                event_generator(), media_type="text/event-stream", background=background
-            )
-        else:
-            log.error(f"Direct completion status is False! Response: {res}")
-            raise Exception(str(res))
-    else:
-        res = await event_caller(
-            {
-                "type": "request:chat:completion",
-                "data": {
-                    "form_data": form_data,
-                    "model": models[form_data["model"]],
-                    "channel": channel,
-                    "session_id": session_id,
-                },
-            }
-        )
-
-        if "error" in res and res["error"]:
-            raise Exception(res["error"])
-
-        return res
-
-
 async def generate_chat_completion(
     request: Request,
     form_data: dict,
@@ -200,10 +100,10 @@ async def generate_chat_completion(
     log.info(f"🔄 ROUTING: model_id={model_id}, is_in_backend_models={is_in_backend_models}, is_direct_flag_set={is_direct_flag_set}")
 
     if is_direct_flag_set and not is_in_backend_models:
-        log.info(f"🔄 ROUTING: Using DIRECT completion flow for {model_id}")
-        return await generate_direct_chat_completion(
-            request, form_data, user=user, models=models
+        log.warning(
+            f"🔄 ROUTING: Direct-connection flow requested for {model_id} but is disabled in this deployment"
         )
+        raise Exception("Direct connections are not supported in this deployment")
     else:
         log.info(f"🔄 ROUTING: Using BACKEND completion flow for {model_id} (owned_by: {model.get('owned_by')})")
         # Check if user has access to the model
