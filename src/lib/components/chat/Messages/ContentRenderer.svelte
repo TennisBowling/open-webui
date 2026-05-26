@@ -56,31 +56,86 @@
 	let contentContainerElement;
 	let floatingButtonsElement;
 
-	// Cached per-block markdown projections. Text/reasoning blocks only need the
-	// current tail block re-projected while streaming, but tool_calls blocks can
-	// receive results after a later text/reasoning block has opened. Re-project
-	// those mutable tool blocks every update so live web_search/web_fetch and
-	// subagent placeholders appear without requiring a reload.
+	// Cached per-block markdown projections. The important nuance for v2 is that
+	// not only the tail block can change: a tool_calls block may receive results
+	// after later text/reasoning blocks have opened. Track a cheap signature per
+	// block and only re-project blocks whose render-relevant data changed.
 	/** @type {string[]} */
 	let blockProjections = [];
+	/** @type {string[]} */
+	let blockProjectionSignatures = [];
+
+	const textSig = (value) => {
+		const text = value == null ? '' : String(value);
+		return `${text.length}:${text.slice(0, 32)}:${text.slice(-32)}`;
+	};
+
+	const blockProjectionSignature = (block) => {
+		if (!block || typeof block !== 'object') return 'null';
+		const type = block.type ?? '';
+
+		if (type === 'text') {
+			return `text:${textSig(block.content)}`;
+		}
+
+		if (type === 'reasoning') {
+			return [
+				'reasoning',
+				textSig(block.content),
+				block.started_at ?? '',
+				block.ended_at ?? '',
+				block.duration ?? ''
+			].join(':');
+		}
+
+		if (type === 'tool_calls') {
+			const calls = Array.isArray(block.content)
+				? block.content.map((call) => ({
+						id: call?.id ?? call?.tool_call_id ?? '',
+						name: call?.function?.name ?? '',
+						arguments: textSig(call?.function?.arguments ?? '')
+					}))
+				: [];
+			const results = Array.isArray(block.results)
+				? block.results.map((result) => ({
+						tool_call_id: result?.tool_call_id ?? '',
+						content: textSig(result?.content ?? ''),
+						subagent_id: result?.subagent_id ?? '',
+						files: Array.isArray(result?.files) ? result.files.length : 0,
+						embeds: Array.isArray(result?.embeds) ? result.embeds.length : 0
+					}))
+				: [];
+			return `tool_calls:${JSON.stringify({ calls, results })}`;
+		}
+
+		if (type === 'code_interpreter') {
+			return `code:${textSig(block.content)}:${textSig(JSON.stringify(block.output ?? null))}`;
+		}
+
+		return `${type}:${textSig(JSON.stringify(block))}`;
+	};
+
 	$: {
 		/** @type {any[]} */
 		const blocks = Array.isArray(content_blocks) ? content_blocks : [];
 		if (blocks.length === 0) {
 			if (blockProjections.length !== 0) blockProjections = [];
+			if (blockProjectionSignatures.length !== 0) blockProjectionSignatures = [];
 		} else {
 			/** @type {string[]} */
 			const next = [];
+			/** @type {string[]} */
+			const nextSignatures = [];
 			for (let i = 0; i < blocks.length; i++) {
-				const block = blocks[i];
-				const isLast = i === blocks.length - 1;
-				const mutableAfterOpen = block?.type === 'tool_calls';
-				if (isLast || mutableAfterOpen || blockProjections[i] == null) {
-					next[i] = blocksToDisplayMarkdown([block]);
+				const signature = blockProjectionSignature(blocks[i]);
+				nextSignatures[i] = signature;
+				if (signature !== blockProjectionSignatures[i] || blockProjections[i] == null) {
+					next[i] = blocksToDisplayMarkdown([blocks[i]]);
 				} else {
 					next[i] = blockProjections[i];
 				}
 			}
+			blockProjectionSignatures = nextSignatures;
 			blockProjections = next;
 		}
 	}
