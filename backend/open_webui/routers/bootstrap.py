@@ -69,11 +69,31 @@ def _to_jsonable(value):
     return value
 
 
+def _unwrap_response(value):
+    # Route handlers that are wrapped by `etag_response()` (B4) return a
+    # `Response`/`JSONResponse` instead of a plain dict/list. Bootstrap needs
+    # the raw payload so it can re-serialize and hash it as part of the
+    # bundle. Detect & unwrap; otherwise pass the value through to
+    # `_to_jsonable` which handles Pydantic models, lists, and primitives.
+    if isinstance(value, Response):
+        body = getattr(value, "body", None)
+        if body is None:
+            return None
+        try:
+            return json.loads(body)
+        except (TypeError, ValueError):
+            try:
+                return json.loads(body.decode())
+            except Exception:
+                return None
+    return _to_jsonable(value)
+
+
 async def _resolve_config(request: Request, user):
     # Reuse the existing route handler so feature flag projection stays in sync.
     from open_webui.main import get_app_config
 
-    return await get_app_config(request)
+    return _unwrap_response(await get_app_config(request))
 
 
 async def _resolve_user(request: Request, user):
@@ -97,19 +117,31 @@ async def _resolve_settings(request: Request, user):
 async def _resolve_models(request: Request, user):
     from open_webui.main import get_models
 
-    return await get_models(request, user=user)
+    return _unwrap_response(await get_models(request, user=user))
 
 
 async def _resolve_banners(request: Request, user):
-    return _to_jsonable(await configs_router.get_banners(request=request, user=user))
+    return _unwrap_response(
+        await configs_router.get_banners(request=request, user=user)
+    )
 
 
 async def _resolve_tools(request: Request, user):
-    return _to_jsonable(await tools_router.get_tools(request=request, user=user))
+    return _unwrap_response(
+        await tools_router.get_tools(request=request, user=user)
+    )
 
 
 async def _resolve_folders(request: Request, user):
-    return _to_jsonable(await folders_router.get_folders(user=user))
+    # After B4, folders.get_folders accepts a leading `request` arg (for
+    # etag_response wiring). Pass via kwarg so this works whether or not
+    # B4 has landed yet.
+    try:
+        result = await folders_router.get_folders(request=request, user=user)
+    except TypeError:
+        # Pre-B4 signature: (user=...)
+        result = await folders_router.get_folders(user=user)
+    return _unwrap_response(result)
 
 
 async def _resolve_tags(request: Request, user):
