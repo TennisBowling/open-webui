@@ -20,7 +20,7 @@ from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import SRC_LOG_LEVELS
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Any, List, Literal
 
 
@@ -1238,6 +1238,12 @@ async def delete_all_tags_by_id(
 
 
 class PatchOp(BaseModel):
+    # Frontend may send extra per-op fields (e.g. statusHistory, error, done,
+    # annotation, model, modelName, modelIdx, files, timestamp, merged) that
+    # the upsert partial should preserve. Allow extras through so the
+    # update_message_content handler can spread them into the partial dict.
+    model_config = ConfigDict(extra="allow")
+
     op: Literal[
         "set_param",
         "set_meta",
@@ -1428,13 +1434,34 @@ async def patch_chat_by_id(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="update_message_content requires 'message_id'",
                 )
-            partial: dict = {}
+            # Build the partial from any non-canonical fields the frontend
+            # sent (merged, statusHistory, error, done, annotation, model,
+            # modelName, modelIdx, files, timestamp, ...) — ConfigDict
+            # extra='allow' captures them on the BaseModel. Canonical
+            # control fields are excluded so they don't leak into the
+            # message row. ``op.extra`` (the explicit nested dict) wins
+            # over the spread, and ``content``/``files`` win last.
+            base = op.model_dump(
+                exclude={
+                    "op",
+                    "message_id",
+                    "key",
+                    "value",
+                    "parent_id",
+                    "role",
+                    "annotation",
+                    "content",
+                    "files",
+                    "extra",
+                }
+            )
+            partial: dict = dict(base)
+            if isinstance(op.extra, dict):
+                partial.update(op.extra)
             if op.content is not None:
                 partial["content"] = op.content
             if op.files is not None:
                 partial["files"] = op.files
-            if isinstance(op.extra, dict):
-                partial.update(op.extra)
             if partial:
                 deferred_row_writes.append((op.message_id, partial))
 
@@ -1470,6 +1497,15 @@ async def patch_chat_by_id(
 
     updated_at = chat.updated_at
 
+    # Track whether any op other than a bare set_history_current_id ran.
+    # Pure currentId pointer changes shouldn't reorder the sidebar; every
+    # other body / row mutation bumps updated_at and the other tabs need
+    # to know so the chat row moves to the top.
+    non_pointer_mutation = (
+        any(op != "set_history_current_id" for op in ops_applied)
+        or bool(deferred_row_writes)
+    )
+
     if body_dirty:
         updated = Chats.update_chat_by_id(id, chat_body)
         if updated is None:
@@ -1496,6 +1532,21 @@ async def patch_chat_by_id(
                     },
                 }
             )
+
+    # Emit a generic chat:updated for body-mutating ops so other tabs
+    # reorder the sidebar even when no title change happened. Skip when
+    # the only mutation was a set_history_current_id pointer flip (the
+    # active leaf moves but timestamp ordering shouldn't change for that
+    # alone) — though update_chat_by_id still bumped updated_at, the
+    # sidebar UX matches the rest of the codebase which doesn't reorder
+    # on pointer-only changes.
+    if non_pointer_mutation and (body_dirty or deferred_row_writes):
+        _queue_sidebar(
+            {
+                "type": "chat:updated",
+                "data": {"id": id, "updated_at": updated_at},
+            }
+        )
 
     skip_sid = _skip_sid(request)
     for event in sidebar_events:
