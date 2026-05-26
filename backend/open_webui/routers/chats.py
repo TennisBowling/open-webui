@@ -21,6 +21,7 @@ from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import SRC_LOG_LEVELS
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
+from typing import Any, List, Literal
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user, get_optional_user
@@ -1229,3 +1230,275 @@ async def delete_all_tags_by_id(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
         )
+
+
+############################
+# PatchChatById — single op-vocabulary endpoint
+############################
+
+
+class PatchOp(BaseModel):
+    op: Literal[
+        "set_param",
+        "set_meta",
+        "set_models",
+        "set_files",
+        "set_queue",
+        "set_history_current_id",
+        "append_message",
+        "update_message_content",
+        "set_message_annotation",
+        "delete_message",
+    ]
+    key: Optional[str] = None
+    value: Any = None
+    message_id: Optional[str] = None
+    parent_id: Optional[str] = None
+    role: Optional[str] = None
+    content: Any = None
+    files: Any = None
+    model: Optional[str] = None
+    annotation: Any = None
+    extra: Optional[dict] = None
+
+
+class PatchChatForm(BaseModel):
+    ops: List[PatchOp]
+
+
+def _delete_message_with_relink(messages: dict, message_id: str) -> Optional[str]:
+    """Port of src/lib/components/chat/Messages.svelte:372-407.
+
+    Removes ``message_id`` and its direct children; the grandchildren are
+    re-parented to the deleted message's parent so the branch graph stays
+    connected. Returns the parent id so callers can fix up
+    ``history.currentId`` when the deleted message was the active leaf.
+    """
+    target = messages.get(message_id)
+    if not target:
+        return None
+
+    parent_id = target.get("parentId")
+    child_ids = list(target.get("childrenIds") or [])
+
+    grandchild_ids: list[str] = []
+    for child_id in child_ids:
+        child = messages.get(child_id)
+        if child:
+            grandchild_ids.extend(child.get("childrenIds") or [])
+
+    if parent_id and parent_id in messages:
+        parent = messages[parent_id]
+        parent_children = [
+            cid for cid in (parent.get("childrenIds") or []) if cid != message_id
+        ]
+        parent_children.extend(grandchild_ids)
+        parent["childrenIds"] = parent_children
+
+    for grandchild_id in grandchild_ids:
+        if grandchild_id in messages:
+            messages[grandchild_id]["parentId"] = parent_id
+
+    for mid in [message_id, *child_ids]:
+        messages.pop(mid, None)
+
+    return parent_id
+
+
+@router.patch("/{id}")
+async def patch_chat_by_id(
+    request: Request,
+    id: str,
+    form_data: PatchChatForm,
+    user=Depends(get_verified_user),
+):
+    chat = Chats.get_chat_by_id_and_user_id(id, user.id)
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    # Working copy of chat.chat that we mutate in-memory; flushed via a
+    # single update_chat_by_id at the end when any body op ran.
+    chat_body = json.loads(json.dumps(chat.chat)) if chat.chat else {}
+    body_dirty = False
+
+    # Title routes through the O(1) helper that skips the full message
+    # table re-sync update_chat_by_id performs.
+    title_change: Optional[str] = None
+
+    sidebar_events: list[dict] = []
+    ops_applied: list[str] = []
+
+    # Deferred message-row writes: these hit the fast per-row upsert path
+    # which would be clobbered if a later body-mutating op forced the
+    # final update_chat_by_id to re-sync the message table from our
+    # pre-fetch snapshot. Run them AFTER the body flush.
+    deferred_row_writes: list[tuple[str, dict]] = []
+
+    def _queue_sidebar(event: dict) -> None:
+        if event not in sidebar_events:
+            sidebar_events.append(event)
+
+    for op in form_data.ops:
+        if op.op == "set_param":
+            if not op.key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="set_param requires 'key'",
+                )
+            params = chat_body.get("params") or {}
+            params[op.key] = op.value
+            chat_body["params"] = params
+            body_dirty = True
+
+        elif op.op == "set_meta":
+            if not op.key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="set_meta requires 'key'",
+                )
+            if op.key == "title" and isinstance(op.value, str):
+                title_change = op.value
+            else:
+                chat_body[op.key] = op.value
+                body_dirty = True
+
+        elif op.op == "set_models":
+            chat_body["models"] = op.value if isinstance(op.value, list) else []
+            body_dirty = True
+
+        elif op.op == "set_files":
+            chat_body["files"] = op.value if isinstance(op.value, list) else []
+            body_dirty = True
+
+        elif op.op == "set_queue":
+            chat_body["queue"] = op.value if isinstance(op.value, list) else []
+            body_dirty = True
+
+        elif op.op == "set_history_current_id":
+            history = chat_body.get("history") or {"messages": {}, "currentId": None}
+            target_id = op.value if op.value is not None else op.message_id
+            history["currentId"] = target_id
+            chat_body["history"] = history
+            body_dirty = True
+
+        elif op.op == "append_message":
+            if not op.message_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="append_message requires 'message_id'",
+                )
+            new_msg: dict = {
+                "id": op.message_id,
+                "parentId": op.parent_id,
+                "childrenIds": [],
+            }
+            if op.role is not None:
+                new_msg["role"] = op.role
+            if op.content is not None:
+                new_msg["content"] = op.content
+            if op.files is not None:
+                new_msg["files"] = op.files
+            if op.model is not None:
+                new_msg["model"] = op.model
+            if isinstance(op.extra, dict):
+                for k, v in op.extra.items():
+                    new_msg.setdefault(k, v)
+
+            history = chat_body.get("history") or {"messages": {}, "currentId": None}
+            messages = history.get("messages") or {}
+
+            if op.parent_id and op.parent_id in messages:
+                parent = messages[op.parent_id]
+                parent_children = list(parent.get("childrenIds") or [])
+                if op.message_id not in parent_children:
+                    parent_children.append(op.message_id)
+                parent["childrenIds"] = parent_children
+
+            messages[op.message_id] = {**messages.get(op.message_id, {}), **new_msg}
+            history["messages"] = messages
+            chat_body["history"] = history
+            body_dirty = True
+
+        elif op.op == "update_message_content":
+            if not op.message_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="update_message_content requires 'message_id'",
+                )
+            partial: dict = {}
+            if op.content is not None:
+                partial["content"] = op.content
+            if op.files is not None:
+                partial["files"] = op.files
+            if isinstance(op.extra, dict):
+                partial.update(op.extra)
+            if partial:
+                deferred_row_writes.append((op.message_id, partial))
+
+        elif op.op == "set_message_annotation":
+            if not op.message_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="set_message_annotation requires 'message_id'",
+                )
+            deferred_row_writes.append(
+                (op.message_id, {"annotation": op.annotation})
+            )
+
+        elif op.op == "delete_message":
+            if not op.message_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="delete_message requires 'message_id'",
+                )
+            history = chat_body.get("history") or {"messages": {}, "currentId": None}
+            messages = history.get("messages") or {}
+            was_current = history.get("currentId") == op.message_id
+            new_leaf = _delete_message_with_relink(messages, op.message_id)
+            if was_current:
+                # Matches the frontend's showMessage({id: parentMessageId}) —
+                # falls back to None if the deleted node was the root.
+                history["currentId"] = new_leaf
+            history["messages"] = messages
+            chat_body["history"] = history
+            body_dirty = True
+
+        ops_applied.append(op.op)
+
+    updated_at = chat.updated_at
+
+    if body_dirty:
+        updated = Chats.update_chat_by_id(id, chat_body)
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=ERROR_MESSAGES.DEFAULT(),
+            )
+        updated_at = updated.updated_at
+
+    for message_id, partial in deferred_row_writes:
+        Chats.upsert_message_to_chat_by_id_and_message_id(id, message_id, partial)
+
+    if title_change is not None:
+        renamed = Chats.update_chat_title_by_id(id, title_change)
+        if renamed is not None:
+            updated_at = renamed.updated_at
+            _queue_sidebar(
+                {
+                    "type": "chat:renamed",
+                    "data": {
+                        "id": id,
+                        "title": renamed.title,
+                        "updated_at": renamed.updated_at,
+                    },
+                }
+            )
+
+    skip_sid = _skip_sid(request)
+    for event in sidebar_events:
+        await broadcast_sidebar_event(user.id, event, skip_sid=skip_sid)
+
+    return {"updated_at": updated_at, "ops_applied": ops_applied}
