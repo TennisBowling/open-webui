@@ -66,8 +66,9 @@
 		getChatMeta,
 		getChatMessagesBranch,
 		getTagsById,
-		updateChatById,
-		updateChatFolderIdById
+		updateChatFolderIdById,
+		patchChat,
+		type PatchChatOp
 	} from '$lib/apis/chats';
 	import { decorate, upsertSorted } from '$lib/utils/sidebarSync';
 	import { chatCompletion, generateOpenAIChatCompletion } from '$lib/apis/openai';
@@ -206,7 +207,9 @@
 		params = nextParams;
 		lastPersistedWebSearchEnabled = webSearchEnabled;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'webSearchEnabled', value: webSearchEnabled }
+		]);
 	}
 
 	// Same pattern for studyModeEnabled — persist per-chat so reloads remember.
@@ -226,7 +229,9 @@
 		params = nextParams;
 		lastPersistedStudyModeEnabled = studyModeEnabled;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'studyModeEnabled', value: studyModeEnabled }
+		]);
 	}
 
 	// Same pattern for dataVizEnabled.
@@ -246,7 +251,9 @@
 		params = nextParams;
 		lastPersistedDataVizEnabled = dataVizEnabled;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'dataVizEnabled', value: dataVizEnabled }
+		]);
 	}
 
 	// Same pattern for subagentsEnabled — per-chat toggle, persisted so it
@@ -267,7 +274,9 @@
 		params = nextParams;
 		lastPersistedSubagentsEnabled = subagentsEnabled;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'subagentsEnabled', value: subagentsEnabled }
+		]);
 	}
 
 	// Same pattern for the per-chat subagent reasoning effort override.
@@ -288,7 +297,9 @@
 		params = nextParams;
 		lastPersistedSubagentReasoningEffort = subagentReasoningEffort;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'subagentReasoningEffort', value: subagentReasoningEffort }
+		]);
 	}
 
 	// Same pattern for the per-chat subagent service tier override.
@@ -309,7 +320,9 @@
 		params = nextParams;
 		lastPersistedSubagentServiceTier = subagentServiceTier;
 
-		void saveChatHandler(chatIdToPersist, history, nextParams);
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'subagentServiceTier', value: subagentServiceTier }
+		]);
 	}
 
 	let showCommands = false;
@@ -1269,7 +1282,14 @@
 		}
 
 		await tick();
-		saveChatHandler(_chatId, history);
+		saveChatHandler(
+			_chatId,
+			history,
+			params,
+			history?.currentId
+				? [{ op: 'set_history_current_id', current_id: history.currentId }]
+				: []
+		);
 	};
 
 	const extractSubagentFinalText = (contentBlocks: any[] | undefined, content = '') => {
@@ -3012,15 +3032,10 @@
 
 			if (isVisibleChatEvent(chatId)) {
 				if (!$temporaryChatEnabled) {
-					chat = await updateChatById(localStorage.token, chatId, {
-						models: selectedModels,
-						messages: messages,
-						history: history,
-						params: params,
-						reasoning: reasoning,
-						files: chatFiles,
-						queue: queue
-					});
+					// Backend already persisted the final message state via realtime
+					// chat save during streaming, and the chat:updated socket event
+					// (Wire Contract #7) bumps the sidebar in all tabs. No further
+					// client-side work needed.
 				}
 			}
 		} finally {
@@ -3088,14 +3103,20 @@
 
 			if (isVisibleChatEvent(chatId)) {
 				if (!$temporaryChatEnabled) {
-					chat = await updateChatById(localStorage.token, chatId, {
-						models: selectedModels,
-						messages: messages,
-						history: history,
-						params: params,
-						files: chatFiles,
-						queue: queue
-					});
+					const actionOps: PatchChatOp[] = [];
+					for (const m of res?.messages ?? []) {
+						if (!m?.id) continue;
+						actionOps.push({
+							op: 'update_message_content',
+							message_id: m.id,
+							content: m.content,
+							...(m.files !== undefined ? { files: m.files } : {}),
+							...(m.annotation !== undefined ? { annotation: m.annotation } : {})
+						});
+					}
+					if (actionOps.length > 0) {
+						await patchChat(localStorage.token, chatId, actionOps);
+					}
 				}
 			}
 		} finally {
@@ -3167,13 +3188,36 @@
 			if (messages.length === 0) {
 				await initChatHandler(history);
 			} else {
-				await saveChatHandler(getVisibleChatId(), history);
+				await saveChatHandler(getVisibleChatId(), history, params, [
+					{
+						op: 'append_message',
+						message_id: userMessage.id,
+						parent_id: userMessage.parentId,
+						role: 'user',
+						content: userMessage.content,
+						timestamp: userMessage.timestamp
+					},
+					{
+						op: 'append_message',
+						message_id: responseMessage.id,
+						parent_id: responseMessage.parentId,
+						role: 'assistant',
+						content: responseMessage.content,
+						model: responseMessage.model,
+						modelName: responseMessage.modelName,
+						modelIdx: responseMessage.modelIdx,
+						timestamp: responseMessage.timestamp
+					},
+					{ op: 'set_history_current_id', current_id: history.currentId }
+				]);
 			}
 		}
 	};
 
 	const addMessages = async ({ modelId, parentId, messages }) => {
 		const model = $models.filter((m) => m.id === modelId).at(0);
+
+		const appendOps: PatchChatOp[] = [];
 
 		let parentMessage = history.messages[parentId];
 		let currentParentId = parentMessage ? parentMessage.id : null;
@@ -3195,6 +3239,15 @@
 				}
 
 				history.messages[messageId] = userMessage;
+				appendOps.push({
+					op: 'append_message',
+					message_id: messageId,
+					parent_id: userMessage.parentId,
+					role: 'user',
+					content: userMessage.content,
+					...(userMessage.files !== undefined ? { files: userMessage.files } : {}),
+					timestamp: userMessage.timestamp
+				});
 				parentMessage = userMessage;
 				currentParentId = messageId;
 			} else {
@@ -3216,6 +3269,17 @@
 				}
 
 				history.messages[messageId] = responseMessage;
+				appendOps.push({
+					op: 'append_message',
+					message_id: messageId,
+					parent_id: responseMessage.parentId,
+					role: 'assistant',
+					content: responseMessage.content,
+					model: responseMessage.model,
+					modelName: responseMessage.modelName,
+					modelIdx: responseMessage.modelIdx,
+					timestamp: responseMessage.timestamp
+				});
 				parentMessage = responseMessage;
 				currentParentId = messageId;
 			}
@@ -3231,7 +3295,10 @@
 		if (messages.length === 0) {
 			await initChatHandler(history);
 		} else {
-			await saveChatHandler(getVisibleChatId(), history);
+			if (currentParentId) {
+				appendOps.push({ op: 'set_history_current_id', current_id: currentParentId });
+			}
+			await saveChatHandler(getVisibleChatId(), history, params, appendOps);
 		}
 	};
 
@@ -3963,7 +4030,53 @@
 		// to serialize a request body, and the LLM request is fired in parallel
 		// below, so the save no longer gates the upstream call.
 		_history = history;
-		const initialSavePromise = saveChatHandler(_chatId, _history).catch((err) => {
+
+		// Build append_message ops for the user message + each freshly-created
+		// response message so the backend has a parented chain to attach stream
+		// deltas to via realtime save. Skipped for new chats — initChatHandler's
+		// createNewChat call already persisted the full history.
+		const initialOps: PatchChatOp[] = [];
+		const isNewChatRootSend = newChat && _history.messages[parentId]?.parentId === null;
+		if (!isNewChatRootSend) {
+			const userMsg = _history.messages[parentId];
+			if (userMsg && userMsg.role === 'user') {
+				initialOps.push({
+					op: 'append_message',
+					message_id: userMsg.id,
+					parent_id: userMsg.parentId ?? null,
+					role: 'user',
+					content: userMsg.content,
+					...(userMsg.files !== undefined ? { files: userMsg.files } : {}),
+					...(userMsg.models !== undefined ? { models: userMsg.models } : {}),
+					timestamp: userMsg.timestamp
+				});
+			}
+			for (const respId of Object.values(responseMessageIds)) {
+				const m = _history.messages[respId];
+				if (!m) continue;
+				initialOps.push({
+					op: 'append_message',
+					message_id: m.id,
+					parent_id: m.parentId ?? null,
+					role: 'assistant',
+					content: m.content ?? '',
+					model: m.model,
+					modelName: m.modelName,
+					modelIdx: m.modelIdx,
+					timestamp: m.timestamp
+				});
+			}
+			if (_history.currentId) {
+				initialOps.push({ op: 'set_history_current_id', current_id: _history.currentId });
+			}
+		}
+
+		const initialSavePromise = saveChatHandler(
+			_chatId,
+			_history,
+			params,
+			initialOps.length > 0 ? initialOps : null
+		).catch((err) => {
 			console.error('saveChatHandler failed:', err);
 		});
 		// Subagents persist side-channel state (`subagent_runs`) directly onto the
@@ -4080,7 +4193,13 @@
 										history.messages[parentId] = userMessage;
 										history = { ...history };
 
-										await saveChatHandler(_chatId, _history);
+										await saveChatHandler(_chatId, _history, params, [
+											{
+												op: 'update_message_content',
+												message_id: parentId,
+												content: userMessage.content
+											}
+										]);
 									} catch (visionError) {
 										console.error('Vision preprocessing failed:', visionError);
 										toast.error('Vision preprocessing failed. Sending without analysis.');
@@ -4219,7 +4338,13 @@
 										history.messages[parentId] = userMessage;
 										history = { ...history };
 
-										await saveChatHandler(_chatId, _history);
+										await saveChatHandler(_chatId, _history, params, [
+											{
+												op: 'update_message_content',
+												message_id: parentId,
+												content: userMessage.content
+											}
+										]);
 									} catch (pdfError) {
 										console.error('PDF preprocessing failed:', pdfError);
 
@@ -4238,7 +4363,16 @@
 										history.messages[responseMessageId] = responseMessage;
 										history = { ...history };
 
-										await saveChatHandler(_chatId, _history);
+										await saveChatHandler(_chatId, _history, params, [
+											{
+												op: 'update_message_content',
+												message_id: responseMessageId,
+												content: responseMessage.content,
+												statusHistory: responseMessage.statusHistory,
+												error: responseMessage.error,
+												done: true
+											}
+										]);
 										return; // Stop processing this model
 									}
 								}
@@ -6055,7 +6189,14 @@
 					}
 				}
 
-				await saveChatHandler(_chatId, history);
+				await saveChatHandler(_chatId, history, params, [
+					{
+						op: 'update_message_content',
+						message_id: messageId,
+						content: message.content,
+						merged: mergedResponse
+					}
+				]);
 			} else {
 				console.error(res);
 			}
@@ -6166,7 +6307,7 @@
 		// which is fine — in-memory state is the source of truth for those.
 		const _chatId = getVisibleChatId();
 		if (_chatId) {
-			void saveChatHandler(_chatId, history);
+			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
 		}
 	};
 
@@ -6174,7 +6315,7 @@
 		queue = queue.map((q) => (q.id === id ? { ...q, prompt: nextText } : q));
 		const _chatId = getVisibleChatId();
 		if (_chatId) {
-			void saveChatHandler(_chatId, history);
+			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
 		}
 	};
 
@@ -6182,7 +6323,7 @@
 		queue = queue.filter((q) => q.id !== id);
 		const _chatId = getVisibleChatId();
 		if (_chatId) {
-			void saveChatHandler(_chatId, history);
+			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
 		}
 	};
 
@@ -6203,7 +6344,7 @@
 
 		const _chatId = getVisibleChatId();
 		if (_chatId) {
-			void saveChatHandler(_chatId, history);
+			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
 		}
 
 		const itemFiles = Array.isArray(next.files) ? structuredClone(next.files) : [];
@@ -6302,20 +6443,97 @@
 		}
 	}
 
-	const saveChatHandler = async (_chatId, history, nextParams = params) => {
-		if (isVisibleChatEvent(_chatId)) {
-			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, _chatId, {
-					models: selectedModels,
-					history: history,
-					messages: createMessagesList(history, history.currentId),
-					params: nextParams,
-					files: chatFiles,
-					queue: queue
-				});
+	// Tracks the last values we PATCHed for non-message fields so subsequent
+	// saveChatHandler calls without explicit ops can diff and only send what
+	// actually changed. Reset by loadChat / initChatHandler when the active
+	// chat switches.
+	let lastSavedSnapshot: {
+		chatId: string | null;
+		models: string[];
+		params: any;
+		files: any[];
+		queue: any[];
+		currentId: string | null;
+	} = {
+		chatId: null,
+		models: [],
+		params: {},
+		files: [],
+		queue: [],
+		currentId: null
+	};
 
+	const resetSaveSnapshot = (_chatId: string | null = null) => {
+		lastSavedSnapshot = {
+			chatId: _chatId,
+			models: structuredClone(selectedModels ?? []),
+			params: structuredClone(params ?? {}),
+			files: structuredClone(chatFiles ?? []),
+			queue: structuredClone(queue ?? []),
+			currentId: history?.currentId ?? null
+		};
+	};
+
+	const saveChatHandler = async (
+		_chatId,
+		history,
+		nextParams = params,
+		ops: PatchChatOp[] | null = null
+	) => {
+		if (!isVisibleChatEvent(_chatId)) return;
+		if ($temporaryChatEnabled) return;
+		if (!_chatId || _chatId.startsWith('local:')) return;
+
+		let opList: PatchChatOp[];
+
+		if (ops !== null) {
+			opList = ops;
+		} else {
+			opList = [];
+			if (lastSavedSnapshot.chatId !== _chatId) {
+				opList.push({ op: 'set_models', models: selectedModels ?? [] });
+				opList.push({ op: 'set_files', files: chatFiles ?? [] });
+				opList.push({ op: 'set_queue', queue: queue ?? [] });
+				if (history?.currentId) {
+					opList.push({ op: 'set_history_current_id', current_id: history.currentId });
+				}
+				for (const [key, value] of Object.entries(nextParams ?? {})) {
+					opList.push({ op: 'set_param', key, value });
+				}
+			} else {
+				if (JSON.stringify(lastSavedSnapshot.models) !== JSON.stringify(selectedModels)) {
+					opList.push({ op: 'set_models', models: selectedModels ?? [] });
+				}
+				if (JSON.stringify(lastSavedSnapshot.files) !== JSON.stringify(chatFiles)) {
+					opList.push({ op: 'set_files', files: chatFiles ?? [] });
+				}
+				if (JSON.stringify(lastSavedSnapshot.queue) !== JSON.stringify(queue)) {
+					opList.push({ op: 'set_queue', queue: queue ?? [] });
+				}
+				if (lastSavedSnapshot.currentId !== history?.currentId && history?.currentId) {
+					opList.push({ op: 'set_history_current_id', current_id: history.currentId });
+				}
+				const prevParams = lastSavedSnapshot.params ?? {};
+				const allParamKeys = new Set([
+					...Object.keys(prevParams),
+					...Object.keys(nextParams ?? {})
+				]);
+				for (const key of allParamKeys) {
+					const prev = prevParams[key];
+					const next = (nextParams ?? {})[key];
+					if (JSON.stringify(prev) !== JSON.stringify(next)) {
+						opList.push({ op: 'set_param', key, value: next });
+					}
+				}
 			}
 		}
+
+		if (opList.length === 0) {
+			return;
+		}
+
+		await patchChat(localStorage.token, _chatId, opList);
+		resetSaveSnapshot(_chatId);
 	};
 
 	const MAX_DRAFT_LENGTH = 5000;
