@@ -57,14 +57,19 @@ from uuid import uuid4
 
 from fastapi import Request
 
-from open_webui.env import SRC_LOG_LEVELS
+from open_webui.env import SRC_LOG_LEVELS, STREAM_PROTOCOL_VERSION
 from open_webui.models.chats import Chats, ChatImportForm
 from open_webui.models.models import Models
 from open_webui.models.users import Users
 from open_webui.socket.main import get_event_call, get_event_emitter
 from open_webui.utils.chat import generate_chat_completion as chat_completion_handler
 from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
+from open_webui.socket.main import (
+    stream_version_init,
+    stream_version_incr,
+)
 from open_webui.utils.middleware import (
+    _emit_delta_for_blocks,
     current_tool_call_id_var,
     process_chat_payload,
     process_chat_response,
@@ -497,6 +502,16 @@ def _build_forwarding_emitter(
     }
     FORWARD_FLUSH_INTERVAL_SECONDS = 0.5
 
+    v2_enabled = STREAM_PROTOCOL_VERSION == "v2"
+    inner_message_id = subagent_socket_info.get("message_id") if isinstance(subagent_socket_info, dict) else None
+    # Per-subagent mirror — independent of the parent's v2 mirror. Tracks the
+    # slim (results-stripped) block shape so we can diff fresh content_blocks
+    # into compact chat:delta ops, and remembers which tool_call_ids have
+    # already been shipped as tool_call:result inner events.
+    v2_mirror: dict = {"blocks": [], "tool_results_sent": set()}
+    if v2_enabled and inner_message_id:
+        stream_version_init(inner_message_id)
+
     lock = asyncio.Lock()
     latest_completion_event: Optional[dict] = None
     latest_status_event: Optional[dict] = None
@@ -524,6 +539,95 @@ def _build_forwarding_emitter(
         except Exception as e:  # noqa: BLE001
             log.debug(f"forwarding to parent UI failed: {e}")
 
+    async def _emit_parent_raw(inner_event: dict) -> None:
+        # Adapter passed to `_emit_delta_for_blocks` as `raw_emit`. The
+        # middleware helper already builds the {type: chat:delta, data: ...}
+        # envelope; we just need to wrap it in our subagent envelope so the
+        # parent UI's chat:subagent:update handler routes it correctly.
+        await _emit_parent(inner_event)
+
+    async def _emit_v2_deltas_for_completion(completion_event: dict) -> None:
+        """Translate a coalesced `chat:completion` (with full content_blocks)
+        into compact `chat:delta` inner events, plus separate `tool_call:result`
+        inner events for any newly-finished tool calls. Mirrors B9's wrapper
+        logic but emits via the subagent envelope instead of `emit_to_primary`.
+        """
+        if not inner_message_id:
+            await _emit_parent(completion_event)
+            return
+        data = completion_event.get("data") or {}
+        content_blocks = data.get("content_blocks")
+        # Tool results: emit each NEW result as its own tool_call:result inner
+        # event so the per-chunk diff (which strips result bodies) never
+        # re-ships the heavy payload.
+        if isinstance(content_blocks, list):
+            for block in content_blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_calls":
+                    continue
+                for r in block.get("results") or []:
+                    if not isinstance(r, dict):
+                        continue
+                    tc_id = r.get("tool_call_id")
+                    if not tc_id or tc_id in v2_mirror["tool_results_sent"]:
+                        continue
+                    v2_mirror["tool_results_sent"].add(tc_id)
+                    payload = {
+                        "message_id": inner_message_id,
+                        "tool_call_id": tc_id,
+                        "result": r.get("content"),
+                    }
+                    if r.get("files"):
+                        payload["files"] = r["files"]
+                    if r.get("embeds"):
+                        payload["embeds"] = r["embeds"]
+                    await _emit_parent({"type": "tool_call:result", "data": payload})
+
+        if isinstance(content_blocks, list):
+            awaitables = _emit_delta_for_blocks(
+                _emit_parent_raw, inner_message_id, v2_mirror, content_blocks
+            )
+            if awaitables:
+                await asyncio.gather(*awaitables)
+
+        # Selected model / sources / usage piggybacks on the final completion
+        # event. Mirror B9: emit as separate chat:delta ops.
+        if data.get("selected_model_id"):
+            version = stream_version_incr(inner_message_id)
+            await _emit_parent(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": inner_message_id,
+                        "version": version,
+                        "op": "selected_model_id",
+                        "payload": {"model_id": data["selected_model_id"]},
+                    },
+                }
+            )
+        if data.get("sources"):
+            version = stream_version_incr(inner_message_id)
+            await _emit_parent(
+                {
+                    "type": "chat:delta",
+                    "data": {
+                        "message_id": inner_message_id,
+                        "version": version,
+                        "op": "sources",
+                        "payload": {"sources": data["sources"]},
+                    },
+                }
+            )
+        if data.get("done") is True:
+            # Terminal: ship a chat:done so the parent UI can finalize the
+            # subagent's mirror without waiting on a snapshot. usage piggybacks.
+            done_payload: dict = {
+                "message_id": inner_message_id,
+                "version": stream_version_incr(inner_message_id),
+            }
+            if data.get("usage"):
+                done_payload["usage"] = data["usage"]
+            await _emit_parent({"type": "chat:done", "data": done_payload})
+
     async def _flush_pending() -> None:
         nonlocal latest_completion_event, latest_status_event, flush_task
         async with lock:
@@ -537,7 +641,10 @@ def _build_forwarding_emitter(
         if status_event is not None:
             await _emit_parent(status_event)
         if completion_event is not None:
-            await _emit_parent(completion_event)
+            if v2_enabled:
+                await _emit_v2_deltas_for_completion(completion_event)
+            else:
+                await _emit_parent(completion_event)
 
     async def _delayed_flush() -> None:
         await asyncio.sleep(FORWARD_FLUSH_INTERVAL_SECONDS)
@@ -581,7 +688,13 @@ def _build_forwarding_emitter(
             # keeps final state immediate while preserving the latest content
             # seen before an error/cancel.
             await _flush_pending()
-            await _emit_parent(event)
+            if v2_enabled and etype == "chat:completion":
+                # Translate terminal completion into deltas + chat:done.
+                await _emit_v2_deltas_for_completion(event)
+            else:
+                # Error/cancel pass through as-is; the parent UI handles them
+                # via the existing terminal-event branch (mergeSubagentPendingIntoRun).
+                await _emit_parent(event)
             return
 
         await _queue_parent_event(event)

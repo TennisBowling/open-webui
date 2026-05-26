@@ -1320,6 +1320,9 @@
 		terminalEvent?: any;
 		statuses: any[];
 		hasTerminal: boolean;
+		deltas?: any[];
+		toolResults?: any[];
+		doneEvent?: any;
 	};
 
 	let pendingSubagentUpdates = new Map<string, PendingSubagentUpdate>();
@@ -1342,9 +1345,68 @@
 		const innerData = innerEvent?.data ?? {};
 		return (
 			(innerType === 'chat:completion' && innerData?.done === true) ||
+			innerType === 'chat:done' ||
 			innerType === 'chat:message:error' ||
 			innerType === 'chat:tasks:cancel'
 		);
+	};
+
+	// Stream v2: apply one chat:delta op into a subagent's content_blocks
+	// mirror. Mirrors the parent-message applyDeltaOp logic.
+	const applySubagentDeltaOp = (mirror: { content_blocks: any[] }, op: string, payload: any) => {
+		if (!payload) payload = {};
+		if (op === 'text_append') {
+			const idx = payload.block_idx;
+			const block = mirror.content_blocks[idx];
+			if (block && (block.type === 'text' || block.type === 'reasoning')) {
+				block.content = (block.content || '') + (payload.text || '');
+			} else if (idx === mirror.content_blocks.length) {
+				mirror.content_blocks.push({ type: 'text', content: payload.text || '' });
+			}
+		} else if (op === 'block_open') {
+			const block: any = { type: payload.type, content: '' };
+			if (payload.attrs && typeof payload.attrs === 'object') {
+				Object.assign(block, payload.attrs);
+			}
+			if (payload.type === 'tool_calls' && !Array.isArray(block.content)) {
+				block.content = [];
+			}
+			if (typeof payload.block_idx === 'number') {
+				mirror.content_blocks[payload.block_idx] = block;
+			} else {
+				mirror.content_blocks.push(block);
+			}
+		} else if (op === 'block_close') {
+			const block = mirror.content_blocks[payload.block_idx];
+			if (block) {
+				if (payload.duration != null) block.duration = payload.duration;
+				if (payload.output != null) block.output = payload.output;
+				if (payload.ended != null) block.ended = payload.ended;
+				if (Array.isArray(payload.results)) block.results = payload.results;
+			}
+		} else if (op === 'tool_call_add') {
+			const block = mirror.content_blocks[payload.block_idx];
+			if (block && block.type === 'tool_calls') {
+				if (!Array.isArray(block.content)) block.content = [];
+				block.content.push(payload.tool_call);
+			}
+		} else if (op === 'tool_call_args_append') {
+			for (const block of mirror.content_blocks) {
+				if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+				for (const tc of block.content) {
+					if (tc?.id === payload.tool_call_id || tc?.tool_call_id === payload.tool_call_id) {
+						const fn = tc.function || (tc.function = {});
+						fn.arguments = (fn.arguments || '') + (payload.args_delta || '');
+					}
+				}
+			}
+		} else if (op === 'replace') {
+			if (Array.isArray(payload.content_blocks)) {
+				mirror.content_blocks = payload.content_blocks.slice();
+			}
+		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
+			// Handled by caller (sets fields on the run object).
+		}
 	};
 
 	const mergeSubagentPendingIntoRun = (existing: any, pending: PendingSubagentUpdate) => {
@@ -1375,6 +1437,41 @@
 			cur.statusHistory = [...sh, ...pending.statuses].slice(-SUBAGENT_STATUS_HISTORY_LIMIT);
 		}
 
+		// Stream-v2 inner events: apply deltas + tool results to the per-run
+		// mirror so SubagentBlock keeps rendering off `content_blocks`.
+		if (Array.isArray(pending.deltas) && pending.deltas.length > 0) {
+			let blocks = Array.isArray(cur.content_blocks) ? cur.content_blocks.slice() : [];
+			// Replace shared references so reactive consumers see a new array.
+			const mirror = { content_blocks: blocks };
+			for (const d of pending.deltas) {
+				applySubagentDeltaOp(mirror, d?.op, d?.payload);
+				if (d?.op === 'sources' && Array.isArray(d?.payload?.sources)) {
+					cur.sources = d.payload.sources;
+				} else if (d?.op === 'selected_model_id' && d?.payload?.model_id) {
+					cur.selectedModelId = d.payload.model_id;
+				}
+			}
+			cur.content_blocks = mirror.content_blocks;
+		}
+		if (Array.isArray(pending.toolResults) && pending.toolResults.length > 0) {
+			const blocks = Array.isArray(cur.content_blocks) ? cur.content_blocks.slice() : [];
+			for (const tr of pending.toolResults) {
+				if (!tr?.tool_call_id) continue;
+				for (const block of blocks) {
+					if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+					for (const tc of block.content) {
+						if (
+							tc?.id === tr.tool_call_id ||
+							tc?.tool_call_id === tr.tool_call_id
+						) {
+							tc.result = tr.result;
+						}
+					}
+				}
+			}
+			cur.content_blocks = blocks;
+		}
+
 		if (pending.latestCompletion) {
 			const innerData = pending.latestCompletion?.data ?? {};
 			if (Array.isArray(innerData.content_blocks)) {
@@ -1400,6 +1497,16 @@
 		} else if (terminalType === 'chat:tasks:cancel') {
 			cur.status = 'cancelled';
 			cur.ended_at = Math.floor(Date.now() / 1000);
+		}
+
+		if (pending.doneEvent) {
+			// v2 terminal: chat:done finalizes the subagent's mirror.
+			const doneData = pending.doneEvent?.data ?? {};
+			cur.status = 'done';
+			cur.ended_at = Math.floor(Date.now() / 1000);
+			if (doneData.usage) cur.usage = doneData.usage;
+			cur.final_text =
+				cur.final_text || extractSubagentFinalText(cur.content_blocks, cur.content);
 		}
 
 		return cur;
@@ -1467,7 +1574,10 @@
 			innerType !== 'chat:completion' &&
 			innerType !== 'status' &&
 			innerType !== 'chat:message:error' &&
-			innerType !== 'chat:tasks:cancel'
+			innerType !== 'chat:tasks:cancel' &&
+			innerType !== 'chat:delta' &&
+			innerType !== 'tool_call:result' &&
+			innerType !== 'chat:done'
 		) {
 			return;
 		}
@@ -1478,6 +1588,14 @@
 			pending.statuses = [...pending.statuses, innerData].slice(-SUBAGENT_STATUS_HISTORY_LIMIT);
 		} else if (innerType === 'chat:message:error' || innerType === 'chat:tasks:cancel') {
 			pending.terminalEvent = innerEvent;
+		} else if (innerType === 'chat:delta') {
+			pending.deltas = pending.deltas ?? [];
+			pending.deltas.push(innerData);
+		} else if (innerType === 'tool_call:result') {
+			pending.toolResults = pending.toolResults ?? [];
+			pending.toolResults.push(innerData);
+		} else if (innerType === 'chat:done') {
+			pending.doneEvent = innerEvent;
 		}
 
 		pending.hasTerminal = pending.hasTerminal || isTerminalSubagentInnerEvent(innerEvent);
