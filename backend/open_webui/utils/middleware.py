@@ -341,6 +341,23 @@ def _emit_delta_for_blocks(
                                 "text": text,
                             }
                         )
+                elif new_b.get("type") == "tool_calls":
+                    for tool_call in new_b.get("content") or []:
+                        ops.append(
+                            {
+                                "op": "tool_call_add",
+                                "block_idx": i,
+                                "tool_call": tool_call,
+                            }
+                        )
+                    if new_b.get("results"):
+                        ops.append(
+                            {
+                                "op": "block_close",
+                                "block_idx": i,
+                                "results": new_b.get("results") or [],
+                            }
+                        )
                 old_blocks.append(dict(new_b))
         elif len(new_blocks) < len(old_blocks):
             # truncation — fall back to replace
