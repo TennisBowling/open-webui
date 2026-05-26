@@ -246,16 +246,14 @@
 	};
 </script>
 
-{#if showFullMessages}
+{#if showFullMessages && chat?.chat?.history}
 	<div class="hidden w-full h-full flex-col">
 		<div id="full-messages-container">
 			<Messages
 				className="h-full flex pt-4 pb-8 w-full"
 				chatId={`chat-preview-${chat?.id ?? ''}`}
-				user={$user}
 				readOnly={true}
 				history={chat.chat.history}
-				messages={chat.chat.messages}
 				autoScroll={true}
 				sendMessage={() => {}}
 				continueResponse={() => {}}
