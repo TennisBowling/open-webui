@@ -123,26 +123,6 @@ if WEBSOCKET_MANAGER == "redis":
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
     )
 
-    # Stream v2 snapshot-supporting state (B1/B9). Keyed by message_id.
-    STREAM_VERSION = RedisDict(
-        f"{REDIS_KEY_PREFIX}:stream_version",
-        redis_url=WEBSOCKET_REDIS_URL,
-        redis_sentinels=redis_sentinels,
-        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
-    )
-    TOOL_RESULTS = RedisDict(
-        f"{REDIS_KEY_PREFIX}:tool_results",
-        redis_url=WEBSOCKET_REDIS_URL,
-        redis_sentinels=redis_sentinels,
-        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
-    )
-    STREAM_STATE = RedisDict(
-        f"{REDIS_KEY_PREFIX}:stream_state",
-        redis_url=WEBSOCKET_REDIS_URL,
-        redis_sentinels=redis_sentinels,
-        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
-    )
-
     # Token usage tracking data structures
     TOKEN_GROUPS = RedisDict(
         "open-webui:token_groups",
@@ -169,9 +149,6 @@ else:
     SESSION_POOL = {}
     USER_POOL = {}
     PRIMARY_SESSION_PER_USER = {}
-    STREAM_VERSION = {}
-    TOOL_RESULTS = {}
-    STREAM_STATE = {}
 
     # Token usage tracking data structures (in-memory)
     TOKEN_GROUPS = {}
