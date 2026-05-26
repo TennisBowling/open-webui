@@ -95,6 +95,18 @@ class RedisDict:
     def clear(self):
         self.redis.delete(self.name)
 
+    def expire(self, ttl_seconds):
+        """Set/refresh a TTL (in seconds) on the underlying Redis hash key.
+        Returns True if the TTL was applied.
+
+        Note: TTL is on the WHOLE hash, not per-field. Per-field deletions
+        via __delitem__ do NOT clear or reset this TTL — Redis tracks expiry
+        on the key itself."""
+        try:
+            return bool(self.redis.expire(self.name, int(ttl_seconds)))
+        except Exception:
+            return False
+
     def update(self, other=None, **kwargs):
         if other is not None:
             for k, v in other.items() if hasattr(other, "items") else other:
@@ -106,6 +118,67 @@ class RedisDict:
         if key not in self:
             self[key] = default
         return self[key]
+
+    def setnx(self, key, value):
+        """Atomically set hash field only if it does not exist. Returns True
+        if the value was set, False if the field already had a value.
+
+        Wraps Redis HSETNX so callers can perform a race-free claim against
+        the underlying hash without a separate get/set round trip."""
+        serialized_value = json.dumps(value)
+        result = self.redis.hsetnx(self.name, key, serialized_value)
+        return bool(result)
+
+    def compare_and_swap(self, key, expected, new_value):
+        """Atomically replace the value at `key` with `new_value` only if the
+        current value equals `expected` (or `expected` is None and the field
+        is absent). Returns True on success, False otherwise.
+
+        Implemented as a Lua script so the read/compare/write is a single
+        Redis operation, preventing races between concurrent callers."""
+        expected_serialized = json.dumps(expected) if expected is not None else None
+        new_serialized = json.dumps(new_value)
+        script = """
+        local current = redis.call('HGET', KEYS[1], ARGV[1])
+        if current == false then
+            if ARGV[2] == '__NIL__' then
+                redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+                return 1
+            end
+            return 0
+        end
+        if current == ARGV[2] then
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+            return 1
+        end
+        return 0
+        """
+        result = self.redis.eval(
+            script,
+            1,
+            self.name,
+            key,
+            "__NIL__" if expected_serialized is None else expected_serialized,
+            new_serialized,
+        )
+        return bool(result)
+
+    def compare_and_delete(self, key, expected):
+        """Atomically delete `key` only if its current value equals
+        `expected`. Returns True if the field was deleted."""
+        expected_serialized = json.dumps(expected)
+        script = """
+        local current = redis.call('HGET', KEYS[1], ARGV[1])
+        if current == ARGV[2] then
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            return 1
+        end
+        return 0
+        """
+        result = self.redis.eval(
+            script, 1, self.name, key, expected_serialized
+        )
+        return bool(result)
 
 
 class YdocManager:
