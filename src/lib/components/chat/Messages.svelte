@@ -13,7 +13,7 @@
 	const dispatch = createEventDispatcher();
 
 	import { toast } from 'svelte-sonner';
-	import { getChatList, updateChatById } from '$lib/apis/chats';
+	import { getChatList, patchChat, type PatchChatOp } from '$lib/apis/chats';
 	import { copyToClipboard, extractCurlyBraceWords } from '$lib/utils';
 
 	import Message from './Messages/Message.svelte';
@@ -118,18 +118,32 @@
 		element.scrollTop = element.scrollHeight;
 	};
 
-	const updateChat = async () => {
-		if (!$temporaryChatEnabled) {
-			history = history;
-			await tick();
-			await updateChatById(localStorage.token, chatId, {
-				history: history,
-				messages: messages
-			});
-
-			currentChatPage.set(1);
-			await chats.set(await getChatList(localStorage.token, $currentChatPage));
+	const updateChat = async (ops: PatchChatOp | PatchChatOp[] | undefined = undefined) => {
+		if ($temporaryChatEnabled) {
+			return;
 		}
+		history = history;
+		await tick();
+
+		const opList = ops === undefined ? [] : Array.isArray(ops) ? ops : [ops];
+		if (opList.length === 0) {
+			// Legacy fallback for callers (MultiResponseMessages branch nav,
+			// ResponseMessage code-block edits) that haven't yet been migrated to
+			// pass explicit ops. Sync the current-branch pointer — covers branch
+			// navigation cleanly; content edits from such callers won't persist
+			// through this path and need their own PATCH migration in a later
+			// unit.
+			if (history?.currentId) {
+				opList.push({ op: 'set_history_current_id', current_id: history.currentId });
+			} else {
+				return;
+			}
+		}
+
+		await patchChat(localStorage.token, chatId, opList);
+
+		currentChatPage.set(1);
+		await chats.set(await getChatList(localStorage.token, $currentChatPage));
 	};
 
 	const gotoMessage = async (message, idx) => {
@@ -277,7 +291,11 @@
 			rating: rating
 		};
 
-		await updateChat();
+		await updateChat({
+			op: 'set_message_annotation',
+			message_id: messageId,
+			annotation: history.messages[messageId].annotation
+		});
 	};
 
 	const editMessage = async (messageId, { content, files }, submit = true) => {
@@ -320,7 +338,12 @@
 				// Edit user message
 				history.messages[messageId].content = content;
 				history.messages[messageId].files = files;
-				await updateChat();
+				await updateChat({
+					op: 'update_message_content',
+					message_id: messageId,
+					content,
+					...(files !== undefined ? { files } : {})
+				});
 			}
 		} else {
 			if (submit) {
@@ -350,12 +373,29 @@
 					];
 				}
 
-				await updateChat();
+				await updateChat([
+					{
+						op: 'append_message',
+						message_id: responseMessageId,
+						parent_id: parentId,
+						role: responseMessage.role,
+						content: responseMessage.content,
+						model: responseMessage.model,
+						modelName: responseMessage.modelName,
+						modelIdx: responseMessage.modelIdx,
+						timestamp: responseMessage.timestamp
+					},
+					{ op: 'set_history_current_id', current_id: responseMessageId }
+				]);
 			} else {
 				// Edit response message
 				history.messages[messageId].originalContent = history.messages[messageId].content;
 				history.messages[messageId].content = content;
-				await updateChat();
+				await updateChat({
+					op: 'update_message_content',
+					message_id: messageId,
+					content
+				});
 			}
 		}
 	};
@@ -366,7 +406,12 @@
 
 	const saveMessage = async (messageId, message) => {
 		history.messages[messageId] = message;
-		await updateChat();
+		await updateChat({
+			op: 'update_message_content',
+			message_id: messageId,
+			content: message?.content,
+			...(message?.files !== undefined ? { files: message.files } : {})
+		});
 	};
 
 	const deleteMessage = async (messageId) => {
@@ -403,8 +448,9 @@
 
 		showMessage({ id: parentMessageId });
 
-		// Update the chat
-		await updateChat();
+		// Backend's delete_message op handles the parent/grandchild relinking; we
+		// already applied the same mutations locally above for optimistic UI.
+		await updateChat({ op: 'delete_message', message_id: messageId });
 	};
 
 	const triggerScroll = () => {
