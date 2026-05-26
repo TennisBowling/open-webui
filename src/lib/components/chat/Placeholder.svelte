@@ -7,7 +7,6 @@
 
 	const dispatch = createEventDispatcher();
 
-	import { getChatList } from '$lib/apis/chats';
 	import { updateFolderById } from '$lib/apis/folders';
 
 	import {
@@ -17,9 +16,7 @@
 		modelsLoaded,
 		models as _models,
 		temporaryChatEnabled,
-		selectedFolder,
-		chats,
-		currentChatPage
+		selectedFolder
 	} from '$lib/stores';
 	import { sanitizeResponseContent, extractCurlyBraceWords } from '$lib/utils';
 	import { WEBUI_BASE_URL } from '$lib/constants';
@@ -99,13 +96,10 @@
 				<FolderTitle
 					folder={$selectedFolder}
 					onUpdate={async (folder) => {
-						await chats.set(await getChatList(localStorage.token, $currentChatPage));
-						currentChatPage.set(1);
+						// sidebarSync handles folder:updated broadcasts; no local refetch needed.
 					}}
 					onDelete={async () => {
-						await chats.set(await getChatList(localStorage.token, $currentChatPage));
-						currentChatPage.set(1);
-
+						// sidebarSync handles folder:deleted (cascades to chats refetch); only clear selection here.
 						selectedFolder.set(null);
 					}}
 				/>
