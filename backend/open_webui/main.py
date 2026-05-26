@@ -100,6 +100,7 @@ from open_webui.routers import (
     scim,
     subagents,
     flex_auto_flip,
+    preprocess,
 )
 
 from open_webui.routers.retrieval import (
@@ -1356,6 +1357,7 @@ app.include_router(images.router, prefix="/api/v1/images", tags=["images"])
 app.include_router(audio.router, prefix="/api/v1/audio", tags=["audio"])
 app.include_router(retrieval.router, prefix="/api/v1/retrieval", tags=["retrieval"])
 app.include_router(subagents.router, prefix="/api/v1/subagents", tags=["subagents"])
+app.include_router(preprocess.router, prefix="/api/chat/preprocess", tags=["preprocess"])
 app.include_router(
     flex_auto_flip.router,
     prefix="/api/v1/flex-auto-flip",
