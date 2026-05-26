@@ -28,6 +28,7 @@ from open_webui.env import (
     WEBSOCKET_SENTINEL_HOSTS,
     WEBSOCKET_MAX_MESSAGE_SIZE,
     REDIS_KEY_PREFIX,
+    STREAM_STATE_TTL_SECONDS,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -1217,11 +1218,46 @@ def is_primary_session(user_id, sid) -> bool:
     return primary == sid
 
 
+async def _touch_stream_state_ttl():
+    """Refresh TTL on the stream-state Redis hashes. Called after writes
+    so steady streams keep state alive while idle keys expire.
+
+    Note: TTL is on the WHOLE hash (one key per RedisDict), not per
+    message_id field. That's fine here — these hashes are short-lived per
+    stream and cleared explicitly on chat:done/error/cancel; the TTL only
+    serves to reap orphans from crashed/killed workers."""
+    if REDIS is None:
+        return
+    for key_suffix in ("stream_version", "tool_results", "stream_state"):
+        try:
+            await REDIS.expire(
+                f"{REDIS_KEY_PREFIX}:{key_suffix}", STREAM_STATE_TTL_SECONDS
+            )
+        except Exception:
+            pass
+
+
+def _schedule_stream_state_ttl_refresh() -> None:
+    """Fire-and-forget TTL refresh from synchronous helpers. Skipped when no
+    event loop is running (e.g. module import or sync test context)."""
+    if REDIS is None:
+        return
+    try:
+        asyncio.ensure_future(_touch_stream_state_ttl())
+    except RuntimeError:
+        # No running event loop — drop silently; the next write under a loop
+        # will set the TTL.
+        pass
+    except Exception:
+        pass
+
+
 def stream_version_init(message_id) -> int:
     try:
         STREAM_VERSION[message_id] = 0
     except Exception:
         pass
+    _schedule_stream_state_ttl_refresh()
     return 0
 
 
@@ -1235,6 +1271,7 @@ def stream_version_incr(message_id) -> int:
         STREAM_VERSION[message_id] = nxt
     except Exception:
         pass
+    _schedule_stream_state_ttl_refresh()
     return nxt
 
 
@@ -1254,6 +1291,7 @@ def set_tool_result(message_id, tool_call_id, result) -> None:
         TOOL_RESULTS[message_id] = existing
     except Exception:
         pass
+    _schedule_stream_state_ttl_refresh()
 
 
 def get_tool_results(message_id) -> dict:
