@@ -356,7 +356,7 @@
 
 			<hr class="border-gray-50 dark:border-gray-800 my-1" />
 
-			{#if !$temporaryChatEnabled && ($user?.role === 'admin' || ($user.permissions?.chat?.share ?? true))}
+			{#if !$temporaryChatEnabled && ($user?.role === 'admin' || ($user?.permissions?.chat?.share ?? true))}
 				<DropdownMenu.Item
 					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 					id="chat-share-button"
@@ -382,7 +382,7 @@
 					transition={flyAndScale}
 					sideOffset={8}
 				>
-					{#if $user?.role === 'admin' || ($user.permissions?.chat?.export ?? true)}
+					{#if $user?.role === 'admin' || ($user?.permissions?.chat?.export ?? true)}
 						<DropdownMenu.Item
 							class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 							on:click={() => {

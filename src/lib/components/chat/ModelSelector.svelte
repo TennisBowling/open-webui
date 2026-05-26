@@ -13,6 +13,12 @@
 
 	export let showSetDefault = true;
 
+	// Some routes/users hydrate settings/models asynchronously; keep the selector
+	// on a stable array so Svelte never updates an already-torn-down each block.
+	$: if (!Array.isArray(selectedModels) || selectedModels.length === 0) {
+		selectedModels = [''];
+	}
+
 	const saveDefaultModel = async () => {
 		const hasEmptyModel = selectedModels.filter((it) => it === '');
 		if (hasEmptyModel.length) {
@@ -38,7 +44,7 @@
 		await updateUserSettings(localStorage.token, { ui: $settings });
 	};
 
-	$: if (selectedModels.length > 0 && $models.length > 0) {
+	$: if (Array.isArray(selectedModels) && selectedModels.length > 0 && $models.length > 0) {
 		const _selectedModels = selectedModels.map((model) =>
 			$models.map((m) => m.id).includes(model) ? model : ''
 		);
@@ -50,10 +56,10 @@
 </script>
 
 <div class="flex flex-col w-full items-start">
-	{#each selectedModels as selectedModel, selectedModelIdx}
+	{#each selectedModels as selectedModel, selectedModelIdx (selectedModelIdx)}
 		<div class="flex w-full max-w-fit">
 			<div class="overflow-hidden w-full">
-				<div class="max-w-full {($settings?.highContrastMode ?? false) ? 'm-1' : 'mr-1'}">
+				<div class="max-w-full mr-1">
 					<Selector
 						id={`${selectedModelIdx}`}
 						placeholder={$i18n.t('Select a model')}
