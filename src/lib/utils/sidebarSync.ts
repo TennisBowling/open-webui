@@ -7,9 +7,10 @@
 // is why we avoid the `currentChatPage.set(1); chats.set(getChatList(...))`
 // pattern that the legacy `chat:title` handler used.
 //
-// `chat:updated` events are NOT skip_sid'd — they originate from background
-// streaming tasks (chat:done tail), not frontend-originated mutations, so the
-// originating tab also receives them and updates its `updated_at` in place.
+// `chat:updated` events ARE skip_sid'd — the originating tab updates its
+// sidebar via optimistic patches on the PATCH response (saveChatHandler in
+// Chat.svelte) and via the chat:done handler. Other tabs receive the
+// broadcast and patch in place.
 
 import { get } from 'svelte/store';
 import {
