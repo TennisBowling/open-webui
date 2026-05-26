@@ -491,6 +491,7 @@ from open_webui.utils.auth import (
     get_verified_user,
 )
 from open_webui.utils.plugin import install_tool_and_function_dependencies
+from open_webui.utils.cache import etag_response
 from open_webui.utils.oauth import (
     OAuthManager,
     OAuthClientManager,
@@ -1460,7 +1461,7 @@ async def get_models(
     log.debug(
         f"/api/models returned filtered models accessible to the user: {json.dumps([model.get('id') for model in models])}"
     )
-    return {"data": models}
+    return etag_response({"data": models}, request)
 
 
 @app.get("/api/models/base")
@@ -1803,7 +1804,7 @@ async def get_app_config(request: Request):
     if user is None:
         onboarding = user_count == 0
 
-    return {
+    config_payload = {
         **({"onboarding": True} if onboarding else {}),
         "status": True,
         "name": app.state.WEBUI_NAME,
@@ -1952,6 +1953,9 @@ async def get_app_config(request: Request):
             }
         ),
     }
+
+    # Per-user payload (auth-derived); cache as private with short TTL + ETag for 304s.
+    return etag_response(config_payload, request)
 
 
 class UrlForm(BaseModel):
