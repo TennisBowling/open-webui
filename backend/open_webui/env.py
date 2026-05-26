@@ -589,6 +589,15 @@ STREAM_PROTOCOL_VERSION = os.environ.get("STREAM_PROTOCOL_VERSION", "v2").strip(
 if STREAM_PROTOCOL_VERSION not in ("v1", "v2"):
     STREAM_PROTOCOL_VERSION = "v2"
 
+# Under v2, coalesce per-tick `chat:delta` and `tool_call:result` socket
+# emissions into a single `chat:delta:batch` envelope per user. Reduces socket
+# I/O at high concurrency (many subagents streaming simultaneously). Opt-out
+# via STREAM_DELTA_BATCH_ENABLED=false for ops if anything regresses.
+STREAM_DELTA_BATCH_ENABLED = (
+    os.environ.get("STREAM_DELTA_BATCH_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # TTL (seconds) applied to the per-stream Redis hashes (stream_version,
 # tool_results, stream_state). Set once at stream_version_init so any reasonable
 # stream completes within the window; orphan entries from crashed/killed workers

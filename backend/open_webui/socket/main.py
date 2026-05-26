@@ -29,6 +29,8 @@ from open_webui.env import (
     WEBSOCKET_MAX_MESSAGE_SIZE,
     REDIS_KEY_PREFIX,
     STREAM_STATE_TTL_SECONDS,
+    STREAM_PROTOCOL_VERSION,
+    STREAM_DELTA_BATCH_ENABLED,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -1316,6 +1318,24 @@ async def emit_to_primary(user_id, payload):
     """Emit a single events payload to the user's primary session only. Falls
     back to all sessions if no primary is registered (defensive — keeps v2
     working before B8 ships the election logic)."""
+    # v2 batching layer: collapse per-tick chat:delta / tool_call:result
+    # emissions into a single envelope per user. See _flush_delta_buffer.
+    if (
+        STREAM_DELTA_BATCH_ENABLED
+        and STREAM_PROTOCOL_VERSION == "v2"
+        and user_id
+        and _is_batchable_payload(payload)
+    ):
+        _enqueue_delta(user_id, payload)
+        return
+    # Non-batchable / terminal event: drain any pending batch first so order
+    # is preserved (deltas before the terminal envelope), then emit directly.
+    if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2" and user_id:
+        await _flush_delta_buffer(user_id)
+    await _emit_to_primary_raw(user_id, payload)
+
+
+async def _emit_to_primary_raw(user_id, payload):
     try:
         primary = PRIMARY_SESSION_PER_USER.get(user_id)
     except Exception:
@@ -1329,6 +1349,94 @@ async def emit_to_primary(user_id, payload):
     await asyncio.gather(
         *[sio.emit("events", payload, to=sid) for sid in session_ids]
     )
+
+
+# --- chat:delta batching --------------------------------------------------
+# Per-user FIFO of pending envelopes. Drained at the end of the current
+# asyncio tick via loop.call_soon. Within a tick, multiple synchronous
+# emit_to_primary calls accumulate; across ticks each tick flushes once.
+_BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result"})
+_pending_delta_buffer: Dict[str, list] = {}
+_pending_delta_scheduled: Set[str] = set()
+
+
+def _is_batchable_payload(payload) -> bool:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return False
+        return data.get("type") in _BATCHABLE_TYPES
+    except Exception:
+        return False
+
+
+def _enqueue_delta(user_id, payload) -> None:
+    try:
+        buf = _pending_delta_buffer.get(user_id)
+        if buf is None:
+            buf = []
+            _pending_delta_buffer[user_id] = buf
+        buf.append(payload)
+        if user_id in _pending_delta_scheduled:
+            return
+        _pending_delta_scheduled.add(user_id)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or not loop.is_running():
+            # No running loop (shouldn't happen in async context). Drop the
+            # scheduling marker; the next call will try again. Avoid losing
+            # buffered events by emitting synchronously as a fallback task.
+            _pending_delta_scheduled.discard(user_id)
+            try:
+                asyncio.create_task(_flush_delta_buffer(user_id))
+            except Exception:
+                pass
+            return
+        loop.call_soon(_schedule_flush, user_id)
+    except Exception:
+        log.exception("delta batch enqueue failed")
+        # Fallback: drop the batch path and emit immediately so the event
+        # is never lost.
+        try:
+            asyncio.create_task(_emit_to_primary_raw(user_id, payload))
+        except Exception:
+            pass
+
+
+def _schedule_flush(user_id) -> None:
+    try:
+        asyncio.create_task(_flush_delta_buffer(user_id))
+    except Exception:
+        log.exception("delta batch flush schedule failed")
+        _pending_delta_scheduled.discard(user_id)
+
+
+async def _flush_delta_buffer(user_id) -> None:
+    # Pop the buffer (preserve order) and clear the scheduled marker BEFORE
+    # awaiting so a new enqueue during the await can reschedule.
+    buf = _pending_delta_buffer.pop(user_id, None)
+    _pending_delta_scheduled.discard(user_id)
+    if not buf:
+        return
+    if len(buf) == 1:
+        # Single envelope — no point wrapping in a batch.
+        await _emit_to_primary_raw(user_id, buf[0])
+        return
+    # Use the chat_id/message_id of the first envelope so client-side dedup
+    # has scope. Inner envelopes carry their own ids and will be replayed
+    # individually on the frontend.
+    head = buf[0] if isinstance(buf[0], dict) else {}
+    envelope = {
+        "chat_id": head.get("chat_id"),
+        "message_id": head.get("message_id"),
+        "data": {
+            "type": "chat:delta:batch",
+            "batch": buf,
+        },
+    }
+    await _emit_to_primary_raw(user_id, envelope)
 
 
 def get_event_call(request_info):
