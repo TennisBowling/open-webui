@@ -245,6 +245,7 @@ type ChatCompletedForm = {
 	session_id: string;
 };
 
+/** @deprecated Backend runs outlet filters at the tail of process_chat_response; no client-side completion ping is required. */
 export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
 	let error = null;
 

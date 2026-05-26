@@ -73,7 +73,6 @@
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation, updateUserSettings } from '$lib/apis/users';
 	import {
-		chatCompleted,
 		generateQueries,
 		chatAction,
 		generateMoACompletion,
@@ -2776,50 +2775,6 @@
 		_completedMessageIds.add(responseMessageId);
 
 		try {
-			const res = await chatCompleted(localStorage.token, {
-				model: modelId,
-				messages: messages.map((m) => ({
-					id: m.id,
-					role: m.role,
-					content: m.content,
-					info: m.info ? m.info : undefined,
-					timestamp: m.timestamp,
-					...(m.usage ? { usage: m.usage } : {}),
-					...(m.sources ? { sources: m.sources } : {}),
-					...(m.reasoning_details ? { reasoning_details: m.reasoning_details } : {}),
-					...(m.reasoning_details_per_round
-						? { reasoning_details_per_round: m.reasoning_details_per_round }
-						: {})
-				})),
-				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
-				model_item: $models.find((m) => m.id === modelId),
-				chat_id: chatId,
-				session_id: $socket?.id,
-				id: responseMessageId
-			}).catch((error) => {
-				toast.error(`${error}`);
-				messages.at(-1).error = { content: error };
-
-				return null;
-			});
-
-			if (res !== null && res.messages) {
-				// Update chat history with the new messages
-				for (const message of res.messages) {
-					if (message?.id) {
-						// Add null check for message and message.id
-						history.messages[message.id] = {
-							...history.messages[message.id],
-							...(history.messages[message.id].content !== message.content
-								? { originalContent: history.messages[message.id].content }
-								: {}),
-							...message,
-							...(message.role === 'assistant' ? { done: true } : {})
-						};
-					}
-				}
-			}
-
 			await tick();
 
 			if (isVisibleChatEvent(chatId)) {
