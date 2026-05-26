@@ -150,6 +150,12 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
     )
+    STREAM_STATE = RedisDict(
+        f"{REDIS_KEY_PREFIX}:stream_state",
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
     PRIMARY_SESSION_PER_USER = RedisDict(
         f"{REDIS_KEY_PREFIX}:primary_session_per_user",
         redis_url=WEBSOCKET_REDIS_URL,
@@ -178,6 +184,7 @@ else:
 
     STREAM_VERSION = {}
     TOOL_RESULTS = {}
+    STREAM_STATE = {}
     PRIMARY_SESSION_PER_USER = {}
 
     aquire_func = release_func = renew_func = lambda: True
