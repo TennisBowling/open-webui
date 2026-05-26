@@ -584,6 +584,60 @@ def _project_message_slim(
     return out
 
 
+def _normalize_message_graph(messages: dict) -> dict:
+    """Repair lightweight graph invariants for legacy/corrupt rows.
+
+    A stream-v2 race could create the assistant row via realtime upsert before
+    the frontend's placeholder append landed. Those rows have saved
+    content_blocks/model data but no role/parentId, which breaks branch
+    pagination and makes the UI repeatedly try to load ancestors that the
+    backend cannot find. Normalize the in-memory API shape so reads remain
+    usable, and later writes will persist the corrected graph.
+    """
+    if not isinstance(messages, dict) or not messages:
+        return messages
+
+    ordered = list(messages.items())
+    for _mid, msg in ordered:
+        if not isinstance(msg, dict):
+            continue
+        if not isinstance(msg.get("childrenIds"), list):
+            msg["childrenIds"] = []
+        if (
+            not msg.get("role")
+            and (
+                msg.get("model")
+                or msg.get("selectedModelId")
+                or isinstance(msg.get("content_blocks"), list)
+            )
+        ):
+            msg["role"] = "assistant"
+
+    for idx, (mid, msg) in enumerate(ordered):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("parentId"):
+            continue
+        msg_ts = msg.get("timestamp") if isinstance(msg.get("timestamp"), int) else None
+        parent_id = None
+        for _pmid, candidate in reversed(ordered[:idx]):
+            if not isinstance(candidate, dict) or candidate.get("role") != "user":
+                continue
+            cand_ts = candidate.get("timestamp") if isinstance(candidate.get("timestamp"), int) else None
+            if msg_ts is None or cand_ts is None or cand_ts <= msg_ts:
+                parent_id = candidate.get("id") or _pmid
+                break
+        if parent_id is None:
+            continue
+        msg["parentId"] = parent_id
+        parent = messages.get(parent_id)
+        if isinstance(parent, dict):
+            children = parent.get("childrenIds") if isinstance(parent.get("childrenIds"), list) else []
+            if mid not in children:
+                children.append(mid)
+            parent["childrenIds"] = children
+
+    return messages
+
+
 def _chat_messages_from_table(db, chat_id: str) -> dict:
     """Reconstruct ``{message_id: message_dict}`` from chat_message rows for
     the given chat. Ordered by ``sequence`` so the dict iteration order
@@ -602,7 +656,7 @@ def _chat_messages_from_table(db, chat_id: str) -> dict:
         ).fetchall()
     except Exception:
         return {}
-    return {r[0]: _row_to_message_dict(r) for r in rows}
+    return _normalize_message_graph({r[0]: _row_to_message_dict(r) for r in rows})
 
 
 def _hydrate_chat_messages(db, chat_obj) -> None:

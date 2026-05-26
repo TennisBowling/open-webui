@@ -4153,13 +4153,11 @@
 		).catch((err) => {
 			console.error('saveChatHandler failed:', err);
 		});
-		// Subagents persist side-channel state (`subagent_runs`) directly onto the
-		// parent assistant message as soon as the tool starts. If the user reloads
-		// before this initial chat save lands, the backend can create a partial
-		// orphan row with no parent/role metadata. Pay the small save latency only
-		// when subagents are enabled so reloads during a launch have a fully-linked
-		// parent message to patch.
-		if (subagentsEnabled && !_chatId?.startsWith('local:') && !$temporaryChatEnabled) {
+		// Stream-v2 deltas are keyed to the assistant placeholder row. Make sure
+		// that row exists (with parentId/role/model metadata) before the backend
+		// starts realtime upserts, otherwise the stream can create an orphan row
+		// and reloads lose the user/assistant branch relationship.
+		if (!_chatId?.startsWith('local:') && !$temporaryChatEnabled) {
 			await initialSavePromise;
 		}
 

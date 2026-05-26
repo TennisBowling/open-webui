@@ -69,9 +69,13 @@
 
 	export let messagesCount: number | null = 7;
 	let messagesLoading = false;
+	let paginationChatId = '';
+	let exhaustedBeforeIds = new Set<string>();
 
-	$: if (chatId) {
+	$: if (chatId && chatId !== paginationChatId) {
+		paginationChatId = chatId;
 		messagesCount = 7;
+		exhaustedBeforeIds = new Set();
 	}
 
 	// Merge a paginated message page back into history.messages, preserving any
@@ -149,7 +153,7 @@
 
 		let hydratedCount = 0;
 		const leafId = (history as any)?.currentId ?? null;
-		if (chatId && leafId && oldestId) {
+		if (chatId && leafId && oldestId && !exhaustedBeforeIds.has(oldestId)) {
 			const page = await getChatMessagesBranch(localStorage.token, chatId, {
 				leaf: leafId,
 				before: oldestId,
@@ -158,6 +162,8 @@
 			hydratedCount = mergePaginatedMessages(page);
 			if (hydratedCount > 0) {
 				history = history;
+			} else {
+				exhaustedBeforeIds = new Set([...exhaustedBeforeIds, oldestId]);
 			}
 		}
 
@@ -567,7 +573,7 @@
 			{#key chatId}
 				<section class="w-full" aria-labelledby="chat-conversation">
 					<h2 class="sr-only" id="chat-conversation">{$i18n.t('Chat Conversation')}</h2>
-					{#if messages.length > 0 && messages[0].parentId !== null && history.messages[messages[0].parentId] !== undefined}
+					{#if messages.length > 0 && messages[0].parentId !== null && history.messages[messages[0].parentId] !== undefined && !exhaustedBeforeIds.has(messages[0].id)}
 						<Loader
 							on:visible={(e) => {
 								console.log('visible');
