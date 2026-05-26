@@ -426,6 +426,50 @@ def assemble_conversation_from_leaf(
                 "timestamp": int(time.time()),
                 "models": new_user_message.get("models") or [],
             }
+
+            # Detect migrated vs legacy: migrated chats keep messages in the
+            # chat_message table where childrenIds is *derived* from parent_id
+            # on read (see get_chat_branches), so there is nothing to link on
+            # the parent row. Legacy chats keep the tree inside the JSON blob
+            # and need an explicit childrenIds append on the parent.
+            chat_row = Chats.get_chat_by_id(chat_id)
+            migrated = bool(
+                chat_row is not None
+                and getattr(chat_row, "messages_migrated", 0)
+            )
+
+            # Legacy-only: append new id to the parent's childrenIds. We do
+            # this BEFORE the new-message upsert so the final upsert is the
+            # one that sets history.currentId = new_id (upsert_message_*
+            # always stamps currentId to the message it just wrote).
+            if not migrated and parent_id:
+                parent_msg = messages_map.get(parent_id)
+                if isinstance(parent_msg, dict):
+                    existing_children = list(parent_msg.get("childrenIds") or [])
+                    if new_id not in existing_children:
+                        existing_children.append(new_id)
+                        # Pass only the field that actually changed; the
+                        # legacy path inside upsert_message_to_chat_by_id_*
+                        # merges via {**existing, **incoming}, so this is a
+                        # surgical partial update.
+                        try:
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                chat_id,
+                                parent_id,
+                                {"childrenIds": existing_children},
+                            )
+                        except Exception as e:
+                            log.debug(
+                                f"assemble_conversation_from_leaf: failed to link new id into parent.childrenIds: {e}"
+                            )
+
+            # Persist the new user message. For migrated chats this is a
+            # single-row INSERT into chat_message + a json_set on
+            # chat.history.currentId — both O(1) on the row. For legacy
+            # chats it's an in-place JSON patch (no full re-serialization
+            # of the chat blob via update_chat_by_id). Either way, this
+            # call is what stamps history.currentId = new_id, so no
+            # follow-up update_chat_by_id is needed.
             try:
                 Chats.upsert_message_to_chat_by_id_and_message_id(
                     chat_id, new_id, persisted
@@ -433,51 +477,6 @@ def assemble_conversation_from_leaf(
             except Exception as e:
                 log.debug(
                     f"assemble_conversation_from_leaf: failed to persist new_user_message: {e}"
-                )
-
-            # Mirror the frontend's tree linkage (Chat.svelte ~L3399-3405):
-            # append the new id to the parent's childrenIds and update
-            # history.currentId so subsequent reads of the chat tree are
-            # consistent.
-            if parent_id:
-                parent_msg = messages_map.get(parent_id)
-                if isinstance(parent_msg, dict):
-                    existing_children = list(parent_msg.get("childrenIds") or [])
-                    if new_id not in existing_children:
-                        existing_children.append(new_id)
-                        parent_update = {
-                            **parent_msg,
-                            "childrenIds": existing_children,
-                        }
-                        try:
-                            Chats.upsert_message_to_chat_by_id_and_message_id(
-                                chat_id, parent_id, parent_update
-                            )
-                        except Exception as e:
-                            log.debug(
-                                f"assemble_conversation_from_leaf: failed to link new id into parent.childrenIds: {e}"
-                            )
-
-            # Update chat.history.currentId so the next snapshot read sees
-            # the new leaf. We do a focused read-modify-write of just the
-            # history.currentId field to minimise conflicts with concurrent
-            # realtime saves coming from the frontend.
-            try:
-                chat_row = Chats.get_chat_by_id(chat_id)
-                if chat_row is not None:
-                    chat_body = dict(chat_row.chat or {})
-                    history = dict(chat_body.get("history") or {})
-                    history["currentId"] = new_id
-                    # Don't clobber the messages dict if it's present — leave
-                    # it as-is so update_chat_by_id's peel/sync path can do
-                    # the right thing for migrated chats.
-                    if "messages" not in history:
-                        history["messages"] = {}
-                    chat_body["history"] = history
-                    Chats.update_chat_by_id(chat_id, chat_body)
-            except Exception as e:
-                log.debug(
-                    f"assemble_conversation_from_leaf: failed to update history.currentId: {e}"
                 )
 
             chain.append(persisted)
