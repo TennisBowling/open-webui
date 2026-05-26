@@ -519,17 +519,23 @@ def _project_message_slim(
 ) -> dict:
     """Return a copy of ``msg`` with bandwidth-heavy fields stripped.
 
-    - drops ``originalContent`` (frontend re-derives from ``content`` if needed)
-    - drops ``reasoning_details_per_round`` for non-leaf messages
+    - ALWAYS preserves ``originalContent`` — it carries the pre-edit version
+      of edited messages and is critical for branch/edit history. Stripping
+      it on non-current-leaf messages would lose user edit-history shadows
+      on branch switches, so it must never be dropped on the slim path.
+    - drops ``reasoning_details_per_round`` for non-leaf messages (structured
+      per-round copy used only for next-send context assembly; old branches
+      keep the flat ``reasoning_details`` for replay)
     - replaces ``tool_calls[*].results[*].content`` larger than
       ``_SLIM_TOOL_RESULT_THRESHOLD_BYTES`` with a ``{tool_call_id, truncated,
-      size}`` stub for non-current-branch turns; frontend hydrates on expand
-      via the per-message endpoint.
+      size}`` stub for non-current-branch turns; frontend hydrates on branch
+      switch via the ``/chats/{id}/messages/{message_id}/siblings`` endpoint
+      (``get_message_siblings``) which returns full, non-slim content.
     """
     if not isinstance(msg, dict):
         return msg
     out = dict(msg)
-    out.pop("originalContent", None)
+    # NOTE: do NOT pop "originalContent" — see docstring.
     if not is_current_leaf:
         out.pop("reasoning_details_per_round", None)
 
