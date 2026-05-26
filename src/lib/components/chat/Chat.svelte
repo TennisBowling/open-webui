@@ -1678,6 +1678,26 @@
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
+		// Stream-v2 batching: socket.main may coalesce consecutive chat:delta /
+		// tool_call:result envelopes into one chat:delta:batch. Chat.svelte owns
+		// the live message mirror, so it must unpack the batch itself; the global
+		// layout handler cannot mutate this component's history.
+		if (type === 'chat:delta:batch') {
+			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
+			for (const inner of batch) {
+				if (!inner || typeof inner !== 'object') continue;
+				await chatEventHandler(
+					{
+						chat_id: inner.chat_id ?? event.chat_id,
+						message_id: inner.message_id ?? event.message_id,
+						data: inner.data
+					},
+					cb
+				);
+			}
+			return;
+		}
+
 		if (type === 'chat:title') {
 			chatTitle.set(data);
 			return;
