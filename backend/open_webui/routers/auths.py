@@ -827,6 +827,7 @@ async def get_admin_config(request: Request, user=Depends(get_admin_user)):
         "WEBUI_URL": request.app.state.config.WEBUI_URL,
         "ENABLE_SIGNUP": request.app.state.config.ENABLE_SIGNUP,
         "ENABLE_API_KEY": request.app.state.config.ENABLE_API_KEY,
+        "ENABLE_API_DEBUG_LOGGING": request.app.state.config.ENABLE_API_DEBUG_LOGGING,
         "ENABLE_API_KEY_ENDPOINT_RESTRICTIONS": request.app.state.config.ENABLE_API_KEY_ENDPOINT_RESTRICTIONS,
         "API_KEY_ALLOWED_ENDPOINTS": request.app.state.config.API_KEY_ALLOWED_ENDPOINTS,
         "DEFAULT_USER_ROLE": request.app.state.config.DEFAULT_USER_ROLE,
@@ -847,6 +848,7 @@ class AdminConfig(BaseModel):
     WEBUI_URL: str
     ENABLE_SIGNUP: bool
     ENABLE_API_KEY: bool
+    ENABLE_API_DEBUG_LOGGING: Optional[bool] = None
     ENABLE_API_KEY_ENDPOINT_RESTRICTIONS: bool
     API_KEY_ALLOWED_ENDPOINTS: str
     DEFAULT_USER_ROLE: str
@@ -870,6 +872,10 @@ async def update_admin_config(
     request.app.state.config.ENABLE_SIGNUP = form_data.ENABLE_SIGNUP
 
     request.app.state.config.ENABLE_API_KEY = form_data.ENABLE_API_KEY
+    if form_data.ENABLE_API_DEBUG_LOGGING is not None:
+        request.app.state.config.ENABLE_API_DEBUG_LOGGING = (
+            form_data.ENABLE_API_DEBUG_LOGGING
+        )
     request.app.state.config.ENABLE_API_KEY_ENDPOINT_RESTRICTIONS = (
         form_data.ENABLE_API_KEY_ENDPOINT_RESTRICTIONS
     )
@@ -910,6 +916,7 @@ async def update_admin_config(
         "WEBUI_URL": request.app.state.config.WEBUI_URL,
         "ENABLE_SIGNUP": request.app.state.config.ENABLE_SIGNUP,
         "ENABLE_API_KEY": request.app.state.config.ENABLE_API_KEY,
+        "ENABLE_API_DEBUG_LOGGING": request.app.state.config.ENABLE_API_DEBUG_LOGGING,
         "ENABLE_API_KEY_ENDPOINT_RESTRICTIONS": request.app.state.config.ENABLE_API_KEY_ENDPOINT_RESTRICTIONS,
         "API_KEY_ALLOWED_ENDPOINTS": request.app.state.config.API_KEY_ALLOWED_ENDPOINTS,
         "DEFAULT_USER_ROLE": request.app.state.config.DEFAULT_USER_ROLE,

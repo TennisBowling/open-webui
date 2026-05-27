@@ -12,7 +12,6 @@
 
 	import { get, type Unsubscriber, type Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { throttle, debounce } from 'throttle-debounce';
 	import { WEBUI_BASE_URL, WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import {
@@ -58,6 +57,7 @@
 		getTimeRange
 	} from '$lib/utils';
 	import { loadToolServers } from '$lib/utils/toolServers';
+	import { getStructuredRetryLastRequestContext } from '$lib/utils/retryLastRequest';
 	import {
 		hydrateToolResultsInBlocks,
 		mergeToolResultEntries,
@@ -131,6 +131,7 @@
 	let autoScroll = true;
 	let processing = '';
 	let messagesContainerElement: HTMLDivElement;
+	let messagesContentElement: HTMLDivElement;
 
 	let navbarElement;
 
@@ -3172,25 +3173,86 @@
 		return true;
 	};
 
-	const scrollToBottom = debounce(100, async (behavior = 'auto') => {
-		await tick();
-		if (messagesContainerElement) {
-			messagesContainerElement.scrollTo({
-				top: messagesContainerElement.scrollHeight,
-				behavior
-			});
-		}
-	});
+	const AUTO_SCROLL_STICKY_THRESHOLD = 96;
 
-	const onScroll = throttle(100, (e) => {
-		autoScroll =
-			messagesContainerElement.scrollHeight - messagesContainerElement.scrollTop <=
-			messagesContainerElement.clientHeight + 5;
-	});
+	let scrollToBottomFrame: number | null = null;
+	let scrollStateFrame: number | null = null;
+	let pendingScrollBehavior: ScrollBehavior = 'auto';
+	let observedMessagesContentElement: HTMLDivElement | null = null;
+	let messagesResizeObserver: ResizeObserver | null = null;
+
+	const getBottomDistance = (element: HTMLElement) =>
+		Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight);
+
+	const getBottomScrollTop = (element: HTMLElement) =>
+		Math.max(0, element.scrollHeight - element.clientHeight);
+
+	const isNearBottom = (element: HTMLElement) =>
+		getBottomDistance(element) <= AUTO_SCROLL_STICKY_THRESHOLD;
+
+	const updateAutoScrollFromPosition = () => {
+		if (!messagesContainerElement) return;
+		autoScroll = isNearBottom(messagesContainerElement);
+	};
+
+	const scrollToBottomNow = (behavior: ScrollBehavior = 'auto') => {
+		if (!messagesContainerElement) return;
+		const target = getBottomScrollTop(messagesContainerElement);
+		if (Math.abs(messagesContainerElement.scrollTop - target) <= 1) {
+			autoScroll = true;
+			return;
+		}
+
+		messagesContainerElement.scrollTo({
+			top: target,
+			behavior
+		});
+		autoScroll = true;
+	};
+
+	const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+		// Continuous streaming should be anchored, not CSS-smooth animated: smooth
+		// scroll animations queue up and feel rubber-bandy while tokens arrive.
+		// Explicit smooth callers still win for one-shot UI additions.
+		if (behavior === 'smooth') pendingScrollBehavior = 'smooth';
+
+		if (scrollToBottomFrame !== null) return;
+		scrollToBottomFrame = requestAnimationFrame(async () => {
+			scrollToBottomFrame = null;
+			await tick();
+			const behaviorToUse = pendingScrollBehavior;
+			pendingScrollBehavior = 'auto';
+			scrollToBottomNow(behaviorToUse);
+		});
+	};
+
+	const onScroll = () => {
+		if (scrollStateFrame !== null) return;
+		scrollStateFrame = requestAnimationFrame(() => {
+			scrollStateFrame = null;
+			updateAutoScrollFromPosition();
+		});
+	};
+
+	const observeMessagesContent = (element?: HTMLDivElement) => {
+		if (observedMessagesContentElement === element) return;
+		messagesResizeObserver?.disconnect();
+		messagesResizeObserver = null;
+		observedMessagesContentElement = element ?? null;
+
+		if (!element || typeof ResizeObserver === 'undefined') return;
+		messagesResizeObserver = new ResizeObserver(() => {
+			if (autoScroll) scrollToBottom();
+		});
+		messagesResizeObserver.observe(element);
+	};
+
+	$: observeMessagesContent(messagesContentElement);
 
 	onDestroy(() => {
-		onScroll.cancel();
-		scrollToBottom.cancel();
+		if (scrollToBottomFrame !== null) cancelAnimationFrame(scrollToBottomFrame);
+		if (scrollStateFrame !== null) cancelAnimationFrame(scrollStateFrame);
+		messagesResizeObserver?.disconnect();
 	});
 	let _completedMessageIds = new Set<string>();
 
@@ -4842,6 +4904,7 @@
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
+		const leafMessageId = (opts as any)?.leafMessageId ?? responseMessage.parentId;
 
 		const chatMessageFiles = _messages
 			.filter((message) => message.files)
@@ -5282,7 +5345,7 @@
 				model: model.id,
 				...(useV2Body
 					? {
-							leaf_message_id: responseMessage.parentId
+							leaf_message_id: leafMessageId
 						}
 					: { messages: messages }),
 				params: {
@@ -6298,27 +6361,37 @@
 			return false;
 		}
 
-		const toolContext = getRetryableToolContext(message?.content ?? '');
-		if (!toolContext?.content) {
+		const structuredContext = getStructuredRetryLastRequestContext(message);
+		const legacyToolContext = structuredContext ? null : getRetryableToolContext(message?.content ?? '');
+		if (!structuredContext && !legacyToolContext?.content) {
 			return false;
 		}
 
 		const responseMessageId = uuidv4();
-		const responseMessage = {
+		const responseMessage: any = {
 			parentId: message.parentId,
 			id: responseMessageId,
 			childrenIds: [],
 			role: 'assistant',
-			content: `${toolContext.content}\n\n`,
+			content: structuredContext ? structuredContext.content : `${legacyToolContext?.content ?? ''}\n\n`,
 			model: targetModelId,
 			modelName: model.name ?? targetModelId,
 			modelIdx: message.modelIdx ?? 0,
 			timestamp: Math.floor(Date.now() / 1000),
-			preservedToolContext: true,
-			...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : {}),
-			...(message.reasoning_details_per_round
-				? { reasoning_details_per_round: message.reasoning_details_per_round }
-				: {})
+			...(structuredContext
+				? {
+						content_blocks: structuredContext.content_blocks,
+						...(structuredContext.reasoning_details_per_round
+							? { reasoning_details_per_round: structuredContext.reasoning_details_per_round }
+							: {})
+					}
+				: {
+						preservedToolContext: true,
+						...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : {}),
+						...(message.reasoning_details_per_round
+							? { reasoning_details_per_round: message.reasoning_details_per_round }
+							: {})
+					})
 		};
 
 		history.messages[responseMessageId] = responseMessage;
@@ -6332,6 +6405,36 @@
 		}
 
 		history = history;
+
+		const _chatId = getVisibleChatId();
+		const isTempChat = $temporaryChatEnabled || _chatId?.startsWith('local:');
+		if (_chatId && !isTempChat) {
+			await saveChatHandler(_chatId, history, params, [
+				{
+					op: 'append_message',
+					message_id: responseMessage.id,
+					parent_id: responseMessage.parentId ?? null,
+					role: 'assistant',
+					content: responseMessage.content ?? '',
+					model: responseMessage.model,
+					modelName: responseMessage.modelName,
+					modelIdx: responseMessage.modelIdx,
+					timestamp: responseMessage.timestamp,
+					...(responseMessage.content_blocks
+						? { content_blocks: responseMessage.content_blocks }
+						: {}),
+					...(responseMessage.reasoning_details_per_round
+						? { reasoning_details_per_round: responseMessage.reasoning_details_per_round }
+						: {}),
+					...(responseMessage.reasoning_details
+						? { reasoning_details: responseMessage.reasoning_details }
+						: {}),
+					...(responseMessage.preservedToolContext ? { preservedToolContext: true } : {})
+				},
+				{ op: 'set_history_current_id', current_id: responseMessage.id }
+			]);
+		}
+
 		await tick();
 
 		if (autoScroll) {
@@ -6339,8 +6442,9 @@
 		}
 
 		const messages = createMessagesList(history, responseMessageId);
-		const _chatId = getVisibleChatId();
-		await sendMessageSocket(model, messages, history, responseMessageId, _chatId);
+		await sendMessageSocket(model, messages, history, responseMessageId, _chatId, {
+			leafMessageId: structuredContext ? responseMessageId : undefined
+		});
 
 		return true;
 	};
@@ -7029,10 +7133,11 @@
 							<div
 								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
 								id="messages-container"
+								style="overflow-anchor: none;"
 								bind:this={messagesContainerElement}
 								on:scroll={onScroll}
 							>
-								<div class=" h-full w-full flex flex-col">
+								<div class=" h-full w-full flex flex-col" bind:this={messagesContentElement}>
 									<Messages
 										chatId={activeChatId}
 										bind:history

@@ -1179,6 +1179,10 @@ async def _run_inner_chat(
             # Regular chats still use the global CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE
             # (default 1); this only affects the subagent's inner pipeline.
             "stream_delta_chunk_size": 200,
+            # Subagents use provider-native reasoning deltas. Disabling the
+            # legacy inline <think> tag parser avoids rebuilding a full
+            # ever-growing `content` string for every hidden-worker token.
+            "reasoning_tags": False,
         },
         # Override hooks — process_chat_response in middleware respects these
         # in place of the default get_event_emitter(metadata) lookup.

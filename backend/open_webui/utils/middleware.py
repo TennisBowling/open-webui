@@ -4,6 +4,7 @@ import sys
 import os
 import base64
 import textwrap
+import copy
 
 import asyncio
 import hashlib
@@ -2802,21 +2803,33 @@ async def process_chat_response(
             response_usage = None  # Initialize response_usage at the top level
             chunk_count = 0  # Initialize chunk_count at the top level for logging
 
-            # Only pre-populate a text block when there is already content to carry
-            # forward (e.g. a tool-call continuation).  An empty initial text block
-            # would cause the late-arrival guard below to discard ALL reasoning
-            # tokens (because _last_block_type would be "text" from the very first
-            # chunk), breaking both reasoning display and streaming UX.
-            content_blocks = (
-                [
-                    {
-                        "type": "text",
-                        "content": content,
-                    }
-                ]
-                if content
-                else []
+            existing_content_blocks = (
+                message.get("content_blocks") if isinstance(message, dict) else None
             )
+
+            # Retry-last-request can pre-seed the assistant row with completed
+            # tool-call rounds. Continue streaming from those structured blocks
+            # instead of flattening them to a single text block, otherwise v2
+            # would resend the whole agentic turn instead of just the final
+            # post-tool request.
+            if isinstance(existing_content_blocks, list) and existing_content_blocks:
+                content_blocks = copy.deepcopy(existing_content_blocks)
+            else:
+                # Only pre-populate a text block when there is already content to carry
+                # forward (e.g. a tool-call continuation).  An empty initial text block
+                # would cause the late-arrival guard below to discard ALL reasoning
+                # tokens (because _last_block_type would be "text" from the very first
+                # chunk), breaking both reasoning display and streaming UX.
+                content_blocks = (
+                    [
+                        {
+                            "type": "text",
+                            "content": content,
+                        }
+                    ]
+                    if content
+                    else []
+                )
 
             # Per-round reasoning_details, in order. Each stream_body_handler
             # invocation appends one entry: the reasoning_details captured during
@@ -2826,7 +2839,33 @@ async def process_chat_response(
             # cannot distinguish which round each reasoning item came from, and
             # earlier rounds get attached to the wrong assistant message on
             # follow-up turns.
-            round_reasoning_details = []
+            existing_reasoning_per_round = (
+                message.get("reasoning_details_per_round")
+                if isinstance(message, dict)
+                else None
+            )
+            round_reasoning_details = (
+                copy.deepcopy(existing_reasoning_per_round)
+                if isinstance(existing_reasoning_per_round, list)
+                else []
+            )
+
+            if (
+                STREAM_PROTOCOL_VERSION == "v2"
+                and metadata.get("message_id")
+                and content_blocks
+            ):
+                initial_v2_blocks = copy.deepcopy(_strip_tool_results(content_blocks))
+                v2_mirror = getattr(event_emitter, "_v2_mirror", None)
+                if v2_mirror is not None:
+                    v2_mirror["blocks"] = initial_v2_blocks
+                set_stream_state(
+                    metadata["message_id"],
+                    {
+                        "content_blocks": initial_v2_blocks,
+                        "status": "in_progress",
+                    },
+                )
 
             reasoning_tags_param = metadata.get("params", {}).get("reasoning_tags")
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
@@ -2850,12 +2889,21 @@ async def process_chat_response(
             # chunk. The structured block content is still updated for live
             # rendering/replay, but this legacy `content` string is only needed
             # when inline tag parsing is enabled and for final webhook text.
-            content_parts = [content] if content else []
+            # Hidden v2 subagent runs never need that legacy string: the full
+            # transcript is persisted from content_blocks, and parent transport
+            # receives only slim subagent state.
+            track_legacy_content = not (
+                STREAM_PROTOCOL_VERSION == "v2"
+                and metadata.get("subagent_inner")
+                and not DETECT_REASONING_TAGS
+                and not DETECT_CODE_INTERPRETER
+            )
+            content_parts = [content] if (track_legacy_content and content) else []
             content_dirty = False
 
             def append_plain_content(value: str):
                 nonlocal content, content_parts, content_dirty
-                if not value:
+                if not value or not track_legacy_content:
                     return
                 content_parts.append(value)
                 content_dirty = True
@@ -2865,12 +2913,16 @@ async def process_chat_response(
 
             def reset_plain_content(value: str):
                 nonlocal content, content_parts, content_dirty
+                if not track_legacy_content:
+                    return
                 content = value or ""
                 content_parts = [content] if content else []
                 content_dirty = False
 
             def get_plain_content() -> str:
                 nonlocal content, content_dirty
+                if not track_legacy_content:
+                    return content
                 if content_dirty:
                     content = "".join(content_parts)
                     content_dirty = False
@@ -4328,8 +4380,11 @@ async def process_chat_response(
                         update_data,
                     )
 
-                # Send a webhook notification if the user is not active
-                if not get_active_status_by_user_id(user.id):
+                # Send a webhook notification if the user is not active.
+                # Hidden subagent chats are implementation detail rows; sending
+                # one webhook per inner worker would be noisy and would force us
+                # to keep a legacy full-text buffer just for those hidden runs.
+                if not metadata.get("subagent_inner") and not get_active_status_by_user_id(user.id):
                     webhook_url = Users.get_user_webhook_url_by_id(user.id)
                     if webhook_url:
                         plain_content = get_plain_content()
