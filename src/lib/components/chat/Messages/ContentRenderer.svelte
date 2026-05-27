@@ -13,6 +13,7 @@
 		showOverview
 	} from '$lib/stores';
 	import FloatingButtons from '../ContentRenderer/FloatingButtons.svelte';
+	import ToolCallsBlock from './ToolCallsBlock.svelte';
 	import { blocksToDisplayMarkdown, createMessagesList } from '$lib/utils';
 
 	export let id;
@@ -89,23 +90,8 @@
 		}
 
 		if (type === 'tool_calls') {
-			const calls = Array.isArray(block.content)
-				? block.content.map((call) => ({
-						id: call?.id ?? call?.tool_call_id ?? '',
-						name: call?.function?.name ?? '',
-						arguments: textSig(call?.function?.arguments ?? '')
-					}))
-				: [];
-			const results = Array.isArray(block.results)
-				? block.results.map((result) => ({
-						tool_call_id: result?.tool_call_id ?? '',
-						content: textSig(result?.content ?? ''),
-						subagent_id: result?.subagent_id ?? '',
-						files: Array.isArray(result?.files) ? result.files.length : 0,
-						embeds: Array.isArray(result?.embeds) ? result.embeds.length : 0
-					}))
-				: [];
-			return `tool_calls:${JSON.stringify({ calls, results })}`;
+			// Tool calls render structurally via <ToolCallsBlock>, not markdown.
+			return 'tool_calls:direct';
 		}
 
 		if (type === 'code_interpreter') {
@@ -129,7 +115,9 @@
 			for (let i = 0; i < blocks.length; i++) {
 				const signature = blockProjectionSignature(blocks[i]);
 				nextSignatures[i] = signature;
-				if (signature !== blockProjectionSignatures[i] || blockProjections[i] == null) {
+				if (blocks[i]?.type === 'tool_calls') {
+					next[i] = '';
+				} else if (signature !== blockProjectionSignatures[i] || blockProjections[i] == null) {
 					next[i] = blocksToDisplayMarkdown([blocks[i]]);
 				} else {
 					next[i] = blockProjections[i];
@@ -149,8 +137,8 @@
 	// of block-0 when a second block gets appended (which would otherwise
 	// flip the id from `${id}` to `${id}-b0`, triggering Markdown's `{#key
 	// id}` to tear down and rebuild the rendered DOM).
-	$: structuredMode = blockProjections.length > 0;
-	$: renderedSegments = structuredMode ? blockProjections : [content ?? ''];
+	$: structuredBlocks = Array.isArray(content_blocks) ? content_blocks : [];
+	$: structuredMode = structuredBlocks.length > 0;
 
 	const updateButtonPosition = (event) => {
 		const buttonsContainerElement = document.getElementById(`floating-buttons-${id}`);
@@ -243,16 +231,90 @@
 </script>
 
 <div bind:this={contentContainerElement}>
-	{#each renderedSegments as segment, i (i)}
+	{#if structuredMode}
+		{#each structuredBlocks as block, i (i)}
+			{#if block?.type === 'tool_calls'}
+				<ToolCallsBlock id={`${id}-b${i}`} {block} />
+			{:else}
+				<Markdown
+					id={`${id}-b${i}`}
+					content={blockProjections[i] ?? ''}
+					{model}
+					{save}
+					{preview}
+					{done}
+					{editCodeBlock}
+					topPadding={i === 0 ? topPadding : false}
+					{chatId}
+					{messageId}
+					{dataVizOverrides}
+					sourceIds={(sources ?? []).reduce((acc, source) => {
+						let ids = [];
+						source.document.forEach((document, index) => {
+							if (model?.info?.meta?.capabilities?.citations == false) {
+								ids.push('N/A');
+								return ids;
+							}
+
+							const metadata = source.metadata?.[index];
+							const id = metadata?.source ?? 'N/A';
+
+							if (metadata?.name) {
+								ids.push(metadata.name);
+								return ids;
+							}
+
+							if (id.startsWith('http://') || id.startsWith('https://')) {
+								ids.push(id);
+							} else {
+								ids.push(source?.source?.name ?? id);
+							}
+
+							return ids;
+						});
+
+						acc = [...acc, ...ids];
+
+						// remove duplicates
+						return acc.filter((item, index) => acc.indexOf(item) === index);
+					}, [])}
+					{onSourceClick}
+					{onTaskClick}
+					{onSave}
+					onUpdate={(token) => {
+						const { lang, text: code } = token;
+
+						if (
+							($settings?.detectArtifacts ?? true) &&
+							(['html', 'svg'].includes(lang) || (lang === 'xml' && code.includes('svg'))) &&
+							!$mobile &&
+							chatId
+						) {
+							showArtifacts.set(true);
+							showControls.set(true);
+						}
+					}}
+					onPreview={async (value) => {
+						console.log('Preview', value);
+						await artifactCode.set(value);
+						await showControls.set(true);
+						await showArtifacts.set(true);
+						await showOverview.set(false);
+						await showEmbeds.set(false);
+					}}
+				/>
+			{/if}
+		{/each}
+	{:else}
 		<Markdown
-			id={structuredMode ? `${id}-b${i}` : id}
-			content={segment}
+			{id}
+			content={content ?? ''}
 			{model}
 			{save}
 			{preview}
 			{done}
 			{editCodeBlock}
-			topPadding={i === 0 ? topPadding : false}
+			{topPadding}
 			{chatId}
 			{messageId}
 			{dataVizOverrides}
@@ -283,7 +345,6 @@
 
 				acc = [...acc, ...ids];
 
-				// remove duplicates
 				return acc.filter((item, index) => acc.indexOf(item) === index);
 			}, [])}
 			{onSourceClick}
@@ -311,7 +372,7 @@
 				await showEmbeds.set(false);
 			}}
 		/>
-	{/each}
+	{/if}
 </div>
 
 {#if floatingButtons && model}

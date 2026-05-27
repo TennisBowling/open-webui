@@ -26,8 +26,7 @@
 		createMessagesList,
 		formatDate,
 		removeDetails,
-		removeAllDetails,
-		blocksToDisplayMarkdown
+		removeAllDetails
 	} from '$lib/utils';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
@@ -200,8 +199,12 @@
 		}
 	};
 
-	const hasRenderableToolCalls = (content) =>
-		typeof content === 'string' && content.includes('<details type="tool_calls"');
+	const hasRenderableToolCalls = (m: any, content = '') => {
+		if (Array.isArray(m?.content_blocks)) {
+			return m.content_blocks.some((block: any) => block?.type === 'tool_calls');
+		}
+		return typeof content === 'string' && content.includes('<details type="tool_calls"');
+	};
 
 	const getMessageTextContent = (content) => {
 		if (typeof content === 'string') {
@@ -227,13 +230,21 @@
 		return '';
 	};
 
-	// Prefer the structured content_blocks (canonical for new messages) and render
-	// to the same HTML+markdown shape the existing Markdown component already knows.
-	// Falls back to message.content for legacy chats that pre-date the migration.
-	$: messageTextContent =
-		Array.isArray(message?.content_blocks) && message.content_blocks.length > 0
-			? blocksToDisplayMarkdown(message.content_blocks)
-			: getMessageTextContent(message?.content);
+	const getStructuredTextContent = (blocks: any[] = []) =>
+		blocks
+			.filter((block) => block?.type === 'text')
+			.map((block) => (block?.content ?? '').toString())
+			.join('\n')
+			.trim();
+
+	$: hasStructuredContent =
+		Array.isArray(message?.content_blocks) && message.content_blocks.length > 0;
+	// For structured messages, ContentRenderer renders content_blocks directly.
+	// Keep this as plain assistant text for copy/TTS/edit/image prompts; do not
+	// stringify tool results here or heavy research turns become O(huge) per tick.
+	$: messageTextContent = hasStructuredContent
+		? getStructuredTextContent(message.content_blocks)
+		: getMessageTextContent(message?.content);
 
 	const playAudio = (idx: number) => {
 		return new Promise<void>((res) => {
@@ -811,9 +822,9 @@
 							</div>
 						{:else}
 							<div class="w-full flex flex-col relative" id="response-content-container">
-								{#if messageTextContent === '' && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+								{#if !hasStructuredContent && messageTextContent === '' && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
 									<Skeleton />
-								{:else if messageTextContent && message.error !== true}
+								{:else if (messageTextContent || hasStructuredContent) && message.error !== true}
 									<!-- always show message contents even if there's an error -->
 									<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
 									<ContentRenderer
@@ -1466,7 +1477,7 @@
 													regenerateWithModel(message, modelId, preserveToolContext);
 												}}
 												currentModelId={message.model}
-												hasToolCalls={hasRenderableToolCalls(messageTextContent)}
+												hasToolCalls={hasRenderableToolCalls(message, messageTextContent)}
 											>
 												<Tooltip content={$i18n.t('Regenerate')} placement="bottom">
 													<div
