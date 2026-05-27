@@ -58,6 +58,11 @@
 		getTimeRange
 	} from '$lib/utils';
 	import { loadToolServers } from '$lib/utils/toolServers';
+	import {
+		hydrateToolResultsInBlocks,
+		mergeToolResultEntries,
+		normalizeToolResultEntry
+	} from '$lib/utils/toolResults';
 
 	import {
 		createNewChat,
@@ -1412,7 +1417,10 @@
 	};
 
 	// Stream v2: apply one chat:delta op into a subagent's content_blocks
-	// mirror. Mirrors the parent-message applyDeltaOp logic.
+	// mirror. Mirrors the parent-message applyDeltaOp logic. The v2 wire format
+	// deliberately strips heavy tool result bodies out of content_blocks and
+	// sends them via tool_call:result, so slim `{ tool_call_id }` placeholders
+	// must never overwrite a full result that the mirror already has.
 	const applySubagentDeltaOp = (mirror: { content_blocks: any[] }, op: string, payload: any) => {
 		if (!payload) payload = {};
 		if (op === 'text_append') {
@@ -1462,7 +1470,13 @@
 				if (payload.duration != null) block.duration = payload.duration;
 				if (payload.output != null) block.output = payload.output;
 				if (payload.ended != null) block.ended = payload.ended;
-				if (Array.isArray(payload.results)) block.results = payload.results;
+				if (Array.isArray(payload.results)) {
+					block.results = mergeToolResultEntries(
+						payload.results,
+						undefined,
+						Array.isArray(block.results) ? block.results : []
+					);
+				}
 			}
 		} else if (op === 'tool_call_add') {
 			const block = mirror.content_blocks[payload.block_idx];
@@ -1483,13 +1497,25 @@
 		} else if (op === 'replace') {
 			if (Array.isArray(payload.content_blocks)) {
 				if (typeof payload.block_idx === 'number' && payload.block_idx > 0) {
+					const replacementBlocks = hydrateToolResultsInBlocks(
+						payload.content_blocks,
+						undefined,
+						mirror.content_blocks.slice(
+							payload.block_idx,
+							payload.block_idx + payload.content_blocks.length
+						)
+					);
 					mirror.content_blocks.splice(
 						payload.block_idx,
 						payload.content_blocks.length,
-						...payload.content_blocks
+						...replacementBlocks
 					);
 				} else {
-					mirror.content_blocks = payload.content_blocks.slice();
+					mirror.content_blocks = hydrateToolResultsInBlocks(
+						payload.content_blocks.slice(),
+						undefined,
+						mirror.content_blocks
+					);
 				}
 			}
 		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
@@ -1546,21 +1572,23 @@
 			const blocks = Array.isArray(cur.content_blocks) ? cur.content_blocks.slice() : [];
 			for (const tr of pending.toolResults) {
 				if (!tr?.tool_call_id) continue;
-				const resultEntry = {
+				const resultEntry = normalizeToolResultEntry(tr.tool_call_id, {
 					tool_call_id: tr.tool_call_id,
 					content: tr.result ?? '',
 					...(Array.isArray(tr.files) && tr.files.length > 0 ? { files: tr.files } : {}),
 					...(Array.isArray(tr.embeds) && tr.embeds.length > 0 ? { embeds: tr.embeds } : {}),
 					...(tr.subagent_id ? { subagent_id: tr.subagent_id } : {})
-				};
+				});
 				for (const block of blocks) {
 					if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
 					block.results = Array.isArray(block.results) ? block.results : [];
+					const mergedResult =
+						mergeToolResultEntries([resultEntry], undefined, block.results)[0] ?? resultEntry;
 					const existingIdx = block.results.findIndex(
 						(r: any) => r?.tool_call_id === tr.tool_call_id
 					);
-					if (existingIdx >= 0) block.results[existingIdx] = resultEntry;
-					else block.results.push(resultEntry);
+					if (existingIdx >= 0) block.results[existingIdx] = mergedResult;
+					else block.results.push(mergedResult);
 					for (const tc of block.content) {
 						if (tc?.id === tr.tool_call_id || tc?.tool_call_id === tr.tool_call_id) {
 							tc.result = tr.result;
@@ -1574,7 +1602,11 @@
 		if (pending.latestCompletion) {
 			const innerData = pending.latestCompletion?.data ?? {};
 			if (Array.isArray(innerData.content_blocks)) {
-				cur.content_blocks = innerData.content_blocks;
+				cur.content_blocks = hydrateToolResultsInBlocks(
+					innerData.content_blocks,
+					undefined,
+					Array.isArray(cur.content_blocks) ? cur.content_blocks : []
+				);
 			}
 			if (typeof innerData.content === 'string') {
 				cur.content = innerData.content;
@@ -3708,7 +3740,13 @@
 				if (payload.duration != null) block.duration = payload.duration;
 				if (payload.output != null) block.output = payload.output;
 				if (payload.ended != null) block.ended = payload.ended;
-				if (Array.isArray(payload.results)) block.results = payload.results;
+				if (Array.isArray(payload.results)) {
+					block.results = mergeToolResultEntries(
+						payload.results,
+						mirror.tool_results,
+						Array.isArray(block.results) ? block.results : []
+					);
+				}
 			}
 		} else if (op === 'tool_call_add') {
 			const block = mirror.content_blocks[payload.block_idx];
@@ -3757,16 +3795,32 @@
 		} else if (op === 'replace') {
 			if (typeof payload.block_idx === 'number' && Array.isArray(payload.content_blocks)) {
 				if (payload.block_idx > 0) {
+					const replacementBlocks = hydrateToolResultsInBlocks(
+						payload.content_blocks,
+						mirror.tool_results,
+						mirror.content_blocks.slice(
+							payload.block_idx,
+							payload.block_idx + payload.content_blocks.length
+						)
+					);
 					mirror.content_blocks.splice(
 						payload.block_idx,
 						payload.content_blocks.length,
-						...payload.content_blocks
+						...replacementBlocks
 					);
 				} else {
-					mirror.content_blocks = payload.content_blocks.slice();
+					mirror.content_blocks = hydrateToolResultsInBlocks(
+						payload.content_blocks.slice(),
+						mirror.tool_results,
+						mirror.content_blocks
+					);
 				}
 			} else if (Array.isArray(payload.content_blocks)) {
-				mirror.content_blocks = payload.content_blocks.slice();
+				mirror.content_blocks = hydrateToolResultsInBlocks(
+					payload.content_blocks.slice(),
+					mirror.tool_results,
+					mirror.content_blocks
+				);
 			}
 		} else {
 			console.warn('[chat:delta] unknown op', op, payload);
@@ -3805,16 +3859,16 @@
 			return;
 		}
 
-		mirror.content_blocks = Array.isArray(snap.content_blocks)
-			? snap.content_blocks.slice()
-			: [];
 		mirror.version = typeof snap.version === 'number' ? snap.version : 0;
 		mirror.tool_results = new Map();
 		if (snap.tool_results && typeof snap.tool_results === 'object') {
 			for (const [k, v] of Object.entries(snap.tool_results)) {
-				mirror.tool_results.set(k, v);
+				mirror.tool_results.set(k, normalizeToolResultEntry(k, v));
 			}
 		}
+		mirror.content_blocks = Array.isArray(snap.content_blocks)
+			? hydrateToolResultsInBlocks(snap.content_blocks.slice(), mirror.tool_results)
+			: [];
 
 		const buffered = mirror.pending_deltas;
 		mirror.pending_deltas = [];
@@ -3900,7 +3954,14 @@
 	) => {
 		if (!data?.tool_call_id) return;
 		const mirror = getOrCreateStreamMirror(message.id);
-		mirror.tool_results.set(data.tool_call_id, data.result);
+		const resultEntry = normalizeToolResultEntry(data.tool_call_id, {
+			tool_call_id: data.tool_call_id,
+			content: data.result ?? '',
+			...(Array.isArray(data.files) && data.files.length > 0 ? { files: data.files } : {}),
+			...(Array.isArray(data.embeds) && data.embeds.length > 0 ? { embeds: data.embeds } : {}),
+			...(data.subagent_id ? { subagent_id: data.subagent_id } : {})
+		});
+		mirror.tool_results.set(data.tool_call_id, resultEntry);
 		if (Array.isArray(data.files) && data.files.length > 0) {
 			message.files = [...(message.files ?? []), ...data.files];
 		}
@@ -3910,21 +3971,16 @@
 		// Inline the tool result into the matching tool_calls block so the
 		// renderer keeps working unchanged. blocksToDisplayMarkdown reads
 		// block.results[], while some live components also look at tc.result.
-		const resultEntry = {
-			tool_call_id: data.tool_call_id,
-			content: data.result ?? '',
-			...(Array.isArray(data.files) && data.files.length > 0 ? { files: data.files } : {}),
-			...(Array.isArray(data.embeds) && data.embeds.length > 0 ? { embeds: data.embeds } : {}),
-			...(data.subagent_id ? { subagent_id: data.subagent_id } : {})
-		};
 		for (const block of mirror.content_blocks) {
 			if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
 			block.results = Array.isArray(block.results) ? block.results : [];
+			const mergedResult =
+				mergeToolResultEntries([resultEntry], mirror.tool_results, block.results)[0] ?? resultEntry;
 			const existingIdx = block.results.findIndex(
 				(r: any) => r?.tool_call_id === data.tool_call_id
 			);
-			if (existingIdx >= 0) block.results[existingIdx] = resultEntry;
-			else block.results.push(resultEntry);
+			if (existingIdx >= 0) block.results[existingIdx] = mergedResult;
+			else block.results.push(mergedResult);
 			for (const tc of block.content) {
 				if (tc?.id === data.tool_call_id || tc?.tool_call_id === data.tool_call_id) {
 					tc.result = data.result;

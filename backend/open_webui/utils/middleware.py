@@ -92,6 +92,7 @@ from open_webui.socket.main import (
     stream_version_init,
     stream_version_incr,
     stream_version_get,
+    set_stream_state,
     set_tool_result,
     clear_stream_state,
     emit_to_primary,
@@ -504,6 +505,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
 
         # Usage-only flush
         if set(data.keys()) <= {"usage"} and "usage" in data and message_id:
+            set_stream_state(message_id, {"usage": data["usage"]})
             version = stream_version_incr(message_id)
             await _emit_raw_primary(
                 {
@@ -520,6 +522,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
 
         # Error mid-stream
         if "error" in data and message_id:
+            set_stream_state(message_id, {"status": "error", "error": data["error"]})
             version = stream_version_incr(message_id)
             await _emit_raw_primary(
                 {
@@ -535,6 +538,16 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
 
         # Content-bearing flush
         if "content_blocks" in data and message_id:
+            state_patch = {
+                "content_blocks": _strip_tool_results(data["content_blocks"]),
+                "status": "done" if data.get("done") else "in_progress",
+            }
+            if data.get("usage") is not None:
+                state_patch["usage"] = data["usage"]
+            if data.get("error") is not None:
+                state_patch["error"] = data["error"]
+                state_patch["status"] = "error"
+            set_stream_state(message_id, state_patch)
             awaitables = _emit_delta_for_blocks(
                 _emit_raw_primary, message_id, mirror, data["content_blocks"]
             )

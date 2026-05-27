@@ -18,6 +18,18 @@
 		return results.find((result: any) => result?.tool_call_id === callId);
 	};
 
+	const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key);
+
+	const hasResultPayload = (result: any) => {
+		if (!result || typeof result !== 'object') return false;
+		return (
+			hasOwn(result, 'content') ||
+			(Array.isArray(result.files) && result.files.length > 0) ||
+			(Array.isArray(result.embeds) && result.embeds.length > 0) ||
+			!!result.subagent_id
+		);
+	};
+
 	const stringifyIfNeeded = (value: any) => {
 		if (value == null) return '';
 		return typeof value === 'string' ? value : JSON.stringify(value);
@@ -27,10 +39,11 @@
 		const result = getResultForCall(call);
 		const name = call?.function?.name ?? '';
 		const isSubagent = subagentToolNames.has(name);
+		const resultPayloadReady = isSubagent ? result !== undefined : hasResultPayload(result);
 
 		return {
 			type: isSubagent ? 'subagent_launch' : 'tool_calls',
-			done: result !== undefined ? 'true' : 'false',
+			done: resultPayloadReady ? 'true' : 'false',
 			id: result?.subagent_id ?? call?.id ?? call?.tool_call_id ?? '',
 			tool_call_id: call?.id ?? call?.tool_call_id ?? '',
 			name,

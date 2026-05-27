@@ -51,6 +51,17 @@ export interface ParsedWebFetchResult {
 	raw: string;
 }
 
+export type ToolResultLookup = Map<string, unknown> | Record<string, unknown> | null | undefined;
+
+export interface ToolResultEntry {
+	tool_call_id: string;
+	content?: unknown;
+	files?: unknown[];
+	embeds?: unknown[];
+	subagent_id?: string;
+	[key: string]: unknown;
+}
+
 const JSON_START_CHARS = new Set([
 	'{',
 	'[',
@@ -140,6 +151,142 @@ export const isWebToolName = (name: unknown): name is 'web_search' | 'web_fetch'
 };
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key);
+
+const getToolResultId = (value: unknown) => {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+	const id = (value as Record<string, unknown>).tool_call_id;
+	return typeof id === 'string' ? id : '';
+};
+
+const getToolResultFromLookup = (lookup: ToolResultLookup, toolCallId: string) => {
+	if (!lookup || !toolCallId) return undefined;
+	if (lookup instanceof Map) return lookup.get(toolCallId);
+	return lookup[toolCallId];
+};
+
+export const normalizeToolResultEntry = (toolCallId: string, raw: unknown): ToolResultEntry => {
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+		const obj = { ...(raw as Record<string, unknown>) };
+		const id =
+			typeof obj.tool_call_id === 'string' && obj.tool_call_id ? obj.tool_call_id : toolCallId;
+		if (id) obj.tool_call_id = id;
+		if (!hasOwn(obj, 'content') && hasOwn(obj, 'result')) {
+			obj.content = obj.result;
+		}
+		return obj as ToolResultEntry;
+	}
+
+	return {
+		tool_call_id: toolCallId,
+		content: raw ?? ''
+	};
+};
+
+const toolResultHasContent = (entry: unknown) =>
+	!!entry && typeof entry === 'object' && !Array.isArray(entry) && hasOwn(entry, 'content');
+
+export const mergeToolResultEntries = (
+	incomingResults: unknown[] = [],
+	knownResults?: ToolResultLookup,
+	existingResults: unknown[] = []
+): ToolResultEntry[] => {
+	const existingById = new Map<string, unknown>();
+	for (const existing of existingResults) {
+		const id = getToolResultId(existing);
+		if (id) existingById.set(id, existing);
+	}
+
+	return incomingResults
+		.map((incomingRaw) => {
+			const incomingId = getToolResultId(incomingRaw);
+			const existingRaw = incomingId ? existingById.get(incomingId) : undefined;
+			const knownRaw = incomingId ? getToolResultFromLookup(knownResults, incomingId) : undefined;
+			const existing =
+				existingRaw !== undefined ? normalizeToolResultEntry(incomingId, existingRaw) : null;
+			const known = knownRaw !== undefined ? normalizeToolResultEntry(incomingId, knownRaw) : null;
+			const incoming = normalizeToolResultEntry(
+				incomingId || getToolResultId(known) || getToolResultId(existing),
+				incomingRaw
+			);
+			const id = incoming.tool_call_id || known?.tool_call_id || existing?.tool_call_id || '';
+			const merged: ToolResultEntry = {
+				...(existing ?? {}),
+				...(known ?? {}),
+				...incoming,
+				tool_call_id: id
+			};
+
+			// Stream-v2 content_blocks intentionally carry slim result placeholders
+			// (`{ tool_call_id }`) while the heavy body travels via tool_call:result.
+			// Never let those placeholders erase a full body that arrived earlier or
+			// was supplied by the snapshot endpoint.
+			if (!toolResultHasContent(incoming)) {
+				if (toolResultHasContent(known)) {
+					merged.content = known?.content;
+				} else if (toolResultHasContent(existing)) {
+					merged.content = existing?.content;
+				}
+			}
+
+			return merged;
+		})
+		.filter((entry) => !!entry.tool_call_id);
+};
+
+export const hydrateToolResultsInBlock = (
+	block: unknown,
+	knownResults?: ToolResultLookup,
+	previousBlock?: unknown
+): unknown => {
+	if (!block || typeof block !== 'object' || Array.isArray(block)) return block;
+	const typedBlock = block as Record<string, unknown>;
+	if (typedBlock.type !== 'tool_calls') return block;
+
+	const incomingResults = Array.isArray(typedBlock.results) ? typedBlock.results : [];
+	const previousResults =
+		previousBlock && typeof previousBlock === 'object' && !Array.isArray(previousBlock)
+			? Array.isArray((previousBlock as Record<string, unknown>).results)
+				? ((previousBlock as Record<string, unknown>).results as unknown[])
+				: []
+			: [];
+	const mergedResults = mergeToolResultEntries(incomingResults, knownResults, previousResults);
+	const seen = new Set(mergedResults.map((result) => result.tool_call_id).filter(Boolean));
+
+	const calls = Array.isArray(typedBlock.content) ? typedBlock.content : [];
+	for (const call of calls) {
+		if (!call || typeof call !== 'object' || Array.isArray(call)) continue;
+		const toolCallId =
+			typeof (call as Record<string, unknown>).id === 'string'
+				? ((call as Record<string, unknown>).id as string)
+				: typeof (call as Record<string, unknown>).tool_call_id === 'string'
+					? ((call as Record<string, unknown>).tool_call_id as string)
+					: '';
+		if (!toolCallId || seen.has(toolCallId)) continue;
+		const knownRaw = getToolResultFromLookup(knownResults, toolCallId);
+		if (knownRaw !== undefined) {
+			mergedResults.push(normalizeToolResultEntry(toolCallId, knownRaw));
+			seen.add(toolCallId);
+		}
+	}
+
+	if (mergedResults.length === 0 && !Array.isArray(typedBlock.results)) return block;
+	return {
+		...typedBlock,
+		results: mergedResults
+	};
+};
+
+export const hydrateToolResultsInBlocks = (
+	blocks: unknown[] = [],
+	knownResults?: ToolResultLookup,
+	previousBlocks: unknown[] = []
+) => {
+	return blocks.map((block, index) =>
+		hydrateToolResultsInBlock(block, knownResults, previousBlocks[index])
+	);
+};
 
 const extractMarkdownField = (block: string, label: string) => {
 	const fieldRegex = new RegExp(`^\\s*\\*\\*${escapeRegExp(label)}:\\*\\*\\s*(.*)$`, 'im');

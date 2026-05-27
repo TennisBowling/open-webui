@@ -138,9 +138,9 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
     )
 
-    # Stream v2 state: per-message version counter + tool result cache. Both
-    # are keyed by message_id. Cleared on chat:done / error / cancel. Snapshot
-    # endpoint (B1) reads from here.
+    # Stream v2 state: per-message version counter, slim content snapshot, and
+    # tool result cache. All are keyed by message_id. Cleared on chat:done /
+    # error / cancel. Snapshot endpoint (B1) reads from here.
     STREAM_VERSION = RedisDict(
         f"{REDIS_KEY_PREFIX}:stream_version",
         redis_url=WEBSOCKET_REDIS_URL,
@@ -1286,6 +1286,18 @@ def stream_version_get(message_id) -> int:
         return 0
 
 
+def set_stream_state(message_id, patch: dict) -> None:
+    try:
+        existing = STREAM_STATE.get(message_id, {}) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        if isinstance(patch, dict):
+            existing.update(patch)
+        STREAM_STATE[message_id] = existing
+    except Exception:
+        pass
+
+
 def set_tool_result(message_id, tool_call_id, result) -> None:
     try:
         existing = TOOL_RESULTS.get(message_id, {}) or {}
@@ -1306,7 +1318,7 @@ def get_tool_results(message_id) -> dict:
 
 
 def clear_stream_state(message_id) -> None:
-    for store in (STREAM_VERSION, TOOL_RESULTS):
+    for store in (STREAM_VERSION, TOOL_RESULTS, STREAM_STATE):
         try:
             if message_id in store:
                 del store[message_id]
