@@ -121,6 +121,8 @@
 	const INITIAL_DONE_BLOCK_LIMIT = 12;
 	const BLOCK_HYDRATION_BATCH = 12;
 	const RICH_MARKDOWN_BATCH = 1;
+	const EAGER_BODY_BLOCK_LIMIT = 12;
+	const EAGER_BODY_MAX_CHARS = 160_000;
 
 	let bodyReady = false;
 	let bodyBlockLimit = INITIAL_DONE_BLOCK_LIMIT;
@@ -190,8 +192,45 @@
 		richBlockLimit = 0;
 	};
 
+	const estimateBlockSize = (block: any) => {
+		if (!block || typeof block !== 'object') return 0;
+		if (['text', 'reasoning', 'code_interpreter'].includes(block.type)) {
+			return `${block.content ?? ''}`.length;
+		}
+		try {
+			return JSON.stringify(block).length;
+		} catch {
+			return 0;
+		}
+	};
+
+	const estimateInitialBodySize = () => {
+		const blocks = Array.isArray(run?.content_blocks) ? run.content_blocks : [];
+		if (blocks.length > 0) {
+			return blocks
+				.slice(0, INITIAL_DONE_BLOCK_LIMIT)
+				.reduce((sum: number, block: any) => sum + estimateBlockSize(block), 0);
+		}
+		return `${run?.final_text ?? fallbackContent ?? ''}`.length;
+	};
+
+	const shouldShowBodyImmediately = () => {
+		// Running subagents render text blocks as plain pre-wrapped text, so there is
+		// no expensive final markdown parse to protect. Showing the body immediately
+		// lets the slide transition measure the real in-progress content.
+		if (status === 'running') return true;
+
+		const blocks = Array.isArray(run?.content_blocks) ? run.content_blocks : [];
+		if (blocks.length > EAGER_BODY_BLOCK_LIMIT) return false;
+		return estimateInitialBodySize() <= EAGER_BODY_MAX_CHARS;
+	};
+
 	const scheduleBodyReady = () => {
 		resetHydration();
+		if (shouldShowBodyImmediately()) {
+			bodyReady = true;
+			return;
+		}
 		runAfterPaint(() => {
 			if (!open) return;
 			bodyReady = true;

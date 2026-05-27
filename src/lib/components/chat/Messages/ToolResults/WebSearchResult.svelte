@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext, onDestroy } from 'svelte';
+	import { getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 	import { toast } from 'svelte-sonner';
@@ -25,42 +25,11 @@
 	let filter = '';
 	let visibleCount = PAGE_SIZE;
 	let parsed: ParsedWebSearchResult | null = null;
-	let parseGeneration = 0;
-	let parseFrame: number | null = null;
-	let parseTimeout: ReturnType<typeof setTimeout> | null = null;
-
-	const clearScheduledParse = () => {
-		if (parseFrame !== null) {
-			window.cancelAnimationFrame(parseFrame);
-			parseFrame = null;
-		}
-		if (parseTimeout !== null) {
-			clearTimeout(parseTimeout);
-			parseTimeout = null;
-		}
-	};
 
 	const scheduleParse = () => {
-		clearScheduledParse();
-		parsed = null;
-		const generation = ++parseGeneration;
-
-		if (typeof window === 'undefined') {
-			parsed = parseWebSearchResult(resultRaw, argsRaw);
-			return;
-		}
-
-		// Let the expand click paint first. The parse is usually quick, but doing
-		// it in the same frame as the pointerup makes the row feel sticky.
-		parseFrame = window.requestAnimationFrame(() => {
-			parseFrame = null;
-			parseTimeout = setTimeout(() => {
-				parseTimeout = null;
-				if (generation === parseGeneration) {
-					parsed = parseWebSearchResult(resultRaw, argsRaw);
-				}
-			}, 0);
-		});
+		// Search results are small; parsing them synchronously avoids the slide
+		// transition measuring a short skeleton and then growing a second time.
+		parsed = parseWebSearchResult(resultRaw, argsRaw);
 	};
 
 	$: {
@@ -75,11 +44,6 @@
 			: parsed.results
 		: [];
 	$: visibleResults = filteredResults.slice(0, visibleCount);
-
-	onDestroy(() => {
-		clearScheduledParse();
-		parseGeneration += 1;
-	});
 
 	const searchResultMatches = (result: WebSearchItem, query: string) => {
 		return [result.title, result.url, result.domain, result.snippet]

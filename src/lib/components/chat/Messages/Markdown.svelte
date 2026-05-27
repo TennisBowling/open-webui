@@ -16,6 +16,7 @@
 	export let model = null;
 	export let save = false;
 	export let preview = false;
+	export let parseImmediately = false;
 
 	export let chatId = '';
 	export let messageId = '';
@@ -63,6 +64,21 @@
 	};
 
 	const scheduleParse = () => {
+		// Static, already-complete disclosure bodies need their final height before
+		// the parent slide transition measures them. Keep the default small done
+		// delay for normal message rendering, but let callers opt into eager parse.
+		if (done && parseImmediately) {
+			if (parseTimeout) {
+				clearTimeout(parseTimeout);
+			}
+			if (pendingContent !== null) {
+				parseContent(pendingContent);
+				pendingContent = null;
+			}
+			parseTimeout = null;
+			return;
+		}
+
 		// If done, clear any pending timeouts and parse immediately with minimal delay
 		if (done) {
 			if (parseTimeout) {

@@ -21,6 +21,7 @@
 	export let resultRaw: unknown = '';
 
 	const PREVIEW_CHARS = 1100;
+	const EAGER_PARSE_MAX_CHARS = 350_000;
 
 	let filter = '';
 	let expandedPage: number | null = null;
@@ -46,19 +47,34 @@
 		}
 	};
 
+	const estimateResultSize = (raw: unknown) => {
+		if (typeof raw === 'string') return raw.length;
+		if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+			const obj = raw as Record<string, unknown>;
+			if (typeof obj.content === 'string') return obj.content.length;
+			if (typeof obj.result === 'string') return obj.result.length;
+		}
+		try {
+			return JSON.stringify(raw ?? '').length;
+		} catch {
+			return 0;
+		}
+	};
+
 	const scheduleParse = () => {
 		clearScheduledParse();
 		parsed = null;
 		expandedPage = null;
 		const generation = ++parseGeneration;
 
-		if (typeof window === 'undefined') {
+		if (typeof window === 'undefined' || estimateResultSize(resultRaw) <= EAGER_PARSE_MAX_CHARS) {
 			parsed = parseWebFetchResult(resultRaw);
 			return;
 		}
 
-		// web_fetch can be very large. Paint the opened shell first, then parse
-		// during idle time so the click/expand interaction stays smooth.
+		// Truly large web_fetch outputs can still be expensive. Keep those on the
+		// idle path, but parse normal-sized fetches before the slide transition so
+		// the dropdown does not first open to the loading shell and then grow again.
 		parseFrame = window.requestAnimationFrame(() => {
 			parseFrame = null;
 			const idleWindow = window as any;

@@ -86,6 +86,29 @@
 		}
 	}
 
+	async function toggleToolCallOpen() {
+		if (disabled) return;
+
+		if (open) {
+			open = false;
+			return;
+		}
+
+		// The web result body is code-split and then parses/render large result
+		// trees. If the slide transition starts while the chunk is still resolving,
+		// it measures the tiny loading shell and then visibly grows a second time.
+		// Resolve the chunk before opening so the transition measures the real body.
+		if (isWebToolName(attributes?.name)) {
+			try {
+				await loadToolCallResult();
+			} catch {
+				// Fall through and let the existing {#await} branch show its fallback.
+			}
+		}
+
+		open = true;
+	}
+
 	onMount(() => {
 		if (!isWebToolName(attributes?.name)) return;
 
@@ -167,11 +190,7 @@
 				class="{buttonClassName} cursor-pointer"
 				on:pointerenter={preloadToolCallResult}
 				on:pointerdown={preloadToolCallResult}
-				on:pointerup={() => {
-					if (!disabled) {
-						open = !open;
-					}
-				}}
+				on:pointerup={toggleToolCallOpen}
 			>
 				<div
 					class=" w-full font-medium flex items-center justify-between gap-2 {attributes?.done &&
@@ -201,6 +220,7 @@
 						{:else if attributes?.done === 'true'}
 							<Markdown
 								id={`${collapsibleId}-tool-calls-${attributes?.id}`}
+								parseImmediately={true}
 								content={$i18n.t('View Result from **{{NAME}}**', {
 									NAME: attributes.name
 								})}
@@ -208,6 +228,7 @@
 						{:else}
 							<Markdown
 								id={`${collapsibleId}-tool-calls-${attributes?.id}-executing`}
+								parseImmediately={true}
 								content={$i18n.t('Executing **{{NAME}}**...', {
 									NAME: attributes.name
 								})}
@@ -259,6 +280,7 @@
 								{@const result = decode(rawResult)}
 								<Markdown
 									id={`${collapsibleId}-tool-calls-${attributes?.id}-result`}
+									parseImmediately={true}
 									content={`> \`\`\`json
 > ${formatJSONString(args)}
 > ${formatJSONString(result)}
@@ -267,6 +289,7 @@
 							{:else}
 								<Markdown
 									id={`${collapsibleId}-tool-calls-${attributes?.id}-result`}
+									parseImmediately={true}
 									content={`> \`\`\`json
 > ${formatJSONString(args)}
 > \`\`\``}
