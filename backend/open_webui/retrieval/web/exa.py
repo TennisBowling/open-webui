@@ -46,19 +46,21 @@ async def _post_exa_json(
     path: str,
     payload: dict,
     timeout_seconds: int,
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> dict:
     """POST JSON to Exa and return decoded JSON with good error context."""
     headers = {
         "x-api-key": api_key,
         "Content-Type": "application/json",
     }
-
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
+
+    async def run_with_session(active_session: aiohttp.ClientSession):
+        async with active_session.post(
             f"{EXA_API_BASE}{path}",
             headers=headers,
             json=payload,
+            timeout=timeout,
         ) as response:
             response_text = await response.text()
 
@@ -72,6 +74,12 @@ async def _post_exa_json(
             except Exception as e:
                 raise Exception(f"Exa API {path} returned invalid JSON: {e}")
 
+    if session is not None and not session.closed:
+        return await run_with_session(session)
+
+    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+        return await run_with_session(owned_session)
+
 
 async def search_exa(
     api_key: str,
@@ -80,6 +88,7 @@ async def search_exa(
     search_type: str = "auto",
     include_domains: Optional[List[str]] = None,
     exclude_domains: Optional[List[str]] = None,
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> List[SearchResult]:
     """
     Search using Exa Search API and return the results.
@@ -92,6 +101,7 @@ async def search_exa(
         search_type: Search type - "auto", "neural", or "keyword"
         include_domains: List of domains to include in search
         exclude_domains: List of domains to exclude from search
+        session: Optional shared aiohttp session to reuse pooled connections.
 
     Returns:
         List of SearchResult objects with link, title, and snippet
@@ -123,6 +133,7 @@ async def search_exa(
             path="/search",
             payload=payload,
             timeout_seconds=30,
+            session=session,
         )
 
         results = []
@@ -155,6 +166,7 @@ async def fetch_exa_contents(
     urls: List[str],
     max_characters: int = 10000,
     livecrawl: str = "fallback",
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> List[ExaContentResult]:
     """
     Fetch full content from URLs using Exa Contents API.
@@ -167,6 +179,7 @@ async def fetch_exa_contents(
         urls: List of URLs to fetch content from
         max_characters: Maximum characters to return per page
         livecrawl: Crawl mode - "never", "fallback", "always"
+        session: Optional shared aiohttp session to reuse pooled connections.
 
     Returns:
         List of ExaContentResult objects with full text content
@@ -192,6 +205,7 @@ async def fetch_exa_contents(
             path="/contents",
             payload=payload,
             timeout_seconds=60,
+            session=session,
         )
 
         results = []

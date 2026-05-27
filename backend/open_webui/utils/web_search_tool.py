@@ -74,7 +74,10 @@ class WebSearchTools:
             include_domains = getattr(config, 'EXA_INCLUDE_DOMAINS', [])
             exclude_domains = getattr(config, 'EXA_EXCLUDE_DOMAINS', [])
 
-            # Perform the search with async HTTP I/O.
+            # Perform the search with async HTTP I/O. Reuse the app-level
+            # aiohttp session so a burst of subagent web searches does not pay
+            # a fresh TCP/TLS setup cost per tool call.
+            http_session = getattr(__request__.app.state, "http_session", None)
             results = await search_exa(
                 api_key=config.EXA_API_KEY,
                 query=query,
@@ -82,6 +85,7 @@ class WebSearchTools:
                 search_type=search_type,
                 include_domains=include_domains if include_domains else None,
                 exclude_domains=exclude_domains if exclude_domains else None,
+                session=http_session,
             )
 
             if not results:
@@ -159,7 +163,11 @@ class WebSearchTools:
             viewport_height = getattr(config, 'JINA_READER_VIEWPORT_HEIGHT', 12000)
             timeout_seconds = getattr(config, 'JINA_READER_TIMEOUT', 30)
 
-            # Fetch content
+            # Fetch content. Reuse the app-level aiohttp session; the per-call
+            # semaphore below still limits Jina concurrency for this tool
+            # invocation, while the shared connector avoids repeated TLS/DNS
+            # setup across many simultaneous subagents.
+            http_session = getattr(__request__.app.state, "http_session", None)
             results = await fetch_jina_contents(
                 api_key=config.JINA_API_KEY,
                 urls=url_list,
@@ -167,6 +175,7 @@ class WebSearchTools:
                 viewport_height=viewport_height,
                 timeout_seconds=timeout_seconds,
                 max_concurrency=max_urls,
+                session=http_session,
             )
 
             total_usage_tokens = sum(getattr(result, 'usage_tokens', 0) for result in results)

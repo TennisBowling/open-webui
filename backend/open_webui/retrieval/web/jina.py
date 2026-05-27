@@ -165,6 +165,7 @@ async def fetch_jina_contents(
     viewport_height: int = 12000,
     timeout_seconds: int = 30,
     max_concurrency: int = 5,
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> List[JinaContentResult]:
     """
     Fetch full content from URLs using Jina Reader's POST JSON API.
@@ -176,6 +177,8 @@ async def fetch_jina_contents(
         viewport_height: Browser viewport height sent in the request body.
         timeout_seconds: Jina Reader timeout sent via `X-Timeout`.
         max_concurrency: Maximum concurrent Jina requests.
+        session: Optional shared aiohttp session. When provided, reuse it
+            instead of creating a short-lived session per web_fetch call.
 
     Returns:
         JinaContentResult objects in the same order as the requested URLs, with
@@ -191,17 +194,14 @@ async def fetch_jina_contents(
 
     log.info("Jina Reader fetch for %s URL(s)", len(urls))
 
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds + 10)
-    connector = aiohttp.TCPConnector(limit=max_concurrency, ttl_dns_cache=300)
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-
+    async def run_with_session(active_session: aiohttp.ClientSession):
         async def guarded_fetch(fetch_url: str):
             async with semaphore:
                 try:
                     return await _fetch_jina_content(
-                        session=session,
+                        session=active_session,
                         api_key=api_key,
                         url=fetch_url,
                         viewport_width=viewport_width,
@@ -212,7 +212,15 @@ async def fetch_jina_contents(
                     log.warning("Jina Reader fetch failed for %s: %s", fetch_url, e)
                     return None
 
-        results = await asyncio.gather(*(guarded_fetch(url) for url in urls))
+        return await asyncio.gather(*(guarded_fetch(url) for url in urls))
+
+    if session is not None and not session.closed:
+        results = await run_with_session(session)
+    else:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds + 10)
+        connector = aiohttp.TCPConnector(limit=max_concurrency, ttl_dns_cache=300)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as owned_session:
+            results = await run_with_session(owned_session)
 
     successful_results = [result for result in results if result is not None]
     log.info("Jina Reader returned content for %s URL(s)", len(successful_results))

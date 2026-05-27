@@ -285,6 +285,110 @@ def _subagent_placeholder_block(run: dict) -> dict:
     return block
 
 
+def _final_text_from_blocks_for_parent(content_blocks: list[dict]) -> str:
+    """Return only the synthesized trailing text from a subagent transcript.
+
+    Parent-visible subagent updates do not need the full serialized transcript
+    (especially not web_fetch bodies inside tool result attributes). Keep the
+    hidden subagent chat as the source of truth for the full transcript; the
+    parent transport only needs enough text for a final preview.
+    """
+    if not isinstance(content_blocks, list):
+        return ""
+
+    last_text_blocks: list[dict] = []
+    for block in reversed(content_blocks):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            last_text_blocks.insert(0, block)
+        elif btype in ("tool_calls", "code_interpreter"):
+            break
+        elif btype == "reasoning":
+            continue
+
+    return blocks_to_plain_text(last_text_blocks).strip() if last_text_blocks else ""
+
+
+def _slim_tool_result_for_parent(result: Any) -> dict:
+    """Strip heavy tool result bodies before forwarding inner subagent state.
+
+    A subagent's parent-card UI only needs to know that an inner tool call
+    finished. The full web_search/web_fetch/tool bodies remain persisted in the
+    hidden subagent chat row and are available when the user opens that chat.
+    Sending them through chat:subagent:update is pure transport/JSON/socket CPU.
+    """
+    if not isinstance(result, dict):
+        return {"tool_call_id": "", "result_truncated": True}
+
+    slim: dict = {"tool_call_id": result.get("tool_call_id", "")}
+    if result.get("subagent_id"):
+        slim["subagent_id"] = result.get("subagent_id")
+    if result.get("content"):
+        slim["result_truncated"] = True
+    if result.get("files"):
+        slim["files_truncated"] = True
+    if result.get("embeds"):
+        slim["embeds_truncated"] = True
+    return slim
+
+
+def _slim_content_blocks_for_parent(content_blocks: list[dict]) -> list[dict]:
+    if not isinstance(content_blocks, list):
+        return []
+
+    slim_blocks: list[dict] = []
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            slim_blocks.append(block)
+            continue
+
+        slim_block = dict(block)
+        if block.get("type") == "tool_calls" and isinstance(block.get("results"), list):
+            slim_block["results"] = [
+                _slim_tool_result_for_parent(result)
+                for result in block.get("results") or []
+            ]
+        slim_blocks.append(slim_block)
+    return slim_blocks
+
+
+def _slim_inner_event_for_parent(inner_event: dict) -> dict:
+    """Remove inner subagent tool bodies from parent-forwarded events only."""
+    if not isinstance(inner_event, dict):
+        return inner_event
+
+    etype = inner_event.get("type")
+    if etype == "tool_call:result":
+        data = dict(inner_event.get("data") or {})
+        if data.get("result"):
+            data["result_truncated"] = True
+        if data.get("files"):
+            data["files_truncated"] = True
+        if data.get("embeds"):
+            data["embeds_truncated"] = True
+        data["result"] = ""
+        data.pop("files", None)
+        data.pop("embeds", None)
+        return {**inner_event, "data": data}
+
+    if etype == "chat:completion":
+        data = dict(inner_event.get("data") or {})
+        content_blocks = data.get("content_blocks")
+        if isinstance(content_blocks, list):
+            data["content_blocks"] = _slim_content_blocks_for_parent(content_blocks)
+            if "content" in data:
+                data["content"] = (
+                    _final_text_from_blocks_for_parent(content_blocks)
+                    if data.get("done") is True
+                    else ""
+                )
+        return {**inner_event, "data": data}
+
+    return inner_event
+
+
 def _sync_parent_subagent_placeholder(
     parent_chat_id: str, parent_message_id: str, run: dict
 ) -> None:
@@ -566,11 +670,12 @@ def _build_forwarding_emitter(
         )
 
     async def _emit_parent(inner_event: dict) -> None:
+        parent_inner_event = _slim_inner_event_for_parent(inner_event)
         payload_data = {
             "type": "chat:subagent:update",
             "data": {
                 **subagent_meta,
-                "inner_event": inner_event,
+                "inner_event": parent_inner_event,
             },
         }
         # Under v2 ship via emit_to_primary so the envelope goes to the
@@ -633,12 +738,16 @@ def _build_forwarding_emitter(
                     payload = {
                         "message_id": inner_message_id,
                         "tool_call_id": tc_id,
-                        "result": r.get("content"),
+                        "result": "",
                     }
+                    if r.get("subagent_id"):
+                        payload["subagent_id"] = r["subagent_id"]
+                    if r.get("content"):
+                        payload["result_truncated"] = True
                     if r.get("files"):
-                        payload["files"] = r["files"]
+                        payload["files_truncated"] = True
                     if r.get("embeds"):
-                        payload["embeds"] = r["embeds"]
+                        payload["embeds_truncated"] = True
                     await _emit_parent({"type": "tool_call:result", "data": payload})
 
         if isinstance(content_blocks, list):

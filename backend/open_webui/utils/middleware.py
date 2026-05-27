@@ -2846,6 +2846,36 @@ async def process_chat_response(
                 else:
                     reasoning_tags = DEFAULT_REASONING_TAGS
 
+            # Avoid copying the whole growing plain-text response on every SSE
+            # chunk. The structured block content is still updated for live
+            # rendering/replay, but this legacy `content` string is only needed
+            # when inline tag parsing is enabled and for final webhook text.
+            content_parts = [content] if content else []
+            content_dirty = False
+
+            def append_plain_content(value: str):
+                nonlocal content, content_parts, content_dirty
+                if not value:
+                    return
+                content_parts.append(value)
+                content_dirty = True
+                if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                    content = "".join(content_parts)
+                    content_dirty = False
+
+            def reset_plain_content(value: str):
+                nonlocal content, content_parts, content_dirty
+                content = value or ""
+                content_parts = [content] if content else []
+                content_dirty = False
+
+            def get_plain_content() -> str:
+                nonlocal content, content_dirty
+                if content_dirty:
+                    content = "".join(content_parts)
+                    content_dirty = False
+                return content
+
             try:
                 for event in events:
                     await event_emitter(
@@ -3336,7 +3366,7 @@ async def process_chat_response(
                                                 }
                                             )
 
-                                        content = f"{content}{value}"
+                                        append_plain_content(value)
                                         if not content_blocks:
                                             content_blocks.append(
                                                 {
@@ -3377,9 +3407,12 @@ async def process_chat_response(
                                                     content_blocks,
                                                 )
                                             )
+                                            reset_plain_content(content)
 
                                             if end:
                                                 break
+                                        elif DETECT_REASONING_TAGS:
+                                            reset_plain_content(content)
 
                                         if ENABLE_REALTIME_CHAT_SAVE:
                                             # Save message in the database.
@@ -3876,7 +3909,7 @@ async def process_chat_response(
                                 if not content_blocks or content_blocks[-1]["type"] != "text":
                                     content_blocks.append({"type": "text", "content": ""})
                                 content_blocks[-1]["content"] += msg_content
-                                content = f"{content}{msg_content}"
+                                append_plain_content(msg_content)
                                 
                                 while True:
                                     prev_content = content
@@ -3888,6 +3921,8 @@ async def process_chat_response(
                                         
                                     if content == prev_content:
                                         break
+                                if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                                    reset_plain_content(content)
                             
                             # Process tool calls
                             res_tool_calls = message.get("tool_calls")
@@ -4156,7 +4191,7 @@ async def process_chat_response(
                                     if not content_blocks or content_blocks[-1]["type"] != "text":
                                         content_blocks.append({"type": "text", "content": ""})
                                     content_blocks[-1]["content"] += msg_content
-                                    content = f"{content}{msg_content}"
+                                    append_plain_content(msg_content)
                                     
                                     while True:
                                         prev_content = content
@@ -4168,6 +4203,8 @@ async def process_chat_response(
                                             
                                         if content == prev_content:
                                             break
+                                    if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                                        reset_plain_content(content)
                                 
                                 # Process tool calls
                                 res_tool_calls = message.get("tool_calls")
@@ -4295,13 +4332,14 @@ async def process_chat_response(
                 if not get_active_status_by_user_id(user.id):
                     webhook_url = Users.get_user_webhook_url_by_id(user.id)
                     if webhook_url:
+                        plain_content = get_plain_content()
                         await post_webhook(
                             request.app.state.WEBUI_NAME,
                             webhook_url,
-                            f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content}",
+                            f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{plain_content}",
                             {
                                 "action": "chat",
-                                "message": content,
+                                "message": plain_content,
                                 "title": title,
                                 "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
                             },
