@@ -392,7 +392,11 @@ def _slim_inner_event_for_parent(inner_event: dict) -> dict:
 
 
 def _sync_parent_subagent_placeholder(
-    parent_chat_id: str, parent_message_id: str, run: dict
+    parent_chat_id: str,
+    parent_message_id: str,
+    run: dict,
+    *,
+    allow_append: bool = True,
 ) -> None:
     """Make reloads deterministic while the parent response is mid-tool-call.
 
@@ -402,6 +406,10 @@ def _sync_parent_subagent_placeholder(
     subagent_runs immediately, so mirror a minimal placeholder into the parent
     assistant message whenever a run changes. Later, middleware's final
     end-of-stream save overwrites this with the canonical full content_blocks.
+
+    User-initiated reruns pass ``allow_append=False``. Reruns happen after the
+    parent message already has canonical content_blocks, so appending a new
+    synthetic tool_calls block would look like the parent model continued.
     """
     if not parent_chat_id or parent_chat_id.startswith("local:"):
         return
@@ -426,6 +434,7 @@ def _sync_parent_subagent_placeholder(
         if isinstance(existing_blocks, list):
             blocks = list(existing_blocks)
             found = False
+            blocks_changed = False
             for block in blocks:
                 if not isinstance(block, dict) or block.get("type") != "tool_calls":
                     continue
@@ -434,10 +443,46 @@ def _sync_parent_subagent_placeholder(
                     if isinstance(block.get("content"), list)
                     else []
                 )
-                if not any(
-                    isinstance(c, dict) and c.get("id") == tool_call_id
-                    for c in calls
-                ):
+                results = (
+                    block.get("results")
+                    if isinstance(block.get("results"), list)
+                    else []
+                )
+                matched_tool_call_id = ""
+                for call in calls:
+                    if isinstance(call, dict) and _tool_call_id(call) == tool_call_id:
+                        matched_tool_call_id = tool_call_id
+                        break
+
+                # Old entries can be missing tool_call_id. In that case the
+                # safety validator can still find the parent block by the saved
+                # result's subagent_id; mirror that fallback here so a redo can
+                # update the canonical result instead of appending a duplicate.
+                if not matched_tool_call_id:
+                    wanted_subagent_id = str(
+                        run.get("subagent_id") or run.get("chat_id") or ""
+                    )
+                    result_call_ids = {
+                        str(r.get("tool_call_id") or "")
+                        for r in results
+                        if isinstance(r, dict)
+                        and wanted_subagent_id
+                        and r.get("subagent_id") == wanted_subagent_id
+                        and r.get("tool_call_id")
+                    }
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        call_id = _tool_call_id(call)
+                        if (
+                            call_id
+                            and call_id in result_call_ids
+                            and _subagent_tool_name(call) in _SUBAGENT_TOOL_NAMES
+                        ):
+                            matched_tool_call_id = call_id
+                            break
+
+                if not matched_tool_call_id:
                     continue
                 found = True
                 # Patch the result/subagent_id into an already-present tool_calls
@@ -445,28 +490,31 @@ def _sync_parent_subagent_placeholder(
                 # running, but the completion result was persisted via
                 # subagent_runs before middleware's final content_blocks save.
                 if _subagent_run_is_terminal(run):
-                    results = (
-                        block.get("results")
-                        if isinstance(block.get("results"), list)
-                        else []
-                    )
-                    result = placeholder_block.get("results", [{}])[0]
+                    result = dict(placeholder_block.get("results", [{}])[0])
+                    result["tool_call_id"] = matched_tool_call_id
                     replaced = False
                     for idx, existing_result in enumerate(results):
                         if (
                             isinstance(existing_result, dict)
-                            and existing_result.get("tool_call_id") == tool_call_id
+                            and existing_result.get("tool_call_id") == matched_tool_call_id
                         ):
-                            results[idx] = {**existing_result, **result}
+                            merged_result = {**existing_result, **result}
+                            if merged_result != existing_result:
+                                results[idx] = merged_result
+                                blocks_changed = True
                             replaced = True
                             break
                     if not replaced:
                         results.append(result)
-                    block["results"] = results
+                        blocks_changed = True
+                    if blocks_changed:
+                        block["results"] = results
                 break
-            if not found:
+            if not found and allow_append:
                 blocks.append(placeholder_block)
-            update_data["content_blocks"] = blocks
+                blocks_changed = True
+            if blocks_changed:
+                update_data["content_blocks"] = blocks
         else:
             # If the message has no structured blocks yet (the common reload-
             # while-running gap), install a one-block placeholder. Also do it
@@ -490,7 +538,7 @@ def _sync_parent_subagent_placeholder(
         existing_content = (
             message.get("content") if isinstance(message.get("content"), str) else ""
         )
-        if tool_call_id not in existing_content:
+        if allow_append and tool_call_id not in existing_content:
             placeholder_html = _subagent_placeholder_html(run)
             update_data["content"] = (
                 f"{existing_content.rstrip()}\n{placeholder_html}".strip()
@@ -505,7 +553,13 @@ def _sync_parent_subagent_placeholder(
 
 
 def _upsert_subagent_run(
-    parent_chat_id: str, parent_message_id: str, subagent_id: str, patch: dict
+    parent_chat_id: str,
+    parent_message_id: str,
+    subagent_id: str,
+    patch: dict,
+    *,
+    sync_placeholder: bool = True,
+    allow_placeholder_append: bool = True,
 ) -> None:
     """Merge ``patch`` into ``parent_message.subagent_runs[subagent_id]``,
     preserving other keys and sibling subagents. Idempotent — safe to call
@@ -539,9 +593,13 @@ def _upsert_subagent_run(
         Chats.upsert_message_to_chat_by_id_and_message_id(
             parent_chat_id, parent_message_id, {"subagent_runs": new_runs}
         )
-        _sync_parent_subagent_placeholder(
-            parent_chat_id, parent_message_id, merged_run
-        )
+        if sync_placeholder:
+            _sync_parent_subagent_placeholder(
+                parent_chat_id,
+                parent_message_id,
+                merged_run,
+                allow_append=allow_placeholder_append,
+            )
         print(
             f"!! _upsert_subagent_run COMMITTED sa={subagent_id} runs={len(new_runs)}",
             flush=True,
@@ -2011,6 +2069,105 @@ def _tool_call_id(call: dict) -> str:
     return str(call.get("id") or call.get("tool_call_id") or "")
 
 
+def _subagent_tool_name(call: dict) -> str:
+    return str((call.get("function") or {}).get("name") or "")
+
+
+def _run_placeholder_ids(entry_key: str, run: dict) -> set[str]:
+    """Identifiers a synthetic placeholder may use for one subagent run."""
+    ids = {
+        str(v)
+        for v in (
+            entry_key,
+            run.get("entry_key"),
+            run.get("tool_call_id"),
+        )
+        if v
+    }
+    # Launch entries are keyed by subagent_id. Continuations share the same
+    # subagent_id, so never use bare subagent_id as a continuation alias here.
+    if not run.get("continuation"):
+        ids.update(
+            str(v)
+            for v in (run.get("subagent_id"), run.get("chat_id"))
+            if v
+        )
+    return ids
+
+
+def _subagent_run_lookup_by_placeholder_id(parent_message: dict) -> dict[str, str]:
+    runs = (
+        parent_message.get("subagent_runs")
+        if isinstance(parent_message, dict)
+        else None
+    )
+    if not isinstance(runs, dict):
+        return {}
+
+    lookup: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for entry_key, run in runs.items():
+        if not isinstance(run, dict):
+            continue
+        for identifier in _run_placeholder_ids(str(entry_key), run):
+            if identifier in lookup and lookup[identifier] != str(entry_key):
+                ambiguous.add(identifier)
+                continue
+            lookup[identifier] = str(entry_key)
+    for identifier in ambiguous:
+        lookup.pop(identifier, None)
+    return lookup
+
+
+def _duplicate_subagent_placeholder_block(
+    parent_message: dict, prior_blocks: list[Any], block: Any
+) -> bool:
+    """True for rerun-created duplicate subagent placeholders.
+
+    Older code could append a synthetic subagent tool_calls block after the
+    canonical parent tool-call block. That block is not parent-model output and
+    must not make future redos look consumed.
+    """
+    if not isinstance(block, dict) or block.get("type") != "tool_calls":
+        return False
+    calls = block.get("content") if isinstance(block.get("content"), list) else []
+    if not calls:
+        return False
+
+    lookup = _subagent_run_lookup_by_placeholder_id(parent_message)
+    if not lookup:
+        return False
+
+    prior_run_keys: set[str] = set()
+    for prior in prior_blocks:
+        if not isinstance(prior, dict) or prior.get("type") != "tool_calls":
+            continue
+        prior_calls = (
+            prior.get("content") if isinstance(prior.get("content"), list) else []
+        )
+        for call in prior_calls:
+            if not isinstance(call, dict):
+                continue
+            if _subagent_tool_name(call) not in _SUBAGENT_TOOL_NAMES:
+                continue
+            run_key = lookup.get(_tool_call_id(call))
+            if run_key:
+                prior_run_keys.add(run_key)
+
+    if not prior_run_keys:
+        return False
+
+    for call in calls:
+        if not isinstance(call, dict):
+            return False
+        if _subagent_tool_name(call) not in _SUBAGENT_TOOL_NAMES:
+            return False
+        run_key = lookup.get(_tool_call_id(call))
+        if not run_key or run_key not in prior_run_keys:
+            return False
+    return True
+
+
 def _block_has_meaningful_parent_output(block: Any) -> bool:
     """True when a block after the target tool-call block proves the parent
     model has already continued from that tool result.
@@ -2054,12 +2211,18 @@ def _find_parent_tool_call_block(
     ``reasoning_details_per_round`` to catch parent reasoning that started
     after the tool result even if no visible text was emitted before Stop.
     """
-    blocks = parent_message.get("content_blocks") if isinstance(parent_message, dict) else None
+    blocks = (
+        parent_message.get("content_blocks")
+        if isinstance(parent_message, dict)
+        else None
+    )
     if not isinstance(blocks, list):
         return None
 
     wanted_tool_call_id = str(run_entry.get("tool_call_id") or "")
-    wanted_subagent_id = str(run_entry.get("subagent_id") or run_entry.get("chat_id") or "")
+    wanted_subagent_id = str(
+        run_entry.get("subagent_id") or run_entry.get("chat_id") or ""
+    )
     fallback_match: Optional[tuple[int, int]] = None
     tool_round_number = 0
 
@@ -2133,7 +2296,12 @@ def _validate_parent_subagent_result_unconsumed(
 
     block_idx, tool_round_number = found
     blocks = parent_message.get("content_blocks") or []
+    prior_blocks = blocks[: block_idx + 1]
     for later_block in blocks[block_idx + 1 :]:
+        if _duplicate_subagent_placeholder_block(
+            parent_message, prior_blocks, later_block
+        ):
+            continue
         if _block_has_meaningful_parent_output(later_block):
             _rerun_blocked(
                 "Cannot redo subagent: the parent model already continued after this result."
@@ -2281,7 +2449,13 @@ async def rerun_subagent_turn(
                     and run.get("subagent_id") == subagent_id
                     and k != write_entry_key
                 ):
-                    _upsert_subagent_run(parent_chat_id, m_id, k, {"stale": True})
+                    _upsert_subagent_run(
+                        parent_chat_id,
+                        m_id,
+                        k,
+                        {"stale": True},
+                        sync_placeholder=False,
+                    )
     else:
         # this_turn: revert just this entry's user→assistant pair. The guard
         # above proved that pair is the hidden subagent chat's current leaf, so
@@ -2366,6 +2540,7 @@ async def rerun_subagent_turn(
             "error": None,
             "stale": False,
         },
+        allow_placeholder_append=False,
     )
 
     # Tell the UI a rerun is starting. Same event the original launch used —
@@ -2391,6 +2566,7 @@ async def rerun_subagent_turn(
                 "user_msg_id": user_msg_id,
                 "assistant_msg_id": assistant_msg_id,
             },
+            allow_placeholder_append=False,
         )
         try:
             final_text = await _run_inner_chat(
@@ -2420,6 +2596,7 @@ async def rerun_subagent_turn(
                     "ended_at": int(time.time()),
                     "final_text": final_text,
                 },
+                allow_placeholder_append=False,
             )
             return
         except asyncio.CancelledError:
@@ -2433,6 +2610,7 @@ async def rerun_subagent_turn(
                     "status": "cancelled",
                     "ended_at": int(time.time()),
                 },
+                allow_placeholder_append=False,
             )
             await _emit_subagent_cancel(
                 parent_event_emitter,
@@ -2466,6 +2644,7 @@ async def rerun_subagent_turn(
                     "ended_at": int(time.time()),
                     "error": {"message": last_error},
                 },
+                allow_placeholder_append=False,
             )
             return
 

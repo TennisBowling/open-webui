@@ -201,6 +201,19 @@
 		}
 	}
 
+	// True when the store holds real, displayable numbers (as opposed to the
+	// all-zero placeholder a cold first fetch starts with). During streaming the
+	// refresh trigger fires on every usage delta, and each fetch flips
+	// `loading: true` while preserving the last good values. We use this to keep
+	// the populated box rendered through those refreshes instead of swapping in
+	// the `···` pulse — otherwise the box flashes in and out on every delta.
+	$: hasData =
+		!!$chatTokenStats &&
+		($chatTokenStats.total_tokens > 0 ||
+			$chatTokenStats.message_count > 0 ||
+			$chatTokenStats.last_input_tokens > 0 ||
+			$chatTokenStats.total_output_tokens > 0);
+
 	onDestroy(() => {
 		clearRetry();
 		// Intentionally do NOT clear the store on destroy. If a new ChatTokenStats
@@ -213,7 +226,7 @@
 	});
 </script>
 
-{#if $chatTokenStats && !$chatTokenStats.loading}
+{#if hasData}
 	<Tooltip
 		content={`
 			<div class="text-xs space-y-1">
