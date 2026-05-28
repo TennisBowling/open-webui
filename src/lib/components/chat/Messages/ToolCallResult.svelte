@@ -6,6 +6,7 @@
 
 	import { copyToClipboard } from '$lib/utils';
 	import { decodeToolResultText, formatToolValue } from '$lib/utils/toolResults';
+	import { getChatMessageToolResult } from '$lib/apis/chats';
 	import WebFetchResult from './ToolResults/WebFetchResult.svelte';
 	import WebSearchResult from './ToolResults/WebSearchResult.svelte';
 
@@ -15,9 +16,11 @@
 	export let name = '';
 	export let argsRaw: unknown = '';
 	export let resultRaw: unknown = '';
+	export let resultLazy = false;
+	export let chatId = '';
+	export let messageId = '';
+	export let toolCallId = '';
 	export let done = true;
-
-	type Tab = 'result' | 'request' | 'raw';
 
 	const normalizeLiveResultRaw = (raw: unknown) => {
 		if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -28,11 +31,46 @@
 		return raw;
 	};
 
-	$: normalizedResultRaw = normalizeLiveResultRaw(resultRaw);
-
+	type Tab = 'result' | 'request' | 'raw';
 	const tabs: Tab[] = ['result', 'request', 'raw'];
-
 	let activeTab: Tab = 'result';
+
+	let fetchedResultRaw: unknown = null;
+	let fetchError = '';
+	let fetchPromise: Promise<void> | null = null;
+
+	const ensureLazyResult = async () => {
+		if (
+			!resultLazy ||
+			fetchedResultRaw !== null ||
+			fetchPromise ||
+			!chatId ||
+			!messageId ||
+			!toolCallId
+		) {
+			return;
+		}
+		fetchPromise = getChatMessageToolResult(localStorage.token, chatId, messageId, toolCallId)
+			.then((res) => {
+				fetchedResultRaw = normalizeLiveResultRaw(res);
+				fetchError = '';
+			})
+			.catch((err) => {
+				fetchError = String(err?.detail ?? err ?? 'Failed to load tool result');
+			})
+			.finally(() => {
+				fetchPromise = null;
+			});
+		await fetchPromise;
+	};
+
+	$: if (resultLazy && (activeTab === 'result' || activeTab === 'raw')) {
+		void ensureLazyResult();
+	}
+
+	$: normalizedResultRaw = normalizeLiveResultRaw(
+		resultLazy ? (fetchedResultRaw ?? resultRaw) : resultRaw
+	);
 
 	// Avoid eagerly decoding very large web_fetch results just to render the
 	// chrome. Decode request/raw text only when that tab is visible; the rich
@@ -48,6 +86,7 @@
 
 	const getActiveText = () => {
 		if (activeTab === 'request') return formatToolValue(argsRaw);
+		if (resultLazy && fetchedResultRaw === null) return '';
 		return decodeToolResultText(normalizedResultRaw);
 	};
 
@@ -96,6 +135,18 @@
 					class="rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
 				>
 					{$i18n.t('The tool is still running. The result will appear here when it finishes.')}
+				</div>
+			{:else if resultLazy && fetchedResultRaw === null && !fetchError}
+				<div
+					class="rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
+				>
+					{$i18n.t('Loading tool result…')}
+				</div>
+			{:else if fetchError}
+				<div
+					class="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
+				>
+					{fetchError}
 				</div>
 			{:else if name === 'web_search'}
 				<WebSearchResult id={`${id}-web-search`} resultRaw={normalizedResultRaw} {argsRaw} />

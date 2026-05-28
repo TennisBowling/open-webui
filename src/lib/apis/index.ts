@@ -382,10 +382,10 @@ export const getTaskIdsByChatId = async (token: string, chat_id: string) => {
 	return res;
 };
 
-export const getStreamSnapshot = async (token: string, message_id: string) => {
+export const getActiveStreamsByChatId = async (token: string, chat_id: string) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/streams/${message_id}/snapshot`, {
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/streams/chat/${chat_id}/active`, {
 		method: 'GET',
 		headers: {
 			Accept: 'application/json',
@@ -393,6 +393,48 @@ export const getStreamSnapshot = async (token: string, message_id: string) => {
 			...(token && { authorization: `Bearer ${token}` })
 		}
 	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			if (err && typeof err === 'object' && 'detail' in err) {
+				error = (err as any).detail;
+			} else {
+				error = err;
+			}
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getStreamSnapshot = async (
+	token: string,
+	message_id: string,
+	chat_id?: string | null
+) => {
+	let error = null;
+	const params = new URLSearchParams();
+	if (chat_id) params.set('chat_id', chat_id);
+	const query = params.toString();
+
+	const res = await fetch(
+		`${WEBUI_BASE_URL}/api/v1/streams/${message_id}/snapshot${query ? `?${query}` : ''}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
+		}
+	)
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
 			return res.json();

@@ -161,8 +161,14 @@
 		{@const rawResult = attributes?.result ?? ''}
 		{@const rawFiles = attributes?.files ?? ''}
 		{@const embeds = parseJSONString(decode(attributes?.embeds ?? ''))}
+		{@const summary = parseJSONString(decode(attributes?.summary ?? ''))}
 		{@const toolDone = attributes?.done === 'true'}
-		{@const toolSummary = getToolCallSummary(attributes?.name ?? '', args, rawResult, toolDone)}
+		{@const toolSummary = getToolCallSummary(
+			attributes?.name ?? '',
+			args,
+			summary ? { summary } : rawResult,
+			toolDone
+		)}
 
 		{#if embeds && Array.isArray(embeds) && embeds.length > 0}
 			<div class="py-1 w-full cursor-pointer">
@@ -273,6 +279,10 @@
 										name={attributes.name}
 										argsRaw={args}
 										resultRaw={rawResult}
+										resultLazy={attributes?.result_lazy === 'true'}
+										chatId={attributes?.chat_id ?? ''}
+										messageId={attributes?.message_id ?? ''}
+										toolCallId={attributes?.tool_call_id ?? attributes?.id ?? ''}
 										done={toolDone}
 									/>
 								{/await}

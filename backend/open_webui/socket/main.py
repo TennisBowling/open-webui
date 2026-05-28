@@ -1,11 +1,12 @@
 import asyncio
+import copy
 import random
 
 import socketio
 import logging
 import sys
 import time
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 from redis import asyncio as aioredis
 import pycrdt as Y
 
@@ -708,6 +709,36 @@ async def user_join(sid, data):
     return {"id": user.id, "name": user.name, "primary_session_id": primary_sid}
 
 
+@sio.on("stream:subscribe")
+async def stream_subscribe(sid, data):
+    user = SESSION_POOL.get(sid)
+    if not user:
+        return {"status": False, "error": "Session not found"}
+
+    chat_id = (data or {}).get("chat_id")
+    if not chat_id:
+        return {"status": False, "error": "Missing chat_id"}
+
+    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.get("id"))
+    if chat is None:
+        return {"status": False, "error": "Chat not found"}
+
+    await sio.enter_room(sid, stream_room(chat_id))
+    return {"status": True, "streams": get_active_streams_for_chat(chat_id)}
+
+
+@sio.on("stream:unsubscribe")
+async def stream_unsubscribe(sid, data):
+    chat_id = (data or {}).get("chat_id")
+    if not chat_id:
+        return {"status": False, "error": "Missing chat_id"}
+    try:
+        await sio.leave_room(sid, stream_room(chat_id))
+    except Exception:
+        pass
+    return {"status": True}
+
+
 @sio.on("join-channels")
 async def join_channel(sid, data):
     auth = data["auth"] if "auth" in data else None
@@ -1139,6 +1170,8 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                 )
 
+                if message is None:
+                    message = {}
                 embeds = event_data.get("data", {}).get("embeds", [])
                 embeds.extend(message.get("embeds", []))
 
@@ -1180,6 +1213,8 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                 )
 
+                if message is None:
+                    message = {}
                 files = event_data.get("data", {}).get("files", [])
                 files.extend(message.get("files", []))
 
@@ -1199,6 +1234,8 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                     )
 
+                    if message is None:
+                        message = {}
                     sources = message.get("sources", [])
                     sources.append(data)
 
@@ -1292,11 +1329,131 @@ def _schedule_stream_state_ttl_refresh() -> None:
         pass
 
 
-def stream_version_init(message_id) -> int:
+# Active stream indexes. In the common single-worker deployment these are
+# in-process RAM and are the authoritative source for reload-mid-generation
+# snapshots. Redis-backed deployments still use the RedisDict stores above, but
+# this code path is intentionally optimized for the single-worker case the app
+# runs by default.
+STREAM_MESSAGE_TO_CHAT: Dict[str, str] = {}
+STREAM_ACTIVE_BY_CHAT: Dict[str, Set[str]] = {}
+# Full large tool bodies are kept out of the socket hot path. Keyed by
+# message_id -> tool_call_id -> original result dict. In single-worker mode this
+# gives immediate lazy expansion during/after generation; final DB checkpoints
+# persist the same map for normal reloads.
+TOOL_RESULT_BODIES: Dict[str, Dict[str, dict]] = {}
+_STREAM_CLEANUP_TASKS: Dict[str, asyncio.Task] = {}
+STREAM_DONE_GRACE_SECONDS = 300
+STREAM_ROOM_PREFIX = "stream:chat:"
+STREAM_SCOPED_TYPES = frozenset(
+    {
+        "chat:delta",
+        "chat:delta:batch",
+        "tool_call:result",
+        "chat:subagent:update",
+        "chat:done",
+        "chat:message:error",
+        "chat:tasks:cancel",
+    }
+)
+
+
+def stream_room(chat_id: str) -> str:
+    return f"{STREAM_ROOM_PREFIX}{chat_id}"
+
+
+def _payload_type(payload) -> Optional[str]:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            return data.get("type")
+    except Exception:
+        pass
+    return None
+
+
+def _is_stream_scoped_payload(payload) -> bool:
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("chat_id")
+        and _payload_type(payload) in STREAM_SCOPED_TYPES
+    )
+
+
+def _cancel_stream_cleanup(message_id: str) -> None:
+    task = _STREAM_CLEANUP_TASKS.pop(message_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _index_stream(message_id: str, state: dict) -> None:
+    chat_id = state.get("chat_id")
+    if not chat_id:
+        return
+    STREAM_MESSAGE_TO_CHAT[message_id] = chat_id
+    status = state.get("status", "in_progress")
+    bucket = STREAM_ACTIVE_BY_CHAT.setdefault(chat_id, set())
+    if status == "in_progress":
+        bucket.add(message_id)
+    else:
+        bucket.discard(message_id)
+        if not bucket:
+            STREAM_ACTIVE_BY_CHAT.pop(chat_id, None)
+
+
+def _delete_stream_state_now(message_id: str) -> None:
+    _cancel_stream_cleanup(message_id)
+    chat_id = STREAM_MESSAGE_TO_CHAT.pop(message_id, None)
+    if chat_id:
+        bucket = STREAM_ACTIVE_BY_CHAT.get(chat_id)
+        if bucket:
+            bucket.discard(message_id)
+            if not bucket:
+                STREAM_ACTIVE_BY_CHAT.pop(chat_id, None)
+    TOOL_RESULT_BODIES.pop(message_id, None)
+    for store in (STREAM_VERSION, TOOL_RESULTS, STREAM_STATE):
+        try:
+            if message_id in store:
+                del store[message_id]
+        except Exception:
+            pass
+
+
+async def _delete_stream_state_later(message_id: str, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        _delete_stream_state_now(message_id)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("stream state cleanup failed")
+
+
+def stream_version_init(
+    message_id,
+    *,
+    chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    content_blocks=None,
+) -> int:
+    _cancel_stream_cleanup(str(message_id))
     try:
         STREAM_VERSION[message_id] = 0
     except Exception:
         pass
+    state = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "content_blocks": copy.deepcopy(content_blocks or []),
+        "status": "in_progress",
+        "updated_at": time.time(),
+    }
+    try:
+        STREAM_STATE[message_id] = state
+    except Exception:
+        pass
+    _index_stream(str(message_id), state)
     _schedule_stream_state_ttl_refresh()
     return 0
 
@@ -1323,23 +1480,82 @@ def stream_version_get(message_id) -> int:
 
 def set_stream_state(message_id, patch: dict) -> None:
     try:
-        existing = STREAM_STATE.get(message_id, {}) or {}
+        existing = copy.deepcopy(STREAM_STATE.get(message_id, {}) or {})
         if not isinstance(existing, dict):
             existing = {}
         if isinstance(patch, dict):
-            existing.update(patch)
+            existing.update(copy.deepcopy(patch))
+        existing["updated_at"] = time.time()
         STREAM_STATE[message_id] = existing
+        _index_stream(str(message_id), existing)
+    except Exception:
+        pass
+
+
+def get_stream_state(message_id) -> dict:
+    try:
+        existing = STREAM_STATE.get(message_id, {}) or {}
+        return copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_active_streams_for_chat(chat_id: str) -> list[dict]:
+    out = []
+    for message_id in list(STREAM_ACTIVE_BY_CHAT.get(chat_id, set()) or []):
+        state = get_stream_state(message_id)
+        if not state or state.get("status") != "in_progress":
+            continue
+        out.append(
+            {
+                "message_id": message_id,
+                "version": stream_version_get(message_id),
+                "status": state.get("status", "in_progress"),
+                "updated_at": state.get("updated_at"),
+            }
+        )
+    out.sort(key=lambda item: item.get("updated_at") or 0)
+    return out
+
+
+def set_tool_result_body(message_id, tool_call_id, result) -> None:
+    try:
+        by_message = TOOL_RESULT_BODIES.setdefault(str(message_id), {})
+        by_message[str(tool_call_id)] = copy.deepcopy(result)
+    except Exception:
+        pass
+
+
+def get_tool_result_body(message_id, tool_call_id):
+    try:
+        result = TOOL_RESULT_BODIES.get(str(message_id), {}).get(str(tool_call_id))
+        return copy.deepcopy(result)
+    except Exception:
+        return None
+
+
+def get_tool_result_bodies(message_id) -> dict:
+    try:
+        return copy.deepcopy(TOOL_RESULT_BODIES.get(str(message_id), {}) or {})
+    except Exception:
+        return {}
+
+
+def clear_tool_result_bodies(message_id) -> None:
+    try:
+        TOOL_RESULT_BODIES.pop(str(message_id), None)
     except Exception:
         pass
 
 
 def set_tool_result(message_id, tool_call_id, result) -> None:
     try:
-        existing = TOOL_RESULTS.get(message_id, {}) or {}
+        existing = copy.deepcopy(TOOL_RESULTS.get(message_id, {}) or {})
         if not isinstance(existing, dict):
             existing = {}
-        existing[tool_call_id] = result
+        existing[tool_call_id] = copy.deepcopy(result)
         TOOL_RESULTS[message_id] = existing
+        set_stream_state(message_id, {"tool_results_updated_at": time.time()})
     except Exception:
         pass
 
@@ -1347,26 +1563,38 @@ def set_tool_result(message_id, tool_call_id, result) -> None:
 def get_tool_results(message_id) -> dict:
     try:
         existing = TOOL_RESULTS.get(message_id, {}) or {}
-        return existing if isinstance(existing, dict) else {}
+        return copy.deepcopy(existing) if isinstance(existing, dict) else {}
     except Exception:
         return {}
 
 
-def clear_stream_state(message_id) -> None:
-    for store in (STREAM_VERSION, TOOL_RESULTS, STREAM_STATE):
-        try:
-            if message_id in store:
-                del store[message_id]
-        except Exception:
-            pass
+def clear_stream_state(message_id, delay: float = STREAM_DONE_GRACE_SECONDS) -> None:
+    """Retain terminal stream state briefly so a reload racing with chat:done
+    can still reconcile from RAM instead of falling back to a potentially stale
+    DB read. Passing delay<=0 deletes immediately."""
+    if delay <= 0:
+        _delete_stream_state_now(str(message_id))
+        return
+    _cancel_stream_cleanup(str(message_id))
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            _STREAM_CLEANUP_TASKS[str(message_id)] = loop.create_task(
+                _delete_stream_state_later(str(message_id), delay)
+            )
+            return
+    except Exception:
+        pass
+    # If no loop is available, keep state rather than risking reload races.
 
 
 async def emit_to_primary(user_id, payload):
-    """Emit a single events payload to the user's primary session only. Falls
-    back to all sessions if no primary is registered (defensive — keeps v2
-    working before B8 ships the election logic)."""
+    """Emit a single events payload. Stream-scoped v2 events route to the
+    current chat room plus origin socket; unrelated tabs do not receive token
+    deltas. Non-stream events retain the primary/fallback behavior."""
     # v2 batching layer: collapse per-tick chat:delta / tool_call:result
-    # emissions into a single envelope per user. See _flush_delta_buffer.
+    # emissions into a single envelope per (user, chat). Batching by user only
+    # can mix two chats and route a combined batch to the wrong stream room.
     if (
         STREAM_DELTA_BATCH_ENABLED
         and STREAM_PROTOCOL_VERSION == "v2"
@@ -1375,10 +1603,10 @@ async def emit_to_primary(user_id, payload):
     ):
         _enqueue_delta(user_id, payload)
         return
-    # Non-batchable / terminal event: drain any pending batch first so order
-    # is preserved (deltas before the terminal envelope), then emit directly.
+    # Non-batchable / terminal event: drain this chat's pending batch first so
+    # order is preserved (deltas before the terminal envelope), then emit.
     if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2" and user_id:
-        await _flush_delta_buffer(user_id)
+        await _flush_delta_buffers_for_payload(user_id, payload)
     await _emit_to_primary_raw(user_id, payload)
 
 
@@ -1388,14 +1616,6 @@ async def _emit_to_primary_raw(user_id, payload):
     except Exception:
         primary = None
 
-    # Stream-v2 chat responses are initiated by one concrete browser session,
-    # but are normally routed through the elected primary session so that the
-    # primary tab can BroadcastChannel-relay to sibling tabs. If the submitting
-    # tab is not primary (or the primary entry is stale), primary-only delivery
-    # makes that tab wait forever. When an envelope carries the originating
-    # session_id, deliver to both the primary and the origin. Versioned v2
-    # deltas are idempotent on the client, so a same-browser BroadcastChannel
-    # replay plus this direct emit will not double-append content.
     origin_sid = None
     try:
         origin_sid = payload.get("session_id") if isinstance(payload, dict) else None
@@ -1403,30 +1623,46 @@ async def _emit_to_primary_raw(user_id, payload):
         origin_sid = None
 
     targets = []
-    if primary:
-        targets.append(primary)
-    if origin_sid and origin_sid not in targets:
-        targets.append(origin_sid)
 
-    if targets:
-        await asyncio.gather(*[sio.emit("events", payload, to=sid) for sid in targets])
-        return
+    if _is_stream_scoped_payload(payload):
+        # Stream subscribers are tabs currently viewing this chat. This avoids
+        # sending every token to every tab while preserving reload/resume: Chat
+        # subscribes before requesting active snapshots.
+        try:
+            for sid in get_session_ids_from_room(stream_room(payload.get("chat_id"))):
+                if sid and sid not in targets:
+                    targets.append(sid)
+        except Exception:
+            pass
+        if origin_sid and origin_sid not in targets:
+            targets.append(origin_sid)
+        # If nobody is subscribed yet (e.g. very early stream startup), fall back
+        # to the primary so at least one same-user tab can still relay/display.
+        if not targets and primary:
+            targets.append(primary)
+    else:
+        if primary:
+            targets.append(primary)
+        if origin_sid and origin_sid not in targets:
+            targets.append(origin_sid)
+        if not targets:
+            for sid in USER_POOL.get(user_id, []) or []:
+                if sid and sid not in targets:
+                    targets.append(sid)
 
-    session_ids = USER_POOL.get(user_id, []) or []
-    if not session_ids:
+    if not targets:
         return
-    await asyncio.gather(
-        *[sio.emit("events", payload, to=sid) for sid in session_ids]
-    )
+    await asyncio.gather(*[sio.emit("events", payload, to=sid) for sid in targets])
 
 
 # --- chat:delta batching --------------------------------------------------
-# Per-user FIFO of pending envelopes. Drained at the end of the current
-# asyncio tick via loop.call_soon. Within a tick, multiple synchronous
-# emit_to_primary calls accumulate; across ticks each tick flushes once.
+# Per-(user, chat) FIFO of pending envelopes. Drained at the end of the current
+# asyncio tick via loop.call_soon. Chat scoping prevents simultaneous streams in
+# two chats from being coalesced into one room-routed batch.
 _BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result", "chat:subagent:update"})
-_pending_delta_buffer: Dict[str, list] = {}
-_pending_delta_scheduled: Set[str] = set()
+DeltaBatchKey = tuple[str, str]
+_pending_delta_buffer: Dict[DeltaBatchKey, list] = {}
+_pending_delta_scheduled: Set[DeltaBatchKey] = set()
 
 
 def _is_batchable_payload(payload) -> bool:
@@ -1439,16 +1675,26 @@ def _is_batchable_payload(payload) -> bool:
         return False
 
 
+def _delta_batch_key(user_id, payload) -> DeltaBatchKey:
+    chat_id = ""
+    try:
+        chat_id = str(payload.get("chat_id") or "") if isinstance(payload, dict) else ""
+    except Exception:
+        chat_id = ""
+    return (str(user_id), chat_id)
+
+
 def _enqueue_delta(user_id, payload) -> None:
     try:
-        buf = _pending_delta_buffer.get(user_id)
+        key = _delta_batch_key(user_id, payload)
+        buf = _pending_delta_buffer.get(key)
         if buf is None:
             buf = []
-            _pending_delta_buffer[user_id] = buf
+            _pending_delta_buffer[key] = buf
         buf.append(payload)
-        if user_id in _pending_delta_scheduled:
+        if key in _pending_delta_scheduled:
             return
-        _pending_delta_scheduled.add(user_id)
+        _pending_delta_scheduled.add(key)
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -1457,13 +1703,13 @@ def _enqueue_delta(user_id, payload) -> None:
             # No running loop (shouldn't happen in async context). Drop the
             # scheduling marker; the next call will try again. Avoid losing
             # buffered events by emitting synchronously as a fallback task.
-            _pending_delta_scheduled.discard(user_id)
+            _pending_delta_scheduled.discard(key)
             try:
-                asyncio.create_task(_flush_delta_buffer(user_id))
+                asyncio.create_task(_flush_delta_buffer(key))
             except Exception:
                 pass
             return
-        loop.call_soon(_schedule_flush, user_id)
+        loop.call_soon(_schedule_flush, key)
     except Exception:
         log.exception("delta batch enqueue failed")
         # Fallback: drop the batch path and emit immediately so the event
@@ -1474,21 +1720,31 @@ def _enqueue_delta(user_id, payload) -> None:
             pass
 
 
-def _schedule_flush(user_id) -> None:
+def _schedule_flush(key: DeltaBatchKey) -> None:
     try:
-        asyncio.create_task(_flush_delta_buffer(user_id))
+        asyncio.create_task(_flush_delta_buffer(key))
     except Exception:
         log.exception("delta batch flush schedule failed")
-        _pending_delta_scheduled.discard(user_id)
+        _pending_delta_scheduled.discard(key)
 
 
-async def _flush_delta_buffer(user_id) -> None:
+async def _flush_delta_buffers_for_payload(user_id, payload) -> None:
+    if isinstance(payload, dict) and payload.get("chat_id"):
+        await _flush_delta_buffer(_delta_batch_key(user_id, payload))
+        return
+    for key in list(_pending_delta_buffer.keys()):
+        if key[0] == str(user_id):
+            await _flush_delta_buffer(key)
+
+
+async def _flush_delta_buffer(key: DeltaBatchKey) -> None:
     # Pop the buffer (preserve order) and clear the scheduled marker BEFORE
     # awaiting so a new enqueue during the await can reschedule.
-    buf = _pending_delta_buffer.pop(user_id, None)
-    _pending_delta_scheduled.discard(user_id)
+    buf = _pending_delta_buffer.pop(key, None)
+    _pending_delta_scheduled.discard(key)
     if not buf:
         return
+    user_id = key[0]
     if len(buf) == 1:
         # Single envelope — no point wrapping in a batch.
         await _emit_to_primary_raw(user_id, buf[0])

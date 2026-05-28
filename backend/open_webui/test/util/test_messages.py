@@ -466,3 +466,72 @@ def test_non_reasoning_conversation_passes_through_unchanged():
     assert len(out) == 4
     for m in out:
         assert "reasoning_details" not in m
+
+
+def test_tool_result_ref_hydrates_from_message_body_store():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "web_fetch", "arguments": "{}"},
+                            }
+                        ],
+                        "results": [
+                            {
+                                "tool_call_id": "call_1",
+                                "result_ref": "call_1",
+                                "result_lazy": True,
+                                "content": "",
+                            }
+                        ],
+                    }
+                ],
+                "tool_result_bodies": {
+                    "call_1": {"tool_call_id": "call_1", "content": "full fetched body"}
+                },
+            }
+        ]
+    )
+
+    assert out[1]["role"] == "tool"
+    assert out[1]["content"] == [{"type": "text", "text": "full fetched body"}]
+
+
+def test_tool_result_ref_without_body_fails_loudly():
+    import pytest
+
+    with pytest.raises(ValueError):
+        blocks_to_api_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content_blocks": [
+                        {
+                            "type": "tool_calls",
+                            "content": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "web_fetch", "arguments": "{}"},
+                                }
+                            ],
+                            "results": [
+                                {
+                                    "tool_call_id": "call_1",
+                                    "result_ref": "call_1",
+                                    "result_lazy": True,
+                                    "content": "",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )

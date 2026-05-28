@@ -14,7 +14,10 @@ const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.c
 const getToolCallId = (call: any) => call?.id ?? call?.tool_call_id ?? '';
 
 const toolResultHasBody = (result: any) =>
-	!!result && typeof result === 'object' && !Array.isArray(result) && hasOwn(result, 'content');
+	!!result &&
+	typeof result === 'object' &&
+	!Array.isArray(result) &&
+	(hasOwn(result, 'content') || hasOwn(result, 'result_ref'));
 
 const isCompletedToolCallsBlock = (block: any) => {
 	if (block?.type !== 'tool_calls') return false;
@@ -22,10 +25,10 @@ const isCompletedToolCallsBlock = (block: any) => {
 	const results = Array.isArray(block.results) ? block.results : [];
 	if (calls.length === 0 || results.length === 0) return false;
 
-	const resultsById = new Map(
+	const resultsById = new Map<string, any>(
 		results
-			.map((result: any) => [result?.tool_call_id ?? '', result])
-			.filter(([toolCallId]) => !!toolCallId)
+			.map((result: any): [string, any] => [result?.tool_call_id ?? '', result])
+			.filter(([toolCallId]: [string, any]) => !!toolCallId)
 	);
 
 	return calls.every((call: any) => {

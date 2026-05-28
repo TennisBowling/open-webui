@@ -234,7 +234,7 @@
 	{#if structuredMode}
 		{#each structuredBlocks as block, i (i)}
 			{#if block?.type === 'tool_calls'}
-				<ToolCallsBlock id={`${id}-b${i}`} {block} />
+				<ToolCallsBlock id={`${id}-b${i}`} {block} {chatId} {messageId} />
 			{:else}
 				<Markdown
 					id={`${id}-b${i}`}

@@ -506,6 +506,8 @@ def assemble_conversation_from_leaf(
                 "role": "assistant",
                 "content_blocks": message["content_blocks"],
             }
+            if message.get("tool_result_bodies"):
+                forwarded["tool_result_bodies"] = message["tool_result_bodies"]
             if message.get("reasoning_details_per_round"):
                 forwarded["reasoning_details_per_round"] = message["reasoning_details_per_round"]
             if message.get("reasoning_details"):

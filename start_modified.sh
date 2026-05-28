@@ -37,8 +37,10 @@ else
     echo "✅ Frontend build is up to date (skipping build)"
 fi
 
-# Enable API Debug Logging to see model responses in console
-export ENABLE_API_DEBUG_LOGGING=true
+# API debug logging prints every streamed chunk and is very expensive for
+# high-throughput reasoning models. Opt in explicitly if needed:
+#   ENABLE_API_DEBUG_LOGGING=true ./start_modified.sh
+export ENABLE_API_DEBUG_LOGGING="${ENABLE_API_DEBUG_LOGGING:-false}"
 
 # Set up environment to use existing OpenWebUI data (Ubuntu-specific paths)
 if [ -d "/home/tennisbowling" ]; then
@@ -75,4 +77,4 @@ echo "Press Ctrl+C to stop the server"
 echo "============================================================"
 echo ""
 
-exec python -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081
+exec python -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 75

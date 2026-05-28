@@ -95,6 +95,9 @@ from open_webui.socket.main import (
     stream_version_get,
     set_stream_state,
     set_tool_result,
+    set_tool_result_body,
+    get_tool_result_bodies,
+    clear_tool_result_bodies,
     clear_stream_state,
     emit_to_primary,
     broadcast_sidebar_event,
@@ -199,17 +202,6 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
-DEFAULT_REASONING_TAGS = [
-    ("<think>", "</think>"),
-    ("<thinking>", "</thinking>"),
-    ("<reason>", "</reason>"),
-    ("<reasoning>", "</reasoning>"),
-    ("<thought>", "</thought>"),
-    ("<Thought>", "</Thought>"),
-    ("<|begin_of_thought|>", "<|end_of_thought|>"),
-    ("◁think▷", "◁/think▷"),
-]
-DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
@@ -228,21 +220,93 @@ DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 #   text_append, block_open, block_close, tool_call_add, replace, sources,
 #   selected_model_id. tool_call:result is emitted separately at exec time.
 
-def _strip_tool_results(content_blocks):
-    """Mirror state stores block shapes but never the heavy tool result bodies
-    — those go via tool_call:result. Returned copy is safe to diff against."""
+WEB_TOOL_NAMES = {"web_search", "web_fetch"}
+WEB_TOOL_INLINE_RESULT_MAX = 2048
+
+
+def _tool_call_name_by_id(block):
+    out = {}
+    for call in block.get("content") or []:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id") or call.get("tool_call_id")
+        if call_id:
+            out[call_id] = call.get("function", {}).get("name", "")
+    return out
+
+
+def _summarize_tool_result(tool_name: str, content: str) -> dict:
+    summary = {"kind": tool_name or "tool", "size": len((content or "").encode("utf-8"))}
+    if tool_name == "web_search":
+        match = re.search(r"^Found\s+(\d+)\s+results", content or "", flags=re.I | re.M)
+        if match:
+            summary["result_count"] = int(match.group(1))
+    elif tool_name == "web_fetch":
+        match = re.search(r"^Retrieved content from\s+(\d+)\s+URL", content or "", flags=re.I | re.M)
+        if match:
+            summary["page_count"] = int(match.group(1))
+    return summary
+
+
+def _slim_tool_result(result, tool_name: str = "", *, store_body: bool = False):
+    if not isinstance(result, dict):
+        return result, None
+    content = result.get("content")
+    if not (
+        tool_name in WEB_TOOL_NAMES
+        and isinstance(content, str)
+        and len(content.encode("utf-8")) > WEB_TOOL_INLINE_RESULT_MAX
+    ):
+        return result, None
+
+    tool_call_id = result.get("tool_call_id") or ""
+    body = dict(result)
+    slim = {k: v for k, v in result.items() if k != "content"}
+    slim.update(
+        {
+            "tool_call_id": tool_call_id,
+            "content": "",
+            "result_ref": tool_call_id,
+            "result_lazy": True,
+            "size": len(content.encode("utf-8")),
+            "sha256": hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
+            "summary": _summarize_tool_result(tool_name, content),
+        }
+    )
+    return slim, body if store_body else None
+
+
+def split_tool_result_bodies(content_blocks):
+    """Return (slim_blocks, bodies_by_tool_call_id). Large web tool bodies are
+    replaced with refs in the message hot path and persisted separately on the
+    assistant message as `tool_result_bodies`."""
+    bodies = {}
     out = []
     for block in content_blocks or []:
         if block.get("type") == "tool_calls" and "results" in block:
+            name_by_id = _tool_call_name_by_id(block)
             slim = {k: v for k, v in block.items() if k != "results"}
-            slim["results"] = [
-                {"tool_call_id": r.get("tool_call_id")}
-                for r in (block.get("results") or [])
-            ]
+            slim_results = []
+            for r in block.get("results") or []:
+                tc_id = r.get("tool_call_id") if isinstance(r, dict) else ""
+                slim_r, body = _slim_tool_result(
+                    r, name_by_id.get(tc_id, ""), store_body=True
+                )
+                if body is not None and tc_id:
+                    bodies[tc_id] = body
+                slim_results.append(slim_r)
+            slim["results"] = slim_results
             out.append(slim)
         else:
             out.append(block)
-    return out
+    return out, bodies
+
+
+def _strip_tool_results(content_blocks):
+    """Mirror state stores block shapes but never heavy web tool result bodies.
+    Non-web/small results remain inline for compatibility; large web results
+    retain refs/metadata so collapsed cards can render cheaply."""
+    return split_tool_result_bodies(content_blocks)[0]
 
 
 def _emit_delta_for_blocks(
@@ -451,7 +515,13 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
     mirror = {"blocks": [], "tool_results_sent": set()}
 
     if message_id:
-        stream_version_init(message_id)
+        stream_version_init(
+            message_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            session_id=session_id,
+            content_blocks=[],
+        )
 
     async def _emit_raw_primary(payload):
         # Send a fully-formed `events` envelope to the primary session only.
@@ -490,6 +560,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
         # short-circuit when content_blocks is absent — otherwise fall through
         # so the content diff still ships.
         if "selected_model_id" in data and "content_blocks" not in data and message_id:
+            set_stream_state(message_id, {"selected_model_id": data["selected_model_id"]})
             version = stream_version_incr(message_id)
             await _emit_raw_primary(
                 {
@@ -559,6 +630,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
             for awaitable in awaitables:
                 await awaitable
             if "selected_model_id" in data:
+                set_stream_state(message_id, {"selected_model_id": data["selected_model_id"]})
                 version = stream_version_incr(message_id)
                 await _emit_raw_primary(
                     {
@@ -573,6 +645,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
                 )
             # Sources arrive in the same payload occasionally
             if data.get("sources"):
+                set_stream_state(message_id, {"sources": data["sources"]})
                 version = stream_version_incr(message_id)
                 await _emit_raw_primary(
                     {
@@ -2818,11 +2891,21 @@ async def process_chat_response(
             )
 
             response_usage = None  # Initialize response_usage at the top level
+            terminal_error = None
             chunk_count = 0  # Initialize chunk_count at the top level for logging
 
             existing_content_blocks = (
                 message.get("content_blocks") if isinstance(message, dict) else None
             )
+            persisted_tool_result_bodies = (
+                copy.deepcopy(message.get("tool_result_bodies") or {})
+                if isinstance(message, dict)
+                else {}
+            )
+            if metadata.get("message_id") and isinstance(persisted_tool_result_bodies, dict):
+                for _tcid, _body in persisted_tool_result_bodies.items():
+                    if isinstance(_body, dict):
+                        set_tool_result_body(metadata.get("message_id"), _tcid, _body)
 
             # Retry-last-request can pre-seed the assistant row with completed
             # tool-call rounds. Continue streaming from those structured blocks
@@ -2869,6 +2952,22 @@ async def process_chat_response(
 
             if (
                 STREAM_PROTOCOL_VERSION == "v2"
+                and content_blocks
+                and not str(metadata.get("chat_id", "")).startswith("local:")
+            ):
+                # Existing rows from before lazy web-result refs may still carry
+                # full web_fetch bodies inline. Split them once at stream start
+                # so subsequent native appends don't repeatedly hash/copy huge
+                # tool payloads.
+                content_blocks, initial_tool_bodies = split_tool_result_bodies(
+                    content_blocks
+                )
+                if metadata.get("message_id"):
+                    for _tcid, _body in initial_tool_bodies.items():
+                        set_tool_result_body(metadata.get("message_id"), _tcid, _body)
+
+            if (
+                STREAM_PROTOCOL_VERSION == "v2"
                 and metadata.get("message_id")
                 and content_blocks
             ):
@@ -2884,35 +2983,18 @@ async def process_chat_response(
                     },
                 )
 
-            reasoning_tags_param = metadata.get("params", {}).get("reasoning_tags")
-            DETECT_REASONING_TAGS = reasoning_tags_param is not False
             DETECT_CODE_INTERPRETER = metadata.get("features", {}).get(
                 "code_interpreter", False
             )
 
-            reasoning_tags = []
-            if DETECT_REASONING_TAGS:
-                if (
-                    isinstance(reasoning_tags_param, list)
-                    and len(reasoning_tags_param) == 2
-                ):
-                    reasoning_tags = [
-                        (reasoning_tags_param[0], reasoning_tags_param[1])
-                    ]
-                else:
-                    reasoning_tags = DEFAULT_REASONING_TAGS
-
             # Avoid copying the whole growing plain-text response on every SSE
-            # chunk. The structured block content is still updated for live
-            # rendering/replay, but this legacy `content` string is only needed
-            # when inline tag parsing is enabled and for final webhook text.
-            # Hidden v2 subagent runs never need that legacy string: the full
-            # transcript is persisted from content_blocks, and parent transport
-            # receives only slim subagent state.
+            # chunk. Native provider reasoning fields are rendered from
+            # structured `content_blocks`; legacy inline reasoning-tag scanning
+            # has been removed. Hidden v2 subagent runs never need the legacy
+            # string unless code-interpreter parsing is active.
             track_legacy_content = not (
                 STREAM_PROTOCOL_VERSION == "v2"
                 and metadata.get("subagent_inner")
-                and not DETECT_REASONING_TAGS
                 and not DETECT_CODE_INTERPRETER
             )
             content_parts = [content] if (track_legacy_content and content) else []
@@ -2924,7 +3006,7 @@ async def process_chat_response(
                     return
                 content_parts.append(value)
                 content_dirty = True
-                if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                if DETECT_CODE_INTERPRETER:
                     content = "".join(content_parts)
                     content_dirty = False
 
@@ -2936,6 +3018,11 @@ async def process_chat_response(
                 content_parts = [content] if content else []
                 content_dirty = False
 
+            last_checkpoint_at = time.monotonic()
+            checkpoint_chars_since = 0
+            CHECKPOINT_INTERVAL_SECONDS = 2.0
+            CHECKPOINT_CHAR_DELTA = 16_384
+
             def get_plain_content() -> str:
                 nonlocal content, content_dirty
                 if not track_legacy_content:
@@ -2944,6 +3031,81 @@ async def process_chat_response(
                     content = "".join(content_parts)
                     content_dirty = False
                 return content
+
+            def _build_checkpoint_update(include_legacy_content: bool = False):
+                if (
+                    STREAM_PROTOCOL_VERSION == "v2"
+                    and not str(metadata.get("chat_id", "")).startswith("local:")
+                ):
+                    slim_blocks, split_bodies = split_tool_result_bodies(content_blocks)
+                    tool_result_bodies = {
+                        **(
+                            persisted_tool_result_bodies
+                            if isinstance(persisted_tool_result_bodies, dict)
+                            else {}
+                        ),
+                        **get_tool_result_bodies(metadata.get("message_id")),
+                        **split_bodies,
+                    }
+                else:
+                    slim_blocks, tool_result_bodies = content_blocks, {}
+                update_data = {
+                    "content_blocks": slim_blocks,
+                }
+                if tool_result_bodies:
+                    update_data["tool_result_bodies"] = tool_result_bodies
+                if include_legacy_content:
+                    update_data["content"] = serialize_content_blocks(
+                        slim_blocks, force=True
+                    )
+                if response_usage:
+                    update_data["usage"] = response_usage
+                if round_reasoning_details:
+                    update_data["reasoning_details_per_round"] = (
+                        round_reasoning_details
+                    )
+                    flat = [
+                        item
+                        for round_details in round_reasoning_details
+                        for item in round_details
+                    ]
+                    if flat:
+                        update_data["reasoning_details"] = flat
+                return update_data
+
+            def checkpoint_stream_state(
+                *,
+                force: bool = False,
+                include_legacy_content: bool = False,
+                char_delta: int = 0,
+            ):
+                """Durable checkpoint for v2 streams. The RAM stream store is
+                the live source of truth; DB checkpoints are intentionally
+                coarse so high-TPS streams do not commit per token."""
+                nonlocal last_checkpoint_at, checkpoint_chars_since
+                if STREAM_PROTOCOL_VERSION != "v2":
+                    return
+                if not metadata.get("chat_id") or not metadata.get("message_id"):
+                    return
+                if str(metadata.get("chat_id", "")).startswith("local:"):
+                    return
+
+                checkpoint_chars_since += max(0, int(char_delta or 0))
+                now = time.monotonic()
+                if not force:
+                    if (
+                        checkpoint_chars_since < CHECKPOINT_CHAR_DELTA
+                        and now - last_checkpoint_at < CHECKPOINT_INTERVAL_SECONDS
+                    ):
+                        return
+
+                Chats.upsert_message_to_chat_by_id_and_message_id(
+                    metadata["chat_id"],
+                    metadata["message_id"],
+                    _build_checkpoint_update(include_legacy_content),
+                )
+                last_checkpoint_at = now
+                checkpoint_chars_since = 0
 
             try:
                 for event in events:
@@ -2967,6 +3129,7 @@ async def process_chat_response(
                     nonlocal content
                     nonlocal content_blocks
                     nonlocal response_usage
+                    nonlocal terminal_error
                     nonlocal chunk_count
                     nonlocal model_id
                     nonlocal round_reasoning_details
@@ -3051,6 +3214,19 @@ async def process_chat_response(
                                 )
                                 if native is not None:
                                     block_idx, appended, new_text = native
+                                    # Snapshot correctness invariant: before a
+                                    # versioned delta is observable, the RAM
+                                    # stream snapshot must already contain at
+                                    # least that delta. Otherwise a reload can
+                                    # receive a high-version/stale-content
+                                    # snapshot and discard buffered appends.
+                                    set_stream_state(
+                                        _v2_message_id,
+                                        {
+                                            "content_blocks": _strip_tool_results(content_blocks),
+                                            "status": "in_progress",
+                                        },
+                                    )
                                     version = stream_version_incr(_v2_message_id)
                                     payload = {
                                         "type": "chat:delta",
@@ -3176,6 +3352,7 @@ async def process_chat_response(
                                         error_payload = chunk_error or {
                                             "message": "Provider returned an error during streaming."
                                         }
+                                        terminal_error = error_payload
                                         await event_emitter(
                                             {
                                                 "type": "chat:completion",
@@ -3409,6 +3586,9 @@ async def process_chat_response(
                                                 reasoning_block = content_blocks[-1]
 
                                             reasoning_block["content"] += reasoning_content
+                                            checkpoint_stream_state(
+                                                char_delta=len(reasoning_content)
+                                            )
 
                                             data = {
                                                 "content": serialize_content_blocks(
@@ -3438,6 +3618,7 @@ async def process_chat_response(
                                                     "content": "",
                                                 }
                                             )
+                                            checkpoint_stream_state(force=True)
 
                                         append_plain_content(value)
                                         if not content_blocks:
@@ -3451,25 +3632,7 @@ async def process_chat_response(
                                         content_blocks[-1]["content"] = (
                                             content_blocks[-1]["content"] + value
                                         )
-
-                                        if DETECT_REASONING_TAGS:
-                                            content, content_blocks, _ = (
-                                                tag_content_handler(
-                                                    "reasoning",
-                                                    reasoning_tags,
-                                                    content,
-                                                    content_blocks,
-                                                )
-                                            )
-
-                                            content, content_blocks, _ = (
-                                                tag_content_handler(
-                                                    "solution",
-                                                    DEFAULT_SOLUTION_TAGS,
-                                                    content,
-                                                    content_blocks,
-                                                )
-                                            )
+                                        checkpoint_stream_state(char_delta=len(value))
 
                                         if DETECT_CODE_INTERPRETER:
                                             content, content_blocks, end = (
@@ -3484,20 +3647,13 @@ async def process_chat_response(
 
                                             if end:
                                                 break
-                                        elif DETECT_REASONING_TAGS:
-                                            reset_plain_content(content)
 
-                                        if ENABLE_REALTIME_CHAT_SAVE:
-                                            # Save message in the database.
-                                            # Under v2, skip the `content`
-                                            # column write per-chunk —
-                                            # serialize_content_blocks would
-                                            # return "" (B9 short-circuit) and
-                                            # writing an empty string per chunk
-                                            # would clobber the column.
-                                            # End-of-stream `force=True` save
-                                            # populates the canonical content
-                                            # row.
+                                        if ENABLE_REALTIME_CHAT_SAVE and STREAM_PROTOCOL_VERSION != "v2":
+                                            # Legacy/non-v2 realtime save path.
+                                            # v2 uses the in-memory stream
+                                            # snapshot for reload/resume and
+                                            # periodic/final checkpoints instead
+                                            # of committing on every token.
                                             update_data = {
                                                 "content_blocks": content_blocks,
                                             }
@@ -3593,6 +3749,7 @@ async def process_chat_response(
                                     reasoning_block["ended_at"]
                                     - reasoning_block["started_at"]
                                 )
+                                checkpoint_stream_state(force=True)
 
                     if response_tool_calls:
                         tool_calls.append(
@@ -3650,6 +3807,7 @@ async def process_chat_response(
                             },
                         }
                     )
+                    checkpoint_stream_state(force=True)
 
                     tools = metadata.get("tools", {})
 
@@ -3829,7 +3987,36 @@ async def process_chat_response(
                             )
                             i += 1
 
-                    content_blocks[-1]["results"] = results
+                    name_by_id = {
+                        tc.get("id"): tc.get("function", {}).get("name", "")
+                        for tc in response_tool_calls
+                        if isinstance(tc, dict)
+                    }
+                    msg_id = metadata.get("message_id")
+                    slim_results = []
+                    allow_lazy_tool_results = (
+                        STREAM_PROTOCOL_VERSION == "v2"
+                        and not str(metadata.get("chat_id", "")).startswith("local:")
+                    )
+                    if allow_lazy_tool_results:
+                        for r in results:
+                            if not r:
+                                slim_results.append(r)
+                                continue
+                            tc_id = r.get("tool_call_id")
+                            slim_result, body_result = _slim_tool_result(
+                                r, name_by_id.get(tc_id, ""), store_body=True
+                            )
+                            if body_result is not None and msg_id and tc_id:
+                                set_tool_result_body(msg_id, tc_id, body_result)
+                            slim_results.append(slim_result)
+                    else:
+                        slim_results = results
+
+                    # Under v2, keep canonical content_blocks slim after tool
+                    # execution. Full web bodies live in tool_result_bodies and
+                    # are hydrated only for model replay / explicit UI expansion.
+                    content_blocks[-1]["results"] = slim_results
                     content_blocks.append(
                         {
                             "type": "text",
@@ -3843,13 +4030,13 @@ async def process_chat_response(
                         emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
                         if v2_mirror is not None and emit_raw is not None:
                             sent = v2_mirror.setdefault("tool_results_sent", set())
-                            for r in results:
-                                if not r:
+                            for slim_result in slim_results:
+                                if not slim_result:
                                     continue
-                                tc_id = r.get("tool_call_id")
+                                tc_id = slim_result.get("tool_call_id")
                                 if not tc_id or tc_id in sent:
                                     continue
-                                set_tool_result(msg_id, tc_id, r)
+                                set_tool_result(msg_id, tc_id, slim_result)
                                 sent.add(tc_id)
                                 await emit_raw(
                                     {
@@ -3857,20 +4044,45 @@ async def process_chat_response(
                                         "data": {
                                             "message_id": msg_id,
                                             "tool_call_id": tc_id,
-                                            "result": r.get("content"),
+                                            "result": slim_result.get("content"),
                                             **(
-                                                {"files": r["files"]}
-                                                if r.get("files")
+                                                {"result_ref": slim_result["result_ref"]}
+                                                if slim_result.get("result_ref")
                                                 else {}
                                             ),
                                             **(
-                                                {"embeds": r["embeds"]}
-                                                if r.get("embeds")
+                                                {"result_lazy": True}
+                                                if slim_result.get("result_lazy")
                                                 else {}
                                             ),
                                             **(
-                                                {"subagent_id": r["subagent_id"]}
-                                                if r.get("subagent_id")
+                                                {"size": slim_result["size"]}
+                                                if slim_result.get("size") is not None
+                                                else {}
+                                            ),
+                                            **(
+                                                {"sha256": slim_result["sha256"]}
+                                                if slim_result.get("sha256")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"summary": slim_result["summary"]}
+                                                if slim_result.get("summary")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"files": slim_result["files"]}
+                                                if slim_result.get("files")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"embeds": slim_result["embeds"]}
+                                                if slim_result.get("embeds")
+                                                else {}
+                                            ),
+                                            **(
+                                                {"subagent_id": slim_result["subagent_id"]}
+                                                if slim_result.get("subagent_id")
                                                 else {}
                                             ),
                                         },
@@ -3886,6 +4098,7 @@ async def process_chat_response(
                             },
                         }
                     )
+                    checkpoint_stream_state(force=True)
 
                     try:
                         # Check for pending model switch
@@ -3935,6 +4148,11 @@ async def process_chat_response(
                             "role": "assistant",
                             "content_blocks": content_blocks,
                         }
+                        tool_result_bodies = get_tool_result_bodies(
+                            metadata.get("message_id")
+                        )
+                        if tool_result_bodies:
+                            in_flight_assistant["tool_result_bodies"] = tool_result_bodies
                         if round_reasoning_details:
                             in_flight_assistant["reasoning_details_per_round"] = list(
                                 round_reasoning_details
@@ -3984,17 +4202,12 @@ async def process_chat_response(
                                 content_blocks[-1]["content"] += msg_content
                                 append_plain_content(msg_content)
                                 
-                                while True:
-                                    prev_content = content
-                                    if DETECT_REASONING_TAGS:
-                                        content, content_blocks, _ = tag_content_handler("reasoning", reasoning_tags, content, content_blocks)
-                                        content, content_blocks, _ = tag_content_handler("solution", DEFAULT_SOLUTION_TAGS, content, content_blocks)
-                                    if DETECT_CODE_INTERPRETER:
+                                if DETECT_CODE_INTERPRETER:
+                                    while True:
+                                        prev_content = content
                                         content, content_blocks, _ = tag_content_handler("code_interpreter", DEFAULT_CODE_INTERPRETER_TAGS, content, content_blocks)
-                                        
-                                    if content == prev_content:
-                                        break
-                                if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                                        if content == prev_content:
+                                            break
                                     reset_plain_content(content)
                             
                             # Process tool calls
@@ -4065,9 +4278,10 @@ async def process_chat_response(
                             break
                     except Exception as e:
                         log.exception(f"Error in tool loop: {e}")
+                        terminal_error = {"content": f"Error in tool loop: {str(e)}"}
                         await event_emitter({
                             "type": "chat:message:error",
-                            "data": {"error": {"content": f"Error in tool loop: {str(e)}"}}
+                            "data": {"error": terminal_error}
                         })
                         break
 
@@ -4223,16 +4437,22 @@ async def process_chat_response(
                         )
 
                         try:
+                            in_flight_assistant = {
+                                "role": "assistant",
+                                "content_blocks": content_blocks,
+                            }
+                            tool_result_bodies = get_tool_result_bodies(
+                                metadata.get("message_id")
+                            )
+                            if tool_result_bodies:
+                                in_flight_assistant["tool_result_bodies"] = tool_result_bodies
                             new_form_data = {
                                 **form_data,
                                 "model": model_id,
                                 "stream": True,
                                 "messages": [
                                     *form_data["messages"],
-                                    {
-                                        "role": "assistant",
-                                        "content_blocks": content_blocks,
-                                    },
+                                    in_flight_assistant,
                                 ],
                             }
 
@@ -4270,17 +4490,12 @@ async def process_chat_response(
                                     content_blocks[-1]["content"] += msg_content
                                     append_plain_content(msg_content)
                                     
-                                    while True:
-                                        prev_content = content
-                                        if DETECT_REASONING_TAGS:
-                                            content, content_blocks, _ = tag_content_handler("reasoning", reasoning_tags, content, content_blocks)
-                                            content, content_blocks, _ = tag_content_handler("solution", DEFAULT_SOLUTION_TAGS, content, content_blocks)
-                                        if DETECT_CODE_INTERPRETER:
+                                    if DETECT_CODE_INTERPRETER:
+                                        while True:
+                                            prev_content = content
                                             content, content_blocks, _ = tag_content_handler("code_interpreter", DEFAULT_CODE_INTERPRETER_TAGS, content, content_blocks)
-                                            
-                                        if content == prev_content:
-                                            break
-                                    if DETECT_REASONING_TAGS or DETECT_CODE_INTERPRETER:
+                                            if content == prev_content:
+                                                break
                                         reset_plain_content(content)
                                 
                                 # Process tool calls
@@ -4351,23 +4566,51 @@ async def process_chat_response(
                                 break
                         except Exception as e:
                             log.debug(e)
+                            terminal_error = {"content": f"Error in code interpreter loop: {str(e)}"}
                             await event_emitter({
                                 "type": "chat:message:error",
-                                "data": {"error": {"content": f"Error in code interpreter loop: {str(e)}"}}
+                                "data": {"error": terminal_error}
                             })
                             break
 
+                if terminal_error is not None:
+                    error_content = (
+                        terminal_error.get("content")
+                        if isinstance(terminal_error, dict)
+                        else str(terminal_error)
+                    )
+                    update_data = _build_checkpoint_update(include_legacy_content=True)
+                    update_data["error"] = {"content": error_content}
+                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        update_data,
+                    )
+                    if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                        set_stream_state(
+                            metadata["message_id"],
+                            {"status": "error", "error": {"content": error_content}},
+                        )
+                        clear_tool_result_bodies(metadata["message_id"])
+                        clear_stream_state(metadata["message_id"])
+                    return
+
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                if (
+                    STREAM_PROTOCOL_VERSION == "v2"
+                    and not str(metadata.get("chat_id", "")).startswith("local:")
+                ):
+                    final_slim_blocks, final_split_bodies = split_tool_result_bodies(content_blocks)
+                    for _tcid, _body in final_split_bodies.items():
+                        set_tool_result_body(metadata.get("message_id"), _tcid, _body)
+                else:
+                    final_slim_blocks = content_blocks
                 data = {
                     "done": True,
-                    # force=True: end-of-stream final emit. The serialize
-                    # short-circuit (hot-path skip when realtime save is off)
-                    # is bypassed here so the canonical `content` string lands
-                    # on the wire for legacy clients + exports + the
-                    # post-stream DB write below. Modern clients render from
-                    # `content_blocks` and ignore this field.
-                    "content": serialize_content_blocks(content_blocks, force=True),
-                    "content_blocks": content_blocks,
+                    # force=True: end-of-stream final emit. Use slim blocks so
+                    # huge web tool bodies do not re-enter the socket hot path.
+                    "content": serialize_content_blocks(final_slim_blocks, force=True),
+                    "content_blocks": final_slim_blocks,
                     "title": title,
                 }
 
@@ -4376,44 +4619,24 @@ async def process_chat_response(
                     data["usage"] = response_usage
                     data["selected_model_id"] = model_id  # Include model ID for socket emission
 
-                if not ENABLE_REALTIME_CHAT_SAVE:
-                    # Save message in the database
-                    update_data = {
-                        # force=True: end-of-stream DB write. Even when the
-                        # hot-path serialize is short-circuited (realtime save
-                        # off), we compute once here so the persisted row has
-                        # a usable `content` column for legacy clients,
-                        # exports, search indexing, etc.
-                        "content": serialize_content_blocks(content_blocks, force=True),
-                        "content_blocks": content_blocks,
-                    }
-                    if response_usage:
-                        update_data["usage"] = response_usage
-
-                    # Per-round reasoning lets multi-turn replays attach the right
-                    # round's reasoning to each tool_calls message. Flat array kept
-                    # for backward compat with older saved messages.
-                    if round_reasoning_details:
-                        update_data["reasoning_details_per_round"] = (
-                            round_reasoning_details
-                        )
-                        flat = [
-                            item
-                            for round_details in round_reasoning_details
-                            for item in round_details
-                        ]
-                        if flat:
-                            update_data["reasoning_details"] = flat
+                if STREAM_PROTOCOL_VERSION == "v2" or not ENABLE_REALTIME_CHAT_SAVE:
+                    # Save the final canonical message in the database. v2 no
+                    # longer relies on per-token DB writes; the live stream
+                    # store is authoritative while generation is active and
+                    # this final checkpoint is the durable history record.
+                    update_data = _build_checkpoint_update(include_legacy_content=True)
 
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         update_data,
                     )
+                    if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                        clear_tool_result_bodies(metadata["message_id"])
                 elif response_usage:
-                    # Realtime-save mode writes content on the hot path; still
-                    # persist final usage so opened full subagent chats and
-                    # future rebuilds can recover provider/cache details.
+                    # Non-v2 realtime-save mode writes content on the hot path;
+                    # still persist final usage so opened full subagent chats
+                    # and future rebuilds can recover provider/cache details.
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
@@ -4455,6 +4678,14 @@ async def process_chat_response(
                     final_hash = hashlib.sha256(
                         (final_content or "").encode("utf-8", "replace")
                     ).hexdigest()
+                    set_stream_state(
+                        msg_id,
+                        {
+                            "content_blocks": _strip_tool_results(final_blocks),
+                            "status": "done",
+                            **({"usage": response_usage} if response_usage else {}),
+                        },
+                    )
                     version = stream_version_incr(msg_id)
                     chat_obj = None
                     try:
@@ -4536,39 +4767,20 @@ async def process_chat_response(
                 await event_emitter({"type": "chat:tasks:cancel"})
 
                 if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                    set_stream_state(metadata["message_id"], {"status": "cancelled"})
                     clear_stream_state(metadata["message_id"])
 
-                if not ENABLE_REALTIME_CHAT_SAVE:
+                if STREAM_PROTOCOL_VERSION == "v2" or not ENABLE_REALTIME_CHAT_SAVE:
                     # Save message in the database
-                    update_data = {
-                        # force=True: cancellation DB write. Same reasoning
-                        # as the success-path end-of-stream save — we want
-                        # the persisted row to have the partial canonical
-                        # content even when realtime-save is off.
-                        "content": serialize_content_blocks(content_blocks, force=True),
-                        "content_blocks": content_blocks,
-                    }
-
-                    # Per-round reasoning lets multi-turn replays attach the right
-                    # round's reasoning to each tool_calls message. Flat array kept
-                    # for backward compat with older saved messages.
-                    if round_reasoning_details:
-                        update_data["reasoning_details_per_round"] = (
-                            round_reasoning_details
-                        )
-                        flat = [
-                            item
-                            for round_details in round_reasoning_details
-                            for item in round_details
-                        ]
-                        if flat:
-                            update_data["reasoning_details"] = flat
+                    update_data = _build_checkpoint_update(include_legacy_content=True)
 
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         update_data,
                     )
+                    if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                        clear_tool_result_bodies(metadata["message_id"])
 
             if response.background is not None:
                 await response.background()

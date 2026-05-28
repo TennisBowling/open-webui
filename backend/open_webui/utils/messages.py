@@ -20,6 +20,7 @@ bugs the current design replaces.
 """
 
 from typing import Optional
+import copy
 
 
 def _dedupe_repeated_tool_name(name: Optional[str]) -> str:
@@ -247,6 +248,29 @@ def _expand_assistant(
     return api_messages
 
 
+def _hydrate_tool_result_refs(
+    content_blocks: list[dict], bodies: Optional[dict]
+) -> list[dict]:
+    hydrated = copy.deepcopy(content_blocks)
+    for block in hydrated:
+        if not isinstance(block, dict) or block.get("type") != "tool_calls":
+            continue
+        for result in block.get("results") or []:
+            if not isinstance(result, dict):
+                continue
+            if result.get("content"):
+                continue
+            ref = result.get("result_ref") or result.get("tool_call_id")
+            body = bodies.get(ref) if isinstance(bodies, dict) else None
+            if isinstance(body, dict) and "content" in body:
+                result.update(body)
+            elif result.get("result_ref"):
+                raise ValueError(
+                    f"Missing tool result body for ref {result.get('result_ref')}"
+                )
+    return hydrated
+
+
 def blocks_to_api_messages(messages: list[dict]) -> list[dict]:
     """Normalise a list of open-webui internal messages into OpenAI-compatible API messages.
 
@@ -269,9 +293,12 @@ def blocks_to_api_messages(messages: list[dict]) -> list[dict]:
             and isinstance(msg.get("content_blocks"), list)
             and msg["content_blocks"]
         ):
+            content_blocks = _hydrate_tool_result_refs(
+                msg["content_blocks"], msg.get("tool_result_bodies")
+            )
             out.extend(
                 _expand_assistant(
-                    msg["content_blocks"],
+                    content_blocks,
                     reasoning_details_per_round=msg.get("reasoning_details_per_round"),
                     fallback_reasoning_details=msg.get("reasoning_details"),
                     seen_reasoning_ids=seen_reasoning_ids,
@@ -283,7 +310,12 @@ def blocks_to_api_messages(messages: list[dict]) -> list[dict]:
             cleaned = {
                 k: v
                 for k, v in msg.items()
-                if k not in ("content_blocks", "reasoning_details_per_round")
+                if k
+                not in (
+                    "content_blocks",
+                    "reasoning_details_per_round",
+                    "tool_result_bodies",
+                )
             }
             # Legacy assistant messages (pre-content_blocks migration, or chats
             # whose backfill couldn't recover a text block) may arrive with

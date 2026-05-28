@@ -67,10 +67,12 @@ from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_te
 from open_webui.socket.main import (
     stream_version_init,
     stream_version_incr,
+    set_stream_state,
     emit_to_primary,
 )
 from open_webui.utils.middleware import (
     _emit_delta_for_blocks,
+    _strip_tool_results,
     current_tool_call_id_var,
     process_chat_payload,
     process_chat_response,
@@ -654,7 +656,13 @@ def _build_forwarding_emitter(
     # already been shipped as tool_call:result inner events.
     v2_mirror: dict = {"blocks": [], "tool_results_sent": set()}
     if v2_enabled and inner_message_id:
-        stream_version_init(inner_message_id)
+        stream_version_init(
+            inner_message_id,
+            chat_id=subagent_socket_info.get("chat_id") if isinstance(subagent_socket_info, dict) else None,
+            user_id=user_id_for_primary,
+            session_id=session_id_for_primary,
+            content_blocks=[],
+        )
 
     lock = asyncio.Lock()
     latest_completion_event: Optional[dict] = None
@@ -751,6 +759,20 @@ def _build_forwarding_emitter(
                     await _emit_parent({"type": "tool_call:result", "data": payload})
 
         if isinstance(content_blocks, list):
+            set_stream_state(
+                inner_message_id,
+                {
+                    "content_blocks": _strip_tool_results(content_blocks),
+                    "status": "done" if data.get("done") else "in_progress",
+                    **({"usage": data["usage"]} if data.get("usage") else {}),
+                    **({"sources": data["sources"]} if data.get("sources") else {}),
+                    **(
+                        {"selected_model_id": data["selected_model_id"]}
+                        if data.get("selected_model_id")
+                        else {}
+                    ),
+                },
+            )
             awaitables = _emit_delta_for_blocks(
                 _emit_parent_raw, inner_message_id, v2_mirror, content_blocks
             )
@@ -1183,10 +1205,6 @@ async def _run_inner_chat(
             # Regular chats still use the global CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE
             # (default 1); this only affects the subagent's inner pipeline.
             "stream_delta_chunk_size": 200,
-            # Subagents use provider-native reasoning deltas. Disabling the
-            # legacy inline <think> tag parser avoids rebuilding a full
-            # ever-growing `content` string for every hidden-worker token.
-            "reasoning_tags": False,
         },
         # Override hooks — process_chat_response in middleware respects these
         # in place of the default get_event_emitter(metadata) lookup.

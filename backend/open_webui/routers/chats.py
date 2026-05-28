@@ -3,7 +3,12 @@ import logging
 from typing import Optional
 
 
-from open_webui.socket.main import broadcast_sidebar_event, get_event_emitter
+from open_webui.socket.main import (
+    broadcast_sidebar_event,
+    get_event_emitter,
+    get_stream_state,
+    get_tool_result_body,
+)
 from open_webui.models.chats import (
     ChatForm,
     ChatImportForm,
@@ -12,6 +17,8 @@ from open_webui.models.chats import (
     Chats,
     ChatTitleIdResponse,
     _project_message_slim,
+    strip_tool_result_bodies_from_chat_model,
+    strip_tool_result_bodies_from_message,
 )
 from open_webui.models.tags import TagModel, Tags
 from open_webui.models.folders import Folders
@@ -179,7 +186,7 @@ async def create_new_chat(
             {"type": "chat:created", "data": _chat_row_payload(chat)},
             skip_sid=_skip_sid(request),
         )
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -215,7 +222,7 @@ async def import_chat(
                 skip_sid=_skip_sid(request),
             )
 
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -283,7 +290,7 @@ async def get_chats_by_folder_id(folder_id: str, user=Depends(get_verified_user)
         folder_ids.extend([folder.id for folder in children_folders])
 
     return [
-        ChatResponse(**chat.model_dump())
+        ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
         for chat in Chats.get_chats_by_folder_ids_and_user_id(folder_ids, user.id)
     ]
 
@@ -330,10 +337,7 @@ async def get_user_pinned_chats(request: Request, user=Depends(get_verified_user
 @router.get("/all", response_model=list[ChatResponse])
 async def get_user_chats(user=Depends(get_verified_user)):
     # Export endpoint — needs full chat JSON.
-    return [
-        ChatResponse(**chat.model_dump())
-        for chat in Chats.get_chats_with_data_by_user_id(user.id)
-    ]
+    return [ChatResponse(**chat.model_dump()) for chat in Chats.get_chats_with_data_by_user_id(user.id)]
 
 
 ############################
@@ -384,10 +388,7 @@ async def get_all_user_chats_in_db(user=Depends(get_admin_user)):
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
     # Admin export endpoint — needs full chat JSON.
-    return [
-        ChatResponse(**chat.model_dump())
-        for chat in Chats.get_chats_with_data()
-    ]
+    return [ChatResponse(**chat.model_dump()) for chat in Chats.get_chats_with_data()]
 
 
 ############################
@@ -488,12 +489,68 @@ async def get_shared_chat_by_id(share_id: str, user=Depends(get_optional_user)):
         chat = Chats.get_chat_by_share_id(share_id)
 
     if chat:
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
 
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
         )
+
+
+@router.get("/share/{share_id}/messages/{message_id}/tool-results/{tool_call_id}")
+async def get_shared_chat_message_tool_result(
+    share_id: str,
+    message_id: str,
+    tool_call_id: str,
+    user=Depends(get_optional_user),
+):
+    # Mirror get_shared_chat_by_id access: anonymous users can read shared
+    # chats; pending users cannot; admins with admin-chat access can use a raw
+    # chat id as the share_id.
+    if user:
+        if user.role == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+        if user.role == "admin" and ENABLE_ADMIN_CHAT_ACCESS:
+            chat = Chats.get_chat_by_id(share_id) or Chats.get_chat_by_share_id(share_id)
+        else:
+            chat = Chats.get_chat_by_share_id(share_id)
+    else:
+        chat = Chats.get_chat_by_share_id(share_id)
+
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    message = Chats.get_message_by_id_and_message_id(chat.id, message_id)
+    if not message:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message not found",
+        )
+
+    bodies = message.get("tool_result_bodies") if isinstance(message, dict) else None
+    body = bodies.get(tool_call_id) if isinstance(bodies, dict) else None
+    if isinstance(body, dict):
+        return body
+
+    for block in (
+        message.get("content_blocks", []) if isinstance(message, dict) else []
+    ):
+        if block.get("type") != "tool_calls":
+            continue
+        for result in block.get("results") or []:
+            if isinstance(result, dict) and result.get("tool_call_id") == tool_call_id:
+                return result
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Tool result not found",
+    )
 
 
 ############################
@@ -546,7 +603,7 @@ async def get_chat_by_id(
     chat = Chats.get_chat_by_id_and_user_id(id, user.id)
 
     if chat:
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
 
     else:
         raise HTTPException(
@@ -581,7 +638,7 @@ async def update_chat_by_id(
                 },
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -624,10 +681,9 @@ async def get_chat_messages_paginated(
     render a window of messages. Falls back to JSON slicing for unmigrated
     chats so the response shape is identical regardless of storage path.
 
-    ``slim=true`` (default) strips bandwidth-heavy per-message fields
-    (``originalContent``, ``reasoning_details_per_round`` for non-leaf,
-    oversized ``tool_calls`` results for non-current-branch turns). Callers
-    that need the full bodies (admin/export/share) pass ``slim=false``.
+    ``slim=true`` (default) strips bandwidth-heavy per-message fields.
+    Large web tool bodies are always fetched through the dedicated lazy
+    endpoint; ``slim=false`` still omits ``tool_result_bodies``.
     """
     # Lightweight ownership check — avoids hydrating the whole message tree
     # (which would defeat the entire point of paginating).
@@ -649,7 +705,7 @@ async def get_chat_messages_paginated(
         )
 
     if not slim:
-        return messages
+        return [strip_tool_result_bodies_from_message(m) for m in messages]
 
     leaf_for_projection = current_leaf or leaf
     return [
@@ -671,6 +727,64 @@ async def get_chat_messages_paginated(
 ############################
 
 
+@router.get("/{id}/messages/{message_id}/tool-results/{tool_call_id}")
+async def get_chat_message_tool_result(
+    id: str,
+    message_id: str,
+    tool_call_id: str,
+    user=Depends(get_verified_user),
+):
+    """Fetch a large tool result body lazily when the user expands a tool card.
+
+    Stream-v2 keeps large web_search/web_fetch bodies out of socket snapshots and
+    message content_blocks. The full body is available from the live in-memory
+    store while generation is active and from the persisted assistant message's
+    `tool_result_bodies` after checkpoints/final save.
+    """
+    if not Chats.user_owns_chat(id, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    message = Chats.get_message_by_id_and_message_id(id, message_id)
+    if not isinstance(message, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message not found",
+        )
+
+    live_state = get_stream_state(message_id)
+    if live_state:
+        if live_state.get("chat_id") != id or live_state.get("user_id") != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tool result not found",
+            )
+        live_body = get_tool_result_body(message_id, tool_call_id)
+        if isinstance(live_body, dict):
+            return live_body
+    bodies = message.get("tool_result_bodies") if isinstance(message, dict) else None
+    body = bodies.get(tool_call_id) if isinstance(bodies, dict) else None
+    if isinstance(body, dict):
+        return body
+
+    # Backward compatibility: old rows may still have full result bodies inline.
+    for block in (
+        message.get("content_blocks", []) if isinstance(message, dict) else []
+    ):
+        if block.get("type") != "tool_calls":
+            continue
+        for result in block.get("results") or []:
+            if isinstance(result, dict) and result.get("tool_call_id") == tool_call_id:
+                return result
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Tool result not found",
+    )
+
+
 @router.get("/{id}/messages/{message_id}/siblings")
 async def get_chat_message_siblings(
     id: str,
@@ -687,7 +801,7 @@ async def get_chat_message_siblings(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    return Chats.get_message_siblings(id, message_id)
+    return [strip_tool_result_bodies_from_message(m) for m in Chats.get_message_siblings(id, message_id)]
 
 
 ############################
@@ -744,7 +858,7 @@ async def update_chat_message_by_id(
             }
         )
 
-    return ChatResponse(**chat.model_dump())
+    return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
 
 
 ############################
@@ -921,7 +1035,7 @@ async def clone_chat_by_id(
                 skip_sid=_skip_sid(request),
             )
 
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -968,7 +1082,7 @@ async def clone_shared_chat_by_id(
                 {"type": "chat:created", "data": _chat_row_payload(chat)},
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1010,7 +1124,7 @@ async def archive_chat_by_id(
             skip_sid=_skip_sid(request),
         )
 
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1039,7 +1153,7 @@ async def share_chat_by_id(request: Request, id: str, user=Depends(get_verified_
     if chat:
         if chat.share_id:
             shared_chat = Chats.update_shared_chat_by_chat_id(chat.id)
-            return ChatResponse(**shared_chat.model_dump())
+            return ChatResponse(**strip_tool_result_bodies_from_chat_model(shared_chat).model_dump())
 
         shared_chat = Chats.insert_shared_chat_by_chat_id(chat.id)
         if not shared_chat:
@@ -1047,7 +1161,7 @@ async def share_chat_by_id(request: Request, id: str, user=Depends(get_verified_
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
-        return ChatResponse(**shared_chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(shared_chat).model_dump())
 
     else:
         raise HTTPException(
@@ -1109,7 +1223,7 @@ async def update_chat_folder_id_by_id(
                 },
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**chat.model_dump())
+        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()

@@ -233,7 +233,7 @@ export const getChatListByUserId = async (
 				Accept: 'application/json',
 				'Content-Type': 'application/json',
 				...(token && { authorization: `Bearer ${token}` }),
-			...sessionHeader()
+				...sessionHeader()
 			}
 		}
 	)
@@ -396,10 +396,12 @@ export const searchChats = async (
 	qs.append('page', `${params.page ?? 1}`);
 	if (params.limit) qs.append('limit', `${params.limit}`);
 	if (params.sort) qs.append('sort', params.sort);
-	if (params.pinned !== undefined && params.pinned !== null) qs.append('pinned', `${params.pinned}`);
+	if (params.pinned !== undefined && params.pinned !== null)
+		qs.append('pinned', `${params.pinned}`);
 	if (params.archived !== undefined && params.archived !== null)
 		qs.append('archived', `${params.archived}`);
-	if (params.shared !== undefined && params.shared !== null) qs.append('shared', `${params.shared}`);
+	if (params.shared !== undefined && params.shared !== null)
+		qs.append('shared', `${params.shared}`);
 	if (params.updated_after) qs.append('updated_after', `${params.updated_after}`);
 	if (params.updated_before) qs.append('updated_before', `${params.updated_before}`);
 	for (const fid of params.folder_ids ?? []) qs.append('folder_ids', fid);
@@ -429,11 +431,7 @@ export const searchChats = async (
 // Back-compat helper: callers that only need a chat list (no snippets) can
 // keep using getChatListBySearchText. Returns a list shape compatible with
 // the old signature so legacy callers don't break.
-export const getChatListBySearchText = async (
-	token: string,
-	text: string,
-	page: number = 1
-) => {
+export const getChatListBySearchText = async (token: string, text: string, page: number = 1) => {
 	const res = await searchChats(token, { text, page });
 	return res.hits.map((h) => ({
 		id: h.id,
@@ -492,7 +490,7 @@ export const getChatListByFolderId = async (token: string, folderId: string, pag
 				Accept: 'application/json',
 				'Content-Type': 'application/json',
 				...(token && { authorization: `Bearer ${token}` }),
-			...sessionHeader()
+				...sessionHeader()
 			}
 		}
 	)
@@ -801,18 +799,15 @@ export const getChatMessagesBranch = async (
 export const getChatMessagesSiblings = async (token: string, id: string, message_id: string) => {
 	let error = null;
 
-	const res = await fetch(
-		`${WEBUI_API_BASE_URL}/chats/${id}/messages/${message_id}/siblings`,
-		{
-			method: 'GET',
-			headers: {
-				Accept: 'application/json',
-				'Content-Type': 'application/json',
-				...(token && { authorization: `Bearer ${token}` }),
-				...sessionHeader()
-			}
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}/messages/${message_id}/siblings`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` }),
+			...sessionHeader()
 		}
-	)
+	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
 			return res.json();
@@ -828,6 +823,46 @@ export const getChatMessagesSiblings = async (token: string, id: string, message
 	}
 
 	return res;
+};
+
+export const getChatMessageToolResult = async (
+	token: string,
+	id: string,
+	message_id: string,
+	tool_call_id: string
+) => {
+	let firstError = null;
+
+	const fetchResult = async (url: string) =>
+		fetch(url, {
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` }),
+				...sessionHeader()
+			}
+		}).then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		});
+
+	try {
+		return await fetchResult(
+			`${WEBUI_API_BASE_URL}/chats/${id}/messages/${message_id}/tool-results/${tool_call_id}`
+		);
+	} catch (err) {
+		firstError = err;
+	}
+
+	try {
+		return await fetchResult(
+			`${WEBUI_API_BASE_URL}/chats/share/${id}/messages/${message_id}/tool-results/${tool_call_id}`
+		);
+	} catch (err) {
+		console.error(err);
+		throw (err as any)?.detail ?? (firstError as any)?.detail ?? err ?? firstError;
+	}
 };
 
 export const getChatByShareId = async (token: string, share_id: string) => {

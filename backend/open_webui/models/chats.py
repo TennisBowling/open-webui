@@ -514,6 +514,36 @@ def _row_to_message_dict(row) -> dict:
 _SLIM_TOOL_RESULT_THRESHOLD_BYTES = 1024
 
 
+def strip_tool_result_bodies_from_message(message: dict) -> dict:
+    if not isinstance(message, dict):
+        return message
+    out = dict(message)
+    out.pop("tool_result_bodies", None)
+    return out
+
+
+def strip_tool_result_bodies_from_chat_dict(chat: dict) -> dict:
+    if not isinstance(chat, dict):
+        return chat
+    out = copy.deepcopy(chat)
+    history = out.get("history")
+    messages = history.get("messages") if isinstance(history, dict) else None
+    if isinstance(messages, dict):
+        for mid, msg in list(messages.items()):
+            messages[mid] = strip_tool_result_bodies_from_message(msg)
+    if isinstance(out.get("messages"), list):
+        out["messages"] = [strip_tool_result_bodies_from_message(m) for m in out["messages"]]
+    return out
+
+
+def strip_tool_result_bodies_from_chat_model(chat: ChatModel) -> ChatModel:
+    if not chat:
+        return chat
+    data = chat.model_dump()
+    data["chat"] = strip_tool_result_bodies_from_chat_dict(data.get("chat") or {})
+    return ChatModel(**data)
+
+
 def _project_message_slim(
     msg: dict, is_current_leaf: bool = False, is_current_branch: bool = True
 ) -> dict:
@@ -534,8 +564,10 @@ def _project_message_slim(
     """
     if not isinstance(msg, dict):
         return msg
-    out = dict(msg)
+    out = strip_tool_result_bodies_from_message(msg)
     # NOTE: do NOT pop "originalContent" — see docstring.
+    # Large web tool bodies are fetched lazily through the tool-result endpoint;
+    # never include them in normal chat-message list payloads.
     if not is_current_leaf:
         out.pop("reasoning_details_per_round", None)
 
@@ -1382,11 +1414,22 @@ class ChatTable:
     def get_message_by_id_and_message_id(
         self, id: str, message_id: str
     ) -> Optional[dict]:
+        with get_db() as db:
+            if _is_chat_migrated(db, id):
+                row = db.execute(
+                    text(
+                        f"SELECT {_CHAT_MESSAGE_SELECT_COLS} "
+                        "FROM chat_message WHERE chat_id = :cid AND message_id = :mid"
+                    ),
+                    {"cid": id, "mid": message_id},
+                ).fetchone()
+                return _row_to_message_dict(row) if row is not None else None
+
         chat = self.get_chat_by_id(id)
         if chat is None:
             return None
 
-        return chat.chat.get("history", {}).get("messages", {}).get(message_id, {})
+        return chat.chat.get("history", {}).get("messages", {}).get(message_id)
 
     def upsert_message_to_chat_by_id_and_message_id(
         self, id: str, message_id: str, message: dict

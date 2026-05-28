@@ -4,20 +4,21 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import { getContext } from 'svelte';
+	import type { Writable } from 'svelte/store';
+	import type { i18n as i18nType } from 'i18next';
 
-	const i18n = getContext('i18n');
+	const i18n = getContext<Writable<i18nType>>('i18n');
 
 	export let onChange: (params: any) => void = () => {};
 
 	export let admin = false;
 	export let custom = false;
 
-	const defaultParams = {
+	const defaultParams: any = {
 		// Advanced
 		stream_response: null, // Set stream responses for this model individually
 		stream_delta_chunk_size: null, // Set the chunk size for streaming responses
 		function_calling: null,
-		reasoning_tags: null,
 		seed: null,
 		stop: null,
 		temperature: null,
@@ -51,6 +52,8 @@
 	$: if (params) {
 		onChange(params);
 	}
+
+	const inputValue = (event: Event) => (event.currentTarget as HTMLInputElement).value;
 </script>
 
 <div class=" space-y-1 text-xs pb-safe-bottom">
@@ -174,71 +177,6 @@
 				</button>
 			</div>
 		</Tooltip>
-	</div>
-
-	<div class=" py-0.5 w-full justify-between">
-		<Tooltip
-			content={$i18n.t(
-				'Enable, disable, or customize the reasoning tags used by the model. "Enabled" uses default tags, "Disabled" turns off reasoning tags, and "Custom" lets you specify your own start and end tags.'
-			)}
-			placement="top-start"
-			className="inline-tooltip"
-		>
-			<div class="flex w-full justify-between">
-				<div class=" self-center text-xs font-medium">
-					{$i18n.t('Reasoning Tags')}
-				</div>
-				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
-					type="button"
-					on:click={() => {
-						if ((params?.reasoning_tags ?? null) === null) {
-							params.reasoning_tags = ['', ''];
-						} else if ((params?.reasoning_tags ?? []).length === 2) {
-							params.reasoning_tags = true;
-						} else if ((params?.reasoning_tags ?? null) !== false) {
-							params.reasoning_tags = false;
-						} else {
-							params.reasoning_tags = null;
-						}
-					}}
-				>
-					{#if (params?.reasoning_tags ?? null) === null}
-						<span class="ml-2 self-center"> {$i18n.t('Default')} </span>
-					{:else if (params?.reasoning_tags ?? null) === true}
-						<span class="ml-2 self-center"> {$i18n.t('Enabled')} </span>
-					{:else if (params?.reasoning_tags ?? null) === false}
-						<span class="ml-2 self-center"> {$i18n.t('Disabled')} </span>
-					{:else}
-						<span class="ml-2 self-center"> {$i18n.t('Custom')} </span>
-					{/if}
-				</button>
-			</div>
-		</Tooltip>
-
-		{#if ![true, false, null].includes(params?.reasoning_tags ?? null) && (params?.reasoning_tags ?? []).length === 2}
-			<div class="flex mt-0.5 space-x-2">
-				<div class=" flex-1">
-					<input
-						class="text-sm w-full bg-transparent outline-hidden outline-none"
-						type="text"
-						placeholder={$i18n.t('Start Tag')}
-						bind:value={params.reasoning_tags[0]}
-						autocomplete="off"
-					/>
-				</div>
-
-				<div class=" flex-1">
-					<input
-						class="text-sm w-full bg-transparent outline-hidden outline-none"
-						type="text"
-						placeholder={$i18n.t('End Tag')}
-						bind:value={params.reasoning_tags[1]}
-						autocomplete="off"
-					/>
-				</div>
-			</div>
-		{/if}
 	</div>
 
 	<div class=" py-0.5 w-full justify-between">
@@ -1617,7 +1555,7 @@
 									placeholder={$i18n.t('Custom Parameter Name')}
 									value={key}
 									on:change={(e) => {
-										const newKey = e.target.value.trim();
+										const newKey = inputValue(e).trim();
 										if (newKey && newKey !== key) {
 											params.custom_params[newKey] = params.custom_params[key];
 											delete params.custom_params[key];

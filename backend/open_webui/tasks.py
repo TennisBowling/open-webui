@@ -136,6 +136,35 @@ async def list_tasks(redis):
     return list(tasks.keys())
 
 
+async def cancel_all_local_tasks(timeout: float = 60.0):
+    """Cancel and await all tasks created through this registry.
+
+    Used during server shutdown so active chat generations get an
+    asyncio.CancelledError and can run their cancellation/final checkpoint
+    handlers before the DB engine and shared HTTP session are torn down.
+    """
+    pending = list(tasks.items())
+    if not pending:
+        return []
+
+    for _task_id, task in pending:
+        if not task.done():
+            task.cancel()
+
+    results = []
+    for task_id, task in pending:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            results.append({"task_id": task_id, "status": "completed"})
+        except asyncio.CancelledError:
+            results.append({"task_id": task_id, "status": "cancelled"})
+        except asyncio.TimeoutError:
+            results.append({"task_id": task_id, "status": "timeout"})
+        except Exception as e:
+            results.append({"task_id": task_id, "status": "error", "error": str(e)})
+    return results
+
+
 async def list_task_ids_by_item_id(redis, id):
     """
     List all tasks associated with a specific ID.

@@ -71,6 +71,7 @@
 		getChatById,
 		getChatMeta,
 		getChatMessagesBranch,
+		getChatMessageToolResult,
 		getTagsById,
 		updateChatFolderIdById,
 		patchChat,
@@ -86,6 +87,7 @@
 		generateMoACompletion,
 		stopTask,
 		getTaskIdsByChatId,
+		getActiveStreamsByChatId,
 		getStreamSnapshot
 	} from '$lib/apis';
 	import type { ReasoningEffort } from '$lib/apis';
@@ -396,6 +398,7 @@
 		tool_results: Map<string, any>;
 		pending_deltas: StreamDelta[];
 		snapshotting: boolean;
+		snapshotPromise: Promise<void> | null;
 	};
 	const streamMirrors = new Map<string, StreamMirror>();
 
@@ -404,13 +407,12 @@
 		if (!mirror) {
 			const existing = history?.messages?.[messageId];
 			mirror = {
-				content_blocks: Array.isArray(existing?.content_blocks)
-					? existing.content_blocks
-					: [],
+				content_blocks: Array.isArray(existing?.content_blocks) ? existing.content_blocks : [],
 				version: 0,
 				tool_results: new Map(),
 				pending_deltas: [],
-				snapshotting: false
+				snapshotting: false,
+				snapshotPromise: null
 			};
 			streamMirrors.set(messageId, mirror);
 		}
@@ -1366,9 +1368,7 @@
 			_chatId,
 			history,
 			params,
-			history?.currentId
-				? [{ op: 'set_history_current_id', current_id: history.currentId }]
-				: []
+			history?.currentId ? [{ op: 'set_history_current_id', current_id: history.currentId }] : []
 		);
 	};
 
@@ -1504,7 +1504,8 @@
 			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
 				const current = block.content || '';
-				block.content = text.includes(current) && text.length > current.length ? text : current + text;
+				block.content =
+					text.includes(current) && text.length > current.length ? text : current + text;
 			} else if (idx === mirror.content_blocks.length) {
 				const prev = mirror.content_blocks[idx - 1];
 				if (
@@ -1711,8 +1712,7 @@
 			cur.status = 'done';
 			cur.ended_at = Math.floor(Date.now() / 1000);
 			if (doneData.usage) cur.usage = doneData.usage;
-			cur.final_text =
-				cur.final_text || extractSubagentFinalText(cur.content_blocks, cur.content);
+			cur.final_text = cur.final_text || extractSubagentFinalText(cur.content_blocks, cur.content);
 		}
 
 		return cur;
@@ -2279,6 +2279,57 @@
 	let showControlsSubscribe = null;
 	let selectedFolderSubscribe = null;
 	let socketSubscribe = null;
+	let subscribedStreamChatId: string | null = null;
+
+	const emitSocketAck = <T = any,>(
+		event: string,
+		payload: any,
+		timeoutMs = 3000
+	): Promise<T | null> =>
+		new Promise((resolve) => {
+			if (!$socket) {
+				resolve(null);
+				return;
+			}
+			let settled = false;
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				resolve(null);
+			}, timeoutMs);
+			$socket.emit(event, payload, (response: T) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(response ?? null);
+			});
+		});
+
+	const unsubscribeStreamChat = (chatIdToUnsubscribe: string | null = subscribedStreamChatId) => {
+		if (!chatIdToUnsubscribe || !$socket) return;
+		$socket.emit('stream:unsubscribe', { chat_id: chatIdToUnsubscribe });
+		if (subscribedStreamChatId === chatIdToUnsubscribe) {
+			subscribedStreamChatId = null;
+		}
+	};
+
+	const subscribeStreamChat = async (chatIdToSubscribe: string | null) => {
+		if (!chatIdToSubscribe || $temporaryChatEnabled) return null;
+		if (subscribedStreamChatId === chatIdToSubscribe) return null;
+		if (subscribedStreamChatId) {
+			unsubscribeStreamChat(subscribedStreamChatId);
+		}
+		const response = await emitSocketAck<{ status?: boolean; streams?: any[] }>(
+			'stream:subscribe',
+			{
+				chat_id: chatIdToSubscribe
+			}
+		);
+		if (response?.status) {
+			subscribedStreamChatId = chatIdToSubscribe;
+		}
+		return response;
+	};
 
 	// Cmd/Ctrl+S inside a temporary chat saves it instead of triggering the
 	// browser's "Save Page" dialog. Skip when an editable element is focused so
@@ -2311,6 +2362,13 @@
 				_socket.off('events', chatEventHandler);
 				// Register new listener
 				_socket.on('events', chatEventHandler);
+				const visibleChatId = getVisibleChatId();
+				if (visibleChatId && !$temporaryChatEnabled) {
+					// New socket connection/store instance: re-join the visible chat's
+					// stream room even if the logical chat id did not change.
+					subscribedStreamChatId = null;
+					void subscribeStreamChat(visibleChatId);
+				}
 
 				// Reload chat if we reconnect while generating to catch missed completion events
 				const connectHandler = async () => {
@@ -2319,6 +2377,7 @@
 						const visibleChatId = getVisibleChatId();
 
 						if (visibleChatId && !$temporaryChatEnabled) {
+							await subscribeStreamChat(visibleChatId);
 							try {
 								const taskRes = await getTaskIdsByChatId(localStorage.token, visibleChatId);
 								if (!taskRes || !taskRes.task_ids || taskRes.task_ids.length === 0) {
@@ -2330,20 +2389,12 @@
 									await loadChat();
 								} else {
 									console.log('Task is still running on the backend. Resuming stream...');
-									// v2: catch up via snapshot instead of waiting for the next
-									// delta to expose a version gap. We snapshot every pending
-									// response message (any message that's still `generating`,
-									// i.e. !done) on the current branch.
+									// v2: the RAM stream store is authoritative while a
+									// generation is active. Ask the backend for active stream
+									// message ids and snapshot those directly instead of
+									// guessing from DB `done` flags.
 									if (($config as any)?.features?.stream_protocol_version === 'v2') {
-										const pending: string[] = [];
-										for (const m of Object.values(history.messages ?? {}) as any[]) {
-											if (m && m.role === 'assistant' && m.done === false) {
-												pending.push(m.id);
-											}
-										}
-										for (const mid of pending) {
-											requestStreamSnapshot(mid, visibleChatId);
-										}
+										await snapshotActiveStreamsForChat(visibleChatId);
 									}
 								}
 							} catch (e) {
@@ -2452,6 +2503,7 @@
 			pageSubscribe();
 			showControlsSubscribe();
 			selectedFolderSubscribe();
+			unsubscribeStreamChat();
 			socketSubscribe?.();
 			chatIdUnsubscriber?.();
 			window.removeEventListener('message', onMessageHandler);
@@ -2864,7 +2916,13 @@
 			temporaryChatEnabled.set(false);
 		}
 
-		let _chat, _taskRes;
+		// Subscribe before requesting active snapshots so any deltas that arrive
+		// during snapshot fetch are buffered/replayed by the v2 mirror.
+		const _subscribeRes = await subscribeStreamChat(currentChatId);
+
+		let _chat,
+			_taskRes,
+			_activeStreamsRes = _subscribeRes?.streams ? _subscribeRes : null;
 
 		// Stitches the paginated `?meta_only=true` response + a branch-message page
 		// back into the legacy `{id, title, chat: {...}}` shape that downstream code
@@ -2936,24 +2994,32 @@
 			if (resolved && resolved.chatId === currentChatId && resolved.chat) {
 				_chat = resolved.chat;
 				_taskRes = resolved.taskRes;
+				_activeStreamsRes = await getActiveStreamsByChatId(localStorage.token, currentChatId).catch(
+					() => null
+				);
 			} else {
-				[_chat, _taskRes] = await Promise.all([
+				[_chat, _taskRes, _activeStreamsRes] = await Promise.all([
 					loadPaginatedChat(),
 					getTaskIdsByChatId(localStorage.token, currentChatId).catch((error) => {
 						return null;
-					})
+					}),
+					getActiveStreamsByChatId(localStorage.token, currentChatId).catch(() => null)
 				]);
 			}
 		} else if (preloadedData && preloadedData.chatId === currentChatId && preloadedData.chat) {
 			_chat = preloadedData.chat;
 			_taskRes = preloadedData.taskRes;
+			_activeStreamsRes = await getActiveStreamsByChatId(localStorage.token, currentChatId).catch(
+				() => null
+			);
 			preloadedData = null;
 		} else {
-			[_chat, _taskRes] = await Promise.all([
+			[_chat, _taskRes, _activeStreamsRes] = await Promise.all([
 				loadPaginatedChat(),
 				getTaskIdsByChatId(localStorage.token, currentChatId).catch((error) => {
 					return null;
-				})
+				}),
+				getActiveStreamsByChatId(localStorage.token, currentChatId).catch(() => null)
 			]);
 		}
 
@@ -3023,8 +3089,14 @@
 							.find(
 								(m) =>
 									m?.role === 'user' &&
-									(messageTs === null || typeof m.timestamp !== 'number' || m.timestamp <= messageTs)
-							) ?? ordered.slice().reverse().find((m) => m?.role === 'user');
+									(messageTs === null ||
+										typeof m.timestamp !== 'number' ||
+										m.timestamp <= messageTs)
+							) ??
+						ordered
+							.slice()
+							.reverse()
+							.find((m) => m?.role === 'user');
 					if (parent?.id) {
 						message.parentId = parent.id;
 						parent.childrenIds = Array.isArray(parent.childrenIds) ? parent.childrenIds : [];
@@ -3066,6 +3138,18 @@
 		}
 
 		history = loadedHistory;
+
+		const activeStreamMessageIds = Array.isArray(_activeStreamsRes?.streams)
+			? _activeStreamsRes.streams
+					.map((stream: any) => stream?.message_id)
+					.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+			: [];
+		for (const mid of activeStreamMessageIds) {
+			const message = (history.messages as Record<string, any>)?.[mid];
+			if (message && message.role === 'assistant') {
+				message.done = false;
+			}
+		}
 
 		chatTitle.set(chatContent.title);
 
@@ -3228,6 +3312,12 @@
 
 		autoScroll = true;
 
+		if (activeStreamMessageIds.length > 0) {
+			await Promise.all(
+				activeStreamMessageIds.map((mid) => requestStreamSnapshot(mid, currentChatId))
+			);
+		}
+
 		taskIds = _taskRes?.task_ids ?? null;
 
 		// If a task is still running on the backend (we reloaded mid-stream),
@@ -3236,7 +3326,7 @@
 		// receive its terminal event; polling reloads the chat as soon as the task
 		// disappears, closing the reload-during-subagent gap without user refreshes.
 		stopResumeTaskPolling();
-		if (taskIds && taskIds.length > 0) {
+		if ((taskIds && taskIds.length > 0) || activeStreamMessageIds.length > 0) {
 			generating = true;
 			_wasGenerating = true;
 			startResumeTaskPolling(currentChatId);
@@ -3832,7 +3922,8 @@
 			const text = payload.text || '';
 			if (block && (block.type === 'text' || block.type === 'reasoning')) {
 				const current = block.content || '';
-				block.content = text.includes(current) && text.length > current.length ? text : current + text;
+				block.content =
+					text.includes(current) && text.length > current.length ? text : current + text;
 			} else if (idx === mirror.content_blocks.length) {
 				const prev = mirror.content_blocks[idx - 1];
 				// Defensive: if an out-of-order replace/open made the server send a
@@ -3974,72 +4065,103 @@
 
 	const requestStreamSnapshot = async (messageId: string, chatId: string | null) => {
 		const mirror = getOrCreateStreamMirror(messageId);
-		if (mirror.snapshotting) return;
+		if (mirror.snapshotPromise) return mirror.snapshotPromise;
+
 		mirror.snapshotting = true;
+		mirror.snapshotPromise = (async () => {
+			let snap: any = null;
+			try {
+				snap = await getStreamSnapshot(localStorage.token, messageId, chatId);
+			} catch (err) {
+				console.error('[chat:delta] snapshot fetch failed', messageId, err);
+				return;
+			}
 
-		let snap: any = null;
-		try {
-			snap = await getStreamSnapshot(localStorage.token, messageId);
-		} catch (err) {
-			console.error('[chat:delta] snapshot fetch failed', messageId, err);
+			if (!snap) {
+				return;
+			}
+
+			const message = history.messages[messageId];
+			if (!message) {
+				return;
+			}
+
+			mirror.version = typeof snap.version === 'number' ? snap.version : 0;
+			mirror.tool_results = new Map();
+			if (snap.tool_results && typeof snap.tool_results === 'object') {
+				for (const [k, v] of Object.entries(snap.tool_results)) {
+					mirror.tool_results.set(k, normalizeToolResultEntry(k, v));
+				}
+			}
+			mirror.content_blocks = Array.isArray(snap.content_blocks)
+				? hydrateToolResultsInBlocks(snap.content_blocks.slice(), mirror.tool_results)
+				: [];
+
+			const buffered = mirror.pending_deltas;
+			mirror.pending_deltas = [];
+
+			writeMirrorToMessage(mirror, message);
+			if (snap.usage) {
+				message.usage = snap.usage;
+				applyUsageToChatTokenStats(chatId, message.id, snap.usage, { terminal: true });
+				chatTokenStatsRefreshTrigger.update((n) => n + 1);
+			}
+			if (Array.isArray(snap.sources)) {
+				message.sources = snap.sources;
+			}
+			if (snap.selected_model_id) {
+				message.selectedModelId = snap.selected_model_id;
+				message.arena = true;
+			}
+			if (snap.status === 'error' && snap.error) message.error = snap.error;
+			if (snap.status === 'done') message.done = true;
+
+			for (const d of buffered) {
+				if (d.version <= mirror.version) continue;
+				if (d.version > mirror.version + 1) {
+					// Still gapped after snapshot — re-buffer and refetch.
+					mirror.pending_deltas.push(d);
+					continue;
+				}
+				applyDeltaOp(mirror, d.op, d.payload);
+				mirror.version = d.version;
+			}
+
+			writeMirrorToMessage(mirror, message);
+			history.messages[messageId] = message;
+			scheduleStreamingMessageFlush(messageId, { runTTS: false, ownerId: messageId });
+
+			if (mirror.pending_deltas.length > 0) {
+				// Still gapped — kick off another snapshot. This is rare.
+				void requestStreamSnapshot(messageId, chatId);
+			}
+		})().finally(() => {
 			mirror.snapshotting = false;
-			return;
-		}
+			mirror.snapshotPromise = null;
+		});
 
-		if (!snap) {
-			mirror.snapshotting = false;
-			return;
-		}
+		return mirror.snapshotPromise;
+	};
 
-		const message = history.messages[messageId];
-		if (!message) {
-			mirror.snapshotting = false;
-			return;
-		}
+	const snapshotActiveStreamsForChat = async (chatIdToSnapshot: string | null) => {
+		if (!chatIdToSnapshot || $temporaryChatEnabled) return [];
+		const active = await getActiveStreamsByChatId(localStorage.token, chatIdToSnapshot).catch(
+			() => null
+		);
+		const streams = Array.isArray(active?.streams) ? active.streams : [];
+		const messageIds = streams
+			.map((stream: any) => stream?.message_id)
+			.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0);
 
-		mirror.version = typeof snap.version === 'number' ? snap.version : 0;
-		mirror.tool_results = new Map();
-		if (snap.tool_results && typeof snap.tool_results === 'object') {
-			for (const [k, v] of Object.entries(snap.tool_results)) {
-				mirror.tool_results.set(k, normalizeToolResultEntry(k, v));
+		for (const mid of messageIds) {
+			const message = history?.messages?.[mid];
+			if (message && message.role === 'assistant') {
+				message.done = false;
 			}
 		}
-		mirror.content_blocks = Array.isArray(snap.content_blocks)
-			? hydrateToolResultsInBlocks(snap.content_blocks.slice(), mirror.tool_results)
-			: [];
 
-		const buffered = mirror.pending_deltas;
-		mirror.pending_deltas = [];
-		mirror.snapshotting = false;
-
-		writeMirrorToMessage(mirror, message);
-		if (snap.usage) {
-			message.usage = snap.usage;
-			applyUsageToChatTokenStats(chatId, message.id, snap.usage, { terminal: true });
-			chatTokenStatsRefreshTrigger.update((n) => n + 1);
-		}
-		if (snap.status === 'error' && snap.error) message.error = snap.error;
-		if (snap.status === 'done') message.done = true;
-
-		for (const d of buffered) {
-			if (d.version <= mirror.version) continue;
-			if (d.version > mirror.version + 1) {
-				// Still gapped after snapshot — re-buffer and refetch.
-				mirror.pending_deltas.push(d);
-				continue;
-			}
-			applyDeltaOp(mirror, d.op, d.payload);
-			mirror.version = d.version;
-		}
-
-		writeMirrorToMessage(mirror, message);
-		history.messages[messageId] = message;
-		scheduleStreamingMessageFlush(messageId, { runTTS: false, ownerId: messageId });
-
-		if (mirror.pending_deltas.length > 0) {
-			// Still gapped — kick off another snapshot. This is rare.
-			requestStreamSnapshot(messageId, chatId);
-		}
+		await Promise.all(messageIds.map((mid) => requestStreamSnapshot(mid, chatIdToSnapshot)));
+		return messageIds;
 	};
 
 	const chatDeltaHandler = (
@@ -4092,6 +4214,11 @@
 			message_id?: string;
 			tool_call_id?: string;
 			result?: any;
+			result_ref?: string;
+			result_lazy?: boolean;
+			size?: number;
+			sha256?: string;
+			summary?: any;
 			files?: any[];
 			embeds?: any[];
 			subagent_id?: string;
@@ -4103,16 +4230,35 @@
 		const resultEntry = normalizeToolResultEntry(data.tool_call_id, {
 			tool_call_id: data.tool_call_id,
 			content: data.result ?? '',
+			...(data.result_ref ? { result_ref: data.result_ref } : {}),
+			...(data.result_lazy ? { result_lazy: true } : {}),
+			...(typeof data.size === 'number' ? { size: data.size } : {}),
+			...(data.sha256 ? { sha256: data.sha256 } : {}),
+			...(data.summary ? { summary: data.summary } : {}),
 			...(Array.isArray(data.files) && data.files.length > 0 ? { files: data.files } : {}),
 			...(Array.isArray(data.embeds) && data.embeds.length > 0 ? { embeds: data.embeds } : {}),
 			...(data.subagent_id ? { subagent_id: data.subagent_id } : {})
 		});
 		mirror.tool_results.set(data.tool_call_id, resultEntry);
 		if (Array.isArray(data.files) && data.files.length > 0) {
-			message.files = [...(message.files ?? []), ...data.files];
+			const seen = new Set(
+				(message.files ?? []).map((file: any) => file?.url ?? file?.content ?? JSON.stringify(file))
+			);
+			const nextFiles = [...(message.files ?? [])];
+			for (const file of data.files) {
+				const key = file?.url ?? file?.content ?? JSON.stringify(file);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				nextFiles.push(file);
+			}
+			message.files = nextFiles;
 		}
 		if (Array.isArray(data.embeds) && data.embeds.length > 0) {
-			message.embeds = [...(message.embeds ?? []), ...data.embeds];
+			const seen = new Set(message.embeds ?? []);
+			message.embeds = [
+				...(message.embeds ?? []),
+				...data.embeds.filter((embed) => !seen.has(embed))
+			];
 		}
 		// Inline the tool result into the matching tool_calls block so the
 		// renderer keeps working unchanged. blocksToDisplayMarkdown reads
@@ -4556,7 +4702,10 @@
 
 									try {
 										const visionMessages = [
-											{ role: 'system', content: visionPrompt.replace('{query}', userMessage.content) },
+											{
+												role: 'system',
+												content: visionPrompt.replace('{query}', userMessage.content)
+											},
 											{
 												role: 'user',
 												content: [
@@ -4670,7 +4819,10 @@
 
 									try {
 										const visionMessages = [
-											{ role: 'system', content: visionPrompt.replace('{query}', userMessage.content) },
+											{
+												role: 'system',
+												content: visionPrompt.replace('{query}', userMessage.content)
+											},
 											{
 												role: 'user',
 												content: [
@@ -4920,13 +5072,11 @@
 								mirrorHistoryMessage(responseMessageId);
 							}
 						}
-
 					} else {
 						toast.error($i18n.t(`Model {{modelId}} not found`, { modelId }));
 					}
 				})
 			);
-
 		} finally {
 			chatStreamDebug('[chat-stream] sendMessage finally — clearing controller');
 			generating = false;
@@ -5048,340 +5198,346 @@
 		// below also stays as the fallback when the backend hasn't flipped
 		// STREAM_PROTOCOL_VERSION to v2 yet.
 		const isTempChat = $temporaryChatEnabled || _chatId?.startsWith('local:');
-		const useV2Body =
-			($config as any)?.features?.stream_protocol_version === 'v2' && !isTempChat;
+		const useV2Body = ($config as any)?.features?.stream_protocol_version === 'v2' && !isTempChat;
 
 		let messages: any[] = [];
 		if (!useV2Body) {
 			messages = [
-			params?.system || $settings.system
-				? {
-						role: 'system',
-						content: `${params?.system ?? $settings?.system ?? ''}`
-					}
-				: undefined,
-			...expandMessagesForToolResumption(_messages).map((message) => ({
-				...message,
-				content:
-					typeof message.content === 'string' ? processDetails(message.content) : message.content
-			}))
-		].filter((message) => message);
+				params?.system || $settings.system
+					? {
+							role: 'system',
+							content: `${params?.system ?? $settings?.system ?? ''}`
+						}
+					: undefined,
+				...expandMessagesForToolResumption(_messages).map((message) => ({
+					...message,
+					content:
+						typeof message.content === 'string' ? processDetails(message.content) : message.content
+				}))
+			].filter((message) => message);
 
-		const TEXT_FILE_EXTS = new Set([
-			'txt',
-			'md',
-			'markdown',
-			'rst',
-			'csv',
-			'tsv',
-			'json',
-			'jsonl',
-			'ndjson',
-			'yaml',
-			'yml',
-			'toml',
-			'ini',
-			'cfg',
-			'conf',
-			'env',
-			'log',
-			'xml',
-			'svg',
-			'py',
-			'pyi',
-			'ipynb',
-			'js',
-			'mjs',
-			'cjs',
-			'ts',
-			'tsx',
-			'jsx',
-			'vue',
-			'svelte',
-			'java',
-			'kt',
-			'kts',
-			'scala',
-			'groovy',
-			'c',
-			'cc',
-			'cpp',
-			'cxx',
-			'h',
-			'hpp',
-			'hxx',
-			'rs',
-			'go',
-			'rb',
-			'php',
-			'pl',
-			'pm',
-			'lua',
-			'r',
-			'jl',
-			'dart',
-			'swift',
-			'm',
-			'mm',
-			'cs',
-			'fs',
-			'fsx',
-			'ex',
-			'exs',
-			'erl',
-			'hs',
-			'ml',
-			'mli',
-			'clj',
-			'cljs',
-			'sh',
-			'bash',
-			'zsh',
-			'fish',
-			'ps1',
-			'bat',
-			'cmd',
-			'sql',
-			'graphql',
-			'gql',
-			'proto',
-			'css',
-			'scss',
-			'sass',
-			'less',
-			'tex',
-			'bib',
-			'srt',
-			'vtt',
-			'patch',
-			'diff',
-			'gitignore',
-			'dockerignore',
-			'editorconfig'
-		]);
+			const TEXT_FILE_EXTS = new Set([
+				'txt',
+				'md',
+				'markdown',
+				'rst',
+				'csv',
+				'tsv',
+				'json',
+				'jsonl',
+				'ndjson',
+				'yaml',
+				'yml',
+				'toml',
+				'ini',
+				'cfg',
+				'conf',
+				'env',
+				'log',
+				'xml',
+				'svg',
+				'py',
+				'pyi',
+				'ipynb',
+				'js',
+				'mjs',
+				'cjs',
+				'ts',
+				'tsx',
+				'jsx',
+				'vue',
+				'svelte',
+				'java',
+				'kt',
+				'kts',
+				'scala',
+				'groovy',
+				'c',
+				'cc',
+				'cpp',
+				'cxx',
+				'h',
+				'hpp',
+				'hxx',
+				'rs',
+				'go',
+				'rb',
+				'php',
+				'pl',
+				'pm',
+				'lua',
+				'r',
+				'jl',
+				'dart',
+				'swift',
+				'm',
+				'mm',
+				'cs',
+				'fs',
+				'fsx',
+				'ex',
+				'exs',
+				'erl',
+				'hs',
+				'ml',
+				'mli',
+				'clj',
+				'cljs',
+				'sh',
+				'bash',
+				'zsh',
+				'fish',
+				'ps1',
+				'bat',
+				'cmd',
+				'sql',
+				'graphql',
+				'gql',
+				'proto',
+				'css',
+				'scss',
+				'sass',
+				'less',
+				'tex',
+				'bib',
+				'srt',
+				'vtt',
+				'patch',
+				'diff',
+				'gitignore',
+				'dockerignore',
+				'editorconfig'
+			]);
 
-		const isTextFile = (file) => {
-			if (file?.type !== 'file') return false;
-			const name = (file.name || file.file?.filename || '').toLowerCase();
-			if (name.endsWith('.pdf')) return false;
-			const dot = name.lastIndexOf('.');
-			const ext = dot >= 0 ? name.slice(dot + 1) : name;
-			if (ext && TEXT_FILE_EXTS.has(ext)) return true;
-			const ct = (file.content_type || file.file?.meta?.content_type || '').toLowerCase();
-			if (ct.startsWith('text/') && !ct.includes('html')) return true;
-			return false;
-		};
+			const isTextFile = (file) => {
+				if (file?.type !== 'file') return false;
+				const name = (file.name || file.file?.filename || '').toLowerCase();
+				if (name.endsWith('.pdf')) return false;
+				const dot = name.lastIndexOf('.');
+				const ext = dot >= 0 ? name.slice(dot + 1) : name;
+				if (ext && TEXT_FILE_EXTS.has(ext)) return true;
+				const ct = (file.content_type || file.file?.meta?.content_type || '').toLowerCase();
+				if (ct.startsWith('text/') && !ct.includes('html')) return true;
+				return false;
+			};
 
-		// Files that don't read as plain text but the backend can extract from:
-		// office formats, html, epub, etc. These travel as `type: "file"` content
-		// parts with a `processing_mode` and get materialised on the server
-		// (openai.py file-part loop: text mode → <document> text part;
-		// pdf mode → LibreOffice → existing PDF + file-parser plugin path).
-		const EXTRACTABLE_EXTS = new Set([
-			'docx',
-			'doc',
-			'odt',
-			'rtf',
-			'pptx',
-			'ppt',
-			'xlsx',
-			'xls',
-			'html',
-			'htm',
-			'epub'
-		]);
+			// Files that don't read as plain text but the backend can extract from:
+			// office formats, html, epub, etc. These travel as `type: "file"` content
+			// parts with a `processing_mode` and get materialised on the server
+			// (openai.py file-part loop: text mode → <document> text part;
+			// pdf mode → LibreOffice → existing PDF + file-parser plugin path).
+			const EXTRACTABLE_EXTS = new Set([
+				'docx',
+				'doc',
+				'odt',
+				'rtf',
+				'pptx',
+				'ppt',
+				'xlsx',
+				'xls',
+				'html',
+				'htm',
+				'epub'
+			]);
 
-		const isExtractableFile = (file) => {
-			if (file?.type !== 'file') return false;
-			const name = (file.name || file.file?.filename || '').toLowerCase();
-			if (name.endsWith('.pdf')) return false;
-			const dot = name.lastIndexOf('.');
-			const ext = dot >= 0 ? name.slice(dot + 1) : '';
-			return EXTRACTABLE_EXTS.has(ext);
-		};
+			const isExtractableFile = (file) => {
+				if (file?.type !== 'file') return false;
+				const name = (file.name || file.file?.filename || '').toLowerCase();
+				if (name.endsWith('.pdf')) return false;
+				const dot = name.lastIndexOf('.');
+				const ext = dot >= 0 ? name.slice(dot + 1) : '';
+				return EXTRACTABLE_EXTS.has(ext);
+			};
 
-		const fetchTextFileContent = async (file) => {
-			if (typeof file._inlinedText === 'string') return file._inlinedText;
-			try {
-				const blob = await getFileContentById(file.id);
-				const text = blob ? await blob.text() : '';
-				file._inlinedText = text;
-				return text;
-			} catch (e) {
-				console.error('Failed to read text file content:', e);
-				file._inlinedText = '';
-				return '';
-			}
-		};
+			const fetchTextFileContent = async (file) => {
+				if (typeof file._inlinedText === 'string') return file._inlinedText;
+				try {
+					const blob = await getFileContentById(file.id);
+					const text = blob ? await blob.text() : '';
+					file._inlinedText = text;
+					return text;
+				} catch (e) {
+					console.error('Failed to read text file content:', e);
+					file._inlinedText = '';
+					return '';
+				}
+			};
 
-		const escapeXmlAttr = (s) =>
-			String(s)
-				.replace(/&/g, '&amp;')
-				.replace(/</g, '&lt;')
-				.replace(/>/g, '&gt;')
-				.replace(/"/g, '&quot;');
+			const escapeXmlAttr = (s) =>
+				String(s)
+					.replace(/&/g, '&amp;')
+					.replace(/</g, '&lt;')
+					.replace(/>/g, '&gt;')
+					.replace(/"/g, '&quot;');
 
-		const buildTextFileBlocks = async (files) => {
-			const textFiles = (files ?? []).filter(isTextFile);
-			if (!textFiles.length) return '';
-			const blocks = await Promise.all(
-				textFiles.map(async (f) => {
-					const name = f.name || f.file?.filename || 'file';
-					const text = await fetchTextFileContent(f);
-					return `<document filename="${escapeXmlAttr(name)}">\n${text}\n</document>`;
-				})
-			);
-			return blocks.join('\n\n') + '\n\n';
-		};
+			const buildTextFileBlocks = async (files) => {
+				const textFiles = (files ?? []).filter(isTextFile);
+				if (!textFiles.length) return '';
+				const blocks = await Promise.all(
+					textFiles.map(async (f) => {
+						const name = f.name || f.file?.filename || 'file';
+						const text = await fetchTextFileContent(f);
+						return `<document filename="${escapeXmlAttr(name)}">\n${text}\n</document>`;
+					})
+				);
+				return blocks.join('\n\n') + '\n\n';
+			};
 
-		messages = (
-			await Promise.all(
-				messages.map(async (message) => {
-					// Structured content_blocks travel through to the backend untouched —
-					// `blocks_to_api_messages` on the server is the single source of truth
-					// for the internal-message → API-message conversion.
-					if (
-						message?.role === 'assistant' &&
-						Array.isArray(message?.content_blocks) &&
-						message.content_blocks.length > 0
-					) {
-						return {
-							role: 'assistant',
-							content_blocks: message.content_blocks,
-							...(message.reasoning_details_per_round
-								? { reasoning_details_per_round: message.reasoning_details_per_round }
-								: {}),
-							...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : {})
-						};
-					}
+			messages = (
+				await Promise.all(
+					messages.map(async (message) => {
+						// Structured content_blocks travel through to the backend untouched —
+						// `blocks_to_api_messages` on the server is the single source of truth
+						// for the internal-message → API-message conversion.
+						if (
+							message?.role === 'assistant' &&
+							Array.isArray(message?.content_blocks) &&
+							message.content_blocks.length > 0
+						) {
+							return {
+								role: 'assistant',
+								content_blocks: message.content_blocks,
+								...(message.tool_result_bodies
+									? { tool_result_bodies: message.tool_result_bodies }
+									: {}),
+								...(message.reasoning_details_per_round
+									? { reasoning_details_per_round: message.reasoning_details_per_round }
+									: {}),
+								...(message.reasoning_details
+									? { reasoning_details: message.reasoning_details }
+									: {})
+							};
+						}
 
-					if (message.role === 'tool') {
-						return {
-							role: 'tool',
-							content: message.content ?? '',
-							...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {})
-						};
-					}
+						if (message.role === 'tool') {
+							return {
+								role: 'tool',
+								content: message.content ?? '',
+								...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {})
+							};
+						}
 
-					if (message.tool_calls) {
-						if (Array.isArray(message.reasoning_details)) {
-							const signatureDetail = message.reasoning_details.find(
-								(d) => d.type === 'reasoning.encrypted' && d.data
-							);
+						if (message.tool_calls) {
+							if (Array.isArray(message.reasoning_details)) {
+								const signatureDetail = message.reasoning_details.find(
+									(d) => d.type === 'reasoning.encrypted' && d.data
+								);
 
-							if (signatureDetail) {
-								message.tool_calls = message.tool_calls.map((tc) => ({
-									...tc,
-									extra_content: { google: { thought_signature: signatureDetail.data } }
-								}));
+								if (signatureDetail) {
+									message.tool_calls = message.tool_calls.map((tc) => ({
+										...tc,
+										extra_content: { google: { thought_signature: signatureDetail.data } }
+									}));
+								}
 							}
+
+							return {
+								role: 'assistant',
+								content: (message?.merged?.content ?? message.content) || null,
+								tool_calls: message.tool_calls,
+								// OpenAI Responses API (and Anthropic) require the reasoning that
+								// led to a function_call to be preserved on the assistant message
+								// in follow-up requests. Dropping it breaks the reasoning chain on
+								// multi-turn tool-call conversations.
+								...(message.reasoning_details
+									? { reasoning_details: message.reasoning_details }
+									: {})
+							};
+						}
+
+						const hasImages = message.files?.some((file) => file.type === 'image');
+						const isUser = message.role === 'user';
+						const modelSupportsVision = model?.info?.meta?.capabilities?.vision ?? true;
+
+						// Check if message has PDF files
+						const hasPdfFiles = message.files?.some(
+							(file) =>
+								file.type === 'file' &&
+								(file.name?.toLowerCase().endsWith('.pdf') ||
+									file.file?.filename?.toLowerCase().endsWith('.pdf'))
+						);
+
+						// docx/xlsx/pptx/etc. — always sent as file parts so the backend
+						// can text-extract (or PDF-convert per processing_mode). Unlike
+						// images/PDFs these don't gate on vision capability — extracted
+						// text works on every model.
+						const hasExtractableFiles = message.files?.some(isExtractableFile);
+
+						const textPrefix = isUser ? await buildTextFileBlocks(message.files) : '';
+						const baseText = message?.merged?.content ?? message.content ?? '';
+
+						if (
+							isUser &&
+							(((hasImages || hasPdfFiles) && modelSupportsVision) || hasExtractableFiles)
+						) {
+							return {
+								role: message.role,
+								content: [
+									{
+										type: 'text',
+										text: textPrefix + baseText
+									},
+									// Add image content parts (vision-capable models only).
+									...(modelSupportsVision
+										? message.files
+												.filter((file) => file.type === 'image')
+												.map((file) => ({
+													type: 'image_url',
+													image_url: {
+														url: file.url
+													}
+												}))
+										: []),
+									// PDF file parts for OpenRouter's file-parser plugin
+									// (vision-capable models only; existing behavior).
+									...(modelSupportsVision
+										? message.files
+												.filter(
+													(file) =>
+														file.type === 'file' &&
+														(file.name?.toLowerCase().endsWith('.pdf') ||
+															file.file?.filename?.toLowerCase().endsWith('.pdf'))
+												)
+												.map((file) => ({
+													type: 'file',
+													file: {
+														filename: file.name || file.file?.filename || 'document.pdf',
+														file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`
+													}
+												}))
+										: []),
+									// docx/xlsx/pptx/etc. — backend extracts on receipt and
+									// replaces this part with either a <document> text part
+									// (mode == 'text') or a PDF binary part routed through
+									// the file-parser plugin (mode == 'pdf').
+									...message.files.filter(isExtractableFile).map((file) => ({
+										type: 'file',
+										file: {
+											filename: file.name || file.file?.filename || 'document',
+											file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`,
+											processing_mode: file.processing_mode === 'pdf' ? 'pdf' : 'text'
+										}
+									}))
+								]
+							};
 						}
 
 						return {
-							role: 'assistant',
-							content: (message?.merged?.content ?? message.content) || null,
-							tool_calls: message.tool_calls,
-							// OpenAI Responses API (and Anthropic) require the reasoning that
-							// led to a function_call to be preserved on the assistant message
-							// in follow-up requests. Dropping it breaks the reasoning chain on
-							// multi-turn tool-call conversations.
+							role: message.role,
+							content: isUser ? textPrefix + baseText : baseText,
 							...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : {})
 						};
-					}
-
-					const hasImages = message.files?.some((file) => file.type === 'image');
-					const isUser = message.role === 'user';
-					const modelSupportsVision = model?.info?.meta?.capabilities?.vision ?? true;
-
-					// Check if message has PDF files
-					const hasPdfFiles = message.files?.some(
-						(file) =>
-							file.type === 'file' &&
-							(file.name?.toLowerCase().endsWith('.pdf') ||
-								file.file?.filename?.toLowerCase().endsWith('.pdf'))
-					);
-
-					// docx/xlsx/pptx/etc. — always sent as file parts so the backend
-					// can text-extract (or PDF-convert per processing_mode). Unlike
-					// images/PDFs these don't gate on vision capability — extracted
-					// text works on every model.
-					const hasExtractableFiles = message.files?.some(isExtractableFile);
-
-					const textPrefix = isUser ? await buildTextFileBlocks(message.files) : '';
-					const baseText = message?.merged?.content ?? message.content ?? '';
-
-					if (
-						isUser &&
-						(((hasImages || hasPdfFiles) && modelSupportsVision) || hasExtractableFiles)
-					) {
-						return {
-							role: message.role,
-							content: [
-								{
-									type: 'text',
-									text: textPrefix + baseText
-								},
-								// Add image content parts (vision-capable models only).
-								...(modelSupportsVision
-									? message.files
-											.filter((file) => file.type === 'image')
-											.map((file) => ({
-												type: 'image_url',
-												image_url: {
-													url: file.url
-												}
-											}))
-									: []),
-								// PDF file parts for OpenRouter's file-parser plugin
-								// (vision-capable models only; existing behavior).
-								...(modelSupportsVision
-									? message.files
-											.filter(
-												(file) =>
-													file.type === 'file' &&
-													(file.name?.toLowerCase().endsWith('.pdf') ||
-														file.file?.filename?.toLowerCase().endsWith('.pdf'))
-											)
-											.map((file) => ({
-												type: 'file',
-												file: {
-													filename: file.name || file.file?.filename || 'document.pdf',
-													file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`
-												}
-											}))
-									: []),
-								// docx/xlsx/pptx/etc. — backend extracts on receipt and
-								// replaces this part with either a <document> text part
-								// (mode == 'text') or a PDF binary part routed through
-								// the file-parser plugin (mode == 'pdf').
-								...message.files.filter(isExtractableFile).map((file) => ({
-									type: 'file',
-									file: {
-										filename: file.name || file.file?.filename || 'document',
-										file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`,
-										processing_mode: file.processing_mode === 'pdf' ? 'pdf' : 'text'
-									}
-								}))
-							]
-						};
-					}
-
-					return {
-						role: message.role,
-						content: isUser ? textPrefix + baseText : baseText,
-						...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : {})
-					};
-				})
-			)
-		).filter(
-			(message) =>
-				message?.role === 'user' ||
-				message?.role === 'tool' ||
-				hasMessageContent(message?.content) ||
-				message?.reasoning_details ||
-				message?.tool_calls?.length ||
-				(Array.isArray(message?.content_blocks) && message.content_blocks.length > 0)
-		);
+					})
+				)
+			).filter(
+				(message) =>
+					message?.role === 'user' ||
+					message?.role === 'tool' ||
+					hasMessageContent(message?.content) ||
+					message?.reasoning_details ||
+					message?.tool_calls?.length ||
+					(Array.isArray(message?.content_blocks) && message.content_blocks.length > 0)
+			);
 		} // end if (!useV2Body)
 
 		const toolIds = [];
@@ -5419,14 +5575,12 @@
 			}
 		}
 
-		const isFirstTurn =
-			useV2Body
-				? (_messages.length === 1 ||
-					(_messages.length === 2 && _messages[0]?.role === 'system'))
-				: messages.length == 1 ||
-					(messages.length == 2 &&
-						messages.at(0)?.role === 'system' &&
-						messages.at(1)?.role === 'user');
+		const isFirstTurn = useV2Body
+			? _messages.length === 1 || (_messages.length === 2 && _messages[0]?.role === 'system')
+			: messages.length == 1 ||
+				(messages.length == 2 &&
+					messages.at(0)?.role === 'system' &&
+					messages.at(1)?.role === 'user');
 
 		const [res, controller] = await chatCompletion(
 			localStorage.token,
@@ -6441,6 +6595,35 @@
 		});
 	};
 
+	const hydrateLazyToolResultBodiesForRetry = async (
+		message: any,
+		context: any,
+		chatId: string | null
+	) => {
+		if (!chatId || !context?.content_blocks) return null;
+		const bodies: Record<string, any> = {};
+		const fetches: Promise<void>[] = [];
+
+		for (const block of context.content_blocks ?? []) {
+			if (block?.type !== 'tool_calls' || !Array.isArray(block.results)) continue;
+			for (const result of block.results) {
+				if (!result?.result_ref || result?.content) continue;
+				const toolCallId = result.tool_call_id || result.result_ref;
+				fetches.push(
+					getChatMessageToolResult(localStorage.token, chatId, message.id, toolCallId).then(
+						(body) => {
+							if (body) bodies[result.result_ref] = body;
+						}
+					)
+				);
+			}
+		}
+
+		if (fetches.length === 0) return null;
+		await Promise.all(fetches);
+		return Object.keys(bodies).length > 0 ? bodies : null;
+	};
+
 	const retryFromLastRequest = async (message, modelId = null) => {
 		if (!history.currentId) {
 			return false;
@@ -6453,8 +6636,21 @@
 			return false;
 		}
 
+		const _chatId = getVisibleChatId();
 		const structuredContext = getStructuredRetryLastRequestContext(message);
-		const legacyToolContext = structuredContext ? null : getRetryableToolContext(message?.content ?? '');
+		let structuredToolResultBodies = null;
+		try {
+			structuredToolResultBodies = structuredContext
+				? await hydrateLazyToolResultBodiesForRetry(message, structuredContext, _chatId)
+				: null;
+		} catch (err) {
+			console.error('Failed to hydrate lazy tool results for retry', err);
+			toast.error($i18n.t('Failed to load tool result for retry.'));
+			return false;
+		}
+		const legacyToolContext = structuredContext
+			? null
+			: getRetryableToolContext(message?.content ?? '');
 		if (!structuredContext && !legacyToolContext?.content) {
 			return false;
 		}
@@ -6465,7 +6661,9 @@
 			id: responseMessageId,
 			childrenIds: [],
 			role: 'assistant',
-			content: structuredContext ? structuredContext.content : `${legacyToolContext?.content ?? ''}\n\n`,
+			content: structuredContext
+				? structuredContext.content
+				: `${legacyToolContext?.content ?? ''}\n\n`,
 			model: targetModelId,
 			modelName: model.name ?? targetModelId,
 			modelIdx: message.modelIdx ?? 0,
@@ -6473,6 +6671,9 @@
 			...(structuredContext
 				? {
 						content_blocks: structuredContext.content_blocks,
+						...(structuredToolResultBodies
+							? { tool_result_bodies: structuredToolResultBodies }
+							: {}),
 						...(structuredContext.reasoning_details_per_round
 							? { reasoning_details_per_round: structuredContext.reasoning_details_per_round }
 							: {})
@@ -6498,7 +6699,6 @@
 
 		history = history;
 
-		const _chatId = getVisibleChatId();
 		const isTempChat = $temporaryChatEnabled || _chatId?.startsWith('local:');
 		if (_chatId && !isTempChat) {
 			await saveChatHandler(_chatId, history, params, [
@@ -6517,6 +6717,9 @@
 						: {}),
 					...(responseMessage.reasoning_details_per_round
 						? { reasoning_details_per_round: responseMessage.reasoning_details_per_round }
+						: {}),
+					...(responseMessage.tool_result_bodies
+						? { tool_result_bodies: responseMessage.tool_result_bodies }
 						: {}),
 					...(responseMessage.reasoning_details
 						? { reasoning_details: responseMessage.reasoning_details }

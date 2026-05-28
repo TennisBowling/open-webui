@@ -3,6 +3,8 @@
 
 	export let id = '';
 	export let block: any = {};
+	export let chatId = '';
+	export let messageId = '';
 
 	const subagentToolNames = new Set([
 		'subagent_launch',
@@ -46,9 +48,16 @@
 			done: resultPayloadReady ? 'true' : 'false',
 			id: result?.subagent_id ?? call?.id ?? call?.tool_call_id ?? '',
 			tool_call_id: call?.id ?? call?.tool_call_id ?? '',
+			chat_id: chatId,
+			message_id: messageId,
 			name,
 			arguments: stringifyIfNeeded(call?.function?.arguments ?? ''),
 			result: result?.content ?? '',
+			result_ref: result?.result_ref ?? '',
+			result_lazy: result?.result_lazy ? 'true' : 'false',
+			size: result?.size ?? '',
+			sha256: result?.sha256 ?? '',
+			summary: result?.summary ? JSON.stringify(result.summary) : '',
 			files: result?.files ? JSON.stringify(result.files) : '',
 			embeds: result?.embeds ? JSON.stringify(result.embeds) : ''
 		};

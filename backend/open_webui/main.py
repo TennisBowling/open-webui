@@ -511,6 +511,7 @@ from open_webui.tasks import (
     create_task,
     stop_task,
     list_tasks,
+    cancel_all_local_tasks,
 )  # Import from tasks.py
 
 from open_webui.utils.redis import get_sentinels_from_env
@@ -634,6 +635,14 @@ async def lifespan(app: FastAPI):
         )
 
     yield
+
+    try:
+        shutdown_results = await cancel_all_local_tasks(timeout=60.0)
+        timed_out = [r for r in shutdown_results if r.get("status") == "timeout"]
+        if timed_out:
+            log.warning(f"Timed out waiting for tasks during shutdown: {timed_out}")
+    except Exception as e:
+        log.exception(f"Error cancelling active tasks during shutdown: {e}")
 
     if hasattr(app.state, "http_session"):
         await app.state.http_session.close()
@@ -1606,14 +1615,10 @@ async def chat_completion(
         stream_delta_chunk_size = form_data.get("params", {}).get(
             "stream_delta_chunk_size"
         )
-        reasoning_tags = form_data.get("params", {}).get("reasoning_tags")
 
         # Model Params
         if model_info_params.get("stream_delta_chunk_size"):
             stream_delta_chunk_size = model_info_params.get("stream_delta_chunk_size")
-
-        if model_info_params.get("reasoning_tags") is not None:
-            reasoning_tags = model_info_params.get("reasoning_tags")
 
         metadata = {
             "user_id": user.id,
@@ -1631,7 +1636,6 @@ async def chat_completion(
             "direct": model_item.get("direct", False),
             "params": {
                 "stream_delta_chunk_size": stream_delta_chunk_size,
-                "reasoning_tags": reasoning_tags,
                 "function_calling": (
                     "native"
                     if (

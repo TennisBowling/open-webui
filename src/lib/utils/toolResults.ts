@@ -464,6 +464,10 @@ export const getToolCallSummary = (
 	// that actually use the richer summary metadata.
 	if (name === 'web_search') {
 		const args = getToolArgumentsObject(rawArgs);
+		const summary =
+			rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+				? ((rawResult as Record<string, any>).summary ?? null)
+				: null;
 		const rawResultString = typeof rawResult === 'string' ? rawResult : '';
 		const queryFromArgs = typeof args.query === 'string' ? args.query.trim() : '';
 		const decodedResultForFallback = done && !queryFromArgs ? decodeToolResultText(rawResult) : '';
@@ -472,8 +476,10 @@ export const getToolCallSummary = (
 			decodedResultForFallback.match(/^##\s*Search Results for:\s*(.+?)\s*$/im)?.[1]?.trim() ||
 			'';
 		const count = done
-			? (parseDeclaredSearchCount(rawResultString) ??
-				(decodedResultForFallback ? parseDeclaredSearchCount(decodedResultForFallback) : null))
+			? typeof summary?.result_count === 'number'
+				? summary.result_count
+				: (parseDeclaredSearchCount(rawResultString) ??
+					(decodedResultForFallback ? parseDeclaredSearchCount(decodedResultForFallback) : null))
 			: null;
 
 		return {
@@ -486,13 +492,21 @@ export const getToolCallSummary = (
 
 	if (name === 'web_fetch') {
 		const args = getToolArgumentsObject(rawArgs);
+		const summary =
+			rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+				? ((rawResult as Record<string, any>).summary ?? null)
+				: null;
 		const rawResultString = typeof rawResult === 'string' ? rawResult : '';
 		const urlsArg = typeof args.urls === 'string' ? args.urls : '';
 		const requestedUrls = urlsArg
 			.split(/[\n,]+/)
 			.map((url) => url.trim())
 			.filter(Boolean);
-		const count = done ? parseDeclaredFetchCount(rawResultString) : null;
+		const count = done
+			? typeof summary?.page_count === 'number'
+				? summary.page_count
+				: parseDeclaredFetchCount(rawResultString)
+			: null;
 
 		return {
 			kind: 'web_fetch',

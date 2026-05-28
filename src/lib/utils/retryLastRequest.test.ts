@@ -31,7 +31,7 @@ describe('getStructuredRetryLastRequestContext', () => {
 		expect(context?.content).toBe('');
 	});
 
-	it('requires result bodies instead of stream-v2 slim placeholders', () => {
+	it('requires result bodies or durable refs instead of stream-v2 slim placeholders', () => {
 		const context = getStructuredRetryLastRequestContext({
 			content_blocks: [
 				{
@@ -45,7 +45,23 @@ describe('getStructuredRetryLastRequestContext', () => {
 		expect(context).toBeNull();
 	});
 
+	it('accepts durable lazy result refs as completed tool rounds', () => {
+		const context = getStructuredRetryLastRequestContext({
+			content_blocks: [
+				{
+					type: 'tool_calls',
+					content: [{ id: 'call_1', function: { name: 'web_fetch', arguments: '{}' } }],
+					results: [{ tool_call_id: 'call_1', result_ref: 'call_1', result_lazy: true }]
+				}
+			]
+		});
+
+		expect(context?.content_blocks).toHaveLength(1);
+	});
+
 	it('returns null when there is no completed tool round', () => {
-		expect(getStructuredRetryLastRequestContext({ content_blocks: [{ type: 'text', content: 'hi' }] })).toBeNull();
+		expect(
+			getStructuredRetryLastRequestContext({ content_blocks: [{ type: 'text', content: 'hi' }] })
+		).toBeNull();
 	});
 });

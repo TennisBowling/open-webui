@@ -318,7 +318,19 @@
 		}
 	};
 
+	const STREAM_SCOPED_EVENT_TYPES = new Set([
+		'chat:delta',
+		'chat:delta:batch',
+		'tool_call:result',
+		'chat:subagent:update',
+		'chat:done',
+		'chat:message:error',
+		'chat:tasks:cancel'
+	]);
+
 	const chatEventHandler = async (event, cb) => {
+		const eventType = event?.data?.type ?? null;
+		const streamScoped = STREAM_SCOPED_EVENT_TYPES.has(eventType);
 		// Re-broadcast to sibling tabs of the same user so the backend can emit
 		// stream events to a single elected primary session per user. The
 		// non-primary tabs receive the same payload via BroadcastChannel and
@@ -329,7 +341,8 @@
 			eventsBc &&
 			primarySessionId &&
 			$socket?.id &&
-			$socket.id === primarySessionId
+			$socket.id === primarySessionId &&
+			!streamScoped
 		) {
 			try {
 				eventsBc.postMessage(event);
@@ -344,7 +357,7 @@
 		// handlers (and stores) see each inner event as if it had arrived
 		// individually. Re-broadcast (above) forwards the outer batch so
 		// non-primary tabs unpack the same way here.
-		if (event?.data?.type === 'chat:delta:batch') {
+		if (eventType === 'chat:delta:batch') {
 			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
 			const prevSuppress = suppressBroadcast;
 			// Don't re-broadcast each inner event individually — the outer
@@ -607,9 +620,7 @@
 					// queueSubagentUpdate is idempotent for repeated state.
 					if (type === 'chat:delta:batch') {
 						const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
-						const hasSubagentUpdate = batch.some(
-							(b) => b?.data?.type === 'chat:subagent:update'
-						);
+						const hasSubagentUpdate = batch.some((b) => b?.data?.type === 'chat:subagent:update');
 						if (hasSubagentUpdate) {
 							// Bypass dedup — replay every batch as-is.
 							suppressBroadcast = true;
