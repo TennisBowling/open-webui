@@ -28,7 +28,6 @@
 	} from '$lib/stores';
 
 	import {
-		convertHeicToJpeg,
 		createMessagesList,
 		extractContentFromFile,
 		extractCurlyBraceWords,
@@ -1016,8 +1015,41 @@
 	const normalizeImageMimeType = (type: string) => {
 		const normalized = (type || '').toLowerCase();
 		if (normalized === 'image/jpg') return 'image/jpeg';
+		if (normalized === 'image/pjpeg') return 'image/jpeg';
+		if (normalized === 'image/x-png') return 'image/png';
 		return normalized;
 	};
+
+	const SAFE_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+	const HEIC_LIKE_IMAGE_MIME_TYPES = new Set([
+		'image/heic',
+		'image/heif',
+		'image/heic-sequence',
+		'image/heif-sequence',
+		'image/x-heic',
+		'image/x-heif'
+	]);
+	const HEIC_LIKE_IMAGE_EXTENSIONS = new Set([
+		'.heic',
+		'.heif',
+		'.heics',
+		'.heifs',
+		'.hif',
+		'.hifs'
+	]);
+	const HEIF_FILE_BRANDS = new Set([
+		'heic',
+		'heix',
+		'hevc',
+		'hevx',
+		'heim',
+		'heis',
+		'hevm',
+		'hevs',
+		'mif1',
+		'msf1'
+	]);
+	const SAFE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 
 	const inferImageMimeTypeFromExtension = (filename: string) => {
 		const ext = getFileExtension(filename || '');
@@ -1037,43 +1069,38 @@
 	};
 
 	const isHeicLikeImage = (file: File) => {
-		const type = (file.type || '').toLowerCase();
+		const type = normalizeImageMimeType(file.type || '');
 		const ext = getFileExtension(file.name || '');
-		return (
-			type === 'image/heic' ||
-			type === 'image/heif' ||
-			type === 'image/heic-sequence' ||
-			type === 'image/heif-sequence' ||
-			ext === '.heic' ||
-			ext === '.heif'
-		);
+		return HEIC_LIKE_IMAGE_MIME_TYPES.has(type) || HEIC_LIKE_IMAGE_EXTENSIONS.has(ext);
+	};
+
+	const hasHeifSignature = async (file: File) => {
+		try {
+			const bytes = new Uint8Array(await file.slice(0, 64).arrayBuffer());
+			if (bytes.length < 12) return false;
+
+			const decoder = new TextDecoder('ascii');
+			if (decoder.decode(bytes.slice(4, 8)) !== 'ftyp') return false;
+
+			for (let offset = 8; offset + 4 <= bytes.length; offset += 4) {
+				if (HEIF_FILE_BRANDS.has(decoder.decode(bytes.slice(offset, offset + 4)))) {
+					return true;
+				}
+			}
+		} catch (e) {
+			console.debug('HEIF signature sniff failed', e);
+		}
+		return false;
 	};
 
 	const isImageLikeFile = (file: File) => {
 		const type = normalizeImageMimeType(file.type || '');
-		if (
-			[
-				'image/png',
-				'image/jpeg',
-				'image/webp',
-				'image/gif',
-				'image/heic',
-				'image/heif',
-				'image/heic-sequence',
-				'image/heif-sequence'
-			].includes(type)
-		) {
+		if (SAFE_IMAGE_MIME_TYPES.has(type) || HEIC_LIKE_IMAGE_MIME_TYPES.has(type)) {
 			return true;
 		}
 
 		const ext = getFileExtension(file.name || '');
-		return ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif'].includes(ext);
-	};
-
-	const replaceExtension = (filename: string, newExtension: string) => {
-		const dotIndex = filename.lastIndexOf('.');
-		if (dotIndex === -1) return `${filename}${newExtension}`;
-		return `${filename.slice(0, dotIndex)}${newExtension}`;
+		return SAFE_IMAGE_EXTENSIONS.has(ext) || HEIC_LIKE_IMAGE_EXTENSIONS.has(ext);
 	};
 
 	const inputFilesHandler = async (inputFiles: File[] | FileList) => {
@@ -1147,7 +1174,8 @@
 				extension: file.name.split('.').at(-1)
 			});
 
-			const isImageLike = isImageLikeFile(file);
+			const heicLikeBySignature = await hasHeifSignature(file);
+			const isImageLike = isImageLikeFile(file) || heicLikeBySignature;
 			if (!isImageLike) {
 				if (maxSizeBytes !== null && file.size > maxSizeBytes) {
 					console.log('File exceeds max size limit:', {
@@ -1176,79 +1204,54 @@
 			imageUploadAbortControllers.set(tempImageId, abortController);
 
 			let fileToUpload: File = file;
-
-			if (!isHeicLikeImage(file)) {
-				const normalizedType = normalizeImageMimeType(file.type || '');
-				const inferredType = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(
-					normalizedType
-				)
-					? normalizedType
-					: inferImageMimeTypeFromExtension(file.name || '');
-
-				if (inferredType) {
-					const currentType = (fileToUpload.type || '').toLowerCase();
-					const fileName = fileToUpload.name || `image-${Date.now()}`;
-					fileToUpload =
-						currentType === inferredType
-							? fileToUpload
-							: new File([fileToUpload], fileName, {
-									type: inferredType,
-									lastModified: fileToUpload.lastModified
-								});
-				}
-			}
-
-			let previewUrl = URL.createObjectURL(fileToUpload);
-			files = [
-				...files,
-				{
-					type: 'image',
-					url: previewUrl,
-					status: 'uploading',
-					progress: 0,
-					itemId: tempImageId
-				}
-			];
-
-			const updateProgress = (progress: number) => {
-				const fileIndex = files.findIndex((f) => f.itemId === tempImageId);
-				if (fileIndex !== -1) {
-					// Upload progress can reach 100% before the server responds (e.g. remote storage),
-					// so cap at 99% until we actually mark the file as uploaded.
-					files[fileIndex].progress = Math.max(0, Math.min(99, progress));
-					files = files;
-				}
-			};
+			let previewUrl = '';
+			const heicLike = isHeicLikeImage(file) || heicLikeBySignature;
 
 			try {
-				if (isHeicLikeImage(file)) {
-					let converted: any;
-					try {
-						converted = await convertHeicToJpeg(file, { quality: 0.92 });
-					} catch (conversionErr) {
-						const conversionText = getErrorText(conversionErr);
-						throw new Error(
-							conversionText
-								? `HEIC/HEIF conversion failed: ${conversionText}`
-								: 'HEIC/HEIF conversion failed'
-						);
+				if (!heicLike) {
+					const normalizedType = normalizeImageMimeType(file.type || '');
+					const inferredType = SAFE_IMAGE_MIME_TYPES.has(normalizedType)
+						? normalizedType
+						: inferImageMimeTypeFromExtension(file.name || '');
+
+					if (inferredType) {
+						const currentType = normalizeImageMimeType(fileToUpload.type || '');
+						const fileName = fileToUpload.name || `image-${Date.now()}`;
+						fileToUpload =
+							currentType === inferredType
+								? fileToUpload
+								: new File([fileToUpload], fileName, {
+										type: inferredType,
+										lastModified: fileToUpload.lastModified
+									});
 					}
-					const outputName = replaceExtension(file.name || 'image', '.jpg');
-					fileToUpload = new File([converted as BlobPart], outputName, {
-						type: 'image/jpeg',
-						lastModified: file.lastModified
-					});
 
-					const jpegPreviewUrl = URL.createObjectURL(fileToUpload);
-					URL.revokeObjectURL(previewUrl);
-					previewUrl = jpegPreviewUrl;
+					previewUrl = URL.createObjectURL(fileToUpload);
+				}
 
+				files = [
+					...files,
+					{
+						type: 'image',
+						url: previewUrl,
+						name: file.name,
+						status: 'uploading',
+						progress: 0,
+						serverProcessing: heicLike,
+						itemId: tempImageId
+					}
+				];
+
+				const updateProgress = (progress: number) => {
 					const fileIndex = files.findIndex((f) => f.itemId === tempImageId);
 					if (fileIndex !== -1) {
-						files[fileIndex].url = previewUrl;
+						// Upload progress can reach 100% before the server responds (e.g. remote storage),
+						// so cap at 99% until we actually mark the file as uploaded.
+						files[fileIndex].progress = Math.max(0, Math.min(99, progress));
+						files[fileIndex].serverProcessing = heicLike && files[fileIndex].progress >= 99;
 						files = files;
 					}
-				}
+				};
 
 				const uploadedFile = await uploadFile(localStorage.token, fileToUpload, null, {
 					onProgress: updateProgress,
@@ -1259,7 +1262,7 @@
 					throw new Error('Upload failed: server returned an empty response');
 				}
 
-				URL.revokeObjectURL(previewUrl);
+				if (previewUrl) URL.revokeObjectURL(previewUrl);
 
 				const fileIndex = files.findIndex((f) => f.itemId === tempImageId);
 				if (fileIndex === -1 || canceledImageUploads.has(tempImageId)) {
@@ -1274,15 +1277,17 @@
 				files[fileIndex] = {
 					type: 'image',
 					url: `${WEBUI_API_BASE_URL}/files/${uploadedFile.id}/content`,
+					name: uploadedFile?.meta?.name ?? file.name,
 					status: 'uploaded',
 					progress: 100,
+					serverProcessing: false,
 					itemId: tempImageId,
 					file: uploadedFile,
 					id: uploadedFile.id
 				};
 				files = files;
 			} catch (err: any) {
-				URL.revokeObjectURL(previewUrl);
+				if (previewUrl) URL.revokeObjectURL(previewUrl);
 
 				const isAbortError = err?.name === 'AbortError';
 				if (isAbortError || canceledImageUploads.has(tempImageId)) {
@@ -1729,14 +1734,25 @@
 											{#if file.type === 'image'}
 												<div class="relative group">
 													<div class="relative">
-														<Image
-															src={file.url}
-															alt=""
-															imageClassName="max-h-48 max-w-64 rounded-xl object-cover"
-														/>
+														{#if file.url}
+															<Image
+																src={file.url}
+																alt=""
+																imageClassName="max-h-48 max-w-64 rounded-xl object-cover"
+															/>
+														{:else}
+															<div
+																class="h-32 w-48 max-h-48 max-w-64 rounded-xl bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 flex flex-col items-center justify-center text-gray-500 dark:text-gray-400 text-xs"
+															>
+																<Photo className="size-7" strokeWidth="1.75" />
+																<div class="mt-2 max-w-36 truncate">
+																	{file.name ?? $i18n.t('Image')}
+																</div>
+															</div>
+														{/if}
 														{#if file.status === 'uploading'}
 															<div
-																class="absolute inset-0 rounded-xl bg-black/40 flex items-center justify-center"
+																class="absolute inset-0 rounded-xl bg-black/40 flex flex-col gap-1 items-center justify-center text-white"
 															>
 																<!-- Circular progress ring -->
 																<svg class="size-12" viewBox="0 0 36 36">
@@ -1767,6 +1783,13 @@
 																		class="transition-all duration-150"
 																	/>
 																</svg>
+																{#if file.serverProcessing}
+																	<div class="text-[11px] font-medium px-2 text-center">
+																		{(file.progress ?? 0) >= 99
+																			? $i18n.t('Converting image…')
+																			: $i18n.t('Uploading image…')}
+																	</div>
+																{/if}
 															</div>
 														{/if}
 														{#if atSelectedModel ? effectiveVisionCapableModels.length === 0 : selectedModels.length !== effectiveVisionCapableModels.length}

@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 import uuid
@@ -40,6 +41,7 @@ from open_webui.utils.file_extraction import (
     file_needs_extraction,
 )
 from open_webui.utils.file_conversion import convert_and_cache_file_to_pdf
+from open_webui.utils.image_conversion import convert_heif_to_jpeg, is_heif_image
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -128,6 +130,7 @@ def upload_file_handler(
         file_extension = os.path.splitext(filename)[1]
         # Remove the leading dot from the file extension
         file_extension = file_extension[1:].lower() if file_extension else ""
+        original_file_extension = file_extension
 
         content_type = file.content_type
         if content_type:
@@ -138,6 +141,10 @@ def upload_file_handler(
                 content_type = "image/jpeg"
             elif content_type == "image/x-png":
                 content_type = "image/png"
+            elif content_type in ("image/x-heic", "image/heic-sequence"):
+                content_type = "image/heic"
+            elif content_type in ("image/x-heif", "image/heif-sequence"):
+                content_type = "image/heif"
 
         inferred_content_type = {
             "png": "image/png",
@@ -146,7 +153,11 @@ def upload_file_handler(
             "gif": "image/gif",
             "webp": "image/webp",
             "heic": "image/heic",
+            "heics": "image/heic",
             "heif": "image/heif",
+            "heifs": "image/heif",
+            "hif": "image/heif",
+            "hifs": "image/heif",
             "pdf": "application/pdf",
             "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "doc": "application/msword",
@@ -189,6 +200,61 @@ def upload_file_handler(
                 # so downstream loader/extraction code routes the file correctly.
                 content_type = inferred_content_type
 
+        upload_stream = file.file
+        conversion_metadata = None
+
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
+
+        try:
+            header = file.file.read(64)
+        except Exception:
+            header = b""
+        finally:
+            try:
+                file.file.seek(0)
+            except Exception:
+                pass
+
+        if is_heif_image(content_type, filename, header):
+            original_name = filename
+            original_content_type = content_type
+            try:
+                raw = file.file.read()
+                if not raw:
+                    raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
+                converted = convert_heif_to_jpeg(raw)
+            except Exception as e:
+                log.exception("HEIC/HEIF conversion failed for %s: %s", filename, e)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT(
+                        f"Could not convert HEIC/HEIF image to JPEG: {e}"
+                    ),
+                )
+
+            base, _ = os.path.splitext(filename)
+            filename = f"{base or 'image'}.jpg"
+            file_extension = "jpg"
+            content_type = "image/jpeg"
+            upload_stream = io.BytesIO(converted)
+            conversion_metadata = {
+                "type": "heic_to_jpeg",
+                "original_name": original_name,
+                "original_content_type": original_content_type,
+                "original_extension": original_file_extension,
+                "original_size": len(raw),
+                "converted_content_type": content_type,
+                "converted_size": len(converted),
+            }
+        else:
+            try:
+                file.file.seek(0)
+            except Exception:
+                pass
+
         if request.app.state.config.ALLOWED_FILE_EXTENSIONS:
             allowed_extensions = [
                 ext.lower().lstrip(".")
@@ -201,7 +267,12 @@ def upload_file_handler(
             if "jpg" in allowed_extensions and "jpeg" not in allowed_extensions:
                 allowed_extensions.append("jpeg")
 
-            if file_extension not in allowed_extensions:
+            original_extension_allowed = bool(
+                conversion_metadata
+                and original_file_extension
+                and original_file_extension in allowed_extensions
+            )
+            if file_extension not in allowed_extensions and not original_extension_allowed:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=ERROR_MESSAGES.DEFAULT(
@@ -214,7 +285,7 @@ def upload_file_handler(
         name = filename
         filename = f"{id}_{filename}"
         size, file_path = Storage.upload_file(
-            file.file,
+            upload_stream,
             filename,
             {
                 "OpenWebUI-User-Email": user.email,
@@ -242,6 +313,11 @@ def upload_file_handler(
                         "content_type": content_type,
                         "size": size,
                         "data": file_metadata,
+                        **(
+                            {"converted_from": conversion_metadata}
+                            if conversion_metadata
+                            else {}
+                        ),
                     },
                 }
             ),
@@ -529,6 +605,14 @@ async def get_file_content_by_id(
                             f"inline; filename*=UTF-8''{encoded_filename}"
                         )
                         content_type = "application/pdf"
+                    elif (
+                        content_type
+                        and content_type.startswith("image/")
+                        and content_type != "image/svg+xml"
+                    ):
+                        headers["Content-Disposition"] = (
+                            f"inline; filename*=UTF-8''{encoded_filename}"
+                        )
                     elif content_type != "text/plain":
                         headers["Content-Disposition"] = (
                             f"attachment; filename*=UTF-8''{encoded_filename}"

@@ -104,6 +104,10 @@
 		return `${value.toFixed(value >= 10 ? 0 : 1)}%`;
 	}
 
+	function cachePct(item: { total_cache_read_tokens?: number; total_input_tokens?: number }) {
+		return pct(item.total_cache_read_tokens ?? 0, item.total_input_tokens ?? 0);
+	}
+
 	function fullNumber(value: number | null | undefined) {
 		return (value ?? 0).toLocaleString();
 	}
@@ -422,7 +426,7 @@
 						<h2 class="text-xl font-semibold">Subagent model mix</h2>
 						<div class="mt-5 space-y-4">
 							{#each subagents.top_models.slice(0, 8) as model}
-								<div><div class="mb-1 flex items-center justify-between gap-3 text-sm"><span class="truncate font-medium">{modelName(model.model_id)}</span><span class="text-gray-500 dark:text-gray-400">{model.percentage.toFixed(1)}%</span></div><div class="h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"><div class="h-full rounded-full bg-violet-500" style="width: {model.percentage}%"></div></div><div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached</div></div>
+								<div><div class="mb-1 flex items-center justify-between gap-3 text-sm"><span class="truncate font-medium">{modelName(model.model_id)}</span><span class="text-gray-500 dark:text-gray-400">{model.percentage.toFixed(1)}%</span></div><div class="h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"><div class="h-full rounded-full bg-violet-500" style="width: {model.percentage}%"></div></div><div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached · {fmtPct(cachePct(model))} of input</div></div>
 							{/each}
 						</div>
 					</div>
@@ -491,7 +495,7 @@
 							<div>
 								<div class="mb-1 flex items-center justify-between gap-3 text-sm"><span class="truncate font-medium">{modelName(model.model_id)}</span><span class="text-gray-500 dark:text-gray-400">{model.percentage.toFixed(1)}%</span></div>
 								<div class="h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"><div class="h-full rounded-full bg-gradient-to-r from-red-500 to-fuchsia-500" style="width: {model.percentage}%"></div></div>
-								<div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached</div>
+								<div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached · {fmtPct(cachePct(model))} of input</div>
 							</div>
 						{/each}
 					</div>
@@ -509,7 +513,7 @@
 						<div class="space-y-3">
 							<div class="text-sm font-medium text-gray-500 dark:text-gray-400">Models</div>
 							{#each cacheModels as m}
-								<div><div class="mb-1 flex justify-between gap-3 text-sm"><span class="truncate font-medium">{modelName(m.model_id)}</span><span class="text-gray-500 dark:text-gray-400">{formatTokenCount(m.total_cache_read_tokens)}</span></div><div class="h-1.5 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"><div class="h-full rounded-full bg-violet-500" style="width: {pct(m.total_cache_read_tokens, cacheModels[0]?.total_cache_read_tokens ?? 0)}%"></div></div></div>
+								<div><div class="mb-1 flex justify-between gap-3 text-sm"><span class="truncate font-medium">{modelName(m.model_id)}</span><span class="text-gray-500 dark:text-gray-400">{formatTokenCount(m.total_cache_read_tokens)} · {fmtPct(cachePct(m))}</span></div><div class="h-1.5 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"><div class="h-full rounded-full bg-violet-500" style="width: {pct(m.total_cache_read_tokens, cacheModels[0]?.total_cache_read_tokens ?? 0)}%"></div></div></div>
 							{/each}
 						</div>
 					</div>

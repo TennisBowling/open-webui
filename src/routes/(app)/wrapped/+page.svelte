@@ -111,6 +111,10 @@
 		return `${value.toFixed(value >= 10 ? 0 : 1)}%`;
 	}
 
+	function cachePct(item: { total_cache_read_tokens?: number; total_input_tokens?: number }) {
+		return pct(item.total_cache_read_tokens ?? 0, item.total_input_tokens ?? 0);
+	}
+
 	function fullNumber(value: number | null | undefined) {
 		return (value ?? 0).toLocaleString();
 	}
@@ -258,7 +262,15 @@
 				</p>
 			</div>
 
-			<div class="flex items-center gap-3">
+			<div class="flex flex-wrap items-center gap-3">
+				{#if $user?.role === 'admin'}
+					<button
+						class="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-semibold text-red-700 shadow-sm transition hover:bg-red-100 dark:border-red-900/70 dark:bg-red-950/50 dark:text-red-300 dark:hover:bg-red-950"
+						on:click={() => goto('/admin/wrapped')}
+					>
+						Admin analytics
+					</button>
+				{/if}
 				<label for="year-select" class="text-sm font-medium text-gray-500 dark:text-gray-400">Year</label>
 				<select
 					id="year-select"
@@ -458,7 +470,7 @@
 							<div>
 								<div class="mb-1 flex justify-between gap-3 text-sm">
 									<span class="truncate font-medium">{modelName(model.model_id)}</span>
-									<span class="text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_cache_read_tokens)}</span>
+									<span class="text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_cache_read_tokens)} · {fmtPct(cachePct(model))}</span>
 								</div>
 								<div class="h-1.5 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
 									<div class="h-full rounded-full bg-violet-500" style="width: {pct(model.total_cache_read_tokens, cacheModels[0]?.total_cache_read_tokens ?? 0)}%"></div>
@@ -485,7 +497,7 @@
 								<div class="h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
 									<div class="h-full rounded-full bg-gradient-to-r from-blue-500 to-violet-500" style="width: {model.percentage}%"></div>
 								</div>
-								<div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached</div>
+								<div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatTokenCount(model.total_tokens)} tokens · {formatTokenCount(model.total_cache_read_tokens ?? 0)} cached · {fmtPct(cachePct(model))} of input</div>
 							</div>
 						{/each}
 					</div>
@@ -512,6 +524,23 @@
 			<div class="rounded-3xl border border-gray-200 bg-white p-8 text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400">
 				No Wrapped data for {selectedYear} yet.
 			</div>
+		{/if}
+
+		{#if $user?.role === 'admin'}
+			<footer class="mt-10 rounded-3xl border border-red-200 bg-red-50 p-5 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
+				<div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+					<div>
+						<div class="font-semibold">Admin view available</div>
+						<div class="mt-1 text-red-700/80 dark:text-red-300/80">Open the site-wide dashboard for per-user, model, cache, and subagent analytics.</div>
+					</div>
+					<button
+						class="rounded-xl bg-red-600 px-4 py-2 font-semibold text-white transition hover:bg-red-700"
+						on:click={() => goto('/admin/wrapped')}
+					>
+						Open admin analytics
+					</button>
+				</div>
+			</footer>
 		{/if}
 	</div>
 </div>

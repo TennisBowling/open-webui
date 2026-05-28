@@ -62,6 +62,11 @@ from open_webui.utils.file_extraction import (
     get_or_extract_file_content,
 )
 from open_webui.utils.file_conversion import get_or_convert_to_pdf
+from open_webui.utils.image_conversion import (
+    SUPPORTED_IMAGE_MIME_TYPES,
+    normalize_image_mime_type,
+    prepare_image_data_for_provider,
+)
 from open_webui.config import (
     DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE,
     DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE,
@@ -78,94 +83,6 @@ log.setLevel(SRC_LOG_LEVELS["OPENAI"])
 # Utility functions
 #
 ##########################################
-
-SUPPORTED_IMAGE_MIME_TYPES = {
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-}
-
-
-def normalize_image_mime_type(mime_type: Optional[str]) -> Optional[str]:
-    if not mime_type:
-        return None
-
-    normalized = mime_type.strip().lower()
-    # Strip any optional parameters (e.g. "image/jpeg; charset=binary")
-    normalized = normalized.split(";", 1)[0].strip()
-
-    if normalized == "image/jpg":
-        return "image/jpeg"
-    if normalized == "image/pjpeg":
-        return "image/jpeg"
-    if normalized == "image/x-png":
-        return "image/png"
-
-    return normalized
-
-
-def sniff_image_mime_type(image_data: bytes) -> Optional[str]:
-    if not image_data:
-        return None
-
-    if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-
-    if image_data.startswith(b"GIF87a") or image_data.startswith(b"GIF89a"):
-        return "image/gif"
-
-    if len(image_data) >= 12 and image_data[:4] == b"RIFF" and image_data[8:12] == b"WEBP":
-        return "image/webp"
-
-    if image_data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-
-    return None
-
-
-def infer_image_mime_type_from_filename(filename: Optional[str]) -> Optional[str]:
-    if not filename:
-        return None
-
-    lower = filename.lower()
-
-    if lower.endswith(".png"):
-        return "image/png"
-    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
-        return "image/jpeg"
-    if lower.endswith(".gif"):
-        return "image/gif"
-    if lower.endswith(".webp"):
-        return "image/webp"
-
-    return None
-
-
-def resolve_image_mime_type(
-    mime_type: Optional[str],
-    filename: Optional[str],
-    image_data: bytes,
-) -> str:
-    normalized = normalize_image_mime_type(mime_type)
-    if normalized in SUPPORTED_IMAGE_MIME_TYPES:
-        return normalized
-
-    sniffed = sniff_image_mime_type(image_data)
-    if sniffed:
-        return sniffed
-
-    inferred = infer_image_mime_type_from_filename(filename)
-    if inferred:
-        return inferred
-
-    # Preserve an explicit image/* content-type if present (even if unsupported by a provider)
-    if normalized and normalized.startswith("image/"):
-        return normalized
-
-    # Final fallback for providers that require an image/* type.
-    return "image/jpeg"
-
 
 def user_can_read_file(file, user: UserModel) -> bool:
     if not file or not user:
@@ -1118,6 +1035,10 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
+    # Open WebUI-internal attachment metadata is consumed before this point
+    # (message content parts + metadata["files"] for tools). It is not an
+    # OpenAI/OpenRouter chat-completions field and some providers reject it.
+    payload.pop("files", None)
 
     # Normalize internal content_blocks → API shape. Single source of truth for the
     # internal-message → upstream-API conversion (shared with the live tool-call loop).
@@ -1138,8 +1059,31 @@ async def generate_chat_completion(
                     if part.get("type") == "image_url":
                         url = part["image_url"]["url"]
                         
-                        # Skip if already a data URL (base64)
+                        # If already a data URL, keep provider-supported image
+                        # formats as-is. Normalize unsupported data:image/*
+                        # payloads (notably HEIC/HEIF from Apple devices) so
+                        # they don't make upstream providers fail request parsing.
                         if url.startswith("data:"):
+                            data_url_match = re.match(r"data:([^;,]+);base64,(.*)$", url, re.S)
+                            if data_url_match:
+                                data_mime = data_url_match.group(1)
+                                normalized_data_mime = normalize_image_mime_type(data_mime)
+                                if normalized_data_mime not in SUPPORTED_IMAGE_MIME_TYPES:
+                                    try:
+                                        raw = base64.b64decode(data_url_match.group(2), validate=False)
+                                        raw, provider_mime = prepare_image_data_for_provider(
+                                            raw,
+                                            data_mime,
+                                            None,
+                                        )
+                                        part["image_url"]["url"] = (
+                                            f"data:{provider_mime};base64,{base64.b64encode(raw).decode('utf-8')}"
+                                        )
+                                    except Exception as e:
+                                        log.error(
+                                            f"Error normalizing image data URL: {e}. Removing image from message."
+                                        )
+                                        parts_to_remove.append(part_idx)
                             continue
                             
                         # Check if it's a local file URL (e.g. /api/v1/files/{id} or /api/v1/files/{id}/content)
@@ -1168,12 +1112,12 @@ async def generate_chat_completion(
                                         log.warning(f"File is empty: {file_path}. Removing image from message.")
                                         parts_to_remove.append(part_idx)
                                         continue
-                                    base64_image = base64.b64encode(image_data).decode("utf-8")
-                                    mime_type = resolve_image_mime_type(
+                                    image_data, mime_type = prepare_image_data_for_provider(
+                                        image_data,
                                         (file.meta or {}).get("content_type"),
                                         getattr(file, "filename", None),
-                                        image_data,
                                     )
+                                    base64_image = base64.b64encode(image_data).decode("utf-8")
                                     part["image_url"]["url"] = f"data:{mime_type};base64,{base64_image}"
                                     log.debug(f"Successfully converted image to base64: mime_type={mime_type}, size={len(image_data)} bytes")
                             except FileNotFoundError as e:
@@ -1290,11 +1234,16 @@ async def generate_chat_completion(
                                 file_path = Storage.get_file(file.path)
                                 with open(file_path, "rb") as f:
                                     raw = f.read()
+                                raw, provider_content_type = prepare_image_data_for_provider(
+                                    raw,
+                                    content_type,
+                                    display_filename,
+                                )
                                 base64_file = base64.b64encode(raw).decode("utf-8")
                                 part.clear()
                                 part["type"] = "image_url"
                                 part["image_url"] = {
-                                    "url": f"data:{content_type};base64,{base64_file}"
+                                    "url": f"data:{provider_content_type};base64,{base64_file}"
                                 }
                             except Exception as e:
                                 log.exception(
@@ -1475,7 +1424,9 @@ async def generate_chat_completion(
             "role": user.role,
         }
 
-    # OpenRouter PDF inputs: prefer native file processing for vision-capable models.
+    # OpenRouter PDF inputs: force native file handling. If the selected model
+    # cannot accept the PDF natively, let OpenRouter return an explicit error
+    # instead of silently falling back to parser/OCR transformations.
     if has_pdf_files and "openrouter.ai" in url:
         plugins = payload.get("plugins")
         if not isinstance(plugins, list):
@@ -1499,7 +1450,7 @@ async def generate_chat_completion(
         file_parser_plugin["pdf"] = pdf_plugin_config
         payload["plugins"] = plugins
 
-        # Always prioritize frontend 'reasoning' object over model 'reasoning_effort'
+    # Always prioritize frontend 'reasoning' object over model 'reasoning_effort'
     # reasoning_effort is deprecated in favor of reasoning object
     if "reasoning" in payload and isinstance(payload["reasoning"], dict):
         payload.pop("reasoning_effort", None)

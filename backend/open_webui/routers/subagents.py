@@ -116,7 +116,11 @@ async def rerun_subagent(
     the existing handler in ``Chat.svelte`` updates ``$subagentLiveStates``
     and the SubagentBlock re-renders in place.
     """
-    from open_webui.utils.subagent import rerun_subagent_turn
+    from open_webui.utils.subagent import (
+        SubagentRerunBlockedError,
+        rerun_subagent_turn,
+        validate_subagent_rerun_allowed,
+    )
 
     # Pre-validate access here (cheap + gives a synchronous 4xx) so we don't
     # silently swallow auth/lookup errors inside the background task.
@@ -127,6 +131,19 @@ async def rerun_subagent(
     )
     if parent_chat is None:
         raise HTTPException(status_code=404, detail="Parent chat not found")
+
+    try:
+        validate_subagent_rerun_allowed(
+            user=user,
+            parent_chat_id=form_data.parent_chat_id,
+            parent_message_id=form_data.parent_message_id,
+            entry_key=form_data.entry_key,
+            scope=form_data.scope,
+        )
+    except SubagentRerunBlockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     async def _run():
         try:
@@ -139,6 +156,26 @@ async def rerun_subagent(
                 entry_key=form_data.entry_key,
                 scope=form_data.scope,
             )
+        except SubagentRerunBlockedError as e:
+            log.info(f"subagent rerun blocked after preflight: {e}")
+            try:
+                from open_webui.socket.main import get_event_emitter
+
+                await get_event_emitter(
+                    {
+                        "user_id": user.id,
+                        "session_id": form_data.session_id,
+                        "chat_id": form_data.parent_chat_id,
+                        "message_id": form_data.parent_message_id,
+                    }
+                )(
+                    {
+                        "type": "notification",
+                        "data": {"type": "error", "content": str(e)},
+                    }
+                )
+            except Exception:
+                pass
         except Exception as e:
             log.exception(f"subagent rerun task failed: {e}")
 

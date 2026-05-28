@@ -56,7 +56,7 @@
 <input
 	id="camera-input"
 	type="file"
-	accept="image/*"
+	accept="image/*,image/heic,image/heif,image/heic-sequence,image/heif-sequence"
 	capture="environment"
 	on:change={handleFileChange}
 	style="display: none;"

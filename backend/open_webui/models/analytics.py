@@ -1075,12 +1075,12 @@ class AnalyticsTable:
                 year_end_ts = int(datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp())
 
                 base_filter = """
-                    source_chat_id IS NOT NULL
-                    AND attributed_chat_id IS NOT NULL
-                    AND source_chat_id != attributed_chat_id
-                    AND created_at >= :start_ts
-                    AND created_at < :end_ts
-                    AND user_id NOT LIKE 'shared-%'
+                    e.source_chat_id IS NOT NULL
+                    AND e.attributed_chat_id IS NOT NULL
+                    AND e.source_chat_id != e.attributed_chat_id
+                    AND e.created_at >= :start_ts
+                    AND e.created_at < :end_ts
+                    AND e.user_id NOT LIKE 'shared-%'
                 """
                 params = {"start_ts": year_start_ts, "end_ts": year_end_ts}
 
@@ -1088,14 +1088,14 @@ class AnalyticsTable:
                     sql_text(
                         f"""
                         SELECT
-                            COUNT(DISTINCT source_chat_id) AS subagent_chats,
-                            COUNT(DISTINCT attributed_chat_id) AS parent_chats,
-                            COALESCE(SUM(request_count), 0) AS requests,
-                            COALESCE(SUM(prompt_tokens), 0) AS input_tokens,
-                            COALESCE(SUM(completion_tokens), 0) AS output_tokens,
-                            COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                            COALESCE(SUM(cache_read_tokens), 0) AS cache_tokens
-                        FROM token_usage_event
+                            COUNT(DISTINCT e.source_chat_id) AS subagent_chats,
+                            COUNT(DISTINCT e.attributed_chat_id) AS parent_chats,
+                            COALESCE(SUM(e.request_count), 0) AS requests,
+                            COALESCE(SUM(e.prompt_tokens), 0) AS input_tokens,
+                            COALESCE(SUM(e.completion_tokens), 0) AS output_tokens,
+                            COALESCE(SUM(e.total_tokens), 0) AS total_tokens,
+                            COALESCE(SUM(e.cache_read_tokens), 0) AS cache_tokens
+                        FROM token_usage_event e
                         WHERE {base_filter}
                         """
                     ),
@@ -1196,16 +1196,16 @@ class AnalyticsTable:
                     sql_text(
                         f"""
                         SELECT
-                            model_id,
-                            COALESCE(SUM(prompt_tokens), 0) AS total_input_tokens,
-                            COALESCE(SUM(completion_tokens), 0) AS total_output_tokens,
-                            COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                            COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens,
-                            COUNT(DISTINCT attributed_chat_id) AS conversation_count,
-                            COALESCE(SUM(request_count), 0) AS message_count
-                        FROM token_usage_event
+                            e.model_id,
+                            COALESCE(SUM(e.prompt_tokens), 0) AS total_input_tokens,
+                            COALESCE(SUM(e.completion_tokens), 0) AS total_output_tokens,
+                            COALESCE(SUM(e.total_tokens), 0) AS total_tokens,
+                            COALESCE(SUM(e.cache_read_tokens), 0) AS total_cache_read_tokens,
+                            COUNT(DISTINCT e.attributed_chat_id) AS conversation_count,
+                            COALESCE(SUM(e.request_count), 0) AS message_count
+                        FROM token_usage_event e
                         WHERE {base_filter}
-                        GROUP BY model_id
+                        GROUP BY e.model_id
                         ORDER BY total_tokens DESC
                         LIMIT 15
                         """

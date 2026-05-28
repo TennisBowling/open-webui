@@ -40,6 +40,7 @@
 		selectedFolder,
 		pinnedChats,
 		showEmbeds,
+		chatTokenStats,
 		chatTokenStatsRefreshTrigger,
 		subagentLiveStates,
 		isLastActiveTab,
@@ -536,6 +537,79 @@
 	const skipRemainingRetriesSet = new Set();
 	const markSkipRemainingRetries = (messageId) => {
 		if (messageId) skipRemainingRetriesSet.add(messageId);
+	};
+
+	type UsagePayload = {
+		prompt_tokens?: number | string | null;
+		completion_tokens?: number | string | null;
+		total_tokens?: number | string | null;
+		prompt_tokens_details?: { cached_tokens?: number | string | null } | null;
+	};
+
+	const lastAppliedUsageSignatureByMessage = new Map<string, string>();
+
+	// v2 streams send usage as a chat:delta op before chat:done. Apply it to
+	// the navbar counter immediately, then let the analytics fetch converge to
+	// the DB-backed totals. Terminal repeats (snapshot/chat:done) are deduped.
+	const getUsageTokenCounts = (usage: UsagePayload = {}) => {
+		const toNumber = (value: unknown) => {
+			const n = Number(value ?? 0);
+			return Number.isFinite(n) ? n : 0;
+		};
+
+		const promptTokens = toNumber(usage?.prompt_tokens);
+		const completionTokens = toNumber(usage?.completion_tokens);
+		const totalTokens = toNumber(usage?.total_tokens) || promptTokens + completionTokens;
+		const cacheReadTokens = toNumber(usage?.prompt_tokens_details?.cached_tokens);
+
+		return {
+			promptTokens,
+			completionTokens,
+			totalTokens,
+			cacheReadTokens,
+			signature: `${promptTokens}:${completionTokens}:${totalTokens}:${cacheReadTokens}`
+		};
+	};
+
+	const applyUsageToChatTokenStats = (
+		_chatId: string | null | undefined,
+		messageId: string | null | undefined,
+		usage: UsagePayload | null | undefined,
+		{ terminal = false }: { terminal?: boolean } = {}
+	) => {
+		if (!usage || !_chatId || _chatId.startsWith('local:')) return;
+
+		const { promptTokens, completionTokens, totalTokens, cacheReadTokens, signature } =
+			getUsageTokenCounts(usage);
+		if (!promptTokens && !completionTokens && !totalTokens && !cacheReadTokens) return;
+
+		if (messageId) {
+			const lastSignature = lastAppliedUsageSignatureByMessage.get(messageId);
+			if (terminal && lastSignature === signature) {
+				return;
+			}
+			lastAppliedUsageSignatureByMessage.set(messageId, signature);
+			if (lastAppliedUsageSignatureByMessage.size > 1000) {
+				const oldest = lastAppliedUsageSignatureByMessage.keys().next().value;
+				if (oldest) lastAppliedUsageSignatureByMessage.delete(oldest);
+			}
+		}
+
+		chatTokenStats.update((current) => {
+			const base = current?.chat_id === _chatId ? current : null;
+			return {
+				chat_id: _chatId,
+				total_input_tokens: (base?.total_input_tokens ?? 0) + promptTokens,
+				total_output_tokens: (base?.total_output_tokens ?? 0) + completionTokens,
+				total_tokens: (base?.total_tokens ?? 0) + totalTokens,
+				total_cache_read_tokens: (base?.total_cache_read_tokens ?? 0) + cacheReadTokens,
+				last_input_tokens: promptTokens,
+				last_output_tokens: completionTokens,
+				last_cache_read_tokens: cacheReadTokens,
+				message_count: (base?.message_count ?? 0) + 1,
+				loading: false
+			};
+		});
 	};
 
 	let chat = null;
@@ -3693,6 +3767,8 @@
 
 		if (usage) {
 			message.usage = usage;
+			applyUsageToChatTokenStats(chatId, message.id, usage, { terminal: done === true });
+			chatTokenStatsRefreshTrigger.update((n) => n + 1);
 			shouldFlushStreamingUpdate = true;
 		}
 
@@ -3937,7 +4013,11 @@
 		mirror.snapshotting = false;
 
 		writeMirrorToMessage(mirror, message);
-		if (snap.usage) message.usage = snap.usage;
+		if (snap.usage) {
+			message.usage = snap.usage;
+			applyUsageToChatTokenStats(chatId, message.id, snap.usage, { terminal: true });
+			chatTokenStatsRefreshTrigger.update((n) => n + 1);
+		}
 		if (snap.status === 'error' && snap.error) message.error = snap.error;
 		if (snap.status === 'done') message.done = true;
 
@@ -3996,6 +4076,10 @@
 		} else if (op === 'selected_model_id' && payload.model_id) {
 			message.selectedModelId = payload.model_id;
 			message.arena = true;
+		} else if (op === 'usage' && payload.usage) {
+			message.usage = payload.usage;
+			applyUsageToChatTokenStats(chatId, message.id, payload.usage);
+			chatTokenStatsRefreshTrigger.update((n) => n + 1);
 		}
 
 		writeMirrorToMessage(mirror, message);
@@ -4071,7 +4155,10 @@
 			await requestStreamSnapshot(message.id, chatId);
 		}
 		writeMirrorToMessage(mirror, message);
-		if (data?.usage) message.usage = data.usage;
+		if (data?.usage) {
+			message.usage = data.usage;
+			applyUsageToChatTokenStats(chatId, message.id, data.usage, { terminal: true });
+		}
 		message = { ...message };
 		emitPendingTTSParts(message, { done: true });
 		cancelStreamingMessageFlush(message.id);
@@ -4903,6 +4990,9 @@
 		opts = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
+		// Same assistant id can be reused by continue/retry flows; a new request
+		// must be allowed to count a fresh usage payload even if numbers match.
+		lastAppliedUsageSignatureByMessage.delete(responseMessageId);
 		const userMessage = _history.messages[responseMessage.parentId];
 		const leafMessageId = (opts as any)?.leafMessageId ?? responseMessage.parentId;
 
@@ -5532,6 +5622,8 @@
 
 								if (usage) {
 									responseMessage.usage = usage;
+									applyUsageToChatTokenStats(_chatId, responseMessageId, usage);
+									chatTokenStatsRefreshTrigger.update((n) => n + 1);
 								}
 
 								if (done) {

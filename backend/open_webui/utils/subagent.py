@@ -1887,6 +1887,304 @@ def _find_launch_entry_for_subagent(
     return (None, None, None)
 
 
+class SubagentRerunBlockedError(ValueError):
+    """Raised when a user-facing subagent rerun would rewrite history that a
+    parent/subagent model turn already depends on.
+
+    This is intentionally separate from generic ValueError so the HTTP router
+    can return a clear 409 instead of spawning a background task that silently
+    no-ops.
+    """
+
+    def __init__(self, message: str, code: str = "subagent_rerun_blocked"):
+        super().__init__(message)
+        self.code = code
+
+
+def _rerun_blocked(message: str, code: str = "subagent_rerun_blocked") -> None:
+    raise SubagentRerunBlockedError(message, code=code)
+
+
+def _history_messages(parent_chat) -> dict:
+    history = ((parent_chat.chat if parent_chat else {}) or {}).get("history") or {}
+    messages = history.get("messages") or {}
+    return messages if isinstance(messages, dict) else {}
+
+
+def _history_current_id(parent_chat) -> Optional[str]:
+    history = ((parent_chat.chat if parent_chat else {}) or {}).get("history") or {}
+    current_id = history.get("currentId") if isinstance(history, dict) else None
+    return current_id if isinstance(current_id, str) and current_id else None
+
+
+def _resolve_subagent_rerun_context(
+    parent_chat, parent_message_id: str, entry_key: str, scope: str
+) -> dict:
+    """Resolve the clicked rerun into the concrete parent entry that would be
+    rewritten.
+
+    For ``scope='this_turn'`` that is the clicked entry. For
+    ``scope='from_launch'`` it is the original launch entry for the same
+    subagent (even when the user clicked the menu on a continuation card).
+    This helper has no side effects so both the router preflight and the
+    background task can use it.
+    """
+    if scope not in ("this_turn", "from_launch"):
+        raise ValueError(f"invalid rerun scope: {scope}")
+
+    located_msg_id, target_entry = _find_subagent_entry(parent_chat, entry_key)
+    if target_entry is None:
+        raise ValueError(f"subagent run entry '{entry_key}' not found")
+    if located_msg_id and located_msg_id != parent_message_id:
+        parent_message_id = located_msg_id
+
+    subagent_id = target_entry.get("subagent_id") or target_entry.get("chat_id")
+    if not subagent_id:
+        raise ValueError("subagent_id missing from entry")
+
+    if scope == "from_launch":
+        launch_msg_id, launch_key, launch_entry = _find_launch_entry_for_subagent(
+            parent_chat, subagent_id
+        )
+        if launch_entry is None:
+            # Preserve the pre-existing fallback behavior, but the safety guard
+            # below will still require that this exact entry is the latest
+            # unresolved subagent turn before any mutation happens.
+            launch_msg_id, launch_key, launch_entry = (
+                parent_message_id,
+                entry_key,
+                target_entry,
+            )
+        write_msg_id = launch_msg_id or parent_message_id
+        write_entry_key = launch_key or entry_key
+        write_entry = launch_entry
+        launch_prompt = (launch_entry.get("prompt") or "") if launch_entry else ""
+        launch_background = (
+            (launch_entry.get("background") or "") if launch_entry else ""
+        )
+        inner_prompt = launch_prompt
+        if launch_background:
+            inner_prompt = (
+                f"{inner_prompt}\n\n<background>\n{launch_background}\n</background>"
+            ).strip()
+    else:
+        write_msg_id = parent_message_id
+        write_entry_key = entry_key
+        write_entry = target_entry
+        inner_prompt = (target_entry.get("prompt") or "") or ""
+        if not inner_prompt:
+            raise ValueError("entry has no stored prompt to re-run")
+
+    return {
+        "parent_message_id": parent_message_id,
+        "target_entry": target_entry,
+        "subagent_id": subagent_id,
+        "write_msg_id": write_msg_id,
+        "write_entry_key": write_entry_key,
+        "write_entry": write_entry,
+        "inner_prompt": inner_prompt,
+    }
+
+
+_SUBAGENT_TOOL_NAMES = {"subagent_launch", "subagent_continue", "subagent_agent_launch"}
+
+
+def _tool_call_id(call: dict) -> str:
+    return str(call.get("id") or call.get("tool_call_id") or "")
+
+
+def _block_has_meaningful_parent_output(block: Any) -> bool:
+    """True when a block after the target tool-call block proves the parent
+    model has already continued from that tool result.
+
+    Empty text placeholders are created by the tool loop before the next parent
+    model request; those are safe and intentionally ignored. Any real text,
+    reasoning, code, or later tool-call block means the old tool result has
+    become part of the parent transcript and must not be rewritten in place.
+    """
+    if not isinstance(block, dict):
+        return bool(block)
+
+    btype = block.get("type")
+    content = block.get("content")
+
+    if btype in {"text", "reasoning", "code_interpreter"}:
+        if isinstance(content, str) and content.strip():
+            return True
+        if btype == "code_interpreter" and block.get("output") not in (None, ""):
+            return True
+        return False
+
+    if btype == "tool_calls":
+        return bool(block.get("content") or block.get("results"))
+
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, (list, dict)):
+        return bool(content)
+    return content is not None
+
+
+def _find_parent_tool_call_block(
+    parent_message: dict, run_entry: dict
+) -> Optional[tuple[int, int]]:
+    """Return ``(block_index, tool_round_number)`` for the parent tool-call
+    block that owns this subagent run, or None when we cannot verify it.
+
+    ``tool_round_number`` is 1-based and counts model emissions that produced
+    tool calls up through the matched block. It lets us compare against
+    ``reasoning_details_per_round`` to catch parent reasoning that started
+    after the tool result even if no visible text was emitted before Stop.
+    """
+    blocks = parent_message.get("content_blocks") if isinstance(parent_message, dict) else None
+    if not isinstance(blocks, list):
+        return None
+
+    wanted_tool_call_id = str(run_entry.get("tool_call_id") or "")
+    wanted_subagent_id = str(run_entry.get("subagent_id") or run_entry.get("chat_id") or "")
+    fallback_match: Optional[tuple[int, int]] = None
+    tool_round_number = 0
+
+    for idx, block in enumerate(blocks):
+        if not isinstance(block, dict) or block.get("type") != "tool_calls":
+            continue
+        tool_round_number += 1
+        calls = block.get("content") if isinstance(block.get("content"), list) else []
+        results = block.get("results") if isinstance(block.get("results"), list) else []
+        result_subagent_ids = {
+            str(r.get("subagent_id") or "")
+            for r in results
+            if isinstance(r, dict) and r.get("subagent_id")
+        }
+
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = _tool_call_id(call)
+            tool_name = ((call.get("function") or {}).get("name") or "")
+            if wanted_tool_call_id and call_id == wanted_tool_call_id:
+                return (idx, tool_round_number)
+            if (
+                not wanted_tool_call_id
+                and tool_name in _SUBAGENT_TOOL_NAMES
+                and wanted_subagent_id
+                and wanted_subagent_id in result_subagent_ids
+            ):
+                if fallback_match is not None:
+                    # Ambiguous without a tool_call_id; refuse to guess.
+                    return None
+                fallback_match = (idx, tool_round_number)
+
+    return fallback_match
+
+
+def _validate_parent_subagent_result_unconsumed(
+    parent_chat, parent_message_id: str, run_entry: dict
+) -> None:
+    """Guard the provider transcript invariant.
+
+    A subagent's final answer/error is the parent tool result. Rewriting that
+    result in place is only safe while it is still the latest unresolved parent
+    tool result. Once the parent model has produced any later output (or the
+    user has continued the chat from that assistant message), closed providers'
+    encrypted reasoning/signature state refers to the old result and must be
+    preserved.
+    """
+    messages = _history_messages(parent_chat)
+    parent_message = messages.get(parent_message_id)
+    if not isinstance(parent_message, dict):
+        _rerun_blocked("Cannot redo subagent: parent message is no longer available.")
+
+    current_id = _history_current_id(parent_chat)
+    if current_id and current_id != parent_message_id:
+        _rerun_blocked(
+            "Cannot redo subagent: the parent chat has already moved past this tool result."
+        )
+
+    children = parent_message.get("childrenIds")
+    if isinstance(children, list) and len(children) > 0:
+        _rerun_blocked(
+            "Cannot redo subagent: later chat turns already depend on this parent response."
+        )
+
+    found = _find_parent_tool_call_block(parent_message, run_entry)
+    if found is None:
+        _rerun_blocked(
+            "Cannot redo subagent safely: could not verify the parent tool-call position."
+        )
+
+    block_idx, tool_round_number = found
+    blocks = parent_message.get("content_blocks") or []
+    for later_block in blocks[block_idx + 1 :]:
+        if _block_has_meaningful_parent_output(later_block):
+            _rerun_blocked(
+                "Cannot redo subagent: the parent model already continued after this result."
+            )
+
+    reasoning_rounds = parent_message.get("reasoning_details_per_round")
+    if isinstance(reasoning_rounds, list) and len(reasoning_rounds) > tool_round_number:
+        _rerun_blocked(
+            "Cannot redo subagent: the parent model already started a later reasoning turn."
+        )
+
+
+def _validate_subagent_turn_is_latest(subagent_chat, run_entry: dict) -> None:
+    """Guard the hidden subagent transcript invariant.
+
+    ``subagent_continue`` mutates the hidden subagent chat. Re-running an
+    earlier launch/continue in place would invalidate every later continuation
+    in that hidden transcript. Therefore the entry we are about to rewrite must
+    be the hidden subagent chat's current leaf.
+    """
+    assistant_msg_id = run_entry.get("assistant_msg_id")
+    if not assistant_msg_id:
+        _rerun_blocked(
+            "Cannot redo subagent safely: this run is missing retry metadata."
+        )
+
+    chat_data = (subagent_chat.chat if subagent_chat else {}) or {}
+    history = chat_data.get("history") or {}
+    messages = history.get("messages") or {}
+    current_id = history.get("currentId")
+
+    if current_id and current_id != assistant_msg_id:
+        _rerun_blocked(
+            "Cannot redo subagent: this is not the latest turn in the subagent conversation."
+        )
+
+    msg = messages.get(assistant_msg_id) if isinstance(messages, dict) else None
+    if isinstance(msg, dict) and msg.get("childrenIds"):
+        _rerun_blocked(
+            "Cannot redo subagent: later subagent continuations already depend on this turn."
+        )
+
+
+def _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx: dict) -> None:
+    write_entry = ctx.get("write_entry") or {}
+    write_msg_id = ctx.get("write_msg_id") or ""
+    _validate_parent_subagent_result_unconsumed(parent_chat, write_msg_id, write_entry)
+    _validate_subagent_turn_is_latest(subagent_chat, write_entry)
+
+
+def validate_subagent_rerun_allowed(
+    *, user, parent_chat_id: str, parent_message_id: str, entry_key: str, scope: str
+) -> None:
+    """Public preflight used by the HTTP router before it creates the rerun
+    background task. ``rerun_subagent_turn`` calls the same validation again
+    immediately before mutating state so races are still caught.
+    """
+    parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    if parent_chat is None:
+        raise ValueError("parent chat not accessible")
+    ctx = _resolve_subagent_rerun_context(
+        parent_chat, parent_message_id, entry_key, scope
+    )
+    subagent_chat = Chats.get_chat_by_id_and_user_id(ctx["subagent_id"], user.id)
+    if subagent_chat is None:
+        raise ValueError("subagent chat not accessible")
+    _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx)
+
+
 async def rerun_subagent_turn(
     *,
     request: Request,
@@ -1923,58 +2221,38 @@ async def rerun_subagent_turn(
     if parent_chat is None:
         raise ValueError("parent chat not accessible")
 
-    # Resolve the clicked entry. If the caller's parent_message_id hint was
-    # stale (e.g. the run lives on a different parent message), find it.
-    located_msg_id, target_entry = _find_subagent_entry(parent_chat, entry_key)
-    if target_entry is None:
-        raise ValueError(f"subagent run entry '{entry_key}' not found")
-    if located_msg_id and located_msg_id != parent_message_id:
-        parent_message_id = located_msg_id
-
-    subagent_id = target_entry.get("subagent_id") or target_entry.get("chat_id")
-    if not subagent_id:
-        raise ValueError("subagent_id missing from entry")
+    # Resolve the clicked entry and the concrete entry this rerun would rewrite.
+    # Validation happens BEFORE any hidden-chat reset/revert so blocked reruns
+    # never mutate parent or subagent history.
+    ctx = _resolve_subagent_rerun_context(
+        parent_chat, parent_message_id, entry_key, scope
+    )
+    parent_message_id = ctx["parent_message_id"]
+    target_entry = ctx["target_entry"]
+    subagent_id = ctx["subagent_id"]
+    write_msg_id = ctx["write_msg_id"]
+    write_entry_key = ctx["write_entry_key"]
+    write_entry = ctx["write_entry"]
+    inner_prompt = ctx["inner_prompt"]
 
     subagent_chat = Chats.get_chat_by_id_and_user_id(subagent_id, user.id)
     if subagent_chat is None:
         raise ValueError("subagent chat not accessible")
 
-    # Pick which entry we'll write back to (and which prompt drives the run).
-    if scope == "from_launch":
-        launch_msg_id, launch_key, launch_entry = _find_launch_entry_for_subagent(
-            parent_chat, subagent_id
-        )
-        if launch_entry is None:
-            # Fall back: treat the clicked entry as the launch. Means we lose
-            # the original launch prompt but at least give the user some
-            # rerun behavior. Background is dropped (we don't know it).
-            launch_msg_id, launch_key, launch_entry = (
-                parent_message_id,
-                entry_key,
-                target_entry,
-            )
-        write_msg_id = launch_msg_id or parent_message_id
-        write_entry_key = launch_key or entry_key
-        write_entry = launch_entry
-        launch_prompt = (launch_entry.get("prompt") or "") if launch_entry else ""
-        launch_background = (
-            (launch_entry.get("background") or "") if launch_entry else ""
-        )
-        inner_prompt = launch_prompt
-        if launch_background:
-            inner_prompt = (
-                f"{inner_prompt}\n\n<background>\n{launch_background}\n</background>"
-            ).strip()
+    _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx)
 
-        # Wipe the entire subagent chat history.
+    if scope == "from_launch":
+        # Wipe the entire subagent chat history. This is safe only after the
+        # guard above proved that the launch entry is still the latest
+        # unresolved parent result AND the current leaf of the hidden subagent
+        # chat (i.e. no continuation depends on it).
         _reset_inner_history(subagent_id)
 
         # Mark every OTHER entry (continues) for this subagent as stale so
-        # the UI can show them differently. Stored as a small flag — the
-        # frontend can choose to grey/strikethrough.
-        history_messages = (
-            ((parent_chat.chat or {}).get("history") or {}).get("messages") or {}
-        )
+        # the UI can show them differently. In the common safe path there are
+        # no later non-stale continuations; this still preserves old defensive
+        # behavior for already-stale rows from previous restarts.
+        history_messages = _history_messages(parent_chat)
         for m_id, msg in history_messages.items():
             runs = msg.get("subagent_runs") if isinstance(msg, dict) else None
             if not isinstance(runs, dict):
@@ -1987,14 +2265,9 @@ async def rerun_subagent_turn(
                 ):
                     _upsert_subagent_run(parent_chat_id, m_id, k, {"stale": True})
     else:
-        # this_turn
-        write_msg_id = parent_message_id
-        write_entry_key = entry_key
-        write_entry = target_entry
-        inner_prompt = (target_entry.get("prompt") or "") or ""
-        if not inner_prompt:
-            raise ValueError("entry has no stored prompt to re-run")
-
+        # this_turn: revert just this entry's user→assistant pair. The guard
+        # above proved that pair is the hidden subagent chat's current leaf, so
+        # removing it cannot invalidate a later continuation.
         prior_user_id = target_entry.get("user_msg_id")
         prior_assistant_id = target_entry.get("assistant_msg_id")
         if prior_user_id:
@@ -2051,6 +2324,14 @@ async def rerun_subagent_turn(
     }
     if not rerun_base_run_patch.get("continuation"):
         subagent_meta.pop("continuation", None)
+
+    def assert_parent_result_still_unconsumed() -> None:
+        refreshed_parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+        if refreshed_parent_chat is None:
+            _rerun_blocked("Cannot finish subagent redo: parent chat is no longer accessible.")
+        _validate_parent_subagent_result_unconsumed(
+            refreshed_parent_chat, write_msg_id, rerun_base_run_patch
+        )
 
     # Flip the entry back to running + clear the prior final_text so the
     # UI's auto-expand-while-running kicks in.
@@ -2110,6 +2391,7 @@ async def rerun_subagent_turn(
             )
             if not final_text:
                 raise RuntimeError("subagent produced no final text")
+            assert_parent_result_still_unconsumed()
             _upsert_subagent_run(
                 parent_chat_id,
                 write_msg_id,
@@ -2123,6 +2405,7 @@ async def rerun_subagent_turn(
             )
             return
         except asyncio.CancelledError:
+            assert_parent_result_still_unconsumed()
             _upsert_subagent_run(
                 parent_chat_id,
                 write_msg_id,
@@ -2141,7 +2424,10 @@ async def rerun_subagent_turn(
                 parent_message_id=write_msg_id,
             )
             raise
+        except SubagentRerunBlockedError:
+            raise
         except Exception as e:  # noqa: BLE001
+            assert_parent_result_still_unconsumed()
             last_error = str(e)
             log.exception(f"subagent rerun attempt {attempt}/2 failed: {e}")
             if attempt == 1:

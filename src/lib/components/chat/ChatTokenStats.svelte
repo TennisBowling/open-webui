@@ -146,9 +146,7 @@
 			}
 
 			if (stats) {
-				clearRetry();
-				retryCount = 0;
-				chatTokenStats.set({
+				const next = {
 					chat_id: stats.chat_id,
 					total_input_tokens: stats.total_input_tokens,
 					total_output_tokens: stats.total_output_tokens,
@@ -159,7 +157,29 @@
 					last_cache_read_tokens: stats.last_cache_read_tokens ?? 0,
 					message_count: stats.message_count,
 					loading: false
+				};
+
+				// If a live usage payload already advanced the counter, don't let a
+				// lagging analytics read reset it to zero/old totals; retry until DB catches up.
+				let staleResponse = false;
+				chatTokenStats.update((current) => {
+					staleResponse =
+						current?.chat_id === next.chat_id &&
+						(current.total_input_tokens > next.total_input_tokens ||
+							current.total_output_tokens > next.total_output_tokens ||
+							current.total_tokens > next.total_tokens ||
+							current.total_cache_read_tokens > next.total_cache_read_tokens ||
+							current.message_count > next.message_count);
+
+					return staleResponse && current ? { ...current, loading: false } : next;
 				});
+
+				if (staleResponse) {
+					scheduleRetry(requestedChatId);
+				} else {
+					clearRetry();
+					retryCount = 0;
+				}
 			} else {
 				// Null can mean: stats don't exist yet (brand-new chat with no
 				// usage-bearing messages), backend indexing lag, or a transient
