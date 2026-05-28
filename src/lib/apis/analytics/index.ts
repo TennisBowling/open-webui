@@ -10,8 +10,10 @@ export interface ChatTokenStats {
 	total_input_tokens: number;
 	total_output_tokens: number;
 	total_tokens: number;
+	total_cache_read_tokens: number;
 	last_input_tokens: number;
 	last_output_tokens: number;
+	last_cache_read_tokens: number;
 	message_count: number;
 	created_at: number;
 	updated_at: number;
@@ -45,6 +47,7 @@ export interface ModelUsage {
 	total_input_tokens: number;
 	total_output_tokens: number;
 	total_tokens: number;
+	total_cache_read_tokens: number;
 	conversation_count: number;
 	message_count: number;
 	percentage: number;
@@ -60,6 +63,8 @@ export interface TopChat {
 	total_tokens: number;
 	total_input_tokens: number;
 	total_output_tokens: number;
+	total_cache_read_tokens: number;
+	last_cache_read_tokens: number;
 	message_count: number;
 }
 
@@ -73,6 +78,7 @@ export interface WrappedSummary {
 	total_input_tokens: number;
 	total_output_tokens: number;
 	total_tokens: number;
+	total_cache_read_tokens: number;
 	days_active: number;
 	most_active_day: {
 		date: string;
@@ -97,12 +103,57 @@ export interface GlobalWrappedSummary {
 	total_conversations: number;
 	total_messages: number;
 	total_tokens: number;
+	total_cache_read_tokens: number;
 	top_models: ModelUsage[];
 	busiest_day: {
 		date: string;
 		tokens: number;
 		day_of_week: string;
 	} | null;
+}
+
+/**
+ * Admin per-user usage stats
+ */
+export interface UserUsage {
+	user_id: string;
+	name: string | null;
+	email: string | null;
+	role: string | null;
+	total_input_tokens: number;
+	total_output_tokens: number;
+	total_tokens: number;
+	total_cache_read_tokens: number;
+	conversation_count: number;
+	message_count: number;
+	days_active: number;
+	avg_tokens_per_active_day: number;
+	avg_tokens_per_message: number;
+	cache_read_rate: number;
+	last_active_at: number | null;
+}
+
+/**
+ * Admin subagent analytics
+ */
+export interface SubagentAnalytics {
+	year: number;
+	total_subagent_chats: number;
+	parent_chat_count: number;
+	request_count: number;
+	total_input_tokens: number;
+	total_output_tokens: number;
+	total_tokens: number;
+	total_cache_read_tokens: number;
+	token_share_percent: number;
+	avg_tokens_per_subagent: number;
+	avg_requests_per_subagent: number;
+	avg_subagents_per_parent: number;
+	status_counts: Record<string, number>;
+	top_parent_chats: Array<Record<string, any>>;
+	top_subagents: Array<Record<string, any>>;
+	top_users: Array<Record<string, any>>;
+	top_models: ModelUsage[];
 }
 
 /**
@@ -344,11 +395,15 @@ export const getGlobalWrapped = async (
  */
 export const getGlobalModelUsage = async (
 	token: string,
-	limit: number = 20
+	limit: number = 20,
+	year?: number
 ): Promise<ModelUsage[]> => {
 	let error = null;
 
 	const params = new URLSearchParams();
+	if (year) {
+		params.append('year', year.toString());
+	}
 	params.append('limit', limit.toString());
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/analytics/global/models?${params.toString()}`, {
@@ -375,6 +430,88 @@ export const getGlobalModelUsage = async (
 	}
 
 	return res || [];
+};
+
+/**
+ * Get per-user usage leaderboard (Admin only)
+ */
+export const getGlobalUserUsage = async (
+	token: string,
+	year?: number,
+	limit: number = 100
+): Promise<UserUsage[]> => {
+	let error = null;
+
+	const params = new URLSearchParams();
+	if (year) {
+		params.append('year', year.toString());
+	}
+	params.append('limit', limit.toString());
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/analytics/global/users?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			console.error('Error fetching global user usage:', err);
+			return [];
+		});
+
+	if (error) {
+		console.error(error);
+		return [];
+	}
+
+	return res || [];
+};
+
+/**
+ * Get subagent usage analytics (Admin only)
+ */
+export const getGlobalSubagentUsage = async (
+	token: string,
+	year?: number
+): Promise<SubagentAnalytics | null> => {
+	let error = null;
+
+	const params = new URLSearchParams();
+	if (year) {
+		params.append('year', year.toString());
+	}
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/analytics/global/subagents?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			console.error('Error fetching subagent analytics:', err);
+			return null;
+		});
+
+	if (error) {
+		console.error(error);
+		return null;
+	}
+
+	return res;
 };
 
 /**

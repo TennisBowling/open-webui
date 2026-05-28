@@ -21,6 +21,8 @@ from open_webui.models.analytics import (
     TopChatResponse,
     WrappedSummaryResponse,
     GlobalWrappedResponse,
+    UserUsageResponse,
+    SubagentAnalyticsResponse,
 )
 from open_webui.models.chats import Chats
 from open_webui.constants import ERROR_MESSAGES
@@ -86,8 +88,10 @@ async def get_chat_token_stats(chat_id: str, user=Depends(get_verified_user)):
             total_input_tokens=0,
             total_output_tokens=0,
             total_tokens=0,
+            total_cache_read_tokens=0,
             last_input_tokens=0,
             last_output_tokens=0,
+            last_cache_read_tokens=0,
             message_count=0,
             created_at=0,
             updated_at=0,
@@ -138,6 +142,8 @@ async def get_user_wrapped(
             total_tokens=chat.total_tokens,
             total_input_tokens=chat.total_input_tokens,
             total_output_tokens=chat.total_output_tokens,
+            total_cache_read_tokens=chat.total_cache_read_tokens,
+            last_cache_read_tokens=chat.last_cache_read_tokens,
             message_count=chat.message_count,
         ))
     
@@ -212,6 +218,8 @@ async def get_user_top_chats(
             total_tokens=chat.total_tokens,
             total_input_tokens=chat.total_input_tokens,
             total_output_tokens=chat.total_output_tokens,
+            total_cache_read_tokens=chat.total_cache_read_tokens,
+            last_cache_read_tokens=chat.last_cache_read_tokens,
             message_count=chat.message_count,
         ))
     
@@ -248,6 +256,7 @@ async def get_global_wrapped(
 
 @router.get("/global/models", response_model=list[ModelUsageResponse])
 async def get_global_model_usage(
+    year: Optional[int] = None,
     limit: int = 20,
     user=Depends(get_admin_user)
 ):
@@ -258,7 +267,30 @@ async def get_global_model_usage(
     
     Returns top models by total token count with percentages.
     """
-    return Analytics.get_global_model_usage(limit)
+    return Analytics.get_global_model_usage(limit, year)
+
+
+@router.get("/global/users", response_model=list[UserUsageResponse])
+async def get_global_user_usage(
+    year: Optional[int] = None,
+    limit: int = 100,
+    user=Depends(get_admin_user)
+):
+    """Get per-user token/cache/message stats for admins."""
+    if year is None:
+        year = datetime.now(timezone.utc).year
+    return Analytics.get_global_user_usage(year, limit)
+
+
+@router.get("/global/subagents", response_model=SubagentAnalyticsResponse)
+async def get_global_subagent_usage(
+    year: Optional[int] = None,
+    user=Depends(get_admin_user)
+):
+    """Get site-wide subagent usage analytics."""
+    if year is None:
+        year = datetime.now(timezone.utc).year
+    return Analytics.get_global_subagent_usage(year)
 
 
 @router.get("/global/heatmap", response_model=HeatmapResponse)

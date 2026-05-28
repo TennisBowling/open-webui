@@ -10,6 +10,7 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
+	const DEFAULT_JINA_READER_API_BASE_URL = 'https://r.jina.ai/';
 
 	export let saveHandler: Function;
 
@@ -24,6 +25,7 @@
 
 	// Jina Reader powers full-content fetches from URLs.
 	let jinaApiKey = '';
+	let jinaReaderApiBaseUrl = DEFAULT_JINA_READER_API_BASE_URL;
 	let jinaReaderTokenUsage = 0;
 	let jinaReaderViewportWidth = 1280;
 	let jinaReaderViewportHeight = 12000;
@@ -34,6 +36,13 @@
 	let jinaConfigLoaded = false;
 
 	let webSearchSystemPrompt = '';
+
+	const normalizeApiBaseUrl = (value: string) =>
+		(value || DEFAULT_JINA_READER_API_BASE_URL).trim().replace(/\/+$/, '');
+
+	$: isHostedJinaReader =
+		normalizeApiBaseUrl(jinaReaderApiBaseUrl) ===
+		normalizeApiBaseUrl(DEFAULT_JINA_READER_API_BASE_URL);
 
 	// YouTube loader settings (kept for compatibility)
 	let youtubeLoaderLanguage = '';
@@ -75,6 +84,7 @@
 				EXA_INCLUDE_DOMAINS: includeDomains,
 				EXA_EXCLUDE_DOMAINS: excludeDomains,
 				JINA_API_KEY: jinaApiKey,
+				JINA_READER_API_BASE_URL: jinaReaderApiBaseUrl.trim() || DEFAULT_JINA_READER_API_BASE_URL,
 				JINA_READER_TOKEN_USAGE: Math.max(0, Math.floor(toNumber(jinaReaderTokenUsage, 0))),
 				JINA_READER_VIEWPORT_WIDTH: Math.max(
 					320,
@@ -110,6 +120,7 @@
 			exaIncludeDomains = (res.web.EXA_INCLUDE_DOMAINS ?? []).join(', ');
 			exaExcludeDomains = (res.web.EXA_EXCLUDE_DOMAINS ?? []).join(', ');
 			jinaApiKey = res.web.JINA_API_KEY ?? '';
+			jinaReaderApiBaseUrl = res.web.JINA_READER_API_BASE_URL ?? DEFAULT_JINA_READER_API_BASE_URL;
 			jinaReaderTokenUsage = res.web.JINA_READER_TOKEN_USAGE ?? 0;
 			jinaReaderViewportWidth = res.web.JINA_READER_VIEWPORT_WIDTH ?? 1280;
 			jinaReaderViewportHeight = res.web.JINA_READER_VIEWPORT_HEIGHT ?? 12000;
@@ -244,23 +255,52 @@
 						</div>
 						<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
 							{$i18n.t(
-								'Used by web_fetch to read full page content. Requests use Jina Reader browser mode with retained links, images, media links, ATX headings, and a final 1280×12000 viewport by default.'
+								'Used by web_fetch to read full page content. Point the base URL at hosted Jina Reader or a self-hosted Reader endpoint. Requests use browser mode with retained links, images, media links, ATX headings, and a final 1280×12000 viewport by default.'
 							)}
 						</div>
 
 						<div class="mb-2.5 flex w-full flex-col">
 							<div class=" self-center text-xs font-medium mb-1">
 								<Tooltip
-									content={$i18n.t('Sent as Authorization: Bearer <key> to https://r.jina.ai/')}
+									content={$i18n.t(
+										'POST endpoint for Jina Reader. Use https://r.jina.ai/ or your self-hosted Reader endpoint.'
+									)}
+								>
+									{$i18n.t('Jina Reader API Base URL')}
+								</Tooltip>
+							</div>
+
+							<input
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+								type="url"
+								placeholder="https://r.jina.ai/"
+								bind:value={jinaReaderApiBaseUrl}
+								required
+								autocomplete="off"
+							/>
+						</div>
+
+						<div class="mb-2.5 flex w-full flex-col">
+							<div class=" self-center text-xs font-medium mb-1">
+								<Tooltip
+									content={isHostedJinaReader
+										? $i18n.t(
+												'Required for hosted Jina Reader. Sent as Authorization: Bearer <key>.'
+											)
+										: $i18n.t(
+												'Optional for self-hosted Jina Reader. When empty, no Authorization header is sent.'
+											)}
 								>
 									{$i18n.t('Jina API Key')}
 								</Tooltip>
 							</div>
 
 							<SensitiveInput
-								placeholder={$i18n.t('Enter Jina API Key')}
+								placeholder={isHostedJinaReader
+									? $i18n.t('Enter Jina API Key')
+									: $i18n.t('Enter Jina API Key (optional)')}
 								bind:value={jinaApiKey}
-								required
+								required={isHostedJinaReader}
 							/>
 						</div>
 

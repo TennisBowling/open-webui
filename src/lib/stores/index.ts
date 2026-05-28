@@ -56,8 +56,10 @@ export interface ChatTokenStatsData {
 	total_input_tokens: number;
 	total_output_tokens: number;
 	total_tokens: number;
+	total_cache_read_tokens: number;
 	last_input_tokens: number;
 	last_output_tokens: number;
+	last_cache_read_tokens: number;
 	message_count: number;
 	loading: boolean;
 }

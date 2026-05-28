@@ -120,8 +120,10 @@
 			total_input_tokens: current?.total_input_tokens ?? 0,
 			total_output_tokens: current?.total_output_tokens ?? 0,
 			total_tokens: current?.total_tokens ?? 0,
+			total_cache_read_tokens: current?.total_cache_read_tokens ?? 0,
 			last_input_tokens: current?.last_input_tokens ?? 0,
 			last_output_tokens: current?.last_output_tokens ?? 0,
+			last_cache_read_tokens: current?.last_cache_read_tokens ?? 0,
 			message_count: current?.message_count ?? 0,
 			loading: true
 		}));
@@ -151,8 +153,10 @@
 					total_input_tokens: stats.total_input_tokens,
 					total_output_tokens: stats.total_output_tokens,
 					total_tokens: stats.total_tokens,
+					total_cache_read_tokens: stats.total_cache_read_tokens ?? 0,
 					last_input_tokens: stats.last_input_tokens,
 					last_output_tokens: stats.last_output_tokens,
+					last_cache_read_tokens: stats.last_cache_read_tokens ?? 0,
 					message_count: stats.message_count,
 					loading: false
 				});
@@ -195,15 +199,19 @@
 			<div class="text-xs space-y-1">
 				<div class="font-semibold mb-1">${$i18n.t('Token Usage')}</div>
 				<div class="flex justify-between gap-4">
-					<span>${$i18n.t('Input')}:</span>
-					<span class="font-mono">${$chatTokenStats.total_input_tokens.toLocaleString()}</span>
+					<span>${$i18n.t('Latest Input')}:</span>
+					<span class="font-mono">${$chatTokenStats.last_input_tokens.toLocaleString()}</span>
 				</div>
 				<div class="flex justify-between gap-4">
-					<span>${$i18n.t('Output')}:</span>
+					<span>${$i18n.t('Output Total')}:</span>
 					<span class="font-mono">${$chatTokenStats.total_output_tokens.toLocaleString()}</span>
 				</div>
+				<div class="flex justify-between gap-4">
+					<span>${$i18n.t('Cache Read')}:</span>
+					<span class="font-mono">${$chatTokenStats.last_cache_read_tokens.toLocaleString()}</span>
+				</div>
 				<div class="flex justify-between gap-4 border-t border-gray-600 pt-1 mt-1">
-					<span>${$i18n.t('Total')}:</span>
+					<span>${$i18n.t('Request Total')}:</span>
 					<span class="font-mono font-semibold">${$chatTokenStats.total_tokens.toLocaleString()}</span>
 				</div>
 				<div class="text-gray-400 text-[10px] mt-2">
@@ -216,8 +224,8 @@
 		<div
 			class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px] font-mono text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-850 border border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-default select-none"
 		>
-			<!-- Input tokens -->
-			<span class="flex items-center gap-0.5" title={$i18n.t('Input tokens')}>
+			<!-- Latest input tokens -->
+			<span class="flex items-center gap-0.5" title={$i18n.t('Latest input tokens')}>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					viewBox="0 0 16 16"
@@ -230,7 +238,7 @@
 						clip-rule="evenodd"
 					/>
 				</svg>
-				<span>{formatTokenCount($chatTokenStats.total_input_tokens)}</span>
+				<span>{formatTokenCount($chatTokenStats.last_input_tokens)}</span>
 			</span>
 
 			<span class="text-gray-300 dark:text-gray-600">·</span>
@@ -254,10 +262,21 @@
 
 			<span class="text-gray-300 dark:text-gray-600">·</span>
 
-			<!-- Total tokens -->
+			<!-- Cached input tokens -->
+			<span
+				class="flex items-center gap-0.5 font-medium text-purple-500 dark:text-purple-400"
+				title={$i18n.t('Cached input tokens')}
+			>
+				<span>R</span>
+				<span>{formatTokenCount($chatTokenStats.last_cache_read_tokens)}</span>
+			</span>
+
+			<span class="text-gray-300 dark:text-gray-600">·</span>
+
+			<!-- Total request tokens -->
 			<span
 				class="flex items-center gap-0.5 font-medium text-gray-600 dark:text-gray-300"
-				title={$i18n.t('Total tokens')}
+				title={$i18n.t('Total request tokens')}
 			>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"

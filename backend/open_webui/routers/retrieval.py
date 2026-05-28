@@ -476,6 +476,7 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
             "EXA_INCLUDE_DOMAINS": request.app.state.config.EXA_INCLUDE_DOMAINS,
             "EXA_EXCLUDE_DOMAINS": request.app.state.config.EXA_EXCLUDE_DOMAINS,
             "JINA_API_KEY": request.app.state.config.JINA_API_KEY,
+            "JINA_READER_API_BASE_URL": request.app.state.config.JINA_READER_API_BASE_URL,
             "JINA_READER_TOKEN_USAGE": request.app.state.config.JINA_READER_TOKEN_USAGE,
             "JINA_READER_VIEWPORT_WIDTH": request.app.state.config.JINA_READER_VIEWPORT_WIDTH,
             "JINA_READER_VIEWPORT_HEIGHT": request.app.state.config.JINA_READER_VIEWPORT_HEIGHT,
@@ -497,6 +498,7 @@ class WebConfig(BaseModel):
     EXA_INCLUDE_DOMAINS: Optional[List[str]] = None
     EXA_EXCLUDE_DOMAINS: Optional[List[str]] = None
     JINA_API_KEY: Optional[str] = None
+    JINA_READER_API_BASE_URL: Optional[str] = None
     JINA_READER_TOKEN_USAGE: Optional[int] = None
     JINA_READER_VIEWPORT_WIDTH: Optional[int] = None
     JINA_READER_VIEWPORT_HEIGHT: Optional[int] = None
@@ -980,6 +982,11 @@ async def update_rag_config(
             else request.app.state.config.JINA_API_KEY
         )
         request.app.state.config.JINA_API_KEY = new_jina_api_key
+        request.app.state.config.JINA_READER_API_BASE_URL = (
+            web_config.JINA_READER_API_BASE_URL.strip()
+            if web_config.JINA_READER_API_BASE_URL is not None
+            else request.app.state.config.JINA_READER_API_BASE_URL
+        ) or "https://r.jina.ai/"
 
         if web_config.JINA_READER_TOKEN_USAGE is not None:
             request.app.state.config.JINA_READER_TOKEN_USAGE = max(
@@ -1115,6 +1122,7 @@ async def update_rag_config(
             "EXA_INCLUDE_DOMAINS": request.app.state.config.EXA_INCLUDE_DOMAINS,
             "EXA_EXCLUDE_DOMAINS": request.app.state.config.EXA_EXCLUDE_DOMAINS,
             "JINA_API_KEY": request.app.state.config.JINA_API_KEY,
+            "JINA_READER_API_BASE_URL": request.app.state.config.JINA_READER_API_BASE_URL,
             "JINA_READER_TOKEN_USAGE": request.app.state.config.JINA_READER_TOKEN_USAGE,
             "JINA_READER_VIEWPORT_WIDTH": request.app.state.config.JINA_READER_VIEWPORT_WIDTH,
             "JINA_READER_VIEWPORT_HEIGHT": request.app.state.config.JINA_READER_VIEWPORT_HEIGHT,

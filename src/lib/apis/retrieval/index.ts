@@ -14,6 +14,7 @@ type WebSearchConfigForm = {
 	EXA_INCLUDE_DOMAINS?: string[];
 	EXA_EXCLUDE_DOMAINS?: string[];
 	JINA_API_KEY?: string;
+	JINA_READER_API_BASE_URL?: string;
 	JINA_READER_TOKEN_USAGE?: number;
 	JINA_READER_VIEWPORT_WIDTH?: number;
 	JINA_READER_VIEWPORT_HEIGHT?: number;

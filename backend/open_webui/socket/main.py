@@ -503,7 +503,11 @@ async def process_token_usage(
     model_id: str,
     usage_data: dict,
     chat_id: str = None,
-    user_id: str = None
+    user_id: str = None,
+    source_chat_id: str = None,
+    message_id: str = None,
+    parent_message_id: str = None,
+    source_type: str = None,
 ):
     """
     Process token usage data and update all tracking tables.
@@ -517,8 +521,12 @@ async def process_token_usage(
     Args:
         model_id: The model being used
         usage_data: Dict containing prompt_tokens, completion_tokens, etc.
-        chat_id: Optional chat ID for conversation tracking
+        chat_id: Optional attributed chat ID for conversation tracking
         user_id: Optional user ID for user-level analytics
+        source_chat_id: Chat that actually ran the model call (hidden subagent chat for subagents)
+        message_id: Assistant message receiving this usage payload
+        parent_message_id: Parent assistant message for subagent runs
+        source_type: chat, subagent, task, proxy, etc.
     """
     log.info(f"📊 [process_token_usage] Called with model={model_id}, chat_id={chat_id}, user_id={user_id}")
     log.info(f"📊 [process_token_usage] usage_data={usage_data}")
@@ -531,17 +539,18 @@ async def process_token_usage(
     prompt_tokens = usage_data.get("prompt_tokens", 0)
     completion_tokens = usage_data.get("completion_tokens", 0)
 
-    # Extract reasoning tokens from completion_tokens_details
-    completion_tokens_details = usage_data.get("completion_tokens_details", {}) or {}
-    reasoning_tokens = completion_tokens_details.get("reasoning_tokens", 0)
+    # Extract provider prompt-cache read tokens.
+    # `completion_tokens` already includes reasoning tokens for OpenAI/OpenRouter-style
+    # usage payloads; use provider `total_tokens` when available so totals match billing.
+    prompt_tokens_details = usage_data.get("prompt_tokens_details", {}) or {}
+    cache_read_tokens = int(prompt_tokens_details.get("cached_tokens", 0) or 0)
 
-    # Calculate IN, OUT, TOTAL according to spec
-    # IN = prompt_tokens
-    # OUT = completion_tokens + reasoning_tokens
-    # TOTAL = IN + OUT
-    token_in = prompt_tokens
-    token_out = completion_tokens + reasoning_tokens
-    token_total = token_in + token_out
+    # IN = prompt_tokens for this request/context
+    # OUT = completion_tokens for this request (reasoning included by provider if billed)
+    # TOTAL = provider-reported total_tokens, falling back to IN + OUT
+    token_in = int(prompt_tokens or 0)
+    token_out = int(completion_tokens or 0)
+    token_total = int(usage_data.get("total_tokens", token_in + token_out) or 0)
     
     log.info(f"📊 [process_token_usage] Calculated: in={token_in}, out={token_out}, total={token_total}")
 
@@ -552,7 +561,30 @@ async def process_token_usage(
     try:
         from open_webui.models.analytics import Analytics
         
-        # 2. Update conversation token usage (per-chat tracking)
+        event_source_chat_id = source_chat_id or chat_id
+        event_source_type = source_type or (
+            "subagent" if event_source_chat_id and chat_id and event_source_chat_id != chat_id else "chat"
+        )
+
+        # 2. Store immutable per-request event first. This is the source of
+        # truth for future rebuilds and precise subagent analytics.
+        if chat_id and user_id:
+            Analytics.record_token_usage_event(
+                user_id=user_id,
+                source_chat_id=event_source_chat_id,
+                attributed_chat_id=chat_id,
+                message_id=message_id,
+                parent_message_id=parent_message_id,
+                model_id=model_id,
+                prompt_tokens=token_in,
+                completion_tokens=token_out,
+                total_tokens=token_total,
+                cache_read_tokens=cache_read_tokens,
+                source_type=event_source_type,
+                raw_usage=usage_data,
+            )
+
+        # 3. Update conversation token usage (per-visible-chat tracking)
         if chat_id and user_id:
             log.info(f"📊 [process_token_usage] Updating conversation token usage for chat={chat_id}, user={user_id}")
             result = Analytics.update_conversation_token_usage(
@@ -561,13 +593,14 @@ async def process_token_usage(
                 model_id=model_id,
                 token_in=token_in,
                 token_out=token_out,
-                token_total=token_total
+                token_total=token_total,
+                cache_read_tokens=cache_read_tokens
             )
             log.info(f"📊 [process_token_usage] Conversation update result: {result}")
         else:
             log.info(f"📊 [process_token_usage] Skipping conversation update - chat_id={chat_id}, user_id={user_id}")
         
-        # 3. Update daily token usage (for heatmaps)
+        # 4. Update daily token usage (for heatmaps)
         if user_id:
             log.info(f"📊 [process_token_usage] Updating daily token usage for user={user_id}")
             Analytics.update_daily_token_usage(
@@ -575,17 +608,19 @@ async def process_token_usage(
                 token_in=token_in,
                 token_out=token_out,
                 token_total=token_total,
-                chat_id=chat_id
+                chat_id=chat_id,
+                cache_read_tokens=cache_read_tokens
             )
         
-        # 4. Update model token usage (for model breakdowns)
+        # 5. Update model token usage (for model breakdowns)
         log.info(f"📊 [process_token_usage] Updating model token usage for model={model_id}")
         Analytics.update_model_token_usage(
             user_id=user_id,
             model_id=model_id,
             token_in=token_in,
             token_out=token_out,
-            token_total=token_total
+            token_total=token_total,
+            cache_read_tokens=cache_read_tokens
         )
         
         log.info(f"📊 [process_token_usage] SUCCESS: model={model_id}, chat={chat_id}, user={user_id}, tokens={token_total}")

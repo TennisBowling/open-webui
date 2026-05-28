@@ -1856,6 +1856,20 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     return form_data, metadata, events
 
 
+def _get_token_usage_chat_id(metadata: dict | None):
+    """Chat id to use for conversation-level token analytics.
+
+    Hidden subagent chats should not get separate conversation_token_usage rows;
+    their LLM usage rolls up into the visible parent chat. The parent's later
+    follow-up prompt is still counted normally as a separate parent model call.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("subagent_inner") and metadata.get("parent_chat_id"):
+        return metadata.get("parent_chat_id")
+    return metadata.get("chat_id")
+
+
 async def process_chat_response(
     request, response, form_data, user, metadata, model, events, tasks
 ):
@@ -2251,6 +2265,9 @@ async def process_chat_response(
                             "role": "assistant",
                             "content": content,
                         }
+
+                        if usage:
+                            update_data["usage"] = usage
 
                         reasoning_details = response_data["choices"][0]["message"].get(
                             "reasoning_details"
@@ -3128,8 +3145,12 @@ async def process_chat_response(
                                         await process_token_usage(
                                             model_id,
                                             usage,
-                                            chat_id=metadata.get("chat_id"),
-                                            user_id=user.id if user else None
+                                            chat_id=_get_token_usage_chat_id(metadata),
+                                            user_id=user.id if user else None,
+                                            source_chat_id=metadata.get("chat_id"),
+                                            message_id=metadata.get("message_id"),
+                                            parent_message_id=metadata.get("parent_message_id"),
+                                            source_type="subagent" if metadata.get("subagent_inner") else "chat"
                                         )
                                         await event_emitter(
                                             {
@@ -3997,8 +4018,12 @@ async def process_chat_response(
                                 await process_token_usage(
                                     model_id,
                                     usage,
-                                    chat_id=metadata.get("chat_id"),
-                                    user_id=user.id if user else None
+                                    chat_id=_get_token_usage_chat_id(metadata),
+                                    user_id=user.id if user else None,
+                                    source_chat_id=metadata.get("chat_id"),
+                                    message_id=metadata.get("message_id"),
+                                    parent_message_id=metadata.get("parent_message_id"),
+                                    source_type="subagent" if metadata.get("subagent_inner") else "chat"
                                 )
                                 await event_emitter({
                                     "type": "chat:completion",
@@ -4280,8 +4305,12 @@ async def process_chat_response(
                                     await process_token_usage(
                                         model_id,
                                         usage,
-                                        chat_id=metadata.get("chat_id"),
-                                        user_id=user.id if user else None
+                                        chat_id=_get_token_usage_chat_id(metadata),
+                                        user_id=user.id if user else None,
+                                        source_chat_id=metadata.get("chat_id"),
+                                        message_id=metadata.get("message_id"),
+                                        parent_message_id=metadata.get("parent_message_id"),
+                                        source_type="subagent" if metadata.get("subagent_inner") else "chat"
                                     )
                                     await event_emitter({
                                         "type": "chat:completion",
@@ -4358,6 +4387,8 @@ async def process_chat_response(
                         "content": serialize_content_blocks(content_blocks, force=True),
                         "content_blocks": content_blocks,
                     }
+                    if response_usage:
+                        update_data["usage"] = response_usage
 
                     # Per-round reasoning lets multi-turn replays attach the right
                     # round's reasoning to each tool_calls message. Flat array kept
@@ -4378,6 +4409,15 @@ async def process_chat_response(
                         metadata["chat_id"],
                         metadata["message_id"],
                         update_data,
+                    )
+                elif response_usage:
+                    # Realtime-save mode writes content on the hot path; still
+                    # persist final usage so opened full subagent chats and
+                    # future rebuilds can recover provider/cache details.
+                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        {"usage": response_usage},
                     )
 
                 # Send a webhook notification if the user is not active.

@@ -18,7 +18,14 @@ from open_webui.env import SRC_LOG_LEVELS
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
 
-JINA_READER_API_BASE = "https://r.jina.ai/"
+DEFAULT_JINA_READER_API_BASE_URL = "https://r.jina.ai/"
+JINA_READER_API_BASE = DEFAULT_JINA_READER_API_BASE_URL
+
+
+def normalize_jina_reader_api_base_url(api_base_url: Optional[str] = None) -> str:
+    """Return a usable Jina Reader API base URL, falling back to hosted Jina."""
+    base_url = (api_base_url or DEFAULT_JINA_READER_API_BASE_URL).strip()
+    return base_url or DEFAULT_JINA_READER_API_BASE_URL
 
 
 @dataclass
@@ -113,6 +120,7 @@ def _jina_headers(api_key: str, timeout_seconds: int) -> dict[str, str]:
 async def _fetch_jina_content(
     session: aiohttp.ClientSession,
     api_key: str,
+    api_base_url: str,
     url: str,
     viewport_width: int,
     viewport_height: int,
@@ -127,7 +135,7 @@ async def _fetch_jina_content(
     }
 
     async with session.post(
-        JINA_READER_API_BASE,
+        normalize_jina_reader_api_base_url(api_base_url),
         headers=_jina_headers(api_key, timeout_seconds),
         json=payload,
     ) as response:
@@ -166,12 +174,13 @@ async def fetch_jina_contents(
     timeout_seconds: int = 30,
     max_concurrency: int = 5,
     session: Optional[aiohttp.ClientSession] = None,
+    api_base_url: str = DEFAULT_JINA_READER_API_BASE_URL,
 ) -> List[JinaContentResult]:
     """
     Fetch full content from URLs using Jina Reader's POST JSON API.
 
     Args:
-        api_key: Jina API key. Used as `Authorization: Bearer <key>`.
+        api_key: Jina API key. Used as `Authorization: Bearer <key>` when set.
         urls: URLs to fetch.
         viewport_width: Browser viewport width sent in the request body.
         viewport_height: Browser viewport height sent in the request body.
@@ -179,6 +188,7 @@ async def fetch_jina_contents(
         max_concurrency: Maximum concurrent Jina requests.
         session: Optional shared aiohttp session. When provided, reuse it
             instead of creating a short-lived session per web_fetch call.
+        api_base_url: Jina Reader API endpoint. Defaults to hosted Jina Reader.
 
     Returns:
         JinaContentResult objects in the same order as the requested URLs, with
@@ -187,6 +197,7 @@ async def fetch_jina_contents(
     if not urls:
         return []
 
+    api_base_url = normalize_jina_reader_api_base_url(api_base_url)
     viewport_width = max(320, int(viewport_width or 1280))
     viewport_height = max(1000, int(viewport_height or 12000))
     timeout_seconds = max(1, int(timeout_seconds or 30))
@@ -203,6 +214,7 @@ async def fetch_jina_contents(
                     return await _fetch_jina_content(
                         session=active_session,
                         api_key=api_key,
+                        api_base_url=api_base_url,
                         url=fetch_url,
                         viewport_width=viewport_width,
                         viewport_height=viewport_height,

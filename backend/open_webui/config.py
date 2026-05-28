@@ -2829,6 +2829,12 @@ JINA_API_KEY = PersistentConfig(
     os.getenv("JINA_API_KEY", ""),
 )
 
+JINA_READER_API_BASE_URL = PersistentConfig(
+    "JINA_READER_API_BASE_URL",
+    "rag.web.search.jina_reader_api_base_url",
+    os.getenv("JINA_READER_API_BASE_URL", "https://r.jina.ai/"),
+)
+
 JINA_READER_TOKEN_USAGE = PersistentConfig(
     "JINA_READER_TOKEN_USAGE",
     "rag.web.search.jina_reader_token_usage",

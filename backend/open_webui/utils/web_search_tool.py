@@ -11,7 +11,11 @@ from pydantic import BaseModel
 from fastapi import Request
 
 from open_webui.retrieval.web.exa import search_exa
-from open_webui.retrieval.web.jina import fetch_jina_contents
+from open_webui.retrieval.web.jina import (
+    DEFAULT_JINA_READER_API_BASE_URL,
+    fetch_jina_contents,
+    normalize_jina_reader_api_base_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -142,9 +146,27 @@ class WebSearchTools:
 
         try:
             config = __request__.app.state.config
-            
-            if not config.JINA_API_KEY:
-                return "Error: Jina API key not configured. Please set it in Admin Settings > Web Search."
+            api_key = (getattr(config, "JINA_API_KEY", "") or "").strip()
+            api_base_url = normalize_jina_reader_api_base_url(
+                getattr(
+                    config,
+                    "JINA_READER_API_BASE_URL",
+                    DEFAULT_JINA_READER_API_BASE_URL,
+                )
+            )
+            hosted_jina_api_base_url = normalize_jina_reader_api_base_url(
+                DEFAULT_JINA_READER_API_BASE_URL
+            )
+
+            if (
+                not api_key
+                and api_base_url.rstrip("/").lower()
+                == hosted_jina_api_base_url.rstrip("/").lower()
+            ):
+                return (
+                    "Error: Jina API key not configured. Please set it in Admin Settings > "
+                    "Web Search, or configure a self-hosted Jina Reader API base URL."
+                )
 
             # Parse URLs from the input string
             url_list = self._parse_urls(urls)
@@ -169,8 +191,9 @@ class WebSearchTools:
             # setup across many simultaneous subagents.
             http_session = getattr(__request__.app.state, "http_session", None)
             results = await fetch_jina_contents(
-                api_key=config.JINA_API_KEY,
+                api_key=api_key,
                 urls=url_list,
+                api_base_url=api_base_url,
                 viewport_width=viewport_width,
                 viewport_height=viewport_height,
                 timeout_seconds=timeout_seconds,

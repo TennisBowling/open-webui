@@ -1173,6 +1173,10 @@ async def _run_inner_chat(
         "timezone": parent_metadata.get("timezone"),
         "model": subagent_model,
         "direct": False,
+        # Token analytics attribution: subagent LLM usage should roll up into
+        # the visible parent chat, not into the hidden subagent chat row.
+        "parent_chat_id": parent_metadata.get("chat_id"),
+        "parent_message_id": parent_metadata.get("message_id"),
         "params": {
             "function_calling": "native",
             # Batch 200 content-delta chunks per socket emission for subagents.
