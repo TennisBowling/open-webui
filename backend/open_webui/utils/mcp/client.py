@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import re
 from typing import Optional
 from contextlib import AsyncExitStack
 
@@ -13,6 +15,86 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAu
 
 MCP_INIT_TIMEOUT = 10
 MCP_CALL_TIMEOUT = 60
+
+_MCP_TOOL_NAME_MAX = 64
+_MCP_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def mcp_tool_alias(server_id: str, tool_name: str) -> str:
+    """Build a model-facing tool name that satisfies OpenAI/OpenRouter's
+    ``^[a-zA-Z0-9_-]{1,64}$`` constraint.
+
+    Naive ``f"{server_id}_{tool_name}"`` overflows the 64-char cap as soon as
+    server_id is a uuid, and any provider rejects the entire chat-completion
+    request -- not just the offending tool. We collapse the server id into an
+    8-char hash so multiple servers stay distinct, sanitize the original tool
+    name into the allowed alphabet, and clip to the limit.
+    """
+    safe_name = _MCP_TOOL_NAME_INVALID.sub("_", tool_name or "")
+    digest = hashlib.sha1((server_id or "").encode("utf-8")).hexdigest()[:8]
+    prefix = f"mcp_{digest}_"
+    return (prefix + safe_name)[:_MCP_TOOL_NAME_MAX] or prefix[:_MCP_TOOL_NAME_MAX]
+
+
+def build_mcp_connect_kwargs(
+    connection: dict,
+    *,
+    bearer_token: Optional[str],
+    user=None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Single source of truth for ``MCPClient.connect(**kwargs)`` arguments.
+
+    The verify endpoint, the runtime middleware, and the subagent runner all
+    used to assemble the same shape of headers, stdio detection, and
+    custom-header merge inline. They drifted (verify never tested stdio;
+    middleware had a slightly different rule for "send headers only when no
+    command"), which meant verify could pass while runtime broke and vice
+    versa. Centralizing it kills the drift.
+
+    The caller resolves the bearer token because the *source* differs per
+    site (verify reads cookies / oauth_manager; runtime has a pre-fetched
+    ``__oauth_token__``); everything else is the same.
+
+    Reserved headers (``Authorization``, ``Content-Type``, ...) are dropped
+    from custom headers by ``resolve_tool_server_headers``, so the
+    ``Authorization`` set here can't be clobbered by misconfiguration.
+    """
+    # Late import: this module is imported at server startup by middleware,
+    # and utils.tools pulls in heavy deps. Keeping it lazy avoids the cycle
+    # and the cost.
+    from open_webui.utils.tools import resolve_tool_server_headers
+
+    mcp_config = connection.get("config") or {}
+    command = mcp_config.get("command")
+    args = mcp_config.get("args")
+    env = mcp_config.get("env")
+
+    headers: dict = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    try:
+        custom_headers = resolve_tool_server_headers(
+            connection, user=user, metadata=metadata
+        )
+    except Exception:
+        custom_headers = None
+    if custom_headers:
+        headers = {**headers, **custom_headers}
+
+    if command:
+        # stdio: URL and HTTP headers are meaningless.
+        return {
+            "command": command,
+            "args": args,
+            "env": env,
+        }
+
+    return {
+        "url": connection.get("url", "") or None,
+        "headers": headers or None,
+    }
 
 
 class MCPClient:
@@ -74,23 +156,34 @@ class MCPClient:
         if not self.session:
             raise RuntimeError("MCP client is not connected.")
 
+        tool_specs: list[dict] = []
+        cursor: Optional[str] = None
+        # Servers can paginate large tool catalogs since MCP spec 2025-03-26
+        # (SDK 1.15+ ships paginated decorators for the server side). Loop
+        # until nextCursor stops moving so we surface the entire catalog,
+        # not just the first page.
         with anyio.fail_after(MCP_CALL_TIMEOUT):
-            result = await self.session.list_tools()
-        tools = result.tools
+            while True:
+                result = await self.session.list_tools(cursor=cursor)
+                tools = result.tools or []
 
-        tool_specs = []
-        for tool in tools:
-            name = tool.name
-            description = tool.description
+                for tool in tools:
+                    name = tool.name
+                    description = tool.description
 
-            inputSchema = tool.inputSchema
+                    inputSchema = tool.inputSchema
 
-            # TODO: handle outputSchema if needed
-            outputSchema = getattr(tool, "outputSchema", None)
+                    # TODO: handle outputSchema if needed
+                    outputSchema = getattr(tool, "outputSchema", None)
 
-            tool_specs.append(
-                {"name": name, "description": description, "parameters": inputSchema}
-            )
+                    tool_specs.append(
+                        {"name": name, "description": description, "parameters": inputSchema}
+                    )
+
+                next_cursor = getattr(result, "nextCursor", None)
+                if not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
 
         return tool_specs
 

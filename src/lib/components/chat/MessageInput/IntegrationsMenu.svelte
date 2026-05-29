@@ -468,6 +468,19 @@
 									let parts = toolId.split(':');
 									let serverId = parts?.at(-1) ?? toolId;
 
+									// Without this toast, the click silently
+									// redirects to OAuth instead of toggling.
+									// After auth the user returns thinking the
+									// tool is enabled, but selectedToolIds was
+									// never updated -- a common "I enabled MCP
+									// but the model doesn't use it" trap.
+									toast.info(
+										$i18n.t(
+											'Opening sign-in for {{name}} — you must enable it again after authorizing.',
+											{ name: tools[toolId]?.name ?? serverId }
+										)
+									);
+
 									const authUrl = getOAuthClientAuthorizationUrl(serverId, 'mcp');
 									window.open(authUrl, '_self', 'noopener');
 								} else {

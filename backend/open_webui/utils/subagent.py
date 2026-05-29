@@ -1313,13 +1313,6 @@ async def _run_inner_chat(
         # subagent" and avoid nesting / re-triggering features.
         "subagent_inner": True,
     }
-    # Optional per-chat iteration cap.
-    max_iter = chat_params.get("subagentMaxIterations")
-    if max_iter:
-        try:
-            inner_metadata["max_tool_call_retries"] = int(max_iter)
-        except (TypeError, ValueError):
-            pass
 
     inner_form_data["metadata"] = inner_metadata
 

@@ -14,7 +14,7 @@ from open_webui.utils.tools import (
     get_tool_server_url,
     set_tool_servers,
 )
-from open_webui.utils.mcp.client import MCPClient
+from open_webui.utils.mcp.client import MCPClient, build_mcp_connect_kwargs
 
 from open_webui.env import SRC_LOG_LEVELS
 
@@ -202,96 +202,109 @@ async def verify_tool_servers_config(
 ):
     """
     Verify the connection to the tool server.
+
+    For MCP servers this uses the SAME connection path as the chat runtime
+    (``build_mcp_connect_kwargs`` + ``MCPClient.connect``) so a successful
+    verify is a reliable predictor of runtime, and a failed verify reports
+    the actual upstream error instead of a generic "Failed to create MCP
+    client" string.
     """
+    client = None
     try:
         if form_data.type == "mcp":
-            if form_data.auth_type == "oauth_2.1":
-                discovery_urls = get_discovery_urls(form_data.url)
-                for discovery_url in discovery_urls:
-                    log.debug(
-                        f"Trying to fetch OAuth 2.1 discovery document from {discovery_url}"
-                    )
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            discovery_url
-                        ) as oauth_server_metadata_response:
-                            if oauth_server_metadata_response.status == 200:
-                                try:
-                                    oauth_server_metadata = (
-                                        OAuthMetadata.model_validate(
-                                            await oauth_server_metadata_response.json()
-                                        )
-                                    )
-                                    return {
-                                        "status": True,
-                                        "oauth_server_metadata": oauth_server_metadata.model_dump(
-                                            mode="json"
-                                        ),
-                                    }
-                                except Exception as e:
-                                    log.info(
-                                        f"Failed to parse OAuth 2.1 discovery document: {e}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail=f"Failed to parse OAuth 2.1 discovery document from {discovery_url}",
-                                    )
+            # Resolve a bearer token first; falls back to OAuth 2.1 discovery
+            # probe only when no token is available so newly-configured but
+            # not-yet-authorized servers can still validate their metadata.
+            bearer_token = None
+            connection_dict = form_data.model_dump()
+            server_id = (connection_dict.get("info") or {}).get("id") or ""
 
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to fetch OAuth 2.1 discovery document from {discovery_urls}",
-                )
-            else:
+            if form_data.auth_type == "bearer":
+                bearer_token = form_data.key
+            elif form_data.auth_type == "session":
+                bearer_token = request.state.token.credentials
+            elif form_data.auth_type == "system_oauth":
                 try:
-                    client = MCPClient()
-                    headers = {}
+                    if request.cookies.get("oauth_session_id", None):
+                        bearer_token = (
+                            await request.app.state.oauth_manager.get_oauth_token(
+                                user.id,
+                                request.cookies.get("oauth_session_id", None),
+                            )
+                        )
+                        if isinstance(bearer_token, dict):
+                            bearer_token = bearer_token.get("access_token")
+                except Exception:
+                    pass
+            elif form_data.auth_type == "oauth_2.1":
+                # Try to reuse an existing token for this user. If none, fall
+                # back to the discovery-document probe so the admin can
+                # confirm the server's OAuth metadata is reachable BEFORE
+                # they've authorized.
+                try:
+                    if server_id:
+                        oauth_token = (
+                            await request.app.state.oauth_client_manager.get_oauth_token(
+                                user.id, f"mcp:{server_id}"
+                            )
+                        )
+                        if oauth_token:
+                            bearer_token = oauth_token.get("access_token")
+                except Exception:
+                    bearer_token = None
 
-                    token = None
-                    if form_data.auth_type == "bearer":
-                        token = form_data.key
-                    elif form_data.auth_type == "session":
-                        token = request.state.token.credentials
-                    elif form_data.auth_type == "system_oauth":
+                if not bearer_token:
+                    discovery_urls = get_discovery_urls(form_data.url)
+                    last_err = None
+                    for discovery_url in discovery_urls:
+                        log.debug(
+                            f"Trying to fetch OAuth 2.1 discovery document from {discovery_url}"
+                        )
                         try:
-                            if request.cookies.get("oauth_session_id", None):
-                                token = await request.app.state.oauth_manager.get_oauth_token(
-                                    user.id,
-                                    request.cookies.get("oauth_session_id", None),
-                                )
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(
+                                    discovery_url
+                                ) as oauth_server_metadata_response:
+                                    if oauth_server_metadata_response.status == 200:
+                                        oauth_server_metadata = (
+                                            OAuthMetadata.model_validate(
+                                                await oauth_server_metadata_response.json()
+                                            )
+                                        )
+                                        return {
+                                            "status": True,
+                                            "auth_required": True,
+                                            "oauth_server_metadata": oauth_server_metadata.model_dump(
+                                                mode="json"
+                                            ),
+                                        }
                         except Exception as e:
-                            pass
+                            last_err = e
+                            continue
 
-                    if token:
-                        headers["Authorization"] = f"Bearer {token}"
-
-                    # Mirror the runtime merge so verification uses the
-                    # same headers a real chat request would. No chat
-                    # context here, so template tokens resolve to empty.
-                    from open_webui.utils.tools import resolve_tool_server_headers
-
-                    custom_headers = resolve_tool_server_headers(
-                        form_data.model_dump(), user=user, metadata=None
-                    )
-                    if custom_headers:
-                        headers = {**headers, **custom_headers}
-
-                    await client.connect(
-                        form_data.url, headers=headers or None
-                    )
-                    specs = await client.list_tool_specs()
-                    return {
-                        "status": True,
-                        "specs": specs,
-                    }
-                except Exception as e:
-                    log.debug(f"Failed to create MCP client: {e}")
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Failed to create MCP client",
+                        detail=(
+                            f"Failed to fetch OAuth 2.1 discovery document from "
+                            f"{discovery_urls}"
+                            + (f": {type(last_err).__name__}: {last_err}" if last_err else "")
+                        ),
                     )
-                finally:
-                    if client:
-                        await client.disconnect()
+
+            connect_kwargs = build_mcp_connect_kwargs(
+                connection_dict,
+                bearer_token=bearer_token,
+                user=user,
+                metadata=None,
+            )
+
+            client = MCPClient()
+            await client.connect(**connect_kwargs)
+            specs = await client.list_tool_specs()
+            return {
+                "status": True,
+                "specs": specs or [],
+            }
         else:  # openapi
             token = None
             if form_data.auth_type == "bearer":
@@ -310,14 +323,20 @@ async def verify_tool_servers_config(
 
             url = get_tool_server_url(form_data.url, form_data.path)
             return await get_tool_server_data(token, url)
-    except HTTPException as e:
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
-        log.debug(f"Failed to connect to the tool server: {e}")
+        log.exception("Failed to verify tool server connection")
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to connect to the tool server",
+            detail=f"{type(e).__name__}: {e}",
         )
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                log.exception("MCP verify disconnect failed")
 
 
 ############################

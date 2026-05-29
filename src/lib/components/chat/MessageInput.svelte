@@ -1535,7 +1535,8 @@
 		}
 
 		const fetchedToolIdSet = new Set((fetchedTools ?? []).map((t) => t?.id).filter(Boolean));
-		selectedToolIds = (selectedToolIds ?? []).filter((id) => {
+		const previousSelectedToolIds = selectedToolIds ?? [];
+		selectedToolIds = previousSelectedToolIds.filter((id) => {
 			if (!id) return false;
 			if (fetchedToolIdSet.has(id)) return true;
 
@@ -1547,6 +1548,28 @@
 
 			return false;
 		});
+
+		// Surface dropped MCP / OpenAPI server selections instead of silently
+		// stripping them. Previously a missing /tools/ entry just disappeared
+		// from selectedToolIds, so the user thought a tool was on while the
+		// outbound request had no tool_ids — a major "MCP doesn't work" footgun.
+		const droppedServerIds = previousSelectedToolIds.filter(
+			(id) =>
+				id &&
+				!selectedToolIds.includes(id) &&
+				(id.startsWith('server:mcp:') || id.startsWith('server:'))
+		);
+		if (droppedServerIds.length > 0) {
+			toast.warning(
+				droppedServerIds.length === 1
+					? $i18n.t('Tool server "{{id}}" is unavailable and has been deselected.', {
+							id: droppedServerIds[0].replace(/^server:(mcp:)?/, '')
+						})
+					: $i18n.t('{{count}} tool servers are unavailable and have been deselected.', {
+							count: droppedServerIds.length
+						})
+			);
+		}
 		toolSelectionReady = true;
 
 		// Load reasoning effort preferences

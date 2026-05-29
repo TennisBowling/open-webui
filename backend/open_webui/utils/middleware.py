@@ -179,7 +179,7 @@ from open_webui.utils.filter import (
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
-from open_webui.utils.mcp.client import MCPClient
+from open_webui.utils.mcp.client import MCPClient, mcp_tool_alias, build_mcp_connect_kwargs
 
 
 from open_webui.config import (
@@ -192,7 +192,6 @@ from open_webui.env import (
     SRC_LOG_LEVELS,
     GLOBAL_LOG_LEVEL,
     CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE,
-    CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES,
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_QUERIES_CACHE,
@@ -1717,13 +1716,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     mcp_clients = {}
     mcp_tools_dict = {}
+    mcp_failures: list[dict] = []
 
     if tool_ids:
         for tool_id in tool_ids:
             if tool_id.startswith("server:mcp:"):
+                # Snapshot the original id BEFORE the oauth_2.1 branch mutates
+                # `server_id` to its trailing colon-segment. Use the original
+                # for all per-server bookkeeping (mcp_clients key, failure
+                # records, error messages) so two servers whose ids share a
+                # trailing segment can't silently overwrite each other.
+                original_server_id = tool_id[len("server:mcp:") :]
+                server_id = original_server_id
                 try:
-                    server_id = tool_id[len("server:mcp:") :]
-
                     mcp_server_connection = None
                     for (
                         server_connection
@@ -1737,70 +1742,64 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
                     if not mcp_server_connection:
                         log.error(f"MCP server with id {server_id} not found")
+                        mcp_failures.append(
+                            {
+                                "server_id": original_server_id,
+                                "name": original_server_id,
+                                "reason": "Configured MCP server not found",
+                            }
+                        )
                         continue
 
                     auth_type = mcp_server_connection.get("auth_type", "")
 
-                    headers = {}
+                    bearer_token: Optional[str] = None
                     if auth_type == "bearer":
-                        headers["Authorization"] = (
-                            f"Bearer {mcp_server_connection.get('key', '')}"
-                        )
+                        bearer_token = mcp_server_connection.get("key", "") or None
                     elif auth_type == "none":
-                        # No authentication
                         pass
                     elif auth_type == "session":
-                        headers["Authorization"] = (
-                            f"Bearer {request.state.token.credentials}"
-                        )
+                        bearer_token = request.state.token.credentials
                     elif auth_type == "system_oauth":
                         oauth_token = extra_params.get("__oauth_token__", None)
                         if oauth_token:
-                            headers["Authorization"] = (
-                                f"Bearer {oauth_token.get('access_token', '')}"
-                            )
+                            bearer_token = oauth_token.get("access_token", "") or None
                     elif auth_type == "oauth_2.1":
                         try:
                             splits = server_id.split(":")
-                            server_id = splits[-1] if len(splits) > 1 else server_id
+                            # Keep `oauth_lookup_id` distinct from
+                            # `original_server_id`; the OAuth client manager
+                            # is keyed on the trailing segment per existing
+                            # convention, but our dicts stay keyed by the
+                            # full id to avoid collisions.
+                            oauth_lookup_id = (
+                                splits[-1] if len(splits) > 1 else server_id
+                            )
 
                             oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                                user.id, f"mcp:{server_id}"
+                                user.id, f"mcp:{oauth_lookup_id}"
                             )
 
                             if oauth_token:
-                                headers["Authorization"] = (
-                                    f"Bearer {oauth_token.get('access_token', '')}"
+                                bearer_token = (
+                                    oauth_token.get("access_token", "") or None
                                 )
                         except Exception as e:
                             log.error(f"Error getting OAuth token: {e}")
                             oauth_token = None
 
-                    mcp_clients[server_id] = MCPClient()
-                    mcp_config = mcp_server_connection.get("config", {})
-                    command = mcp_config.get("command") if mcp_config else None
-                    args = mcp_config.get("args") if mcp_config else None
-                    env = mcp_config.get("env") if mcp_config else None
+                    mcp_clients[original_server_id] = MCPClient()
 
-                    # Merge user-configured custom headers (with {{CHAT_ID}}
-                    # etc. substituted) into the outbound MCP request
-                    # headers. Reserved headers are filtered by the helper,
-                    # so Authorization set above can't be clobbered.
-                    custom_headers = resolve_tool_server_headers(
-                        mcp_server_connection, user, metadata
-                    )
-                    if custom_headers:
-                        headers = {**headers, **custom_headers}
-
-                    await mcp_clients[server_id].connect(
-                        url=mcp_server_connection.get("url", "") if not command else None,
-                        headers=headers if headers and not command else None,
-                        command=command,
-                        args=args,
-                        env=env,
+                    connect_kwargs = build_mcp_connect_kwargs(
+                        mcp_server_connection,
+                        bearer_token=bearer_token,
+                        user=user,
+                        metadata=metadata,
                     )
 
-                    tool_specs = await mcp_clients[server_id].list_tool_specs()
+                    await mcp_clients[original_server_id].connect(**connect_kwargs)
+
+                    tool_specs = await mcp_clients[original_server_id].list_tool_specs()
                     for tool_spec in tool_specs:
 
                         def make_tool_function(client, function_name):
@@ -1813,17 +1812,30 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             return tool_function
 
                         tool_function = make_tool_function(
-                            mcp_clients[server_id], tool_spec["name"]
+                            mcp_clients[original_server_id], tool_spec["name"]
                         )
 
-                        mcp_tools_dict[f"{server_id}_{tool_spec['name']}"] = {
+                        # Model-facing name must satisfy OpenAI/OpenRouter
+                        # ^[a-zA-Z0-9_-]{1,64}$. server_id is often a uuid
+                        # (~36 chars) so naive prefixing blows the limit and
+                        # 400s the entire request. The callable above still
+                        # invokes the ORIGINAL tool name on the MCP server.
+                        alias = mcp_tool_alias(original_server_id, tool_spec["name"])
+                        log.debug(
+                            "MCP tool alias: %s -> server=%s tool=%s",
+                            alias,
+                            original_server_id,
+                            tool_spec["name"],
+                        )
+
+                        mcp_tools_dict[alias] = {
                             "spec": {
                                 **tool_spec,
-                                "name": f"{server_id}_{tool_spec['name']}",
+                                "name": alias,
                             },
                             "callable": tool_function,
                             "type": "mcp",
-                            "client": mcp_clients[server_id],
+                            "client": mcp_clients[original_server_id],
                             "direct": False,
                             "metadata": {
                                 "parallelizable": bool(
@@ -1841,10 +1853,49 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     # never-connected MCPClient.
                     log.exception(
                         "MCP server %r failed during connect/list_tool_specs",
-                        server_id,
+                        original_server_id,
                     )
-                    mcp_clients.pop(server_id, None)
+                    mcp_clients.pop(original_server_id, None)
+                    server_name = (
+                        (mcp_server_connection or {})
+                        .get("info", {})
+                        .get("name")
+                        or original_server_id
+                    )
+                    mcp_failures.append(
+                        {
+                            "server_id": original_server_id,
+                            "name": server_name,
+                            "reason": f"{type(e).__name__}: {e}",
+                        }
+                    )
                     continue
+
+        # Surface MCP load failures to the user via the chat event stream.
+        # Previously these were log.exception-only, so a misconfigured server
+        # silently produced an empty tool list and the model never saw the
+        # tools the user thought they'd enabled.
+        if mcp_failures:
+            event_emitter = extra_params.get("__event_emitter__") if extra_params else None
+            if event_emitter:
+                for fail in mcp_failures:
+                    try:
+                        await event_emitter(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "mcp_server",
+                                    "description": (
+                                        f"MCP server '{fail['name']}' failed to load: "
+                                        f"{fail['reason']}"
+                                    ),
+                                    "done": True,
+                                    "error": True,
+                                },
+                            }
+                        )
+                    except Exception:
+                        log.exception("Failed to emit MCP failure status")
 
         tools_dict = await get_tools(
             request,
@@ -1859,6 +1910,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         )
         if mcp_tools_dict:
             tools_dict = {**tools_dict, **mcp_tools_dict}
+            # Mirror the built-in pattern at L1616/L1642/L1663: any tool source
+            # that emits real function-shaped specs needs native function
+            # calling, otherwise the gate below routes through
+            # chat_completion_tools_handler which never puts `tools=[...]` in
+            # the outbound model request -- and the model never sees the MCP
+            # tools.
+            metadata.setdefault("params", {})["function_calling"] = "native"
+            log.info(
+                "Auto-enabled native function calling for %d MCP tool(s)",
+                len(mcp_tools_dict),
+            )
 
     if direct_tool_servers:
         for tool_server in direct_tool_servers:
@@ -3793,14 +3855,7 @@ async def process_chat_response(
 
                 await stream_body_handler(response, form_data)
 
-                tool_call_retries = 0
-
-                while (
-                    len(tool_calls) > 0
-                    and tool_call_retries < CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES
-                ):
-
-                    tool_call_retries += 1
+                while len(tool_calls) > 0:
 
                     tool_call_item = tool_calls.pop(0)
                     if (
@@ -3922,6 +3977,21 @@ async def process_chat_response(
 
                             except Exception as e:
                                 tool_result = str(e)
+                        else:
+                            # Model emitted a tool name we don't have
+                            # registered for this turn. Most common cause:
+                            # a saved chat is being replayed and the model
+                            # parrots back an old tool name (pre-rename, or
+                            # from an MCP server that's been removed). The
+                            # request continues with an empty result -- the
+                            # model usually adapts -- but log it so this is
+                            # debuggable instead of silently degrading.
+                            log.warning(
+                                "Tool call for unknown function %r; "
+                                "known tools: %s",
+                                tool_function_name,
+                                sorted(tools.keys()),
+                            )
 
                         tool_result, tool_result_files, tool_result_embeds = (
                             process_tool_result(

@@ -609,19 +609,6 @@ STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "17280
 # batches via metadata.params.stream_delta_chunk_size.
 
 
-CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES = os.environ.get(
-    "CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES", "30"
-)
-
-if CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES == "":
-    CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES = 30
-else:
-    try:
-        CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES = int(CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES)
-    except Exception:
-        CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES = 30
-
-
 ####################################
 # WEBSOCKET SUPPORT
 ####################################

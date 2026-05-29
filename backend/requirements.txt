@@ -38,7 +38,7 @@ orjson>=3.10
 
 # AI libraries
 tiktoken
-mcp==1.14.1
+mcp>=1.27,<2
 
 openai
 anthropic

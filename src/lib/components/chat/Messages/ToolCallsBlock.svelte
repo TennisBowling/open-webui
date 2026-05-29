@@ -12,6 +12,18 @@
 		'subagent_agent_launch'
 	]);
 
+	// Backend prefixes MCP tool names with `mcp_<8hex>_` to satisfy the
+	// OpenAI/OpenRouter 64-char function-name limit. The model still sees
+	// (and uses) the alias on the wire, but in the UI we'd rather show the
+	// real tool name. Falls through unchanged for non-MCP / non-aliased
+	// names.
+	const MCP_ALIAS_RE = /^mcp_[0-9a-f]{8}_(.+)$/;
+	const friendlyName = (name: string) => {
+		if (!name) return '';
+		const m = name.match(MCP_ALIAS_RE);
+		return m ? m[1] : name;
+	};
+
 	$: calls = Array.isArray(block?.content) ? block.content : [];
 	$: results = Array.isArray(block?.results) ? block.results : [];
 
@@ -50,7 +62,7 @@
 			tool_call_id: call?.id ?? call?.tool_call_id ?? '',
 			chat_id: chatId,
 			message_id: messageId,
-			name,
+			name: friendlyName(name),
 			arguments: stringifyIfNeeded(call?.function?.arguments ?? ''),
 			result: result?.content ?? '',
 			result_ref: result?.result_ref ?? '',

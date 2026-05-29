@@ -16,6 +16,7 @@
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
+	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import Tags from './common/Tags.svelte';
 	import { getToolServerData } from '$lib/apis';
 	import { verifyToolServerConnection, registerOAuthClient } from '$lib/apis/configs';
@@ -58,6 +59,22 @@
 	let enable = true;
 	let parallelizable = false;
 	let loading = false;
+	let verifying = false;
+
+	// Discovered tool specs from the most recent successful verify, rendered
+	// below the URL row. Cleared whenever the user changes a field that
+	// would affect what's actually reachable, so stale results don't linger.
+	let verifiedSpecs: any[] | null = null;
+	let verifiedAt: number | null = null;
+	let lastVerifyError: string | null = null;
+
+	$: if (url || type || auth_type || key || path || spec_type || spec) {
+		// Reset on ANY connection-shaping field change. Cheap and avoids the
+		// "I changed the URL but the old tool list is still here" trap.
+		verifiedSpecs = null;
+		verifiedAt = null;
+		lastVerifyError = null;
+	}
 
 	const registerOAuthClientHandler = async () => {
 		if (url === '') {
@@ -95,6 +112,44 @@
 		}
 	};
 
+	// The connection object posted to the backend. Extracted so verify and
+	// submit send the EXACT SAME shape — previously verify sent a partial
+	// object missing spec_type/spec/parallelizable/config.command|args|env,
+	// so "verify passed" did not reliably mean "runtime will work."
+	const buildConnection = () => ({
+		type,
+		url,
+		spec_type,
+		spec,
+		path,
+		auth_type,
+		key,
+		headers: headers.map((h) => ({ key: h.key.trim(), value: h.value })).filter((h) => h.key !== ''),
+		parallelizable,
+		config: {
+			enable,
+			access_control: accessControl
+		},
+		info: {
+			id,
+			name,
+			description,
+			...(oauthClientInfo ? { oauth_client_info: oauthClientInfo } : {})
+		}
+	});
+
+	const extractErrorMessage = (err: any): string => {
+		if (!err) return $i18n.t('Connection failed');
+		if (typeof err === 'string') return err;
+		if (typeof err.detail === 'string') return err.detail;
+		if (typeof err.message === 'string') return err.message;
+		try {
+			return JSON.stringify(err);
+		} catch {
+			return $i18n.t('Connection failed');
+		}
+	};
+
 	const verifyHandler = async () => {
 		if (url === '') {
 			toast.error($i18n.t('Please enter a valid URL'));
@@ -113,45 +168,63 @@
 			}
 		}
 
-		if (direct) {
-			const res = await getToolServerData(
-				auth_type === 'bearer' ? key : localStorage.token,
-				path.includes('://') ? path : `${url}${path.startsWith('/') ? '' : '/'}${path}`
-			).catch((err) => {
-				toast.error($i18n.t('Connection failed'));
-			});
-
-			if (res) {
-				toast.success($i18n.t('Connection successful'));
-				console.debug('Connection successful', res);
-			}
-		} else {
-			const res = await verifyToolServerConnection(localStorage.token, {
-				url,
-				path,
-				type,
-				auth_type,
-				key,
-				headers: headers
-					.map((h) => ({ key: h.key.trim(), value: h.value }))
-					.filter((h) => h.key !== ''),
-				config: {
-					enable: enable,
-					access_control: accessControl
-				},
-				info: {
-					id,
-					name,
-					description
+		verifying = true;
+		verifiedSpecs = null;
+		verifiedAt = null;
+		lastVerifyError = null;
+		try {
+			if (direct) {
+				let res;
+				try {
+					res = await getToolServerData(
+						auth_type === 'bearer' ? key : localStorage.token,
+						path.includes('://') ? path : `${url}${path.startsWith('/') ? '' : '/'}${path}`
+					);
+				} catch (err) {
+					lastVerifyError = extractErrorMessage(err);
+					toast.error(lastVerifyError);
+					return;
 				}
-			}).catch((err) => {
-				toast.error($i18n.t('Connection failed'));
-			});
 
-			if (res) {
-				toast.success($i18n.t('Connection successful'));
-				console.debug('Connection successful', res);
+				if (res) {
+					toast.success($i18n.t('Connection successful'));
+					console.debug('Connection successful', res);
+				}
+			} else {
+				let res;
+				try {
+					res = await verifyToolServerConnection(localStorage.token, buildConnection());
+				} catch (err) {
+					lastVerifyError = extractErrorMessage(err);
+					toast.error(lastVerifyError);
+					return;
+				}
+
+				if (res) {
+					if (res.auth_required) {
+						// OAuth 2.1 server pre-authorization: metadata is
+						// reachable but we don't yet have a token, so we
+						// can't list tools. Tell the user the next step
+						// instead of silently rendering an empty list.
+						toast.success($i18n.t('OAuth metadata reachable — register & authorize to list tools'));
+					} else if (Array.isArray(res.specs)) {
+						verifiedSpecs = res.specs;
+						verifiedAt = Date.now();
+						toast.success(
+							res.specs.length === 1
+								? $i18n.t('Connection successful — 1 tool discovered')
+								: $i18n.t('Connection successful — {{count}} tools discovered', {
+										count: res.specs.length
+									})
+						);
+					} else {
+						toast.success($i18n.t('Connection successful'));
+					}
+					console.debug('Connection successful', res);
+				}
 			}
+		} finally {
+			verifying = false;
 		}
 	};
 
@@ -276,34 +349,7 @@
 			}
 		}
 
-		const connection = {
-			type,
-			url,
-
-			spec_type,
-			spec,
-			path,
-
-			auth_type,
-			key,
-
-			headers: headers
-				.map((h) => ({ key: h.key.trim(), value: h.value }))
-				.filter((h) => h.key !== ''),
-
-			parallelizable,
-
-			config: {
-				enable: enable,
-				access_control: accessControl
-			},
-			info: {
-				id: id,
-				name: name,
-				description: description,
-				...(oauthClientInfo ? { oauth_client_info: oauthClientInfo } : {})
-			}
-		};
+		const connection = buildConnection();
 
 		await onSubmit(connection);
 
@@ -481,26 +527,33 @@
 										className="shrink-0 flex items-center mr-1"
 									>
 										<button
-											class="self-center p-1 bg-transparent hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 rounded-lg transition"
+											class="self-center p-1 bg-transparent hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 rounded-lg transition {verifying
+												? 'cursor-wait opacity-60'
+												: ''}"
 											on:click={() => {
 												verifyHandler();
 											}}
 											aria-label={$i18n.t('Verify Connection')}
 											type="button"
+											disabled={verifying}
 										>
-											<svg
-												xmlns="http://www.w3.org/2000/svg"
-												viewBox="0 0 20 20"
-												fill="currentColor"
-												class="w-4 h-4"
-												aria-hidden="true"
-											>
-												<path
-													fill-rule="evenodd"
-													d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z"
-													clip-rule="evenodd"
-												/>
-											</svg>
+											{#if verifying}
+												<Spinner className="size-4" />
+											{:else}
+												<svg
+													xmlns="http://www.w3.org/2000/svg"
+													viewBox="0 0 20 20"
+													fill="currentColor"
+													class="w-4 h-4"
+													aria-hidden="true"
+												>
+													<path
+														fill-rule="evenodd"
+														d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z"
+														clip-rule="evenodd"
+													/>
+												</svg>
+											{/if}
 										</button>
 									</Tooltip>
 
@@ -510,6 +563,45 @@
 								</div>
 							</div>
 						</div>
+
+						{#if verifiedSpecs && verifiedSpecs.length > 0}
+							<div class="mt-2 px-2 py-2 rounded-xl bg-gray-50 dark:bg-gray-950/50 border border-gray-100 dark:border-gray-850">
+								<Collapsible buttonClassName="w-full" chevron open>
+									<div class="flex items-center justify-between text-xs">
+										<div class="font-medium text-gray-700 dark:text-gray-200">
+											{verifiedSpecs.length === 1
+												? $i18n.t('1 tool discovered')
+												: $i18n.t('{{count}} tools discovered', {
+														count: verifiedSpecs.length
+													})}
+										</div>
+									</div>
+									<div slot="content" class="mt-1.5 text-xs space-y-1.5">
+										{#each verifiedSpecs as toolSpec}
+											<div class="px-2 py-1.5 rounded-md bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-850">
+												<div class="font-mono text-[11px] font-medium text-gray-800 dark:text-gray-100">
+													{toolSpec?.name}
+												</div>
+												{#if toolSpec?.description}
+													<div class="text-gray-500 mt-0.5 whitespace-pre-wrap break-words">
+														{toolSpec.description}
+													</div>
+												{/if}
+											</div>
+										{/each}
+									</div>
+								</Collapsible>
+							</div>
+						{:else if verifiedSpecs && verifiedSpecs.length === 0}
+							<div class="mt-2 px-2 py-2 rounded-xl bg-yellow-500/10 text-yellow-700 dark:text-yellow-200 text-xs">
+								{$i18n.t('Connection succeeded but the server reported no tools.')}
+							</div>
+						{:else if lastVerifyError}
+							<div class="mt-2 px-2 py-2 rounded-xl bg-red-500/10 text-red-700 dark:text-red-300 text-xs break-words">
+								<span class="font-medium">{$i18n.t('Verify failed')}:</span>
+								{lastVerifyError}
+							</div>
+						{/if}
 
 						{#if ['', 'openapi'].includes(type)}
 							<div class="flex gap-2 mt-2">
