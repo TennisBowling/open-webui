@@ -684,6 +684,7 @@ def _build_forwarding_emitter(
     *,
     parent_chat_id: Optional[str] = None,
     parent_message_id: Optional[str] = None,
+    force_fanout: bool = False,
 ) -> Callable[[dict], Awaitable[None]]:
     """Wrap the inner event_emitter and throttle parent-facing live updates.
 
@@ -693,6 +694,11 @@ def _build_forwarding_emitter(
     raw forwarding turns every inner chunk into a socket event + store
     invalidation. We coalesce non-terminal parent updates to 2Hz per subagent
     and always flush terminal/error/cancel events immediately.
+
+    ``force_fanout`` makes parent-facing updates bypass the v2 stream-scoped
+    ``emit_to_primary`` path and fan out to every one of the user's sessions
+    directly. Reruns set this because they run detached from any parent stream,
+    where stream-room/primary-election routing is unreliable (see _emit_parent).
     """
     base_emitter = get_event_emitter(subagent_socket_info)
 
@@ -771,7 +777,19 @@ def _build_forwarding_emitter(
         # event via the primary tab's BroadcastChannel relay. Under v1 we
         # use the original fan-out emitter so every session keeps getting
         # its own copy directly from the server.
-        if v2_enabled and user_id_for_primary:
+        #
+        # EXCEPTION — reruns (force_fanout): a redo runs as a DETACHED
+        # background task with no active parent generation. The v2
+        # emit_to_primary path is stream-scoped: it targets stream-room
+        # subscribers + the elected primary session. During a real parent
+        # stream the visible tab is provably in that room, but for a detached
+        # rerun that routing depends on fragile cross-tab state (primary
+        # election + stream-room membership) and can deliver the live updates
+        # to the wrong session — leaving the clicked card stuck on "starting
+        # up". Fan out directly to every one of the user's sessions instead;
+        # the per-token-fanout cost emit_to_primary exists to avoid is
+        # irrelevant for a single rerun.
+        if v2_enabled and user_id_for_primary and not force_fanout:
             envelope = {
                 "chat_id": parent_chat_id_for_primary,
                 "message_id": parent_message_id_for_primary,
@@ -1117,6 +1135,7 @@ async def _run_inner_chat(
     parent_event_call: Optional[Callable],
     subagent_meta: dict,
     chat_params: dict,
+    force_fanout: bool = False,
 ) -> str:
     """Drive one inner subagent turn end-to-end. Returns the final assistant
     text. Raises on unrecoverable error (caller decides retry vs. surface).
@@ -1258,6 +1277,7 @@ async def _run_inner_chat(
         subagent_meta=subagent_meta,
         parent_chat_id=parent_metadata.get("chat_id"),
         parent_message_id=parent_metadata.get("message_id"),
+        force_fanout=force_fanout,
     )
     subagent_event_caller = get_event_call(subagent_socket_info)
 
@@ -2649,6 +2669,7 @@ async def rerun_subagent_turn(
                 parent_event_call=None,
                 subagent_meta=subagent_meta,
                 chat_params=chat_params,
+                force_fanout=True,
             )
             if not final_text:
                 raise RuntimeError("subagent produced no final text")

@@ -5101,12 +5101,12 @@
 			features = {
 				image_generation:
 					$config?.features?.enable_image_generation &&
-					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+					($user?.role === 'admin' || $user?.permissions?.features?.image_generation !== false)
 						? imageGenerationEnabled
 						: false,
 				code_interpreter:
 					$config?.features?.enable_code_interpreter &&
-					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter !== false)
 						? codeInterpreterEnabled
 						: false,
 				web_search:

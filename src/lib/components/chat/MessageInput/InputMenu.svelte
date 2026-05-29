@@ -36,7 +36,7 @@
 	let fileUploadEnabled = true;
 	$: fileUploadEnabled =
 		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || $user?.permissions?.chat?.file_upload);
+		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
 
 	const detectMobile = () => {
 		const userAgent = navigator.userAgent || navigator.vendor || window.opera;

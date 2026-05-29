@@ -760,7 +760,9 @@
 		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
 			webSearchCapableModels.length &&
 		($config == null || !!$config?.features?.enable_web_search) &&
-		($_user == null || $_user?.role === 'admin' || $_user?.permissions?.features?.web_search !== false);
+		($_user == null ||
+			$_user?.role === 'admin' ||
+			$_user?.permissions?.features?.web_search !== false);
 
 	let showSubagentsButton = false;
 	// Subagents are model-agnostic (the inner subagent picks its own model
@@ -769,7 +771,9 @@
 	// web-search does. Just gate on the global feature flag + user permission.
 	$: showSubagentsButton =
 		($config == null || !!$config?.features?.enable_subagents) &&
-		($_user == null || $_user?.role === 'admin' || $_user?.permissions?.features?.subagents !== false);
+		($_user == null ||
+			$_user?.role === 'admin' ||
+			$_user?.permissions?.features?.subagents !== false);
 
 	// Resolves the subagent's effective model id the same way the backend
 	// (`utils/subagent._resolve_subagent_model_id`) does — admin default →
@@ -800,7 +804,7 @@
 		($config == null || !!$config?.features?.enable_image_generation) &&
 		($_user == null ||
 			$_user?.role === 'admin' ||
-			!!$_user?.permissions?.features?.image_generation);
+			$_user?.permissions?.features?.image_generation !== false);
 
 	let showCodeInterpreterButton = false;
 	$: showCodeInterpreterButton =
@@ -809,7 +813,7 @@
 		($config == null || !!$config?.features?.enable_code_interpreter) &&
 		($_user == null ||
 			$_user?.role === 'admin' ||
-			!!$_user?.permissions?.features?.code_interpreter);
+			$_user?.permissions?.features?.code_interpreter !== false);
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');

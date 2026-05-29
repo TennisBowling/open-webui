@@ -71,7 +71,7 @@
 	let fileUploadEnabled = true;
 	$: fileUploadEnabled =
 		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || $user?.permissions?.chat?.file_upload);
+		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
 
 	const notifyToolServerError = (data: any) => {
 		toast.error(

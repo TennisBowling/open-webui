@@ -332,6 +332,7 @@
 	// socket instead.
 	$: if (
 		open &&
+		!stale &&
 		status !== 'running' &&
 		subagentChatId &&
 		!hasContent &&
@@ -513,7 +514,24 @@
 		>
 			<!-- Status icon -->
 			<span class="shrink-0 inline-flex items-center justify-center size-5">
-				{#if status === 'running'}
+				{#if stale}
+					<!-- Superseded by a restart: its old outcome (error/done) is no
+						longer meaningful, so show a neutral muted marker instead of a
+						red X that would read as "the redo failed". -->
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						class="size-4 text-gray-400 dark:text-gray-500"
+					>
+						<path d="M3 12a9 9 0 1 0 9-9" />
+						<polyline points="3 4 3 9 8 9" />
+					</svg>
+				{:else if status === 'running'}
 					<Spinner className="size-4" />
 				{:else if status === 'done'}
 					<svg
@@ -581,15 +599,17 @@
 
 			<!-- Status badge -->
 			<span
-				class="shrink-0 text-xs font-medium uppercase tracking-wide {status === 'done'
-					? 'text-green-600 dark:text-green-500'
-					: status === 'error'
-						? 'text-red-600 dark:text-red-500'
-						: status === 'cancelled'
-							? 'text-gray-500'
-							: 'text-blue-600 dark:text-blue-400'}"
+				class="shrink-0 text-xs font-medium uppercase tracking-wide {stale
+					? 'text-gray-400 dark:text-gray-500'
+					: status === 'done'
+						? 'text-green-600 dark:text-green-500'
+						: status === 'error'
+							? 'text-red-600 dark:text-red-500'
+							: status === 'cancelled'
+								? 'text-gray-500'
+								: 'text-blue-600 dark:text-blue-400'}"
 			>
-				{statusBadgeText(status)}
+				{stale ? $i18n.t('Superseded') : statusBadgeText(status)}
 			</span>
 
 			<!-- Caret -->
@@ -691,7 +711,15 @@
 					</div>
 				{/if}
 
-				{#if status === 'error' && run?.error}
+				{#if stale}
+					<div
+						class="rounded-lg bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm text-gray-500 dark:text-gray-400 italic"
+					>
+						{$i18n.t(
+							'This turn was superseded when the subagent was restarted. Its old result no longer reflects the subagent and has been kept only for reference.'
+						)}
+					</div>
+				{:else if status === 'error' && run?.error}
 					<div
 						class="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3 py-2 text-sm text-red-700 dark:text-red-300"
 					>

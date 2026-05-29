@@ -1186,7 +1186,7 @@ MODEL_ORDER_LIST = PersistentConfig(
 DEFAULT_USER_ROLE = PersistentConfig(
     "DEFAULT_USER_ROLE",
     "ui.default_user_role",
-    os.getenv("DEFAULT_USER_ROLE", "pending"),
+    os.getenv("DEFAULT_USER_ROLE", "user"),
 )
 
 PENDING_USER_OVERLAY_TITLE = PersistentConfig(
@@ -1342,7 +1342,7 @@ USER_PERMISSIONS_CHAT_TEMPORARY_ENFORCED = (
 
 
 USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS = (
-    os.environ.get("USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS", "False").lower()
+    os.environ.get("USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS", "True").lower()
     == "true"
 )
 
@@ -2787,7 +2787,7 @@ YOUTUBE_LOADER_PROXY_URL = PersistentConfig(
 ENABLE_WEB_SEARCH = PersistentConfig(
     "ENABLE_WEB_SEARCH",
     "rag.web.search.enable",
-    os.getenv("ENABLE_WEB_SEARCH", "False").lower() == "true",
+    os.getenv("ENABLE_WEB_SEARCH", "True").lower() == "true",
 )
 
 # Exa API Configuration
@@ -3041,7 +3041,7 @@ DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT = PersistentConfig(
 ENABLE_SUBAGENTS = PersistentConfig(
     "ENABLE_SUBAGENTS",
     "subagents.enable",
-    os.getenv("ENABLE_SUBAGENTS", "False").lower() == "true",
+    os.getenv("ENABLE_SUBAGENTS", "True").lower() == "true",
 )
 
 # Empty string = no global default; falls back to the parent chat's model.

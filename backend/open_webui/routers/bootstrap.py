@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, Response
 
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.utils.auth import get_verified_user
+from open_webui.utils.access_control import get_permissions
 
 from open_webui.models.users import Users
 from open_webui.models.chats import Chats
@@ -104,6 +105,9 @@ async def _resolve_user(request: Request, user):
         "name": fresh.name,
         "role": fresh.role,
         "profile_image_url": fresh.profile_image_url,
+        "permissions": get_permissions(
+            fresh.id, request.app.state.config.USER_PERMISSIONS
+        ),
     }
 
 
