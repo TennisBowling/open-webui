@@ -2059,6 +2059,7 @@ def _resolve_subagent_rerun_context(
         "write_entry_key": write_entry_key,
         "write_entry": write_entry,
         "inner_prompt": inner_prompt,
+        "scope": scope,
     }
 
 
@@ -2385,7 +2386,16 @@ def _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx: dict) -> N
     write_entry = ctx.get("write_entry") or {}
     write_msg_id = ctx.get("write_msg_id") or ""
     _validate_parent_subagent_result_unconsumed(parent_chat, write_msg_id, write_entry)
-    _validate_subagent_turn_is_latest(subagent_chat, write_entry)
+    # The hidden-chat leaf guard only applies to ``this_turn``, which rewrites a
+    # single user→assistant pair IN PLACE and would corrupt any later
+    # continuation built on top of it. ``from_launch`` wipes the entire hidden
+    # subagent history (``_reset_inner_history``) and marks sibling
+    # continuations stale, so requiring the launch turn to still be the leaf is
+    # self-contradictory — a launch that was later continued can never be its
+    # own chat's leaf, yet restarting from it is exactly what the user asked for
+    # and is safe after the wipe.
+    if ctx.get("scope") != "from_launch":
+        _validate_subagent_turn_is_latest(subagent_chat, write_entry)
 
 
 def validate_subagent_rerun_allowed(
