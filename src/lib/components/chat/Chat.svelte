@@ -1407,13 +1407,19 @@
 					? existingRuns[entryKey]
 					: {};
 
+			// `live` is a session-only marker (see SubagentRun.live). Strip it
+			// from the copy that lands in history.messages so it never persists
+			// to the DB — otherwise a reload would treat a stale `running` row as
+			// authoritative and never fall back to terminal placeholder evidence.
+			const { live: _live, ...runForHistory } = run ?? {};
+
 			nextMessages[parentMessageId] = {
 				...parentMessage,
 				subagent_runs: {
 					...existingRuns,
 					[entryKey]: {
 						...prior,
-						...run,
+						...runForHistory,
 						entry_key: entryKey
 					}
 				}
@@ -1973,6 +1979,10 @@
 						background: sd.background ?? existing.background,
 						continuation: sd.continuation === true,
 						status: 'running',
+						// This session now owns the stream — make the store status
+						// authoritative over the parent message's persisted
+						// `<details done="true">` placeholder (not rewritten on redo).
+						live: true,
 						started_at: existing.started_at || now
 					};
 					persistedRun = next;

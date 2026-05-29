@@ -509,6 +509,27 @@ def _sync_parent_subagent_placeholder(
                         blocks_changed = True
                     if blocks_changed:
                         block["results"] = results
+                else:
+                    # Non-terminal: a rerun just flipped this run back to
+                    # "running". Drop any stale result for this tool call from
+                    # the canonical block so EVERY reader (reload re-seeding in
+                    # Chat.svelte, a second browser tab) sees a consistent
+                    # running-with-no-result state instead of the old answer.
+                    # Without this, reload-mid-rerun re-derives status=done from
+                    # the lingering result and flashes the previous output until
+                    # the next live event arrives. The new result is written
+                    # back here once the rerun reaches a terminal state.
+                    kept_results = [
+                        r
+                        for r in results
+                        if not (
+                            isinstance(r, dict)
+                            and r.get("tool_call_id") == matched_tool_call_id
+                        )
+                    ]
+                    if len(kept_results) != len(results):
+                        block["results"] = kept_results
+                        blocks_changed = True
                 break
             if not found and allow_append:
                 blocks.append(placeholder_block)

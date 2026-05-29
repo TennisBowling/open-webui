@@ -76,12 +76,20 @@
 	// evidence from the persisted placeholder/final_text win over a stale
 	// `running` row left behind by a reload while the old socket session owned
 	// the stream.
+	//
+	// EXCEPTION: when the run is `live` (this session is actively driving it —
+	// e.g. just after a redo), the store's status is authoritative even when it
+	// is `running`. Otherwise the parent message's persisted
+	// `<details done="true">` placeholder (never rewritten on redo) would clamp
+	// a freshly-restarted run straight back to `done`.
 	$: status = (
-		run?.status && run.status !== 'running'
-			? run.status
-			: run?.final_text || attributes?.done === 'true'
-				? 'done'
-				: (run?.status ?? 'running')
+		run?.live
+			? (run?.status ?? 'running')
+			: run?.status && run.status !== 'running'
+				? run.status
+				: run?.final_text || attributes?.done === 'true'
+					? 'done'
+					: (run?.status ?? 'running')
 	) as 'running' | 'done' | 'error' | 'cancelled';
 
 	$: displayName = run?.name || attrArgs?.name || '';
@@ -317,8 +325,14 @@
 	// Trigger fallback fetch when user expands and content is missing. This is a
 	// reload safety net: if the parent run row/placeholder is stale, the hidden
 	// subagent chat itself is still the source of truth for the answer.
+	//
+	// Never fetch while the run is actively in flight (`running`): the hidden
+	// chat is mid-rewrite (a redo wipes it), so a fetch would surface the old
+	// "(empty response)" the rerun is replacing. Live updates arrive via the
+	// socket instead.
 	$: if (
 		open &&
+		status !== 'running' &&
 		subagentChatId &&
 		!hasContent &&
 		!run?.final_text &&
@@ -327,6 +341,15 @@
 		!fallbackError
 	) {
 		fetchFallbackContent();
+	}
+
+	// When a run (re)enters the live running state, drop any cached fallback
+	// text/error from a prior terminal view of this same block so the body
+	// doesn't keep showing the old result while the rerun streams.
+	$: if (run?.live && status === 'running' && (fallbackContent || fallbackError)) {
+		fallbackContent = '';
+		fallbackError = '';
+		fallbackFetching = false;
 	}
 
 	const toggle = () => {
@@ -445,6 +468,7 @@
 				const next: any = {
 					...cur,
 					status: 'running',
+					live: true,
 					content_blocks: [],
 					content: '',
 					final_text: undefined,

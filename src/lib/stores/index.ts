@@ -97,6 +97,14 @@ export interface SubagentRun {
 	name: string;
 	chat_id: string; // alias of subagent_id; used by `Open full chat` link
 	status: 'running' | 'done' | 'error' | 'cancelled';
+	// Session-only marker: true while THIS browser session is actively driving
+	// the run — set by the redo button's optimistic flip and by every
+	// `chat:subagent:start` / `chat:subagent:update` event. It makes a fresh
+	// `running` authoritative over the parent message's persisted
+	// `<details done="true">` placeholder (which is NOT rewritten on redo).
+	// Deliberately stripped before writing back into `history.messages` so a
+	// reload re-seeds without it and the stale-running backstop still applies.
+	live?: boolean;
 	// Live: latest content_blocks/content from the inner pipeline. May be
 	// undefined during the brief window between chat:subagent:start and the
 	// first chat:subagent:update.
