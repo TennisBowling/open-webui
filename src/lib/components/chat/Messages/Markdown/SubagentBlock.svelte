@@ -83,13 +83,20 @@
 	// `<details done="true">` placeholder (never rewritten on redo) would clamp
 	// a freshly-restarted run straight back to `done`.
 	$: status = (
-		run?.live
-			? (run?.status ?? 'running')
-			: run?.status && run.status !== 'running'
-				? run.status
-				: run?.final_text || attributes?.done === 'true'
-					? 'done'
-					: (run?.status ?? 'running')
+		stale
+			? // A stale entry was orphaned by a "Redo subagent" restart: its own
+				// recorded outcome (usually a leftover `error`) is meaningless, and
+				// it now points at the same hidden chat the relaunch finished into.
+				// The user wants it to read like any other finished run — green
+				// "Done" check — and the body fetches that chat's real content.
+				'done'
+			: run?.live
+				? (run?.status ?? 'running')
+				: run?.status && run.status !== 'running'
+					? run.status
+					: run?.final_text || attributes?.done === 'true'
+						? 'done'
+						: (run?.status ?? 'running')
 	) as 'running' | 'done' | 'error' | 'cancelled';
 
 	$: displayName = run?.name || attrArgs?.name || '';
@@ -113,7 +120,17 @@
 	// `marked.parse` per chunk. Once the run is complete we swap each text
 	// block to a full `<Markdown>` render so the final answer gets headings,
 	// lists, code blocks, etc. (one parse, total).
-	$: contentBlocks = (open ? (run?.content_blocks ?? []) : []) as any[];
+	// For a stale (orphaned-by-restart) entry, its own persisted content_blocks
+	// are the OLD turn that the relaunch replaced — ignore them and render the
+	// hidden chat's current content (fetched into fallbackBlocks) instead, so
+	// the card shows the new run's thinking / tool calls / answer.
+	$: contentBlocks = (
+		open
+			? stale
+				? (fallbackBlocks ?? [])
+				: (run?.content_blocks ?? (run?.final_text ? [] : fallbackBlocks) ?? [])
+			: []
+	) as any[];
 	$: hasContent = contentBlocks.length > 0;
 	$: doneRendering = status !== 'running';
 
@@ -250,6 +267,9 @@
 	let fallbackFetching = false;
 	let fallbackContent = '';
 	let fallbackError = '';
+	// Structured content_blocks of the hidden chat's final assistant message,
+	// used to render thinking / tool calls / answer exactly like a live run.
+	let fallbackBlocks: any[] | null = null;
 
 	$: visibleContentBlocks = doneRendering
 		? contentBlocks.slice(0, Math.min(bodyBlockLimit, contentBlocks.length))
@@ -298,18 +318,34 @@
 			const chat = await getChatById(localStorage.token, chatId);
 			if (chat?.chat?.history) {
 				const msgs = chat.chat.history.messages ?? {};
-				// Find the last assistant message
+				// Walk to the leaf assistant message via currentId when available
+				// so we read the actual final turn, not whatever Object.values
+				// order happens to surface.
+				const currentId = chat.chat.history.currentId;
+				let leaf: any =
+					currentId && msgs[currentId] ? msgs[currentId] : null;
 				let lastContent = '';
-				for (const msg of Object.values(msgs)) {
-					if ((msg as any).role === 'assistant') {
-						lastContent =
-							(typeof (msg as any).content === 'string' && (msg as any).content.trim()) ||
-							(Array.isArray((msg as any).content_blocks)
-								? blocksToDisplayMarkdown((msg as any).content_blocks)
-								: '') ||
-							'';
+				let lastBlocks: any[] | null = null;
+				const capture = (msg: any) => {
+					if (!msg || msg.role !== 'assistant') return;
+					if (Array.isArray(msg.content_blocks) && msg.content_blocks.length) {
+						lastBlocks = msg.content_blocks;
+					}
+					lastContent =
+						(typeof msg.content === 'string' && msg.content.trim()) ||
+						(Array.isArray(msg.content_blocks)
+							? blocksToDisplayMarkdown(msg.content_blocks)
+							: '') ||
+						lastContent;
+				};
+				if (leaf) {
+					capture(leaf);
+				} else {
+					for (const msg of Object.values(msgs)) {
+						capture(msg);
 					}
 				}
+				fallbackBlocks = lastBlocks;
 				fallbackContent = lastContent || $i18n.t('(empty response)');
 			} else {
 				fallbackError = $i18n.t('Could not load subagent results.');
@@ -332,7 +368,6 @@
 	// socket instead.
 	$: if (
 		open &&
-		!stale &&
 		status !== 'running' &&
 		subagentChatId &&
 		!hasContent &&
@@ -347,9 +382,14 @@
 	// When a run (re)enters the live running state, drop any cached fallback
 	// text/error from a prior terminal view of this same block so the body
 	// doesn't keep showing the old result while the rerun streams.
-	$: if (run?.live && status === 'running' && (fallbackContent || fallbackError)) {
+	$: if (
+		run?.live &&
+		status === 'running' &&
+		(fallbackContent || fallbackError || fallbackBlocks)
+	) {
 		fallbackContent = '';
 		fallbackError = '';
+		fallbackBlocks = null;
 		fallbackFetching = false;
 	}
 
@@ -499,9 +539,7 @@
 </script>
 
 <div
-	class="my-2 rounded-2xl border {stale
-		? 'border-gray-200/60 dark:border-gray-800/50 bg-white/20 dark:bg-gray-900/20 opacity-70'
-		: 'border-gray-200 dark:border-gray-800 bg-white/40 dark:bg-gray-900/40'} overflow-hidden subagent-block"
+	class="my-2 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white/40 dark:bg-gray-900/40 overflow-hidden subagent-block"
 	data-tool-call-id={attributes?.tool_call_id ?? ''}
 	data-subagent-id={attributes?.id ?? ''}
 >
@@ -514,24 +552,7 @@
 		>
 			<!-- Status icon -->
 			<span class="shrink-0 inline-flex items-center justify-center size-5">
-				{#if stale}
-					<!-- Superseded by a restart: its old outcome (error/done) is no
-						longer meaningful, so show a neutral muted marker instead of a
-						red X that would read as "the redo failed". -->
-					<svg
-						xmlns="http://www.w3.org/2000/svg"
-						viewBox="0 0 24 24"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="2"
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						class="size-4 text-gray-400 dark:text-gray-500"
-					>
-						<path d="M3 12a9 9 0 1 0 9-9" />
-						<polyline points="3 4 3 9 8 9" />
-					</svg>
-				{:else if status === 'running'}
+				{#if status === 'running'}
 					<Spinner className="size-4" />
 				{:else if status === 'done'}
 					<svg
@@ -587,29 +608,19 @@
 						— {displayName}{continuation ? ` (${$i18n.t('continued')})` : ''}
 					</span>
 				{/if}
-				{#if stale}
-					<span
-						class="text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500 italic"
-						title={$i18n.t('Subagent was restarted; this turn is outdated.')}
-					>
-						{$i18n.t('stale')}
-					</span>
-				{/if}
 			</div>
 
 			<!-- Status badge -->
 			<span
-				class="shrink-0 text-xs font-medium uppercase tracking-wide {stale
-					? 'text-gray-400 dark:text-gray-500'
-					: status === 'done'
-						? 'text-green-600 dark:text-green-500'
-						: status === 'error'
-							? 'text-red-600 dark:text-red-500'
-							: status === 'cancelled'
-								? 'text-gray-500'
-								: 'text-blue-600 dark:text-blue-400'}"
+				class="shrink-0 text-xs font-medium uppercase tracking-wide {status === 'done'
+					? 'text-green-600 dark:text-green-500'
+					: status === 'error'
+						? 'text-red-600 dark:text-red-500'
+						: status === 'cancelled'
+							? 'text-gray-500'
+							: 'text-blue-600 dark:text-blue-400'}"
 			>
-				{stale ? $i18n.t('Superseded') : statusBadgeText(status)}
+				{statusBadgeText(status)}
 			</span>
 
 			<!-- Caret -->
@@ -711,15 +722,7 @@
 					</div>
 				{/if}
 
-				{#if stale}
-					<div
-						class="rounded-lg bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm text-gray-500 dark:text-gray-400 italic"
-					>
-						{$i18n.t(
-							'This turn was superseded when the subagent was restarted. Its old result no longer reflects the subagent and has been kept only for reference.'
-						)}
-					</div>
-				{:else if status === 'error' && run?.error}
+				{#if status === 'error' && run?.error}
 					<div
 						class="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3 py-2 text-sm text-red-700 dark:text-red-300"
 					>
