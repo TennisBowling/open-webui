@@ -459,9 +459,11 @@
 					[entryKey]: next
 				};
 			});
-			// Note: we don't auto-expand the body on rerun. The default is
-			// collapsed in every state; the user clicks the header to see
-			// the live work if they want to.
+			// Open the subagent body after redo so the live rerun is visible
+			// even after the redo dropdown closes.
+			open = true;
+			resetHydration();
+			bodyReady = true;
 		} catch (err: any) {
 			console.error(err);
 			toast.error(`${err?.detail ?? err?.message ?? err}`);
