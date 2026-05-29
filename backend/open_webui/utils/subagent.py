@@ -2168,6 +2168,34 @@ def _duplicate_subagent_placeholder_block(
     return True
 
 
+def _block_is_pure_subagent_fanout(block: Any) -> bool:
+    """True for a tool-call block that ONLY launches/continues subagents.
+
+    During a parallel fan-out the parent emits one such block per subagent and
+    never produces text/reasoning between them. A later sibling fan-out block is
+    NOT the parent "continuing" from an earlier subagent's result — it carries no
+    parent-authored text and (for non-reasoning rounds) no signed transcript
+    state. Rewriting an earlier subagent result therefore stays valid, so these
+    blocks must not make an earlier subagent look consumed.
+
+    Signed parent reasoning is handled separately by the
+    ``reasoning_details_per_round`` check in
+    ``_validate_parent_subagent_result_unconsumed`` — if the parent signed any
+    round after the target block, that guard still blocks the redo.
+    """
+    if not isinstance(block, dict) or block.get("type") != "tool_calls":
+        return False
+    calls = block.get("content") if isinstance(block.get("content"), list) else []
+    if not calls:
+        return False
+    for call in calls:
+        if not isinstance(call, dict):
+            return False
+        if _subagent_tool_name(call) not in _SUBAGENT_TOOL_NAMES:
+            return False
+    return True
+
+
 def _block_has_meaningful_parent_output(block: Any) -> bool:
     """True when a block after the target tool-call block proves the parent
     model has already continued from that tool result.
@@ -2301,6 +2329,14 @@ def _validate_parent_subagent_result_unconsumed(
         if _duplicate_subagent_placeholder_block(
             parent_message, prior_blocks, later_block
         ):
+            continue
+        # A later block that ONLY launches/continues subagents is a sibling
+        # fan-out round, not the parent model continuing from this result. It
+        # carries no parent-authored text and no signed transcript state, so it
+        # must not make this earlier subagent look consumed. Signed parent
+        # reasoning is still caught by the reasoning_details_per_round check
+        # below.
+        if _block_is_pure_subagent_fanout(later_block):
             continue
         if _block_has_meaningful_parent_output(later_block):
             _rerun_blocked(
