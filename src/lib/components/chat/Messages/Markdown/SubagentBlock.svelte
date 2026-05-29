@@ -72,6 +72,27 @@
 	$: stateKey = runEntry?.[0] || attrToolCallId || attrSubagentId || '';
 	$: run = runEntry?.[1];
 
+	// A stale entry was orphaned by a "Redo subagent" (from_launch) restart: its
+	// own recorded status is frozen at whatever it was before the wipe, so it
+	// can't be trusted. The relaunch's outcome lives on the SAME subagent's
+	// non-continuation (launch) entry, which the load path re-seeds with the
+	// real result. Find that sibling so this card can mirror it instead of
+	// inventing a status. If no launch sibling exists, fall back to the entry's
+	// own state.
+	$: staleLaunchSibling = (
+		stale && run?.subagent_id
+			? (Object.values($subagentLiveStates).find(
+					(r: any) =>
+						r &&
+						!r.continuation &&
+						(r.subagent_id === run.subagent_id || r.chat_id === run.subagent_id)
+				) as any)
+			: null
+	);
+	// The run we actually present for a stale card: the launch sibling when we
+	// found one, else the (frozen) stale entry itself.
+	$: effectiveRun = stale ? (staleLaunchSibling ?? run) : run;
+
 	// Header status the user sees. Prefer the store entry, but let terminal
 	// evidence from the persisted placeholder/final_text win over a stale
 	// `running` row left behind by a reload while the old socket session owned
@@ -84,12 +105,18 @@
 	// a freshly-restarted run straight back to `done`.
 	$: status = (
 		stale
-			? // A stale entry was orphaned by a "Redo subagent" restart: its own
-				// recorded outcome (usually a leftover `error`) is meaningless, and
-				// it now points at the same hidden chat the relaunch finished into.
-				// The user wants it to read like any other finished run — green
-				// "Done" check — and the body fetches that chat's real content.
-				'done'
+			? // Mirror the relaunch's authoritative outcome (its launch sibling),
+				// NOT the frozen status on this orphaned entry. Only show a green
+				// "done" when that run truly finished with a final answer; if the
+				// relaunch was cancelled / errored / is still running, surface that
+				// honestly instead of faking success.
+				effectiveRun?.status === 'done' || effectiveRun?.final_text
+				? 'done'
+				: effectiveRun?.status === 'cancelled'
+					? 'cancelled'
+					: effectiveRun?.status === 'running'
+						? 'running'
+						: 'error'
 			: run?.live
 				? (run?.status ?? 'running')
 				: run?.status && run.status !== 'running'
@@ -127,12 +154,15 @@
 	$: contentBlocks = (
 		open
 			? stale
-				? (fallbackBlocks ?? [])
+				? (effectiveRun?.content_blocks ?? fallbackBlocks ?? [])
 				: (run?.content_blocks ?? (run?.final_text ? [] : fallbackBlocks) ?? [])
 			: []
 	) as any[];
 	$: hasContent = contentBlocks.length > 0;
 	$: doneRendering = status !== 'running';
+	// Final answer text to show when there are no structured blocks to render.
+	// Stale cards mirror their launch sibling's answer.
+	$: displayFinalText = (stale ? effectiveRun?.final_text : run?.final_text) || '';
 
 	// Default collapsed in every state (running / done / error / cancelled).
 	// The user clicks the header (or the redo button) to expand and watch
@@ -277,7 +307,7 @@
 	$: hasMoreContentBlocks = doneRendering && bodyBlockLimit < contentBlocks.length;
 	$: richTarget = hasContent
 		? Math.min(bodyBlockLimit, contentBlocks.length)
-		: run?.final_text || fallbackContent
+		: displayFinalText || fallbackContent
 			? 1
 			: 0;
 
@@ -371,7 +401,7 @@
 		status !== 'running' &&
 		subagentChatId &&
 		!hasContent &&
-		!run?.final_text &&
+		!displayFinalText &&
 		!fallbackFetching &&
 		!fallbackContent &&
 		!fallbackError
@@ -722,13 +752,14 @@
 					</div>
 				{/if}
 
-				{#if status === 'error' && run?.error}
+				{#if status === 'error' && (effectiveRun?.error || run?.error)}
+					{@const errSrc = effectiveRun?.error ?? run?.error}
 					<div
 						class="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3 py-2 text-sm text-red-700 dark:text-red-300"
 					>
-						{typeof run.error === 'string'
-							? run.error
-							: (run.error?.message ?? $i18n.t('Subagent failed without details.'))}
+						{typeof errSrc === 'string'
+							? errSrc
+							: (errSrc?.message ?? $i18n.t('Subagent failed without details.'))}
 					</div>
 				{/if}
 
@@ -800,12 +831,12 @@
 							{/if}
 						{/each}
 					</div>
-				{:else if run?.final_text}
+				{:else if displayFinalText}
 					{#if richBlockLimit >= 1}
 						<div class="markdown-prose">
 							<Markdown
 								id={`subagent-${stateKey}-final`}
-								content={run.final_text}
+								content={displayFinalText}
 								done={true}
 								editCodeBlock={false}
 							/>
@@ -814,7 +845,7 @@
 						<div
 							class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
 						>
-							{previewText(run.final_text)}
+							{previewText(displayFinalText)}
 						</div>
 					{/if}
 				{:else if fallbackContent}
