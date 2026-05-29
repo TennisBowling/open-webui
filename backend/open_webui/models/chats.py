@@ -670,6 +670,41 @@ def _normalize_message_graph(messages: dict) -> dict:
     return messages
 
 
+def _pick_fallback_leaf(messages: dict) -> Optional[str]:
+    """Pick a sensible leaf id when ``currentId`` is missing or dangling.
+
+    Builds a children index from each row's ``parentId`` (rather than trusting
+    the possibly-stale ``childrenIds`` field) and returns the newest message
+    that has no children — i.e. an actual leaf of the tree. Falls back to the
+    last-inserted message if no clean leaf is found.
+    """
+    if not isinstance(messages, dict) or not messages:
+        return None
+
+    has_children: set[str] = set()
+    for m in messages.values():
+        if not isinstance(m, dict):
+            continue
+        pid = m.get("parentId")
+        if pid is not None and pid in messages:
+            has_children.add(pid)
+
+    last_leaf: Optional[str] = None
+    for mid, m in messages.items():
+        if not isinstance(m, dict):
+            continue
+        if mid not in has_children:
+            last_leaf = mid
+    if last_leaf is not None:
+        return last_leaf
+
+    # Pathological: every message has a child (cycle). Use last-inserted.
+    try:
+        return next(reversed(messages))
+    except StopIteration:
+        return None
+
+
 def _chat_messages_from_table(db, chat_id: str) -> dict:
     """Reconstruct ``{message_id: message_dict}`` from chat_message rows for
     the given chat. Ordered by ``sequence`` so the dict iteration order
@@ -717,9 +752,23 @@ def _hydrate_chat_messages(db, chat_obj) -> None:
     chat_dict = chat_obj.chat if isinstance(chat_obj.chat, dict) else {}
     history = chat_dict.get("history") if isinstance(chat_dict.get("history"), dict) else {}
     history["messages"] = msgs
-    if "currentId" not in history and msgs:
-        # Fall back to the last-inserted message_id if currentId is missing.
-        history["currentId"] = next(reversed(msgs))
+    # Repair currentId when missing OR dangling (points at an id not in msgs).
+    # A dangling currentId is what produces the "chat cut off" symptom: the
+    # frontend walk from history.currentId immediately hits an orphan and the
+    # Loader gate's `history.messages[parentId] !== undefined` check is false,
+    # so there's no recovery affordance. Save races (set_history_current_id
+    # PATCHed before its append_message) are the usual cause.
+    if msgs:
+        current_id = history.get("currentId")
+        if current_id is None or current_id not in msgs:
+            fallback = _pick_fallback_leaf(msgs)
+            if fallback is not None:
+                if current_id is not None and current_id != fallback:
+                    log.warning(
+                        "Repaired dangling currentId=%s for chat=%s → %s",
+                        current_id, getattr(chat_obj, "id", "?"), fallback,
+                    )
+                history["currentId"] = fallback
     chat_dict["history"] = history
     chat_obj.chat = chat_dict
 
@@ -2079,6 +2128,7 @@ class ChatTable:
         messages_map = history.get("messages") if isinstance(history, dict) else None
 
         sibling_stubs: list[dict] = []
+        orphan_parent_count = 0
         if isinstance(messages_map, dict):
             children_index: dict[str, list[str]] = {}
             for mid, m in messages_map.items():
@@ -2090,6 +2140,13 @@ class ChatTable:
             for mid, m in messages_map.items():
                 if not isinstance(m, dict):
                     continue
+                pid = m.get("parentId")
+                # Integrity check: parentId references a row not in messages_map.
+                # The frontend's new `orphan` frontier kind handles this by
+                # re-fetching from the missing id, but we want to know when it
+                # happens server-side so we can correlate with save-race logs.
+                if pid is not None and pid not in messages_map:
+                    orphan_parent_count += 1
                 stored_children = m.get("childrenIds")
                 children = (
                     stored_children
@@ -2099,11 +2156,35 @@ class ChatTable:
                 sibling_stubs.append(
                     {
                         "id": mid,
-                        "parentId": m.get("parentId"),
+                        "parentId": pid,
                         "childrenIds": children,
                         "role": m.get("role"),
                     }
                 )
+
+        if orphan_parent_count:
+            log.warning(
+                "Chat %s has %d message(s) with parentId pointing to a missing row",
+                id, orphan_parent_count,
+            )
+
+        # Dangling-currentId repair for the legacy path (migrated chats are
+        # already repaired in _hydrate_chat_messages). Belt-and-suspenders for
+        # chats whose JSON blob carries a stale currentId from a save race.
+        current_id = history.get("currentId") if isinstance(history, dict) else None
+        if (
+            isinstance(messages_map, dict)
+            and messages_map
+            and (current_id is None or current_id not in messages_map)
+        ):
+            fallback = _pick_fallback_leaf(messages_map)
+            if fallback is not None:
+                if current_id is not None:
+                    log.warning(
+                        "Repaired dangling currentId=%s for chat=%s → %s (meta)",
+                        current_id, id, fallback,
+                    )
+                current_id = fallback
 
         return {
             "id": chat.id,
@@ -2115,7 +2196,7 @@ class ChatTable:
             "files": chat_dict.get("files") or [],
             "queue": chat_dict.get("queue") or [],
             "history": {
-                "currentId": history.get("currentId") if isinstance(history, dict) else None,
+                "currentId": current_id,
                 "sibling_stubs": sibling_stubs,
             },
         }

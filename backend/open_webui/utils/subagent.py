@@ -1366,13 +1366,14 @@ async def _run_inner_chat(
             setattr(request.state, k, v)
         # Clean up MCP clients spun up by inner process_chat_payload (mirrors
         # the same cleanup in main.py's process_chat finally block).
-        try:
-            inner_mcp_clients = inner_metadata.get("mcp_clients")
-            if inner_mcp_clients:
-                for client in inner_mcp_clients.values():
-                    await client.disconnect()
-        except Exception as e:  # noqa: BLE001
-            log.debug(f"subagent mcp cleanup: {e}")
+        inner_mcp_clients = inner_metadata.get("mcp_clients") or {}
+        for server_id, client in inner_mcp_clients.items():
+            try:
+                await asyncio.shield(client.disconnect())
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "subagent mcp cleanup failed for %r", server_id
+                )
 
     # 6. Read the final text out of the subagent chat row.
     return _extract_final_text(subagent_chat_id, assistant_msg_id)

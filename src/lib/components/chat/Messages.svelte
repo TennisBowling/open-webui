@@ -67,15 +67,47 @@
 
 	export let onSelect = (e) => {};
 
-	export let messagesCount: number | null = 7;
+	export let messagesCount: number | null = 25;
 	let messagesLoading = false;
 	let paginationChatId = '';
-	let exhaustedBeforeIds = new Set<string>();
+	// Tracks the most recent outcome per anchor message id. 'exhausted' is
+	// sticky (no more older rows on the server); 'error' is transient (a
+	// retry can clear it). Replaces a single `Set<exhaustedBeforeIds>` whose
+	// latch trapped users whenever a transient fetch error was indistinguishable
+	// from a genuinely empty page.
+	type AnchorState = 'exhausted' | 'error';
+	let anchorStates: Map<string, AnchorState> = new Map();
+
+	// Initial render window and per-page hydration size. 7 was too small —
+	// on most chats the Loader fires on open before the user can scroll,
+	// compounding every other pagination bug. 25 covers a typical "what was
+	// I just saying" scrollback without ceremony.
+	const MESSAGE_PAGE_SIZE = 25;
+
+	// Discriminated state describing why the display walk stopped. The Loader
+	// renders for every kind except `complete`, and routes its action by kind.
+	// Before this existed the walk silently terminated and the Loader's gate
+	// was the inverse of the very condition the walk had just proved true,
+	// trapping users with no recovery affordance.
+	//
+	// `anchorId` keys per-frontier state in `anchorStates` (so a transient
+	// error on one stub doesn't poison adjacent ones). `beforeId` for the
+	// stub variant is the youngest *hydrated* ancestor — what the backend
+	// `before=` pagination semantic uses; using the stub itself would exclude
+	// it from the returned chain and leave it forever a stub.
+	type ChainFrontier =
+		| { kind: 'complete' }
+		| { kind: 'capped' }
+		| { kind: 'stub'; anchorId: string; beforeId: string | null }
+		| { kind: 'orphan'; missingId: string; anchorId: string }
+		| { kind: 'error'; anchorId: string; beforeId: string | null };
+	let frontier: ChainFrontier = { kind: 'complete' };
 
 	$: if (chatId && chatId !== paginationChatId) {
 		paginationChatId = chatId;
-		messagesCount = 7;
-		exhaustedBeforeIds = new Set();
+		messagesCount = MESSAGE_PAGE_SIZE;
+		anchorStates = new Map();
+		frontier = { kind: 'complete' };
 	}
 
 	// Merge a paginated message page back into history.messages, preserving any
@@ -102,9 +134,10 @@
 		return hydrated;
 	};
 
-	// Hydrate the branch ending at `leafId` if any ancestor is still a stub.
-	// Used by branch-switch handlers when the user picks a sibling that wasn't
-	// included in the initial loadChat page.
+	// Hydrate the branch ending at `leafId` if any ancestor is still a stub
+	// OR truly missing from the map (orphan: parentId set but no entry).
+	// Used by branch-switch handlers when the user picks a sibling that
+	// wasn't included in the initial loadChat page.
 	const hydrateBranchIfNeeded = async (leafId: string | null) => {
 		const h: any = history;
 		if (!leafId || !chatId || !h?.messages) return;
@@ -115,12 +148,22 @@
 				needsFetch = true;
 				break;
 			}
-			cursor = cursor.parentId ? h.messages[cursor.parentId] : null;
+			if (cursor.parentId === null || cursor.parentId === undefined) break;
+			const parent = h.messages[cursor.parentId];
+			if (!parent) {
+				// Orphan chain — parent should exist but doesn't. Previously
+				// this loop exited silently (cursor became undefined, _stub
+				// check never ran) so branch switches into orphan-chained
+				// leaves rendered truncated with no recovery.
+				needsFetch = true;
+				break;
+			}
+			cursor = parent;
 		}
 		if (!needsFetch) return;
 		const page = await getChatMessagesBranch(localStorage.token, chatId, {
 			leaf: leafId,
-			limit: 7
+			limit: MESSAGE_PAGE_SIZE
 		}).catch(() => null);
 		if (mergePaginatedMessages(page) > 0) {
 			history = history;
@@ -128,81 +171,211 @@
 		}
 	};
 
-	const loadMoreMessages = async () => {
-		const element = document.getElementById('messages-container');
-		let previousScrollHeight = 0;
-		let previousScrollTop = 0;
-
-		if (element) {
-			previousScrollHeight = element.scrollHeight;
-			previousScrollTop = element.scrollTop;
-		}
-
-		messagesLoading = true;
-
-		// Find the oldest currently-rendered non-stub message to paginate before.
-		let oldestId: string | null = null;
-		if (messages.length) {
-			for (const m of messages) {
-				if (m && !m._stub) {
-					oldestId = m.id;
-					break;
-				}
-			}
-		}
-
-		let hydratedCount = 0;
-		const leafId = (history as any)?.currentId ?? null;
-		if (chatId && leafId && oldestId && !exhaustedBeforeIds.has(oldestId)) {
-			const page = await getChatMessagesBranch(localStorage.token, chatId, {
-				leaf: leafId,
-				before: oldestId,
-				limit: 20
-			}).catch(() => null);
-			hydratedCount = mergePaginatedMessages(page);
-			if (hydratedCount > 0) {
-				history = history;
-			} else {
-				exhaustedBeforeIds = new Set([...exhaustedBeforeIds, oldestId]);
-			}
-		}
-
-		// Grow the render window by however many real messages we actually loaded
-		// so the walk below picks them up — adding a fixed +20 would either
-		// overshoot (re-including stubs) or undershoot if the server returned
-		// fewer than requested.
-		if (messagesCount !== null) {
-			messagesCount += hydratedCount;
-		}
-
-		await tick();
-
-		if (element) {
-			element.scrollTop = previousScrollTop + (element.scrollHeight - previousScrollHeight);
-		}
-
-		messagesLoading = false;
+	// Hydrate a chain rooted at `missingId` — used when the display walk
+	// detects an orphan parent. Fetches by `leaf=missingId` so the response
+	// includes that node plus its ancestors, stitching the gap closed.
+	const hydrateFromLeaf = async (missingId: string): Promise<number> => {
+		if (!chatId || !missingId) return 0;
+		const page = await getChatMessagesBranch(localStorage.token, chatId, {
+			leaf: missingId,
+			limit: MESSAGE_PAGE_SIZE
+		});
+		const hydrated = mergePaginatedMessages(page);
+		if (hydrated > 0) history = history;
+		return hydrated;
 	};
 
-	$: if (history.currentId) {
-		let _messages = [];
+	// Advance the chain by one step, routing on the current frontier kind.
+	// Replaces the old `loadMoreMessages` whose single code path conflated
+	// "stub ahead" with "older messages exist beyond render window," and
+	// whose error handling (`.catch(() => null)`) collapsed network failures
+	// into the same "no more rows" outcome as a genuinely empty page.
+	const advanceFrontier = async (target: ChainFrontier) => {
+		if (messagesLoading) return;
+		if (target.kind === 'complete') return;
 
-		let message = history.messages[history.currentId];
-		// Walk parent_id back toward the root, but stop as soon as we hit a
-		// stub: stubs have no content and would render as empty Message blocks.
-		// The user can trigger pagination (load more) to hydrate older ancestors.
-		while (
-			message &&
-			!message._stub &&
-			(messagesCount !== null ? _messages.length <= messagesCount : true)
-		) {
-			_messages.unshift(message);
-			message = message.parentId !== null ? history.messages[message.parentId] : null;
+		const element = document.getElementById('messages-container');
+		const previousScrollHeight = element ? element.scrollHeight : 0;
+		const previousScrollTop = element ? element.scrollTop : 0;
+
+		messagesLoading = true;
+		try {
+			if (target.kind === 'capped') {
+				// All loaded messages already in the map; just grow the window.
+				if (messagesCount !== null) {
+					messagesCount += MESSAGE_PAGE_SIZE;
+				}
+				await tick();
+				return;
+			}
+
+			const leafId = (history as any)?.currentId ?? null;
+			if (!chatId || !leafId) return;
+
+			if (target.kind === 'orphan') {
+				// Fill the gap: fetch from the missing id so the response
+				// includes it and its ancestors. Walk will re-converge on
+				// the next reactive pass.
+				try {
+					const hydrated = await hydrateFromLeaf(target.missingId);
+					if (hydrated > 0) {
+						if (messagesCount !== null) messagesCount += hydrated;
+						// Anchor recovered — clear any stale error state.
+						if (anchorStates.has(target.anchorId)) {
+							anchorStates.delete(target.anchorId);
+							anchorStates = new Map(anchorStates);
+						}
+					} else {
+						// Server has no row for this id — graph is inconsistent,
+						// nothing more we can do client-side. Mark exhausted so
+						// we stop trying. Backend repair (_normalize_message_graph)
+						// should prevent this from persisting.
+						anchorStates.set(target.anchorId, 'exhausted');
+						anchorStates = new Map(anchorStates);
+					}
+				} catch (err) {
+					anchorStates.set(target.anchorId, 'error');
+					anchorStates = new Map(anchorStates);
+				}
+				await tick();
+				return;
+			}
+
+			// target.kind === 'stub' or 'error' → page ancestors of the anchor.
+			//
+			// `beforeId` is the youngest hydrated message; the backend treats
+			// `before` as exclusive, so we page strictly older than that. When
+			// the leaf itself is a stub (no hydrated message has been pushed),
+			// `beforeId` is null and we instead hydrate by `leaf=anchorId`,
+			// which fetches the anchor + its ancestors.
+			const anchorId = target.anchorId;
+			const beforeId = target.beforeId;
+			let hydratedCount = 0;
+			try {
+				const page = beforeId
+					? await getChatMessagesBranch(localStorage.token, chatId, {
+							leaf: leafId,
+							before: beforeId,
+							limit: MESSAGE_PAGE_SIZE
+						})
+					: await getChatMessagesBranch(localStorage.token, chatId, {
+							leaf: anchorId,
+							limit: MESSAGE_PAGE_SIZE
+						});
+				hydratedCount = mergePaginatedMessages(page);
+				if (hydratedCount > 0) {
+					history = history;
+					if (anchorStates.has(anchorId)) {
+						anchorStates.delete(anchorId);
+						anchorStates = new Map(anchorStates);
+					}
+				} else {
+					// Genuine empty page — nothing older on this branch.
+					anchorStates.set(anchorId, 'exhausted');
+					anchorStates = new Map(anchorStates);
+				}
+			} catch (err) {
+				// Network/server error. Don't mark exhausted — a retry can
+				// recover. The frontier reactive walk will see the 'error'
+				// state on the next pass and the Loader will render an
+				// inline retry affordance.
+				anchorStates.set(anchorId, 'error');
+				anchorStates = new Map(anchorStates);
+			}
+
+			if (messagesCount !== null) {
+				messagesCount += hydratedCount;
+			}
+			await tick();
+		} finally {
+			if (element) {
+				element.scrollTop = previousScrollTop + (element.scrollHeight - previousScrollHeight);
+			}
+			messagesLoading = false;
 		}
+	};
 
-		messages = _messages;
-	} else {
-		messages = [];
+	$: {
+		// Compute both the rendered list and its frontier in a single pass.
+		// The frontier carries the reason the walk stopped — `complete`
+		// (root), `capped` (hit messagesCount), `stub` (next ancestor is an
+		// unhydrated placeholder), `orphan` (parentId set but no row), or
+		// `error` (last advance failed for this anchor). Loader visibility
+		// + action are driven entirely by this state.
+		if (!history?.currentId) {
+			messages = [];
+			frontier = { kind: 'complete' };
+		} else {
+			const _messages: any[] = [];
+			let message = history.messages[history.currentId];
+			let newFrontier: ChainFrontier = { kind: 'complete' };
+			// Track the most-recently-pushed hydrated message id so a `stub`
+			// frontier can hand the backend a valid `before=` anchor — the
+			// stub's own id would be excluded by the backend's exclusive-
+			// before semantic, leaving it as a stub forever.
+			let lastHydratedId: string | null = null;
+			while (message) {
+				if (message._stub) {
+					newFrontier = {
+						kind: 'stub',
+						anchorId: message.id,
+						beforeId: lastHydratedId
+					};
+					break;
+				}
+				if (messagesCount !== null && _messages.length >= messagesCount) {
+					newFrontier = { kind: 'capped' };
+					break;
+				}
+				_messages.unshift(message);
+				lastHydratedId = message.id;
+				if (message.parentId === null || message.parentId === undefined) {
+					newFrontier = { kind: 'complete' };
+					break;
+				}
+				const parent = history.messages[message.parentId];
+				if (!parent) {
+					newFrontier = {
+						kind: 'orphan',
+						missingId: message.parentId,
+						anchorId: message.id
+					};
+					break;
+				}
+				message = parent;
+			}
+
+			// Promote per-anchor state into the frontier so the Loader can
+			// react. 'exhausted' on the current anchor means "no recovery
+			// available" → treat as complete (don't render the Loader).
+			// 'error' overrides everything else for that anchor.
+			const anchorId =
+				newFrontier.kind === 'stub' || newFrontier.kind === 'orphan'
+					? newFrontier.anchorId
+					: _messages.length
+						? _messages[0].id
+						: null;
+			if (anchorId) {
+				const state = anchorStates.get(anchorId);
+				if (state === 'error') {
+					// Preserve the beforeId from the stub variant if that's
+					// what failed; otherwise this is an error against the
+					// oldest rendered id.
+					const beforeId =
+						newFrontier.kind === 'stub'
+							? newFrontier.beforeId
+							: _messages.length
+								? _messages[0].id
+								: null;
+					newFrontier = { kind: 'error', anchorId, beforeId };
+				} else if (state === 'exhausted' && newFrontier.kind !== 'capped') {
+					newFrontier = { kind: 'complete' };
+				}
+			}
+
+			messages = _messages;
+			frontier = newFrontier;
+		}
 	}
 
 	$: if (autoScroll && bottomPadding) {
@@ -573,19 +746,37 @@
 			{#key chatId}
 				<section class="w-full" aria-labelledby="chat-conversation">
 					<h2 class="sr-only" id="chat-conversation">{$i18n.t('Chat Conversation')}</h2>
-					{#if messages.length > 0 && messages[0].parentId !== null && history.messages[messages[0].parentId] !== undefined && !exhaustedBeforeIds.has(messages[0].id)}
+					{#if frontier.kind !== 'complete'}
 						<Loader
-							on:visible={(e) => {
-								console.log('visible');
-								if (!messagesLoading) {
-									loadMoreMessages();
+							root={typeof document !== 'undefined'
+								? document.getElementById('messages-container')
+								: null}
+							on:visible={() => {
+								if (!messagesLoading && frontier.kind !== 'error') {
+									advanceFrontier(frontier);
 								}
 							}}
 						>
-							<div class="w-full flex justify-center py-1 text-xs animate-pulse items-center gap-2">
-								<Spinner className=" size-4" />
-								<div class=" ">{$i18n.t('Loading...')}</div>
-							</div>
+							{#if frontier.kind === 'error'}
+								<div
+									class="w-full flex justify-center py-1 text-xs items-center gap-2"
+								>
+									<button
+										type="button"
+										class="underline text-red-600 dark:text-red-400"
+										on:click={() => advanceFrontier(frontier)}
+									>
+										{$i18n.t('Failed to load older messages. Retry')}
+									</button>
+								</div>
+							{:else}
+								<div
+									class="w-full flex justify-center py-1 text-xs animate-pulse items-center gap-2"
+								>
+									<Spinner className=" size-4" />
+									<div class=" ">{$i18n.t('Loading...')}</div>
+								</div>
+							{/if}
 						</Loader>
 					{/if}
 					<ul role="log" aria-live="polite" aria-relevant="additions" aria-atomic="false">

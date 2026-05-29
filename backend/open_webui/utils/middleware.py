@@ -166,7 +166,11 @@ from open_webui.utils.misc import (
     convert_logit_bias_input_to_json,
     get_content_from_message,
 )
-from open_webui.utils.tools import get_tools, get_web_search_tool_specs
+from open_webui.utils.tools import (
+    get_tools,
+    get_web_search_tool_specs,
+    resolve_tool_server_headers,
+)
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.filter import (
     get_sorted_filter_ids,
@@ -1778,6 +1782,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     args = mcp_config.get("args") if mcp_config else None
                     env = mcp_config.get("env") if mcp_config else None
 
+                    # Merge user-configured custom headers (with {{CHAT_ID}}
+                    # etc. substituted) into the outbound MCP request
+                    # headers. Reserved headers are filtered by the helper,
+                    # so Authorization set above can't be clobbered.
+                    custom_headers = resolve_tool_server_headers(
+                        mcp_server_connection, user, metadata
+                    )
+                    if custom_headers:
+                        headers = {**headers, **custom_headers}
+
                     await mcp_clients[server_id].connect(
                         url=mcp_server_connection.get("url", "") if not command else None,
                         headers=headers if headers and not command else None,
@@ -1820,7 +1834,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             },
                         }
                 except Exception as e:
-                    log.debug(e)
+                    # Log with traceback at ERROR so MCP failures are
+                    # visible without flipping the global log level, and
+                    # drop the half-constructed client so the cleanup
+                    # finally in process_chat doesn't try to disconnect a
+                    # never-connected MCPClient.
+                    log.exception(
+                        "MCP server %r failed during connect/list_tool_specs",
+                        server_id,
+                    )
+                    mcp_clients.pop(server_id, None)
                     continue
 
         tools_dict = await get_tools(

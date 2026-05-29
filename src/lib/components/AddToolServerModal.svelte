@@ -45,6 +45,8 @@
 	let auth_type = 'bearer';
 	let key = '';
 
+	let headers: { key: string; value: string }[] = [];
+
 	let accessControl = {};
 
 	let id = '';
@@ -130,6 +132,9 @@
 				type,
 				auth_type,
 				key,
+				headers: headers
+					.map((h) => ({ key: h.key.trim(), value: h.value }))
+					.filter((h) => h.key !== ''),
 				config: {
 					enable: enable,
 					access_control: accessControl
@@ -180,6 +185,12 @@
 				if (data.auth_type) auth_type = data.auth_type;
 				if (data.key) key = data.key;
 
+				if (Array.isArray(data.headers)) {
+					headers = data.headers
+						.filter((h) => h && typeof h === 'object')
+						.map((h) => ({ key: String(h.key ?? ''), value: String(h.value ?? '') }));
+				}
+
 				if (typeof data.parallelizable === 'boolean') {
 					parallelizable = data.parallelizable;
 				}
@@ -216,6 +227,8 @@
 
 				auth_type,
 				key,
+
+				headers: headers.filter((h) => h.key.trim() !== ''),
 
 				parallelizable,
 
@@ -274,6 +287,10 @@
 			auth_type,
 			key,
 
+			headers: headers
+				.map((h) => ({ key: h.key.trim(), value: h.value }))
+				.filter((h) => h.key !== ''),
+
 			parallelizable,
 
 			config: {
@@ -303,6 +320,7 @@
 
 		key = '';
 		auth_type = 'bearer';
+		headers = [];
 
 		id = '';
 		name = '';
@@ -325,6 +343,12 @@
 
 			auth_type = connection?.auth_type ?? 'bearer';
 			key = connection?.key ?? '';
+
+			headers = Array.isArray(connection?.headers)
+				? connection.headers
+						.filter((h) => h && typeof h === 'object')
+						.map((h) => ({ key: String(h.key ?? ''), value: String(h.value ?? '') }))
+				: [];
 
 			parallelizable = connection?.parallelizable ?? false;
 
@@ -687,6 +711,68 @@
 
 									<Switch bind:state={parallelizable} />
 								</div>
+							</div>
+						</div>
+
+						<div class="flex flex-col w-full mt-3">
+							<div class="flex w-full justify-between items-center mb-1">
+								<div
+									class={`text-xs ${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : 'text-gray-500'}`}
+								>
+									{$i18n.t('Custom Headers')}
+								</div>
+								<button
+									class="px-2 py-0.5 text-xs rounded-md bg-gray-100 dark:bg-gray-900 hover:bg-gray-200 dark:hover:bg-gray-850 transition"
+									type="button"
+									on:click={() => {
+										headers = [...headers, { key: '', value: '' }];
+									}}
+								>
+									{$i18n.t('Add header')}
+								</button>
+							</div>
+
+							{#if headers.length > 0}
+								<div class="flex flex-col gap-1.5">
+									{#each headers as header, idx (idx)}
+										<div class="flex gap-1.5 items-center">
+											<input
+												class={`flex-1 min-w-0 text-sm bg-transparent border border-gray-100 dark:border-gray-800 rounded-md px-2 py-1 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+												type="text"
+												bind:value={header.key}
+												placeholder={$i18n.t('Header name')}
+												autocomplete="off"
+												spellcheck="false"
+											/>
+											<input
+												class={`flex-[2] min-w-0 text-sm bg-transparent border border-gray-100 dark:border-gray-800 rounded-md px-2 py-1 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+												type="text"
+												bind:value={header.value}
+												placeholder={$i18n.t('Value')}
+												autocomplete="off"
+												spellcheck="false"
+											/>
+											<button
+												class="shrink-0 p-1 rounded-md bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+												type="button"
+												aria-label={$i18n.t('Remove header')}
+												on:click={() => {
+													headers = headers.filter((_, i) => i !== idx);
+												}}
+											>
+												<Minus className={'size-3.5'} />
+											</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+
+							<div
+								class={`text-xs mt-1 leading-snug ${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : 'text-gray-500'}`}
+							>
+								{$i18n.t(
+									'Variables: {{CHAT_ID}}, {{MESSAGE_ID}}, {{SESSION_ID}}, {{USER_ID}}, {{USER_NAME}}. Reserved headers (Authorization, Content-Type, Accept, Cookie) are ignored.'
+								)}
 							</div>
 						</div>
 

@@ -202,16 +202,40 @@ def _expand_assistant(
         pending_blocks = []
 
         if tool_calls:
+            # OpenAI-compatible upstreams (incl. OpenRouter) reject a conversation
+            # where an assistant `tool_calls` entry has no matching `tool` message,
+            # OR where that `tool` message has empty content ("No tool output found
+            # for function call <id>"). Both happen with subagent launches that were
+            # cancelled / "produced no final text": their result is persisted with
+            # content="" and never backfilled. Guarantee the invariant HERE — the
+            # single conversion gate every outbound conversation passes through —
+            # by emitting exactly one non-empty `tool` message per issued tool_call,
+            # keyed off the calls themselves rather than the (possibly empty or
+            # misaligned) results list.
+            results_by_id: dict = {}
             for result in tool_calls_block.get("results") or []:
+                if isinstance(result, dict):
+                    rid = result.get("tool_call_id")
+                    if rid and rid not in results_by_id:
+                        results_by_id[rid] = result
+
+            for call in tool_calls:
+                call_id = call.get("id", "") if isinstance(call, dict) else ""
+                result = results_by_id.get(call_id) or {}
                 # Tool results travel as list-of-text-parts so the cache_control
                 # transform applied during the live tool loop's last-message marker
                 # is shape-stable between live and replay (the same message would
                 # otherwise be a string when it isn't the last on replay).
                 result_content = result.get("content", "") or ""
+                if not (isinstance(result_content, str) and result_content.strip()):
+                    # Empty/missing output — emit a non-empty placeholder so the
+                    # message validates. Surfaces the subagent's terminal state
+                    # (e.g. cancelled with no final text) to the parent model.
+                    result_content = "[No output was produced for this tool call.]"
                 api_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": result.get("tool_call_id", ""),
+                        "tool_call_id": call_id,
                         "content": [{"type": "text", "text": result_content}],
                     }
                 )

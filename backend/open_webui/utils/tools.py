@@ -50,6 +50,69 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 
+# Header names the tool-server layer manages itself; we refuse to let custom
+# header config override them so a misconfigured connection can't strip the
+# Authorization the auth_type just resolved, or break the MCP SDK's content
+# negotiation.
+_RESERVED_TOOL_SERVER_HEADERS = frozenset(
+    {"authorization", "content-type", "accept", "cookie"}
+)
+
+
+def resolve_tool_server_headers(
+    connection: Dict[str, Any],
+    user: Optional[UserModel] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Resolve a tool-server connection's custom `headers` list into a dict
+    ready to merge into the outbound request.
+
+    Connection storage shape: ``[{"key": str, "value": str}, ...]``. Values
+    may contain template tokens (CHAT_ID, MESSAGE_ID, USER_ID, USER_NAME,
+    SESSION_ID); these are substituted per-request from the live chat
+    metadata and user. Unknown tokens are left as-is so the upstream tool
+    server sees them and can decide how to react.
+
+    Reserved headers (see ``_RESERVED_TOOL_SERVER_HEADERS``) are dropped
+    with a warning so they cannot clobber the auth layer.
+    """
+    raw = connection.get("headers") or []
+    if not isinstance(raw, list):
+        return {}
+
+    metadata = metadata or {}
+    substitutions = {
+        "{{CHAT_ID}}": str(metadata.get("chat_id") or ""),
+        "{{MESSAGE_ID}}": str(metadata.get("message_id") or ""),
+        "{{SESSION_ID}}": str(metadata.get("session_id") or ""),
+        "{{USER_ID}}": str(getattr(user, "id", "") or ""),
+        "{{USER_NAME}}": str(getattr(user, "name", "") or ""),
+    }
+
+    resolved: Dict[str, str] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key", "")).strip()
+        if not key:
+            continue
+        if key.lower() in _RESERVED_TOOL_SERVER_HEADERS:
+            log.warning(
+                "Ignoring reserved custom header %r on tool server %r",
+                key,
+                connection.get("info", {}).get("id", connection.get("url", "?")),
+            )
+            continue
+        value = entry.get("value", "")
+        if not isinstance(value, str):
+            value = str(value)
+        for token, replacement in substitutions.items():
+            if token in value:
+                value = value.replace(token, replacement)
+        resolved[key] = value
+    return resolved
+
+
 def get_async_tool_function_and_apply_extra_params(
     function: Callable, extra_params: dict
 ) -> Callable[..., Awaitable]:
@@ -185,6 +248,19 @@ async def get_tools(
                                 )
 
                         headers["Content-Type"] = "application/json"
+
+                        # Merge in any user-configured custom headers (with
+                        # per-request {{CHAT_ID}} / {{USER_ID}} / etc.
+                        # substitution). resolve_tool_server_headers refuses
+                        # to clobber Authorization/Content-Type/Accept/Cookie,
+                        # so this is safe regardless of merge order.
+                        custom_headers = resolve_tool_server_headers(
+                            tool_server_connection,
+                            user,
+                            extra_params.get("__metadata__"),
+                        )
+                        if custom_headers:
+                            headers = {**headers, **custom_headers}
 
                         def make_tool_function(
                             function_name, tool_server_data, headers
@@ -578,13 +654,20 @@ async def get_tool_servers(request: Request):
     return tool_servers
 
 
-async def get_tool_server_data(token: str, url: str) -> Dict[str, Any]:
+async def get_tool_server_data(
+    token: str, url: str, extra_headers: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        for k, v in extra_headers.items():
+            if k.lower() in _RESERVED_TOOL_SERVER_HEADERS:
+                continue
+            headers[k] = v
 
     error = None
     try:
@@ -660,8 +743,12 @@ async def get_tool_servers_data(servers: List[Dict[str, Any]]) -> List[Dict[str,
                 # Path (to OpenAPI spec URL) can be either a full URL or a path to append to the base URL
                 openapi_path = server.get("path", "openapi.json")
                 spec_url = get_tool_server_url(server_url, openapi_path)
+                # Custom headers configured on the connection. There is no
+                # chat context at spec-fetch time, so {{CHAT_ID}} etc.
+                # resolve to empty strings — that's intentional.
+                spec_headers = resolve_tool_server_headers(server)
                 # Fetch from URL
-                task = get_tool_server_data(token, spec_url)
+                task = get_tool_server_data(token, spec_url, spec_headers)
             elif spec_type == "json" and server.get("spec", ""):
                 # Use provided JSON spec
                 spec_json = None

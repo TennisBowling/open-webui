@@ -1667,11 +1667,17 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model):
+        # Track which stage we reached so the cancel log can say where it
+        # happened — otherwise "Chat processing was cancelled" gives us no
+        # signal about whether the LLM was ever called or which tool block
+        # was active.
+        stage = "payload"
         try:
             form_data, metadata, events = await process_chat_payload(
                 request, form_data, user, metadata, model
             )
 
+            stage = "completion"
             response = await chat_completion_handler(request, form_data, user)
             if metadata.get("chat_id") and metadata.get("message_id"):
                 try:
@@ -1686,11 +1692,17 @@ async def chat_completion(
                 except:
                     pass
 
+            stage = "response"
             return await process_chat_response(
                 request, response, form_data, user, metadata, model, events, tasks
             )
         except asyncio.CancelledError:
-            log.info("Chat processing was cancelled")
+            mcp_server_ids = list((metadata.get("mcp_clients") or {}).keys())
+            log.info(
+                "Chat processing was cancelled (stage=%s, mcp_servers=%s)",
+                stage,
+                mcp_server_ids,
+            )
             try:
                 event_emitter = get_event_emitter(metadata)
                 await event_emitter(
@@ -1726,13 +1738,19 @@ async def chat_completion(
                 except:
                     pass
         finally:
-            try:
-                if mcp_clients := metadata.get("mcp_clients"):
-                    for client in mcp_clients.values():
-                        await client.disconnect()
-            except Exception as e:
-                log.debug(f"Error cleaning up: {e}")
-                pass
+            mcp_clients = metadata.get("mcp_clients") or {}
+            for server_id, client in mcp_clients.items():
+                try:
+                    # Shield disconnect so a cancel arriving during cleanup
+                    # doesn't tear down the transport mid-aclose() (which
+                    # would surface as a BaseExceptionGroup containing a
+                    # CancelledError and mask the real cancellation cause).
+                    await asyncio.shield(client.disconnect())
+                except Exception:
+                    log.exception(
+                        "Error disconnecting MCP client %r during cleanup",
+                        server_id,
+                    )
 
     if (
         metadata.get("session_id")

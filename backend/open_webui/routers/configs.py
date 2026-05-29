@@ -244,7 +244,7 @@ async def verify_tool_servers_config(
             else:
                 try:
                     client = MCPClient()
-                    headers = None
+                    headers = {}
 
                     token = None
                     if form_data.auth_type == "bearer":
@@ -262,9 +262,22 @@ async def verify_tool_servers_config(
                             pass
 
                     if token:
-                        headers = {"Authorization": f"Bearer {token}"}
+                        headers["Authorization"] = f"Bearer {token}"
 
-                    await client.connect(form_data.url, headers=headers)
+                    # Mirror the runtime merge so verification uses the
+                    # same headers a real chat request would. No chat
+                    # context here, so template tokens resolve to empty.
+                    from open_webui.utils.tools import resolve_tool_server_headers
+
+                    custom_headers = resolve_tool_server_headers(
+                        form_data.model_dump(), user=user, metadata=None
+                    )
+                    if custom_headers:
+                        headers = {**headers, **custom_headers}
+
+                    await client.connect(
+                        form_data.url, headers=headers or None
+                    )
                     specs = await client.list_tool_specs()
                     return {
                         "status": True,

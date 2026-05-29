@@ -121,7 +121,7 @@
 				? (run?.status ?? 'running')
 				: run?.status && run.status !== 'running'
 					? run.status
-					: run?.final_text || attributes?.done === 'true'
+					: run?.final_text
 						? 'done'
 						: (run?.status ?? 'running')
 	) as 'running' | 'done' | 'error' | 'cancelled';

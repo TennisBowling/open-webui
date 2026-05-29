@@ -548,11 +548,21 @@
 		prompt_tokens_details?: { cached_tokens?: number | string | null } | null;
 	};
 
-	const lastAppliedUsageSignatureByMessage = new Map<string, string>();
+	type AppliedUsage = {
+		promptTokens: number;
+		completionTokens: number;
+		totalTokens: number;
+		cacheReadTokens: number;
+	};
 
-	// v2 streams send usage as a chat:delta op before chat:done. Apply it to
-	// the navbar counter immediately, then let the analytics fetch converge to
-	// the DB-backed totals. Terminal repeats (snapshot/chat:done) are deduped.
+	// Per-message record of the last cumulative usage we've added to the navbar
+	// totals. Provider usage payloads (OpenRouter, OpenAI, …) are cumulative for
+	// the response and the same response surfaces here through multiple paths
+	// (direct-stream chunk, socket delta op, snapshot reconciliation, chat:done
+	// finalize). Storing the prior cumulative lets us add only the delta on each
+	// re-emission, so totals stay idempotent regardless of order/count of paths.
+	const lastAppliedUsageByMessage = new Map<string, AppliedUsage>();
+
 	const getUsageTokenCounts = (usage: UsagePayload = {}) => {
 		const toNumber = (value: unknown) => {
 			const n = Number(value ?? 0);
@@ -568,32 +578,42 @@
 			promptTokens,
 			completionTokens,
 			totalTokens,
-			cacheReadTokens,
-			signature: `${promptTokens}:${completionTokens}:${totalTokens}:${cacheReadTokens}`
+			cacheReadTokens
 		};
 	};
 
 	const applyUsageToChatTokenStats = (
 		_chatId: string | null | undefined,
 		messageId: string | null | undefined,
-		usage: UsagePayload | null | undefined,
-		{ terminal = false }: { terminal?: boolean } = {}
+		usage: UsagePayload | null | undefined
 	) => {
 		if (!usage || !_chatId || _chatId.startsWith('local:')) return;
 
-		const { promptTokens, completionTokens, totalTokens, cacheReadTokens, signature } =
+		const { promptTokens, completionTokens, totalTokens, cacheReadTokens } =
 			getUsageTokenCounts(usage);
 		if (!promptTokens && !completionTokens && !totalTokens && !cacheReadTokens) return;
 
+		const prior = messageId ? lastAppliedUsageByMessage.get(messageId) : undefined;
+		const isFirstSighting = !prior;
+
+		// Clamp at 0: if a provider ever reports a smaller value on a later
+		// emission, don't subtract — backend analytics is authoritative and
+		// reconciles on reload.
+		const deltaPrompt = Math.max(0, promptTokens - (prior?.promptTokens ?? 0));
+		const deltaCompletion = Math.max(0, completionTokens - (prior?.completionTokens ?? 0));
+		const deltaTotal = Math.max(0, totalTokens - (prior?.totalTokens ?? 0));
+		const deltaCacheRead = Math.max(0, cacheReadTokens - (prior?.cacheReadTokens ?? 0));
+
 		if (messageId) {
-			const lastSignature = lastAppliedUsageSignatureByMessage.get(messageId);
-			if (terminal && lastSignature === signature) {
-				return;
-			}
-			lastAppliedUsageSignatureByMessage.set(messageId, signature);
-			if (lastAppliedUsageSignatureByMessage.size > 1000) {
-				const oldest = lastAppliedUsageSignatureByMessage.keys().next().value;
-				if (oldest) lastAppliedUsageSignatureByMessage.delete(oldest);
+			lastAppliedUsageByMessage.set(messageId, {
+				promptTokens: Math.max(promptTokens, prior?.promptTokens ?? 0),
+				completionTokens: Math.max(completionTokens, prior?.completionTokens ?? 0),
+				totalTokens: Math.max(totalTokens, prior?.totalTokens ?? 0),
+				cacheReadTokens: Math.max(cacheReadTokens, prior?.cacheReadTokens ?? 0)
+			});
+			if (lastAppliedUsageByMessage.size > 1000) {
+				const oldest = lastAppliedUsageByMessage.keys().next().value;
+				if (oldest) lastAppliedUsageByMessage.delete(oldest);
 			}
 		}
 
@@ -601,14 +621,14 @@
 			const base = current?.chat_id === _chatId ? current : null;
 			return {
 				chat_id: _chatId,
-				total_input_tokens: (base?.total_input_tokens ?? 0) + promptTokens,
-				total_output_tokens: (base?.total_output_tokens ?? 0) + completionTokens,
-				total_tokens: (base?.total_tokens ?? 0) + totalTokens,
-				total_cache_read_tokens: (base?.total_cache_read_tokens ?? 0) + cacheReadTokens,
+				total_input_tokens: (base?.total_input_tokens ?? 0) + deltaPrompt,
+				total_output_tokens: (base?.total_output_tokens ?? 0) + deltaCompletion,
+				total_tokens: (base?.total_tokens ?? 0) + deltaTotal,
+				total_cache_read_tokens: (base?.total_cache_read_tokens ?? 0) + deltaCacheRead,
 				last_input_tokens: promptTokens,
 				last_output_tokens: completionTokens,
 				last_cache_read_tokens: cacheReadTokens,
-				message_count: (base?.message_count ?? 0) + 1,
+				message_count: (base?.message_count ?? 0) + (isFirstSighting ? 1 : 0),
 				loading: false
 			};
 		});
@@ -2992,7 +3012,7 @@
 			const branchPage = leafId
 				? await getChatMessagesBranch(localStorage.token, currentChatId, {
 						leaf: leafId,
-						limit: 7
+						limit: 25
 					}).catch(() => null)
 				: [];
 			return stitchPaginatedChat(meta, branchPage);
@@ -3278,6 +3298,14 @@
 						const args = parseToolArgs(call?.function?.arguments ?? '');
 						const result = results.find((r: any) => r?.tool_call_id === callId);
 						const subagentId = result?.subagent_id || '';
+						// A result row only proves the subagent finished with a real
+						// answer when its content is non-empty. The launch placeholder
+						// for a cancelled / no-final-text run persists an EMPTY result
+						// that must NOT be read as success — otherwise the header shows
+						// a green "done" for a subagent that never produced anything.
+						const resultContent =
+							typeof result?.content === 'string' ? result.content : '';
+						const resultHasAnswer = resultContent.trim().length > 0;
 						const existing =
 							(callId && seeded[callId]) ||
 							(toolName === 'subagent_launch' && subagentId && seeded[subagentId]) ||
@@ -3297,12 +3325,15 @@
 								prompt: existing.prompt || args?.prompt || '',
 								background: existing.background || args?.background || '',
 								continuation: existing.continuation || toolName === 'subagent_continue',
-								status: result
+								status: resultHasAnswer
 									? existing.status === 'error'
 										? 'error'
 										: 'done'
-									: existing.status || 'running',
-								final_text: existing.final_text || result?.content || undefined
+									: // No real answer in the result. Trust the run entry's
+										// own terminal status (cancelled / error / running)
+										// rather than forging 'done' off an empty placeholder.
+										existing.status || 'running',
+								final_text: existing.final_text || (resultHasAnswer ? resultContent : undefined)
 							},
 							m,
 							inferredEntryKey
@@ -3867,7 +3898,7 @@
 
 		if (usage) {
 			message.usage = usage;
-			applyUsageToChatTokenStats(chatId, message.id, usage, { terminal: done === true });
+			applyUsageToChatTokenStats(chatId, message.id, usage);
 			chatTokenStatsRefreshTrigger.update((n) => n + 1);
 			shouldFlushStreamingUpdate = true;
 		}
@@ -4113,7 +4144,7 @@
 			writeMirrorToMessage(mirror, message);
 			if (snap.usage) {
 				message.usage = snap.usage;
-				applyUsageToChatTokenStats(chatId, message.id, snap.usage, { terminal: true });
+				applyUsageToChatTokenStats(chatId, message.id, snap.usage);
 				chatTokenStatsRefreshTrigger.update((n) => n + 1);
 			}
 			if (Array.isArray(snap.sources)) {
@@ -4313,7 +4344,7 @@
 		writeMirrorToMessage(mirror, message);
 		if (data?.usage) {
 			message.usage = data.usage;
-			applyUsageToChatTokenStats(chatId, message.id, data.usage, { terminal: true });
+			applyUsageToChatTokenStats(chatId, message.id, data.usage);
 		}
 		message = { ...message };
 		emitPendingTTSParts(message, { done: true });
@@ -5152,7 +5183,7 @@
 		const responseMessage = _history.messages[responseMessageId];
 		// Same assistant id can be reused by continue/retry flows; a new request
 		// must be allowed to count a fresh usage payload even if numbers match.
-		lastAppliedUsageSignatureByMessage.delete(responseMessageId);
+		lastAppliedUsageByMessage.delete(responseMessageId);
 		const userMessage = _history.messages[responseMessage.parentId];
 		const leafMessageId = (opts as any)?.leafMessageId ?? responseMessage.parentId;
 
