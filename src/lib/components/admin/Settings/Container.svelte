@@ -19,7 +19,7 @@
 			'Container workspace is enabled for this chat.\n' +
 			'Use /workspace/inputs for uploaded files and /workspace/outputs for files the user should receive.\n' +
 			'Files in /workspace/outputs persist across turns; when the user asks to modify a previous output, edit the existing file there instead of creating an unrelated copy.\n' +
-			'Do not use sandbox: links in final answers; Open WebUI will attach generated files automatically.'
+			'When you create files for the user, save them under /workspace/outputs. Open WebUI will attach generated files automatically. If you mention a generated file, refer to its filename or use a sandbox:/workspace/... link only for files that actually exist.'
 	};
 
 	const saveHandler = async () => {
