@@ -17,12 +17,50 @@
 	import TextToken from './MarkdownInlineTokens/TextToken.svelte';
 	import CodespanToken from './MarkdownInlineTokens/CodespanToken.svelte';
 	import MentionToken from './MarkdownInlineTokens/MentionToken.svelte';
+	import FileItemModal from '$lib/components/common/FileItemModal.svelte';
 
 	export let id: string;
 	export let done = true;
 	export let tokens: Token[];
+	export let sandboxFiles: any[] = [];
 	export let onSourceClick: Function = () => {};
+
+	let showSandboxFileModal = false;
+	let sandboxFileModalItem: any = null;
+
+	const normalizeSandboxPath = (value: string) => {
+		try {
+			value = decodeURIComponent(value);
+		} catch {
+			// keep original
+		}
+		return value
+			.replace(/^sandbox:\/\/workspace\/?/, '')
+			.replace(/^\/workspace\/?/, '')
+			.replace(/^\/+/, '');
+	};
+
+	const resolveSandboxFile = (href: string) => {
+		if (!href?.startsWith('sandbox:/workspace')) return null;
+		const rel = normalizeSandboxPath(href);
+		const candidates = new Set([rel]);
+		if (rel && !rel.startsWith('outputs/')) candidates.add(`outputs/${rel}`);
+
+		return (sandboxFiles ?? []).find((file) => {
+			const workspacePath = normalizeSandboxPath(file?.container_workspace?.workspace_path ?? '');
+			return candidates.has(workspacePath);
+		});
+	};
+
+	const openSandboxFile = (file: any) => {
+		sandboxFileModalItem = file;
+		showSandboxFileModal = true;
+	};
 </script>
+
+{#if sandboxFileModalItem}
+	<FileItemModal bind:show={showSandboxFileModal} item={sandboxFileModalItem} />
+{/if}
 
 {#each tokens as token}
 	{#if token.type === 'escape'}
@@ -30,9 +68,23 @@
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
 	{:else if token.type === 'link'}
-		{#if token.tokens}
+		{@const sandboxFile = resolveSandboxFile(token.href)}
+		{#if sandboxFile}
+			<button
+				type="button"
+				class="underline text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300"
+				title={token.title}
+				on:click={() => openSandboxFile(sandboxFile)}
+			>
+				{#if token.tokens}
+					<svelte:self id={`${id}-a`} tokens={token.tokens} {sandboxFiles} {onSourceClick} {done} />
+				{:else}
+					{token.text}
+				{/if}
+			</button>
+		{:else if token.tokens}
 			<a href={token.href} target="_blank" rel="nofollow" title={token.title}>
-				<svelte:self id={`${id}-a`} tokens={token.tokens} {onSourceClick} {done} />
+				<svelte:self id={`${id}-a`} tokens={token.tokens} {sandboxFiles} {onSourceClick} {done} />
 			</a>
 		{:else}
 			<a href={token.href} target="_blank" rel="nofollow" title={token.title}>{token.text}</a>
@@ -40,15 +92,15 @@
 	{:else if token.type === 'image'}
 		<Image src={token.href} alt={token.text} />
 	{:else if token.type === 'strong'}
-		<strong><svelte:self id={`${id}-strong`} tokens={token.tokens} {onSourceClick} /></strong>
+		<strong><svelte:self id={`${id}-strong`} tokens={token.tokens} {sandboxFiles} {onSourceClick} /></strong>
 	{:else if token.type === 'em'}
-		<em><svelte:self id={`${id}-em`} tokens={token.tokens} {onSourceClick} /></em>
+		<em><svelte:self id={`${id}-em`} tokens={token.tokens} {sandboxFiles} {onSourceClick} /></em>
 	{:else if token.type === 'codespan'}
 		<CodespanToken {token} {done} />
 	{:else if token.type === 'br'}
 		<br />
 	{:else if token.type === 'del'}
-		<del><svelte:self id={`${id}-del`} tokens={token.tokens} {onSourceClick} /></del>
+		<del><svelte:self id={`${id}-del`} tokens={token.tokens} {sandboxFiles} {onSourceClick} /></del>
 	{:else if token.type === 'inlineKatex'}
 		{#if token.text}
 			<KatexRenderer content={token.text} displayMode={false} />

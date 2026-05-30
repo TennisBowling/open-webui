@@ -838,6 +838,7 @@
 											? message.content_blocks
 											: null}
 										sources={message.sources}
+										sandboxFiles={message.files ?? []}
 										dataVizOverrides={message?.dataVizOverrides ?? {}}
 										floatingButtons={message?.done &&
 											!readOnly &&

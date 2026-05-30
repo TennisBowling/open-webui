@@ -5644,12 +5644,18 @@
 			}
 		}
 
-		const isFirstTurn = useV2Body
-			? _messages.length === 1 || (_messages.length === 2 && _messages[0]?.role === 'system')
-			: messages.length == 1 ||
-				(messages.length == 2 &&
-					messages.at(0)?.role === 'system' &&
-					messages.at(1)?.role === 'user');
+		// In stream-v2, `_messages` is the persisted branch ending at the
+		// just-created assistant placeholder (`responseMessageId`). For a brand-new
+		// chat that makes the branch look like [user, empty assistant], which used
+		// to suppress title/tag generation because it no longer matched the
+		// first-turn length checks. Gate on the conversation before the current
+		// assistant response instead.
+		const firstTurnMessages = useV2Body
+			? _messages.filter((message) => message?.id !== responseMessageId)
+			: messages;
+		const isFirstTurn =
+			firstTurnMessages.filter((message) => message?.role === 'user').length === 1 &&
+			firstTurnMessages.every((message) => ['system', 'user'].includes(message?.role));
 
 		const [res, controller] = await chatCompletion(
 			localStorage.token,

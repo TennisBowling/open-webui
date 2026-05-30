@@ -2413,7 +2413,7 @@ async def process_chat_response(
 
                         title = Chats.get_chat_title_by_id(metadata["chat_id"])
                         container_output_files = await import_changed_container_outputs(
-                            request, metadata, user
+                            request, metadata, user, content=content
                         )
                         if container_output_files:
                             await event_emitter(
@@ -4719,17 +4719,6 @@ async def process_chat_response(
                         clear_stream_state(metadata["message_id"])
                     return
 
-                container_output_files = await import_changed_container_outputs(
-                    request, metadata, user
-                )
-                if container_output_files:
-                    await event_emitter(
-                        {
-                            "type": "files",
-                            "data": {"files": container_output_files},
-                        }
-                    )
-
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 if (
                     STREAM_PROTOCOL_VERSION == "v2"
@@ -4740,11 +4729,28 @@ async def process_chat_response(
                         set_tool_result_body(metadata.get("message_id"), _tcid, _body)
                 else:
                     final_slim_blocks = content_blocks
+                final_content = serialize_content_blocks(final_slim_blocks, force=True)
+
+                container_output_files = await import_changed_container_outputs(
+                    request,
+                    metadata,
+                    user,
+                    content=final_content,
+                    content_blocks=final_slim_blocks,
+                )
+                if container_output_files:
+                    await event_emitter(
+                        {
+                            "type": "files",
+                            "data": {"files": container_output_files},
+                        }
+                    )
+
                 data = {
                     "done": True,
                     # force=True: end-of-stream final emit. Use slim blocks so
                     # huge web tool bodies do not re-enter the socket hot path.
-                    "content": serialize_content_blocks(final_slim_blocks, force=True),
+                    "content": final_content,
                     "content_blocks": final_slim_blocks,
                     "title": title,
                 }

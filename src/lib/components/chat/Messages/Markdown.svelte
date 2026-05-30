@@ -21,6 +21,7 @@
 	export let chatId = '';
 	export let messageId = '';
 	export let dataVizOverrides = {};
+	export let sandboxFiles = [];
 
 	export let editCodeBlock = true;
 	export let topPadding = false;
@@ -136,6 +137,7 @@
 		{chatId}
 		{messageId}
 		{dataVizOverrides}
+		{sandboxFiles}
 		{onTaskClick}
 		{onSourceClick}
 		{onSave}

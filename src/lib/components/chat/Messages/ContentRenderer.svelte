@@ -41,6 +41,7 @@
 	export let done = true;
 	export let model = null;
 	export let sources = null;
+	export let sandboxFiles = [];
 
 	export let save = false;
 	export let preview = false;
@@ -248,6 +249,7 @@
 					{chatId}
 					{messageId}
 					{dataVizOverrides}
+					{sandboxFiles}
 					sourceIds={(sources ?? []).reduce((acc, source) => {
 						let ids = [];
 						source.document.forEach((document, index) => {
@@ -318,6 +320,7 @@
 			{chatId}
 			{messageId}
 			{dataVizOverrides}
+			{sandboxFiles}
 			sourceIds={(sources ?? []).reduce((acc, source) => {
 				let ids = [];
 				source.document.forEach((document, index) => {

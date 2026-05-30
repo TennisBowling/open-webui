@@ -1108,10 +1108,21 @@ CONTAINER_DATA_ROOT = PersistentConfig(
     os.environ.get("CONTAINER_DATA_ROOT", "/mnt/microns/openllm-containers"),
 )
 
+DEFAULT_CONTAINER_SYSTEM_PROMPT = """Container workspace is enabled for this chat.
+Use /workspace/inputs for uploaded files and /workspace/outputs for files the user should receive.
+Files in /workspace/outputs persist across turns; when the user asks to modify a previous output, edit the existing file there instead of creating an unrelated copy.
+Do not use sandbox: links in final answers; Open WebUI will attach generated files automatically."""
+
 CONTAINER_MCP_SERVER_ID = PersistentConfig(
     "CONTAINER_MCP_SERVER_ID",
     "container.mcp_server_id",
     os.environ.get("CONTAINER_MCP_SERVER_ID", ""),
+)
+
+CONTAINER_SYSTEM_PROMPT = PersistentConfig(
+    "CONTAINER_SYSTEM_PROMPT",
+    "container.system_prompt",
+    os.environ.get("CONTAINER_SYSTEM_PROMPT", DEFAULT_CONTAINER_SYSTEM_PROMPT),
 )
 
 ####################################

@@ -14,7 +14,12 @@
 	let containerConfig = {
 		ENABLE_CONTAINER_WORKSPACE_SYNC: false,
 		CONTAINER_DATA_ROOT: '/mnt/microns/openllm-containers',
-		CONTAINER_MCP_SERVER_ID: ''
+		CONTAINER_MCP_SERVER_ID: '',
+		CONTAINER_SYSTEM_PROMPT:
+			'Container workspace is enabled for this chat.\n' +
+			'Use /workspace/inputs for uploaded files and /workspace/outputs for files the user should receive.\n' +
+			'Files in /workspace/outputs persist across turns; when the user asks to modify a previous output, edit the existing file there instead of creating an unrelated copy.\n' +
+			'Do not use sandbox: links in final answers; Open WebUI will attach generated files automatically.'
 	};
 
 	const saveHandler = async () => {
@@ -92,6 +97,21 @@
 					<div class="text-xs text-gray-500 mt-1">
 						{$i18n.t('This is the ID from Admin Settings → External Tools. That MCP connection should send')}
 						<code class="px-1">X-Chat-Id: {'{{'}CHAT_ID{'}}'}</code>.
+					</div>
+				</div>
+
+				<div class="mb-3">
+					<label class="text-xs text-gray-500" for="container-system-prompt">
+						{$i18n.t('Append to System Prompt')}
+					</label>
+					<textarea
+						id="container-system-prompt"
+						class="w-full mt-1 text-sm bg-transparent outline-hidden border border-gray-100 dark:border-gray-800 rounded-lg px-3 py-2 min-h-36 resize-y"
+						bind:value={containerConfig.CONTAINER_SYSTEM_PROMPT}
+						placeholder={$i18n.t('Instructions appended only when the container MCP server is active')}
+					/>
+					<div class="text-xs text-gray-500 mt-1">
+						{$i18n.t('This text is appended to the system prompt only for messages using the configured container MCP server. Open WebUI also appends the current input/output file list automatically.')}
 					</div>
 				</div>
 			</div>

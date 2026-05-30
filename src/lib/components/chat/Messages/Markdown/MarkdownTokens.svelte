@@ -54,6 +54,7 @@
 	export let chatId = '';
 	export let messageId = '';
 	export let dataVizOverrides: Record<string, string> = {};
+	export let sandboxFiles: any[] = [];
 
 	export let save = false;
 	export let preview = false;
@@ -119,6 +120,7 @@
 				id={`${id}-${tokenIdx}-h`}
 				tokens={token.tokens}
 				{done}
+				{sandboxFiles}
 				{onSourceClick}
 			/>
 		</svelte:element>
@@ -173,6 +175,7 @@
 												id={`${id}-${tokenIdx}-header-${headerIdx}`}
 												tokens={header.tokens}
 												{done}
+												{sandboxFiles}
 												{onSourceClick}
 											/>
 										</div>
@@ -198,6 +201,7 @@
 												id={`${id}-${tokenIdx}-row-${rowIdx}-${cellIdx}`}
 												tokens={cell.tokens}
 												{done}
+												{sandboxFiles}
 												{onSourceClick}
 											/>
 										</div>
@@ -375,6 +379,7 @@
 				id={`${id}-${tokenIdx}-p`}
 				tokens={token.tokens ?? []}
 				{done}
+				{sandboxFiles}
 				{onSourceClick}
 			/>
 		</p>
@@ -397,6 +402,7 @@
 				id={`${id}-${tokenIdx}-p`}
 				tokens={token.tokens ?? []}
 				{done}
+				{sandboxFiles}
 				{onSourceClick}
 			/>
 		{:else}

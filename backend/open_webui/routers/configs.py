@@ -348,6 +348,7 @@ class ContainerConfigForm(BaseModel):
     ENABLE_CONTAINER_WORKSPACE_SYNC: bool
     CONTAINER_DATA_ROOT: str
     CONTAINER_MCP_SERVER_ID: str
+    CONTAINER_SYSTEM_PROMPT: str
 
 
 @router.get("/container", response_model=ContainerConfigForm)
@@ -356,6 +357,7 @@ async def get_container_config(request: Request, user=Depends(get_admin_user)):
         "ENABLE_CONTAINER_WORKSPACE_SYNC": request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
         "CONTAINER_DATA_ROOT": request.app.state.config.CONTAINER_DATA_ROOT,
         "CONTAINER_MCP_SERVER_ID": request.app.state.config.CONTAINER_MCP_SERVER_ID,
+        "CONTAINER_SYSTEM_PROMPT": request.app.state.config.CONTAINER_SYSTEM_PROMPT,
     }
 
 
@@ -368,11 +370,13 @@ async def set_container_config(
     )
     request.app.state.config.CONTAINER_DATA_ROOT = form_data.CONTAINER_DATA_ROOT
     request.app.state.config.CONTAINER_MCP_SERVER_ID = form_data.CONTAINER_MCP_SERVER_ID
+    request.app.state.config.CONTAINER_SYSTEM_PROMPT = form_data.CONTAINER_SYSTEM_PROMPT
 
     return {
         "ENABLE_CONTAINER_WORKSPACE_SYNC": request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
         "CONTAINER_DATA_ROOT": request.app.state.config.CONTAINER_DATA_ROOT,
         "CONTAINER_MCP_SERVER_ID": request.app.state.config.CONTAINER_MCP_SERVER_ID,
+        "CONTAINER_SYSTEM_PROMPT": request.app.state.config.CONTAINER_SYSTEM_PROMPT,
     }
 
 

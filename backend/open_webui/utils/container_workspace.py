@@ -8,7 +8,7 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import aiohttp
 from fastapi import Request
@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SANDBOX_WORKSPACE_RE = re.compile(r"sandbox:/workspace/([^\s)\]]+)")
 _MAX_CHAT_ID_LEN = 128
 _CHUNK_SIZE = 1024 * 1024
 _PREVIEW_MAX_BYTES = 2 * 1024 * 1024
@@ -196,15 +197,10 @@ def _current_user_message(chat_id: str, assistant_message_id: str | None) -> tup
     return None, None
 
 
-def _build_workspace_prompt(input_records: list[dict], output_paths: list[str]) -> str:
-    lines = [
-        "Container workspace is enabled for this chat.",
-        "Use /workspace/inputs for uploaded files and /workspace/outputs "
-        "for files the user should receive.",
-        "Files in /workspace/outputs persist across turns; when the user asks "
-        "to modify a previous output, edit the existing file there instead of "
-        "creating an unrelated copy.",
-    ]
+def _build_workspace_prompt(
+    system_prompt: str, input_records: list[dict], output_paths: list[str]
+) -> str:
+    lines = [system_prompt.strip()] if system_prompt.strip() else []
     if input_records:
         lines.append("Uploaded files copied into /workspace/inputs:")
         for record in input_records[:50]:
@@ -219,7 +215,7 @@ def _build_workspace_prompt(input_records: list[dict], output_paths: list[str]) 
             lines.append(f"- /workspace/{path}")
         if len(output_paths) > 50:
             lines.append(f"- ... {len(output_paths) - 50} more output file(s)")
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line)
 
 
 async def prepare_container_workspace_for_turn(
@@ -328,7 +324,10 @@ async def prepare_container_workspace_for_turn(
         except Exception:
             continue
 
-    return _build_workspace_prompt(input_records, output_paths)
+    system_prompt = str(
+        getattr(request.app.state.config, "CONTAINER_SYSTEM_PROMPT", "") or ""
+    )
+    return _build_workspace_prompt(system_prompt, input_records, output_paths)
 
 
 def _container_connection_url(request: Request, server_id: str) -> Optional[str]:
@@ -381,6 +380,49 @@ def _output_files(outputs_dir: Path) -> list[Path]:
         except Exception:
             continue
     return sorted(files)
+
+
+def _iter_text_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_text_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_text_values(child)
+
+
+def _sandbox_linked_files(
+    workspace: Path, content: str | None, content_blocks: list | None
+) -> list[Path]:
+    root = workspace.resolve()
+    texts = []
+    if content:
+        texts.append(content)
+    if content_blocks:
+        texts.extend(_iter_text_values(content_blocks))
+
+    files: list[Path] = []
+    seen: set[str] = set()
+    for text in texts:
+        for match in _SANDBOX_WORKSPACE_RE.finditer(text):
+            rel = unquote(match.group(1)).lstrip("/")
+            if not rel or rel.startswith("inputs/"):
+                continue
+            try:
+                path = root / rel
+                if path.is_symlink() or not path.is_file():
+                    continue
+                path.resolve().relative_to(root)
+                key = str(path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                files.append(path)
+            except Exception:
+                continue
+    return files
 
 
 def _used_output_display_names(outputs_state: dict) -> set[str]:
@@ -448,7 +490,7 @@ def _store_output_file(
     display_name: str,
     size: int,
     sha256: str,
-    rel_path: str,
+    workspace_path: str,
     chat_id: str,
     message_id: str,
     version: int,
@@ -459,7 +501,7 @@ def _store_output_file(
     metadata = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "workspace_path": f"outputs/{rel_path}",
+        "workspace_path": workspace_path,
         "sha256": sha256,
         "version": version,
     }
@@ -519,6 +561,8 @@ async def import_changed_container_outputs(
     request: Request,
     metadata: dict,
     user: UserModel,
+    content: str | None = None,
+    content_blocks: list | None = None,
 ) -> list[dict]:
     if not is_container_workspace_active(request, metadata):
         return []
@@ -545,16 +589,37 @@ async def import_changed_container_outputs(
     imported: list[dict] = []
     changed = False
 
+    candidates: list[tuple[str, str, Path]] = []
+    seen_candidate_paths: set[str] = set()
     for path in _output_files(outputs_dir):
         try:
             rel_path = path.relative_to(outputs_dir).as_posix()
+            key = str(path.resolve())
+            seen_candidate_paths.add(key)
+            candidates.append((rel_path, f"outputs/{rel_path}", path))
+        except Exception:
+            continue
+
+    for path in _sandbox_linked_files(workspace, content, content_blocks):
+        try:
+            key = str(path.resolve())
+            if key in seen_candidate_paths:
+                continue
+            workspace_path = path.relative_to(workspace).as_posix()
+            seen_candidate_paths.add(key)
+            candidates.append((workspace_path, workspace_path, path))
+        except Exception:
+            continue
+
+    for state_key, workspace_path, path in candidates:
+        try:
             size, sha256 = _hash_file(path)
-            state = dict(outputs_state.get(rel_path) or {})
+            state = dict(outputs_state.get(state_key) or {})
             if state.get("last_hash") == sha256:
                 continue
 
             version = int(state.get("version") or 0) + 1
-            display_name = _unique_display_name(rel_path, used_display_names)
+            display_name = _unique_display_name(workspace_path, used_display_names)
             descriptor = _store_output_file(
                 request,
                 user,
@@ -562,7 +627,7 @@ async def import_changed_container_outputs(
                 display_name,
                 size,
                 sha256,
-                rel_path,
+                workspace_path,
                 chat_id,
                 message_id,
                 version,
@@ -581,9 +646,9 @@ async def import_changed_container_outputs(
                     "message_id": message_id,
                 }
             )
-            outputs_state[rel_path] = {
+            outputs_state[state_key] = {
                 **state,
-                "workspace_path": f"outputs/{rel_path}",
+                "workspace_path": workspace_path,
                 "last_hash": sha256,
                 "version": version,
                 "versions": versions,
