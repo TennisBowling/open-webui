@@ -5,6 +5,8 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -50,6 +52,22 @@ _TEXT_PREVIEW_MIME_TYPES = {
     "text/csv",
     "text/markdown",
 }
+_OFFICE_PREVIEW_EXTS = {
+    "doc", "docx", "odt", "rtf", "ppt", "pptx", "odp", "xls", "xlsx", "ods"
+}
+_OFFICE_PREVIEW_MIME_TYPES = {
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/rtf",
+}
+_PREVIEW_CONVERSION_TIMEOUT_SECONDS = 120
 
 
 def _normalize_container_server_id(server_id: str | None) -> str:
@@ -197,18 +215,8 @@ def _current_user_message(chat_id: str, assistant_message_id: str | None) -> tup
     return None, None
 
 
-def _build_workspace_prompt(
-    system_prompt: str, input_records: list[dict], output_paths: list[str]
-) -> str:
+def _build_workspace_prompt(system_prompt: str, output_paths: list[str]) -> str:
     lines = [system_prompt.strip()] if system_prompt.strip() else []
-    if input_records:
-        lines.append("Uploaded files copied into /workspace/inputs:")
-        for record in input_records[:50]:
-            original = record.get("original_name") or "file"
-            path = record.get("workspace_path") or ""
-            lines.append(f"- {original} -> /workspace/{path}")
-        if len(input_records) > 50:
-            lines.append(f"- ... {len(input_records) - 50} more input file(s)")
     if output_paths:
         lines.append("Existing output files available for modification:")
         for path in output_paths[:50]:
@@ -216,6 +224,56 @@ def _build_workspace_prompt(
         if len(output_paths) > 50:
             lines.append(f"- ... {len(output_paths) - 50} more output file(s)")
     return "\n".join(line for line in lines if line)
+
+
+def _xml_attr(value: Any) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _build_input_location_context(input_records: list[dict]) -> str:
+    blocks = []
+    for record in input_records:
+        original = _xml_attr(record.get("original_name") or "file")
+        workspace_path = record.get("workspace_path") or ""
+        if not workspace_path:
+            continue
+        blocks.append(
+            f'<document filename="{original}">\n'
+            f"Uploaded to location /workspace/{workspace_path}\n"
+            "</document>"
+        )
+    return "\n\n".join(blocks)
+
+
+def _append_to_last_user_message(messages: list[dict], content: str) -> list[dict]:
+    if not content:
+        return messages
+    updated = list(messages or [])
+    for idx in range(len(updated) - 1, -1, -1):
+        message = updated[idx]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        msg_content = message.get("content")
+        if isinstance(msg_content, list):
+            parts = list(msg_content)
+            for part_idx, part in enumerate(parts):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = str(part.get("text") or "")
+                    parts[part_idx] = {**part, "text": f"{text}\n\n{content}"}
+                    updated[idx] = {**message, "content": parts}
+                    return updated
+            updated[idx] = {**message, "content": [{"type": "text", "text": content}, *parts]}
+            return updated
+        text = str(msg_content or "")
+        updated[idx] = {**message, "content": f"{text}\n\n{content}" if text else content}
+        return updated
+    return [*updated, {"role": "user", "content": content}]
 
 
 async def prepare_container_workspace_for_turn(
@@ -317,6 +375,12 @@ async def prepare_container_workspace_for_turn(
             {"container_workspace_inputs": [*existing, *input_records]},
         )
 
+    input_context = _build_input_location_context(input_records)
+    if input_context:
+        form_data["messages"] = _append_to_last_user_message(
+            form_data.get("messages", []), input_context
+        )
+
     output_paths = []
     for output in _output_files(workspace / "outputs"):
         try:
@@ -327,7 +391,7 @@ async def prepare_container_workspace_for_turn(
     system_prompt = str(
         getattr(request.app.state.config, "CONTAINER_SYSTEM_PROMPT", "") or ""
     )
-    return _build_workspace_prompt(system_prompt, input_records, output_paths)
+    return _build_workspace_prompt(system_prompt, output_paths)
 
 
 def _container_connection_url(request: Request, server_id: str) -> Optional[str]:
@@ -483,6 +547,97 @@ def _read_text_preview(path: Path, size: int) -> str:
     return text
 
 
+def _is_office_preview_file(filename: str, content_type: str) -> bool:
+    ext = Path(filename or "").suffix.lower().lstrip(".")
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    return ext in _OFFICE_PREVIEW_EXTS or normalized in _OFFICE_PREVIEW_MIME_TYPES
+
+
+def _create_pdf_preview_file(
+    request: Request,
+    user: UserModel,
+    source_path: Path,
+    display_name: str,
+    source_file_id: str,
+) -> tuple[str | None, str | None]:
+    libreoffice_bin = getattr(request.app.state, "LIBREOFFICE_BIN", None)
+    if not libreoffice_bin:
+        return None, "LibreOffice is not installed on the server."
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ow_container_preview_") as workdir:
+            profile_dir = Path(workdir) / "lo_profile"
+            outdir = Path(workdir) / "out"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            outdir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                libreoffice_bin,
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--headless",
+                "--norestore",
+                "--nolockcheck",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(outdir),
+                str(source_path),
+            ]
+            result = subprocess.run(
+                cmd,
+                timeout=_PREVIEW_CONVERSION_TIMEOUT_SECONDS,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", "replace")[:500]
+                return None, f"LibreOffice exited with code {result.returncode}: {stderr}"
+
+            pdf_path = outdir / f"{source_path.stem}.pdf"
+            if not pdf_path.is_file():
+                candidates = list(outdir.glob("*.pdf"))
+                pdf_path = candidates[0] if candidates else pdf_path
+            if not pdf_path.is_file():
+                return None, "LibreOffice did not produce a PDF preview."
+
+            preview_id = str(uuid.uuid4())
+            preview_name = f"{Path(display_name).stem}.pdf"
+            storage_name = f"{preview_id}_{preview_name}"
+            with pdf_path.open("rb") as f:
+                preview_size, stored_path = Storage.upload_file(
+                    f,
+                    storage_name,
+                    {
+                        "OpenWebUI-User-Id": getattr(user, "id", ""),
+                        "OpenWebUI-File-Id": preview_id,
+                        "OpenWebUI-Source-File-Id": source_file_id,
+                    },
+                )
+
+            preview_item = Files.insert_new_file(
+                user.id,
+                FileForm(
+                    id=preview_id,
+                    filename=preview_name,
+                    path=stored_path,
+                    data={"status": "completed", "source_file_id": source_file_id},
+                    meta={
+                        "name": preview_name,
+                        "content_type": "application/pdf",
+                        "size": preview_size,
+                    },
+                ),
+            )
+            if not preview_item:
+                return None, "Failed to persist PDF preview."
+            return preview_id, None
+    except subprocess.TimeoutExpired:
+        return None, f"PDF preview conversion timed out after {_PREVIEW_CONVERSION_TIMEOUT_SECONDS}s."
+    except Exception as exc:
+        log.exception("failed to create output PDF preview for %s: %s", source_path, exc)
+        return None, str(exc)
+
+
 def _store_output_file(
     request: Request,
     user: UserModel,
@@ -528,6 +683,9 @@ def _store_output_file(
         except OSError as exc:
             log.debug("failed to read text preview for %s: %s", source_path, exc)
 
+    if _is_office_preview_file(display_name, content_type):
+        data["preview_status"] = "pending"
+
     file_item = Files.insert_new_file(
         user.id,
         FileForm(
@@ -546,6 +704,23 @@ def _store_output_file(
     if not file_item:
         return None
 
+    if _is_office_preview_file(display_name, content_type):
+        preview_id, preview_error = _create_pdf_preview_file(
+            request, user, source_path, display_name, file_id
+        )
+        if preview_id:
+            data["preview_status"] = "completed"
+            data["preview_file_id"] = preview_id
+            metadata["preview_status"] = "completed"
+            metadata["preview_file_id"] = preview_id
+        else:
+            data["preview_status"] = "failed"
+            data["preview_error"] = preview_error
+            metadata["preview_status"] = "failed"
+            metadata["preview_error"] = preview_error
+        data["container_workspace"] = metadata
+        Files.update_file_data_by_id(file_id, data)
+
     return {
         "type": "file",
         "id": file_id,
@@ -554,6 +729,11 @@ def _store_output_file(
         "size": size,
         "status": "uploaded",
         "container_workspace": metadata,
+        **(
+            {"preview_file_id": metadata["preview_file_id"]}
+            if metadata.get("preview_file_id")
+            else {}
+        ),
     }
 
 
@@ -644,6 +824,11 @@ async def import_changed_container_outputs(
                     "display_name": display_name,
                     "file_id": descriptor["id"],
                     "message_id": message_id,
+                    **(
+                        {"preview_file_id": descriptor["preview_file_id"]}
+                        if descriptor.get("preview_file_id")
+                        else {}
+                    ),
                 }
             )
             outputs_state[state_key] = {

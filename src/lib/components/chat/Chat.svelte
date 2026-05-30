@@ -80,7 +80,7 @@
 	import { decorate, upsertSorted } from '$lib/utils/sidebarSync';
 	import { chatCompletion, generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
-	import { getAndUpdateUserLocation, updateUserSettings } from '$lib/apis/users';
+	import { getAndUpdateUserLocation } from '$lib/apis/users';
 	import {
 		generateQueries,
 		chatAction,
@@ -154,6 +154,7 @@
 	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
 
 	let selectedToolIds = [];
+	let lastPersistedSelectedToolIds: string[] | null = null;
 	let selectedFilterIds = [];
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
@@ -177,24 +178,33 @@
 	let lastPersistedSubagentServiceTier: string | null = null;
 	let codeInterpreterEnabled = false;
 
-	// Auto-save tool preferences when they change
-	let toolSaveTimeout;
-	$: if (selectedToolIds && selectedToolIds.length > 0 && !loading) {
-		// Only save when tools are actually selected (not during reset/init)
-		// Debounce to avoid excessive API calls
-		clearTimeout(toolSaveTimeout);
-		toolSaveTimeout = setTimeout(async () => {
-			try {
-				await updateUserSettings(localStorage.token, {
-					ui: {
-						...$settings,
-						defaultToolIds: selectedToolIds
-					}
-				});
-			} catch (error) {
-				console.error('Failed to save tool preferences:', error);
-			}
-		}, 1000); // Wait 1 second after last change before saving
+	const sameStringArray = (a = [], b = []) =>
+		Array.isArray(a) &&
+		Array.isArray(b) &&
+		a.length === b.length &&
+		a.every((value, idx) => value === b[idx]);
+
+	// Keep selected external/MCP tools per-chat, like Web Search and Subagents.
+	$: if (!sameStringArray(selectedToolIds, params.selectedToolIds ?? [])) {
+		params = { ...params, selectedToolIds: [...(selectedToolIds ?? [])] };
+	}
+	$: if (
+		activeChatId &&
+		!loading &&
+		!$temporaryChatEnabled &&
+		lastPersistedSelectedToolIds !== null &&
+		!sameStringArray(selectedToolIds, lastPersistedSelectedToolIds)
+	) {
+		const nextSelectedToolIds = [...(selectedToolIds ?? [])];
+		const nextParams = { ...params, selectedToolIds: nextSelectedToolIds };
+		const chatIdToPersist = activeChatId;
+
+		params = nextParams;
+		lastPersistedSelectedToolIds = nextSelectedToolIds;
+
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{ op: 'set_param', key: 'selectedToolIds', value: nextSelectedToolIds }
+		]);
 	}
 
 	// Keep the in-memory chat params in sync with the current per-chat web search state.
@@ -994,6 +1004,7 @@
 		loading = true;
 		stopSubagentUpdateBatching();
 		stopResumeTaskPolling();
+		lastPersistedSelectedToolIds = null;
 		lastPersistedWebSearchEnabled = null;
 		lastPersistedStudyModeEnabled = null;
 		lastPersistedDataVizEnabled = null;
@@ -3203,6 +3214,11 @@
 		queue = Array.isArray(chatContent?.queue) ? chatContent.queue : [];
 		_wasGenerating = false;
 
+		if (Array.isArray(params.selectedToolIds)) {
+			selectedToolIds = params.selectedToolIds;
+		}
+		lastPersistedSelectedToolIds = [...(selectedToolIds ?? [])];
+
 		// Restore webSearchEnabled from saved params
 		if (params.webSearchEnabled !== undefined) {
 			const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
@@ -4508,7 +4524,18 @@
 		prompt = '';
 
 		const messages = createMessagesList(history, history.currentId);
-		const _files = structuredClone(files);
+		const containerFeatures = ($config as any)?.features ?? {};
+		const containerToolId = containerFeatures?.container_mcp_server_id
+			? `server:mcp:${containerFeatures.container_mcp_server_id}`
+			: '';
+		const containerWorkspaceActive = Boolean(
+			containerFeatures?.enable_container_workspace_sync &&
+			containerToolId &&
+			(selectedToolIds ?? []).includes(containerToolId)
+		);
+		const _files = structuredClone(files).map((file) =>
+			containerWorkspaceActive ? { ...file, container_mode: true } : file
+		);
 
 		chatFiles.push(
 			..._files.filter((item) =>
@@ -5261,6 +5288,16 @@
 			params?.stream_response ??
 			true;
 
+		const containerFeatures = ($config as any)?.features ?? {};
+		const containerToolId = containerFeatures?.container_mcp_server_id
+			? `server:mcp:${containerFeatures.container_mcp_server_id}`
+			: '';
+		const containerWorkspaceActive = Boolean(
+			containerFeatures?.enable_container_workspace_sync &&
+			containerToolId &&
+			(selectedToolIds ?? []).includes(containerToolId)
+		);
+
 		// v2 body shape: backend assembles the conversation by walking
 		// chat_message rows from leaf_message_id. Temporary chats aren't
 		// persisted, so they keep the v1 messages-array body. The v1 build
@@ -5532,11 +5569,14 @@
 						// text works on every model.
 						const hasExtractableFiles = message.files?.some(isExtractableFile);
 
-						const textPrefix = isUser ? await buildTextFileBlocks(message.files) : '';
+						const textPrefix = isUser && !containerWorkspaceActive
+							? await buildTextFileBlocks(message.files)
+							: '';
 						const baseText = message?.merged?.content ?? message.content ?? '';
 
 						if (
 							isUser &&
+							!containerWorkspaceActive &&
 							(((hasImages || hasPdfFiles) && modelSupportsVision) || hasExtractableFiles)
 						) {
 							return {

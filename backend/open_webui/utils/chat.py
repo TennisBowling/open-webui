@@ -393,6 +393,7 @@ def assemble_conversation_from_leaf(
     new_user_message: Optional[dict] = None,
     model: Optional[dict] = None,
     system_prompt: Optional[str] = None,
+    container_workspace_active: bool = False,
 ) -> list[dict]:
     """Backend equivalent of the frontend's ``createMessagesList`` +
     ``expandMessagesForToolResumption`` + ``buildTextFileBlocks`` +
@@ -550,10 +551,10 @@ def assemble_conversation_from_leaf(
             for f in files
         )
 
-        text_prefix = build_text_file_blocks(files) if is_user else ""
+        text_prefix = build_text_file_blocks(files) if is_user and not container_workspace_active else ""
         base_text = (message.get("merged") or {}).get("content") or message.get("content") or ""
 
-        if is_user and (
+        if is_user and not container_workspace_active and (
             ((has_images or has_pdf) and model_supports_vision) or has_extractable
         ):
             parts: list = [{"type": "text", "text": text_prefix + base_text}]

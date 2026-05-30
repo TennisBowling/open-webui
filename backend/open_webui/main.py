@@ -1574,12 +1574,25 @@ async def chat_completion(
             elif isinstance(form_data.get("model_item"), dict) and form_data["model_item"]:
                 assemble_model = form_data["model_item"]
 
+            container_server_id = str(
+                request.app.state.config.CONTAINER_MCP_SERVER_ID or ""
+            )
+            tool_ids = form_data.get("tool_ids") or []
+            if isinstance(tool_ids, str):
+                tool_ids = [tool_ids]
+            container_workspace_active = bool(
+                request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC
+                and container_server_id
+                and f"server:mcp:{container_server_id}" in tool_ids
+            )
+
             assembled = assemble_conversation_from_leaf(
                 form_data["chat_id"],
                 leaf_id,
                 new_user_message=new_user_message,
                 model=assemble_model,
                 system_prompt=(form_data.get("params") or {}).get("system"),
+                container_workspace_active=container_workspace_active,
             )
             form_data["messages"] = assembled
         except HTTPException:
@@ -1920,6 +1933,8 @@ async def get_app_config(request: Request):
                     "enable_study_mode": app.state.config.ENABLE_STUDY_MODE,
                     "enable_data_viz": app.state.config.ENABLE_DATA_VIZ,
                     "enable_subagents": app.state.config.ENABLE_SUBAGENTS,
+                    "enable_container_workspace_sync": app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
+                    "container_mcp_server_id": app.state.config.CONTAINER_MCP_SERVER_ID,
                     # Surfaced (non-secret) so the per-chat Subagent settings
                     # popover in MessageInput can resolve the effective subagent
                     # model and pick the right `service_tiers` list for its

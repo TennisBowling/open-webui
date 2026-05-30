@@ -296,7 +296,7 @@ def upload_file_handler(
         )
 
         needs_extraction = file_needs_extraction(content_type, file_extension)
-        initial_status = "pending" if needs_extraction else "completed"
+        initial_status = "pending" if needs_extraction and process else "completed"
 
         file_item = Files.insert_new_file(
             user.id,

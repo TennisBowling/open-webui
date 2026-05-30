@@ -1705,7 +1705,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     )
     if container_prompt:
         form_data["messages"] = add_or_update_system_message(
-            container_prompt, form_data["messages"]
+            container_prompt, form_data["messages"], append=True
         )
 
     prompt = get_last_user_message(form_data["messages"])

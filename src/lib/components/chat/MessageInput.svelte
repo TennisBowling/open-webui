@@ -119,13 +119,38 @@
 	const canceledImageUploads = new Set<string>();
 	const imageUploadAbortControllers = new Map<string, AbortController>();
 
-	// Send button disable: blocks while any attached file is still in flight
-	// (browser upload) or having its text extracted on the backend. The chip's
-	// own spinner is the explanation for the disabled state, so no extra banner.
-	$: hasInFlightFiles = files.some((f) => f?.status === 'uploading' || f?.status === 'processing');
-	$: sendDisabled = (prompt === '' && files.length === 0) || hasInFlightFiles;
-
 	export let selectedToolIds = [];
+
+	$: containerFeatures = ($config as any)?.features ?? {};
+	$: containerToolId = containerFeatures?.container_mcp_server_id
+		? `server:mcp:${containerFeatures.container_mcp_server_id}`
+		: '';
+	$: containerWorkspaceConfigured = Boolean(
+		containerFeatures?.enable_container_workspace_sync && containerToolId
+	);
+	$: containerWorkspaceActive = Boolean(
+		containerWorkspaceConfigured && (selectedToolIds ?? []).includes(containerToolId)
+	);
+	$: showContainerButton = containerWorkspaceConfigured;
+
+	const enableContainerTool = () => {
+		if (!containerWorkspaceConfigured || !containerToolId) {
+			toast.error($i18n.t('Container workspace is not configured.'));
+			return;
+		}
+		if (!(selectedToolIds ?? []).includes(containerToolId)) {
+			selectedToolIds = [...(selectedToolIds ?? []), containerToolId];
+		}
+		files = files.map((file) => ({ ...file, container_mode: true }));
+		toast.success($i18n.t('Container enabled for this message'));
+	};
+
+	// Send button disable: blocks while any attached file is still uploading.
+	// When container workspace is active, backend extraction is not required.
+	$: hasInFlightFiles = files.some(
+		(f) => f?.status === 'uploading' || (f?.status === 'processing' && !containerWorkspaceActive)
+	);
+	$: sendDisabled = (prompt === '' && files.length === 0) || hasInFlightFiles;
 	export let selectedFilterIds = [];
 
 	export let imageGenerationEnabled = false;
@@ -619,9 +644,10 @@
 	$: activeServerToolIds = toolSelectionReady
 		? (selectedToolIds ?? []).filter(
 				(id) =>
-					id.startsWith('server:mcp:') ||
-					id.startsWith('server:') ||
-					id.startsWith('direct_server:')
+					id !== containerToolId &&
+					(id.startsWith('server:mcp:') ||
+						id.startsWith('server:') ||
+						id.startsWith('direct_server:'))
 			)
 		: [];
 
@@ -918,6 +944,7 @@
 			size: file.size,
 			error: '',
 			itemId: tempItemId,
+			...(containerWorkspaceActive ? { container_mode: true } : {}),
 			...(fullContext ? { context: 'full' } : {})
 		};
 
@@ -941,8 +968,12 @@
 					};
 				}
 
-				// Upload as a chat attachment (no background content extraction / RAG ingestion).
-				const uploadedFile = await uploadFile(localStorage.token, file, metadata);
+				// Upload as a chat attachment. When container workspace is active,
+				// extraction/PDF preprocessing is unnecessary; the model reads the
+				// original file from /workspace/inputs.
+				const uploadedFile = await uploadFile(localStorage.token, file, metadata, {
+					process: !containerWorkspaceActive
+				});
 
 				if (uploadedFile) {
 					console.log('File upload completed:', {
@@ -1259,7 +1290,8 @@
 
 				const uploadedFile = await uploadFile(localStorage.token, fileToUpload, null, {
 					onProgress: updateProgress,
-					signal: abortController.signal
+					signal: abortController.signal,
+					process: !containerWorkspaceActive
 				});
 
 				if (!uploadedFile) {
@@ -1287,7 +1319,8 @@
 					serverProcessing: false,
 					itemId: tempImageId,
 					file: uploadedFile,
-					id: uploadedFile.id
+					id: uploadedFile.id,
+					...(containerWorkspaceActive ? { container_mode: true } : {})
 				};
 				files = files;
 			} catch (err: any) {
@@ -1905,6 +1938,8 @@
 													dismissible={true}
 													edit={true}
 													small={true}
+													containerMode={containerWorkspaceActive}
+													allowContainer={containerWorkspaceConfigured && !containerWorkspaceActive}
 													modal={['file', 'collection'].includes(file?.type)}
 													on:dismiss={async () => {
 														// Remove from UI state
@@ -1912,6 +1947,9 @@
 														files = files;
 													}}
 													on:modeChange={(e) => {
+														if (e.detail?.mode === 'container') {
+															enableContainerTool();
+														}
 														// Mode toggle on the chip mutates `file.processing_mode`
 														// in place; bump the array reference so reactivity fires.
 														files = files;
@@ -2056,12 +2094,13 @@
 
 															if (e.key === 'Escape') {
 																console.log('Escape');
-																atSelectedModel = undefined;
-																selectedToolIds = [];
-																selectedFilterIds = [];
-
-																imageGenerationEnabled = false;
-																codeInterpreterEnabled = false;
+																if (
+																	generating ||
+																	(taskIds && taskIds.length > 0) ||
+																	(history?.currentId && history.messages[history.currentId]?.done != true)
+																) {
+																	stopResponse();
+																}
 															}
 														}}
 														on:paste={async (e) => {
@@ -2202,6 +2241,34 @@
 											</Tooltip>
 										{/if}
 
+										{#if showContainerButton}
+											<Tooltip content={$i18n.t('Container')} placement="top">
+												<button
+													on:click|preventDefault={() => {
+														if (containerWorkspaceActive) {
+															selectedToolIds = selectedToolIds.filter((id) => id !== containerToolId);
+														} else {
+															selectedToolIds = [...(selectedToolIds ?? []), containerToolId];
+														}
+													}}
+													type="button"
+													class="group p-2 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden {containerWorkspaceActive
+														? ' text-gray-900 dark:text-gray-100 bg-manilla/60 hover:bg-manilla/80 dark:bg-manilla-dark dark:hover:bg-manilla-dark/80 border-hairline border-book-cloth/30 dark:border-book-cloth/40'
+														: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '}"
+													aria-label={containerWorkspaceActive
+														? $i18n.t('Disable Container')
+														: $i18n.t('Enable Container')}
+												>
+													<Terminal className="size-5" strokeWidth="1.75" />
+													{#if containerWorkspaceActive}
+														<div class="hidden group-hover:block">
+															<XMark className="size-4" strokeWidth="1.75" />
+														</div>
+													{/if}
+												</button>
+											</Tooltip>
+										{/if}
+
 										{#if showSubagentsButton}
 											<Tooltip
 												content={$i18n.t(
@@ -2293,7 +2360,7 @@
 											{/each}
 										{/if}
 
-										{#if showStudyModeButton || showDataVizButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
+										{#if showStudyModeButton || showDataVizButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || showContainerButton || (toggleFilters && toggleFilters.length > 0)}
 											<IntegrationsMenu
 												selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
 												{toggleFilters}
@@ -2352,10 +2419,10 @@
 										{/if}
 
 										<div class="ml-1 flex gap-1.5">
-											{#if toolSelectionReady && (selectedToolIds ?? []).length > 0}
+											{#if toolSelectionReady && activeServerToolIds.length > 0}
 												<Tooltip
 													content={$i18n.t('{{COUNT}} Available Tools', {
-														COUNT: selectedToolIds.length
+														COUNT: activeServerToolIds.length
 													})}
 												>
 													<button
@@ -2369,7 +2436,7 @@
 														<Wrench className="size-4" strokeWidth="1.75" />
 
 														<span class="text-sm">
-															{selectedToolIds.length}
+															{activeServerToolIds.length}
 														</span>
 													</button>
 												</Tooltip>

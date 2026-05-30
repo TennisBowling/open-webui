@@ -3,6 +3,8 @@ import { WEBUI_API_BASE_URL } from '$lib/constants';
 export type UploadFileOptions = {
 	onProgress?: (progress: number) => void;
 	signal?: AbortSignal;
+	process?: boolean;
+	processInBackground?: boolean;
 };
 
 const tryParseJson = (text: string) => {
@@ -157,7 +159,10 @@ export const uploadFile = async (
 
 	let error = null;
 
-	const uploadUrl = `${WEBUI_API_BASE_URL}/files/`;
+	const query = new URLSearchParams();
+	if (options.process === false) query.set('process', 'false');
+	if (options.processInBackground === false) query.set('process_in_background', 'false');
+	const uploadUrl = `${WEBUI_API_BASE_URL}/files/${query.toString() ? `?${query.toString()}` : ''}`;
 
 	const res = options.onProgress
 		? await uploadFileWithProgress(

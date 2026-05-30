@@ -33,7 +33,6 @@
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
 	import Skeleton from './Skeleton.svelte';
-	import Image from '$lib/components/common/Image.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import RateComment from './RateComment.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -47,6 +46,7 @@
 	import ContentRenderer from './ContentRenderer.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FileItem from '$lib/components/common/FileItem.svelte';
+	import OutputFileItem from '$lib/components/common/OutputFileItem.svelte';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
 	import { fade } from 'svelte/transition';
 	import { flyAndScale } from '$lib/utils/transitions';
@@ -722,26 +722,6 @@
 							/>
 						{/if}
 
-						{#if message?.files && message.files.length > 0}
-							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">
-								{#each message.files as file}
-									<div>
-										{#if file.type === 'image'}
-											<Image src={file.url} alt={messageTextContent} />
-										{:else}
-											<FileItem
-												item={file}
-												url={file.url}
-												name={file.name}
-												type={file.type}
-												size={file?.size}
-												small={true}
-											/>
-										{/if}
-									</div>
-								{/each}
-							</div>
-						{/if}
 
 						{#if message?.embeds && message.embeds.length > 0}
 							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">
@@ -945,6 +925,14 @@
 						{/if}
 					</div>
 				</div>
+
+				{#if !edit && message?.files && message.files.length > 0}
+					<div class="mt-3 mb-1 flex flex-wrap gap-2">
+						{#each message.files as file}
+							<OutputFileItem item={file} />
+						{/each}
+					</div>
+				{/if}
 
 				{#if !edit}
 					<div

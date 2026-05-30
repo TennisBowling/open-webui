@@ -41,6 +41,8 @@
 	export let item = null;
 	export let edit = false;
 	export let small = false;
+	export let containerMode = false;
+	export let allowContainer = false;
 
 	export let name: string;
 	export let type: string;
@@ -56,7 +58,8 @@
 	let pillAnchor: HTMLButtonElement;
 
 	$: itemExt = getExtension(item?.name || item?.file?.filename || name || '');
-	$: pillVisible = item && item.type === 'file' && !item.locked && EXTRACTABLE_EXTS.has(itemExt);
+	$: effectiveContainerMode = containerMode || item?.container_mode;
+	$: pillVisible = item && item.type === 'file' && !item.locked && !effectiveContainerMode && EXTRACTABLE_EXTS.has(itemExt);
 	$: pillIsSpreadsheet = SPREADSHEET_EXTS.has(itemExt);
 	$: pillMode = (item?.processing_mode as 'text' | 'pdf') || 'text';
 	$: pillStatus = (() => {
@@ -77,7 +80,14 @@
 </script>
 
 {#if item}
-	<FileItemModal bind:show={showModal} bind:item {edit} />
+	<FileItemModal
+		bind:show={showModal}
+		bind:item
+		{edit}
+		containerMode={effectiveContainerMode}
+		{allowContainer}
+		on:modeChange={(e) => dispatch('modeChange', e.detail)}
+	/>
 {/if}
 
 <button
@@ -223,11 +233,12 @@
 						{#if showModePopover}
 							<FileItemModePopover
 								mode={pillMode}
+								{allowContainer}
 								fileId={item?.id ?? null}
 								anchorEl={pillAnchor}
 								isSpreadsheet={pillIsSpreadsheet}
 								on:change={(e) => {
-									if (item) item.processing_mode = e.detail.mode;
+									if (item && e.detail.mode !== 'container') item.processing_mode = e.detail.mode;
 									dispatch('modeChange', e.detail);
 								}}
 								on:close={() => {
@@ -281,11 +292,12 @@
 							{#if showModePopover}
 								<FileItemModePopover
 									mode={pillMode}
+									{allowContainer}
 									fileId={item?.id ?? null}
 									anchorEl={pillAnchor}
 									isSpreadsheet={pillIsSpreadsheet}
 									on:change={(e) => {
-										if (item) item.processing_mode = e.detail.mode;
+										if (item && e.detail.mode !== 'container') item.processing_mode = e.detail.mode;
 										dispatch('modeChange', e.detail);
 									}}
 									on:close={() => {

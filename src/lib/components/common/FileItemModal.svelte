@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { getContext, tick } from 'svelte';
+	import { createEventDispatcher, getContext, tick } from 'svelte';
 	import { formatFileSize } from '$lib/utils';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import { config } from '$lib/stores';
 	import { toast } from 'svelte-sonner';
 
 	const i18n = getContext('i18n');
+	const dispatch = createEventDispatcher();
 
 	import Modal from './Modal.svelte';
 	import XMark from '../icons/XMark.svelte';
@@ -51,6 +52,8 @@
 	export let item;
 	export let show = false;
 	export let edit = false;
+	export let containerMode = false;
+	export let allowContainer = false;
 
 	let isPDF = false;
 	let isAudio = false;
@@ -69,9 +72,9 @@
 		(item?.name && item?.name.toLowerCase().endsWith('.webm'));
 
 	$: itemExt = getExt(item?.name || item?.file?.filename || '');
-	$: showModeToggle = item?.type === 'file' && !item?.locked && EXTRACTABLE_EXTS.has(itemExt);
+	$: showModeToggle = item?.type === 'file' && !item?.locked && !containerMode && EXTRACTABLE_EXTS.has(itemExt);
 	$: currentMode = (item?.processing_mode as 'text' | 'pdf') || 'text';
-	$: pdfConversionAvailable = $config?.features?.pdf_conversion_available ?? true;
+	$: pdfConversionAvailable = ($config as any)?.features?.pdf_conversion_available ?? true;
 	$: extractedContent = (item?.file?.data?.content ?? '').trim();
 	$: extractionStatus = item?.file?.data?.status as
 		| 'pending'
@@ -91,7 +94,12 @@
 
 	let previewExpanded = true;
 
-	const handleModeChange = async (mode: 'text' | 'pdf') => {
+	const handleModeChange = async (mode: 'text' | 'pdf' | 'container') => {
+		if (mode === 'container') {
+			dispatch('modeChange', { mode: 'container' });
+			show = false;
+			return;
+		}
 		if (mode === currentMode) return;
 		if (mode === 'pdf' && !pdfConversionAvailable) {
 			toast.error(
@@ -200,7 +208,7 @@
 				<div class="text-xs text-gray-500 dark:text-gray-400 mb-2">
 					{$i18n.t('How should the model read this file?')}
 				</div>
-				<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+				<div class="grid grid-cols-1 {allowContainer ? 'sm:grid-cols-3' : 'sm:grid-cols-2'} gap-2">
 					<button
 						type="button"
 						class="text-left p-3 rounded-xl border transition
@@ -253,6 +261,24 @@
 							</div>
 						{/if}
 					</button>
+
+					{#if allowContainer}
+						<button
+							type="button"
+							class="text-left p-3 rounded-xl border border-gray-100 dark:border-gray-800 hover:border-gray-200 dark:hover:border-gray-700 transition"
+							on:click={() => handleModeChange('container')}
+						>
+							<div class="flex items-center gap-2 mb-1">
+								<span class="size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600" />
+								<span class="font-medium text-sm dark:text-gray-100">
+									{$i18n.t('Use container')}
+								</span>
+							</div>
+							<div class="text-xs text-gray-500 dark:text-gray-400 pl-6">
+								{$i18n.t('Enable the container tool and read the original file from /workspace/inputs.')}
+							</div>
+						</button>
+					{/if}
 				</div>
 			</div>
 		{/if}

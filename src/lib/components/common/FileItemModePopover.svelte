@@ -12,13 +12,20 @@
 	export let fileId: string | null = null;
 	export let anchorEl: HTMLElement | null = null;
 	export let isSpreadsheet = false;
+	export let allowContainer = false;
 
 	let containerEl: HTMLDivElement;
 
-	$: pdfConversionAvailable = $config?.features?.pdf_conversion_available ?? true;
+	$: pdfConversionAvailable = ($config as any)?.features?.pdf_conversion_available ?? true;
 
-	const select = async (next: 'text' | 'pdf') => {
+	const select = async (next: 'text' | 'pdf' | 'container') => {
 		if (next === mode) {
+			dispatch('close');
+			return;
+		}
+
+		if (next === 'container') {
+			dispatch('change', { mode: next });
 			dispatch('close');
 			return;
 		}
@@ -134,4 +141,20 @@
 			{/if}
 		</span>
 	</button>
+
+	{#if allowContainer}
+		<button
+			type="button"
+			class="w-full text-left p-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 flex items-start gap-2"
+			on:click|stopPropagation={() => select('container')}
+		>
+			<span class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center" />
+			<span class="flex-1">
+				<span class="font-medium block">{$i18n.t('Use container')}</span>
+				<span class="text-xs text-gray-500 dark:text-gray-400">
+					{$i18n.t('Enable the container tool and let the model read the original file from /workspace/inputs.')}
+				</span>
+			</span>
+		</button>
+	{/if}
 </div>
