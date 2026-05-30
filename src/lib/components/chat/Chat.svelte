@@ -2168,8 +2168,20 @@
 			message.content = data.content;
 			history.messages[resolvedMessageId] = message;
 			history = { ...history };
-		} else if (type === 'chat:message:files' || type === 'files') {
+		} else if (type === 'chat:message:files') {
 			message.files = data.files;
+		} else if (type === 'files') {
+			const seen = new Set(
+				(message.files ?? []).map((file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file))
+			);
+			const nextFiles = [...(message.files ?? [])];
+			for (const file of data.files ?? []) {
+				const key = file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				nextFiles.push(file);
+			}
+			message.files = nextFiles;
 		} else if (type === 'chat:message:embeds' || type === 'embeds') {
 			message.embeds = data.embeds;
 		} else if (type === 'data_viz:override') {
@@ -3754,6 +3766,7 @@
 			selected_model_id,
 			error,
 			usage,
+			files: event_files,
 			reasoning_details,
 			reasoning_details_per_round
 		} = data;
@@ -3900,6 +3913,21 @@
 			message.usage = usage;
 			applyUsageToChatTokenStats(chatId, message.id, usage);
 			chatTokenStatsRefreshTrigger.update((n) => n + 1);
+			shouldFlushStreamingUpdate = true;
+		}
+
+		if (Array.isArray(event_files) && event_files.length > 0) {
+			const seen = new Set(
+				(message.files ?? []).map((file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file))
+			);
+			const nextFiles = [...(message.files ?? [])];
+			for (const file of event_files) {
+				const key = file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				nextFiles.push(file);
+			}
+			message.files = nextFiles;
 			shouldFlushStreamingUpdate = true;
 		}
 

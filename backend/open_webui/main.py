@@ -138,6 +138,10 @@ from open_webui.config import (
     THREAD_POOL_SIZE,
     # Tool Server Configs
     TOOL_SERVER_CONNECTIONS,
+    # Container Workspace
+    ENABLE_CONTAINER_WORKSPACE_SYNC,
+    CONTAINER_DATA_ROOT,
+    CONTAINER_MCP_SERVER_ID,
     # Code Execution
     ENABLE_CODE_EXECUTION,
     CODE_EXECUTION_ENGINE,
@@ -737,6 +741,16 @@ app.state.OPENAI_MODELS = {}
 
 app.state.config.TOOL_SERVER_CONNECTIONS = TOOL_SERVER_CONNECTIONS
 app.state.TOOL_SERVERS = []
+
+########################################
+#
+# CONTAINER WORKSPACE
+#
+########################################
+
+app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC = ENABLE_CONTAINER_WORKSPACE_SYNC
+app.state.config.CONTAINER_DATA_ROOT = CONTAINER_DATA_ROOT
+app.state.config.CONTAINER_MCP_SERVER_ID = CONTAINER_MCP_SERVER_ID
 
 ########################################
 #

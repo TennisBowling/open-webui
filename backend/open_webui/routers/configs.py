@@ -340,6 +340,43 @@ async def verify_tool_servers_config(
 
 
 ############################
+# ContainerConfig
+############################
+
+
+class ContainerConfigForm(BaseModel):
+    ENABLE_CONTAINER_WORKSPACE_SYNC: bool
+    CONTAINER_DATA_ROOT: str
+    CONTAINER_MCP_SERVER_ID: str
+
+
+@router.get("/container", response_model=ContainerConfigForm)
+async def get_container_config(request: Request, user=Depends(get_admin_user)):
+    return {
+        "ENABLE_CONTAINER_WORKSPACE_SYNC": request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
+        "CONTAINER_DATA_ROOT": request.app.state.config.CONTAINER_DATA_ROOT,
+        "CONTAINER_MCP_SERVER_ID": request.app.state.config.CONTAINER_MCP_SERVER_ID,
+    }
+
+
+@router.post("/container", response_model=ContainerConfigForm)
+async def set_container_config(
+    request: Request, form_data: ContainerConfigForm, user=Depends(get_admin_user)
+):
+    request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC = (
+        form_data.ENABLE_CONTAINER_WORKSPACE_SYNC
+    )
+    request.app.state.config.CONTAINER_DATA_ROOT = form_data.CONTAINER_DATA_ROOT
+    request.app.state.config.CONTAINER_MCP_SERVER_ID = form_data.CONTAINER_MCP_SERVER_ID
+
+    return {
+        "ENABLE_CONTAINER_WORKSPACE_SYNC": request.app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
+        "CONTAINER_DATA_ROOT": request.app.state.config.CONTAINER_DATA_ROOT,
+        "CONTAINER_MCP_SERVER_ID": request.app.state.config.CONTAINER_MCP_SERVER_ID,
+    }
+
+
+############################
 # CodeInterpreterConfig
 ############################
 class CodeInterpreterConfigForm(BaseModel):

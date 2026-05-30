@@ -180,6 +180,10 @@ from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
 from open_webui.utils.mcp.client import MCPClient, mcp_tool_alias, build_mcp_connect_kwargs
+from open_webui.utils.container_workspace import (
+    import_changed_container_outputs,
+    prepare_container_workspace_for_turn,
+)
 
 
 from open_webui.config import (
@@ -1696,6 +1700,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 form_data["messages"],
             )
 
+    container_prompt = await prepare_container_workspace_for_turn(
+        request, metadata, form_data, user, tool_ids
+    )
+    if container_prompt:
+        form_data["messages"] = add_or_update_system_message(
+            container_prompt, form_data["messages"]
+        )
+
     prompt = get_last_user_message(form_data["messages"])
 
     metadata = {
@@ -2400,6 +2412,16 @@ async def process_chat_response(
                         )
 
                         title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                        container_output_files = await import_changed_container_outputs(
+                            request, metadata, user
+                        )
+                        if container_output_files:
+                            await event_emitter(
+                                {
+                                    "type": "files",
+                                    "data": {"files": container_output_files},
+                                }
+                            )
 
                         # Include usage in the final completion event
                         completion_data = {
@@ -2407,6 +2429,8 @@ async def process_chat_response(
                             "content": content,
                             "title": title,
                         }
+                        if container_output_files:
+                            completion_data["files"] = container_output_files
                         if usage:
                             completion_data["usage"] = usage
                             completion_data["selected_model_id"] = model_id
@@ -2426,6 +2450,13 @@ async def process_chat_response(
 
                         if usage:
                             update_data["usage"] = usage
+                        if container_output_files:
+                            current_message = Chats.get_message_by_id_and_message_id(
+                                metadata["chat_id"], metadata["message_id"]
+                            ) or {}
+                            update_data["files"] = current_message.get(
+                                "files", container_output_files
+                            )
 
                         reasoning_details = response_data["choices"][0]["message"].get(
                             "reasoning_details"
@@ -4688,6 +4719,17 @@ async def process_chat_response(
                         clear_stream_state(metadata["message_id"])
                     return
 
+                container_output_files = await import_changed_container_outputs(
+                    request, metadata, user
+                )
+                if container_output_files:
+                    await event_emitter(
+                        {
+                            "type": "files",
+                            "data": {"files": container_output_files},
+                        }
+                    )
+
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 if (
                     STREAM_PROTOCOL_VERSION == "v2"
@@ -4707,6 +4749,9 @@ async def process_chat_response(
                     "title": title,
                 }
 
+                if container_output_files:
+                    data["files"] = container_output_files
+
                 # Include usage data if available
                 if response_usage:
                     data["usage"] = response_usage
@@ -4718,6 +4763,13 @@ async def process_chat_response(
                     # store is authoritative while generation is active and
                     # this final checkpoint is the durable history record.
                     update_data = _build_checkpoint_update(include_legacy_content=True)
+                    if container_output_files:
+                        current_message = Chats.get_message_by_id_and_message_id(
+                            metadata["chat_id"], metadata["message_id"]
+                        ) or {}
+                        update_data["files"] = current_message.get(
+                            "files", container_output_files
+                        )
 
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],

@@ -722,7 +722,7 @@
 							/>
 						{/if}
 
-						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
+						{#if message?.files && message.files.length > 0}
 							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">
 								{#each message.files as file}
 									<div>

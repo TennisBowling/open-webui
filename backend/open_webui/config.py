@@ -1093,6 +1093,28 @@ TOOL_SERVER_CONNECTIONS = PersistentConfig(
 )
 
 ####################################
+# CONTAINER WORKSPACE
+####################################
+
+ENABLE_CONTAINER_WORKSPACE_SYNC = PersistentConfig(
+    "ENABLE_CONTAINER_WORKSPACE_SYNC",
+    "container.workspace_sync.enable",
+    os.environ.get("ENABLE_CONTAINER_WORKSPACE_SYNC", "False").lower() == "true",
+)
+
+CONTAINER_DATA_ROOT = PersistentConfig(
+    "CONTAINER_DATA_ROOT",
+    "container.data_root",
+    os.environ.get("CONTAINER_DATA_ROOT", "/mnt/microns/openllm-containers"),
+)
+
+CONTAINER_MCP_SERVER_ID = PersistentConfig(
+    "CONTAINER_MCP_SERVER_ID",
+    "container.mcp_server_id",
+    os.environ.get("CONTAINER_MCP_SERVER_ID", ""),
+)
+
+####################################
 # WEBUI
 ####################################
 

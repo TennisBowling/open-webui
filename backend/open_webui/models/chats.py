@@ -1453,6 +1453,23 @@ class ChatTable:
 
         return chat.chat.get("title", "New Chat")
 
+    def update_chat_meta_by_id(self, id: str, meta: dict) -> Optional[ChatModel]:
+        try:
+            with get_db() as db:
+                chat = db.get(Chat, id)
+                if chat is None:
+                    return None
+
+                chat.meta = meta if isinstance(meta, dict) else {}
+                chat.subagent_of = chat.meta.get("subagent_of")
+                chat.updated_at = int(time.time())
+                db.commit()
+                db.refresh(chat)
+                _hydrate_chat_messages(db, chat)
+                return ChatModel.model_validate(chat)
+        except Exception:
+            return None
+
     def get_messages_map_by_chat_id(self, id: str) -> Optional[dict]:
         chat = self.get_chat_by_id(id)
         if chat is None:

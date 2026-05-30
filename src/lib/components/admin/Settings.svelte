@@ -25,6 +25,7 @@
 	import Evaluations from './Settings/Evaluations.svelte';
 	import CodeExecution from './Settings/CodeExecution.svelte';
 	import Tools from './Settings/Tools.svelte';
+	import Container from './Settings/Container.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -41,6 +42,7 @@
 			'model-limits',
 			'evaluations',
 			'tools',
+			'container',
 			'web',
 			'study',
 			'data-viz',
@@ -237,6 +239,33 @@
 				</svg>
 			</div>
 			<div class=" self-center">{$i18n.t('External Tools')}</div>
+		</button>
+
+		<button
+			id="container"
+			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
+			'container'
+				? ''
+				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
+			on:click={() => {
+				goto('/admin/settings/container');
+			}}
+		>
+			<div class=" self-center mr-2">
+				<svg
+					xmlns="http://www.w3.org/2000/svg"
+					viewBox="0 0 24 24"
+					fill="currentColor"
+					class="size-4"
+				>
+					<path
+						fill-rule="evenodd"
+						d="M3.75 4.5a.75.75 0 0 0-.75.75v13.5c0 .414.336.75.75.75h16.5a.75.75 0 0 0 .75-.75V5.25a.75.75 0 0 0-.75-.75H3.75Zm1.5 3.75A.75.75 0 0 1 6 7.5h12a.75.75 0 0 1 0 1.5H6a.75.75 0 0 1-.75-.75Zm0 3A.75.75 0 0 1 6 10.5h7.5a.75.75 0 0 1 0 1.5H6a.75.75 0 0 1-.75-.75Zm0 3A.75.75 0 0 1 6 13.5h9.75a.75.75 0 0 1 0 1.5H6a.75.75 0 0 1-.75-.75Z"
+						clip-rule="evenodd"
+					/>
+				</svg>
+			</div>
+			<div class=" self-center">{$i18n.t('Container')}</div>
 		</button>
 
 		<button
@@ -534,6 +563,12 @@
 			<Evaluations />
 		{:else if selectedTab === 'tools'}
 			<Tools />
+		{:else if selectedTab === 'container'}
+			<Container
+				on:save={() => {
+					toast.success($i18n.t('Settings saved successfully!'));
+				}}
+			/>
 		{:else if selectedTab === 'web'}
 			<WebSearch
 				saveHandler={async () => {
