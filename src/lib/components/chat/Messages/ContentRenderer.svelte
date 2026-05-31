@@ -401,6 +401,7 @@
 				<Markdown
 					id={`${id}-b${i}`}
 					content={blockProjections[i] ?? ''}
+					allowStreamingPlainText={block?.type === 'text'}
 					{model}
 					{save}
 					{preview}
@@ -445,6 +446,7 @@
 		<Markdown
 			{id}
 			content={content ?? ''}
+			allowStreamingPlainText={true}
 			{model}
 			{save}
 			{preview}

@@ -18,6 +18,7 @@
 	export let save = false;
 	export let preview = false;
 	export let parseImmediately = false;
+	export let allowStreamingPlainText = false;
 
 	export let chatId = '';
 	export let messageId = '';
@@ -46,7 +47,11 @@
 	const DONE_DELAY = 50; // Small delay when done to ensure final parse
 	const STREAMING_PLAINTEXT_CHARS = 4000;
 
-	$: streamingPlainText = !done && typeof content === 'string' && content.length > STREAMING_PLAINTEXT_CHARS;
+	$: streamingPlainText =
+		allowStreamingPlainText &&
+		!done &&
+		typeof content === 'string' &&
+		content.length > STREAMING_PLAINTEXT_CHARS;
 
 	const options = {
 		throwOnError: false,
