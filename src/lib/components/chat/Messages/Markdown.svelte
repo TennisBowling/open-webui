@@ -7,6 +7,7 @@
 	import markedExtension from '$lib/utils/marked/extension';
 	import markedKatexExtension from '$lib/utils/marked/katex-extension';
 	import { mentionExtension } from '$lib/utils/marked/mention-extension';
+	import { streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 
 	import MarkdownTokens from './Markdown/MarkdownTokens.svelte';
 
@@ -43,6 +44,9 @@
 	// Throttle interval in ms - parse less frequently during streaming
 	const STREAMING_THROTTLE = 100; // 10 updates per second max during streaming
 	const DONE_DELAY = 50; // Small delay when done to ensure final parse
+	const STREAMING_PLAINTEXT_CHARS = 4000;
+
+	$: streamingPlainText = !done && typeof content === 'string' && content.length > STREAMING_PLAINTEXT_CHARS;
 
 	const options = {
 		throwOnError: false,
@@ -57,10 +61,12 @@
 
 	const parseContent = (contentToParse) => {
 		if (contentToParse && contentToParse !== lastParsedContent) {
+			const perf = streamPerfStart();
 			lastParsedContent = contentToParse;
 			tokens = marked.lexer(
 				replaceTokens(processResponseContent(contentToParse), sourceIds, model?.name, $user?.name)
 			);
+			streamPerfEnd(done ? 'markdown.parse.done' : 'markdown.parse.streaming', perf);
 		}
 	};
 
@@ -112,7 +118,14 @@
 
 	// Use a reactive statement that just schedules parsing instead of doing it immediately
 	$: {
-		if (content) {
+		if (streamingPlainText) {
+			if (parseTimeout) {
+				clearTimeout(parseTimeout);
+				parseTimeout = null;
+			}
+			pendingContent = null;
+			tokens = [];
+		} else if (content) {
 			pendingContent = content;
 			scheduleParse();
 		}
@@ -125,23 +138,27 @@
 	});
 </script>
 
-{#key id}
-	<MarkdownTokens
-		{tokens}
-		{id}
-		{done}
-		{save}
-		{preview}
-		{editCodeBlock}
-		{topPadding}
-		{chatId}
-		{messageId}
-		{dataVizOverrides}
-		{sandboxFiles}
-		{onTaskClick}
-		{onSourceClick}
-		{onSave}
-		{onUpdate}
-		{onPreview}
-	/>
-{/key}
+{#if streamingPlainText}
+	<div dir="auto" class="whitespace-pre-wrap break-words">{content}</div>
+{:else}
+	{#key id}
+		<MarkdownTokens
+			{tokens}
+			{id}
+			{done}
+			{save}
+			{preview}
+			{editCodeBlock}
+			{topPadding}
+			{chatId}
+			{messageId}
+			{dataVizOverrides}
+			{sandboxFiles}
+			{onTaskClick}
+			{onSourceClick}
+			{onSave}
+			{onUpdate}
+			{onPreview}
+		/>
+	{/key}
+{/if}
