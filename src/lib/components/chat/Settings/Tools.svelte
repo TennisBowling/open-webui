@@ -13,6 +13,7 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import Connection from './Tools/Connection.svelte';
+	import PersonalMCPConnections from './Tools/PersonalMCPConnections.svelte';
 
 	import AddToolServerModal from '$lib/components/AddToolServerModal.svelte';
 
@@ -119,6 +120,8 @@
 							target="_blank">{$i18n.t('Learn more about OpenAPI tool servers.')}</a
 						>
 					</div>
+
+					<PersonalMCPConnections />
 				</div>
 			</div>
 		{:else}

@@ -644,6 +644,7 @@
 				(id) =>
 					id !== containerToolId &&
 					(id.startsWith('server:mcp:') ||
+						id.startsWith('user:mcp:') ||
 						id.startsWith('server:') ||
 						id.startsWith('direct_server:'))
 			)
@@ -1571,7 +1572,7 @@
 			(id) =>
 				id &&
 				!selectedToolIds.includes(id) &&
-				(id.startsWith('server:mcp:') || id.startsWith('server:'))
+				(id.startsWith('server:mcp:') || id.startsWith('user:mcp:') || id.startsWith('server:'))
 		);
 		if (droppedServerIds.length > 0) {
 			toast.warning(

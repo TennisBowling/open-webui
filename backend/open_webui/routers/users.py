@@ -182,6 +182,10 @@ class ChatPermissions(BaseModel):
 
 class FeaturesPermissions(BaseModel):
     direct_tool_servers: bool = True
+    mcp_remote_custom: bool = True
+    mcp_static_secrets: bool = True
+    mcp_stdio_templates: bool = True
+    mcp_stdio_custom: bool = False
     web_search: bool = True
     image_generation: bool = True
     notes: bool = True

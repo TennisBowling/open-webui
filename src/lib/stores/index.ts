@@ -150,6 +150,8 @@ export const functions: Writable<any[] | null> = writable(null);
 
 export const toolServers: Writable<any[]> = writable([]);
 export const toolServersLoaded = writable(false);
+export const mcpConnections: Writable<any[]> = writable([]);
+export const mcpConnectionsLoaded = writable(false);
 
 export const banners: Writable<Banner[]> = writable([]);
 
