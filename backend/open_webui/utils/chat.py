@@ -1002,8 +1002,8 @@ async def run_outlet_filters_on_completed_stream(
 
     # Outlet filter mutated the assistant content. Merge the mutation back
     # into content_blocks under TWO unconditional invariants (no fail-safe):
-    #   1. Structural blocks (reasoning, tool_calls, subagent_launch,
-    #      code_interpreter, ...) are preserved BYTE-IDENTICAL regardless
+    #   1. Structural blocks (reasoning, tool_calls, subagent_launch, ...)
+    #      are preserved BYTE-IDENTICAL regardless
     #      of what the filter did to their serialized <details ...> markers
     #      — including filters that elide or reformat those markers.
     #   2. The filter's text changes are ALWAYS applied — never silently

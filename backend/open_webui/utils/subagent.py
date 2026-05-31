@@ -305,7 +305,7 @@ def _final_text_from_blocks_for_parent(content_blocks: list[dict]) -> str:
         btype = block.get("type")
         if btype == "text":
             last_text_blocks.insert(0, block)
-        elif btype in ("tool_calls", "code_interpreter"):
+        elif btype == "tool_calls":
             break
         elif btype == "reasoning":
             continue
@@ -1077,7 +1077,7 @@ def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
     blocks = msg.get("content_blocks")
     if isinstance(blocks, list) and blocks:
         # Only render the trailing TEXT blocks — anything before the final
-        # text block is reasoning/tool_calls/code_interp that we don't want
+        # text block is reasoning/tool_calls that we don't want
         # to repeat back into the parent's context. The subagent's job was
         # to synthesize; the parent only needs that synthesis.
         last_text_blocks: list[dict] = []
@@ -1085,7 +1085,7 @@ def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
             btype = block.get("type") if isinstance(block, dict) else None
             if btype == "text":
                 last_text_blocks.insert(0, block)
-            elif btype in ("tool_calls", "code_interpreter"):
+            elif btype == "tool_calls":
                 break
             elif btype == "reasoning":
                 continue
@@ -2247,10 +2247,8 @@ def _block_has_meaningful_parent_output(block: Any) -> bool:
     btype = block.get("type")
     content = block.get("content")
 
-    if btype in {"text", "reasoning", "code_interpreter"}:
+    if btype in {"text", "reasoning"}:
         if isinstance(content, str) and content.strip():
-            return True
-        if btype == "code_interpreter" and block.get("output") not in (None, ""):
             return True
         return False
 
@@ -2729,4 +2727,3 @@ async def rerun_subagent_turn(
                 allow_placeholder_append=False,
             )
             return
-

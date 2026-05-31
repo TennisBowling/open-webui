@@ -3,7 +3,6 @@ import logging
 import sys
 import os
 import base64
-import textwrap
 import copy
 
 import asyncio
@@ -176,7 +175,6 @@ from open_webui.utils.filter import (
     get_sorted_filter_ids,
     process_filter_functions,
 )
-from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
 from open_webui.utils.mcp.client import MCPClient, mcp_tool_alias, build_mcp_connect_kwargs
@@ -189,8 +187,6 @@ from open_webui.utils.container_workspace import (
 from open_webui.config import (
     CACHE_DIR,
     DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-    DEFAULT_CODE_INTERPRETER_PROMPT,
-    CODE_INTERPRETER_BLOCKED_MODULES,
 )
 from open_webui.env import (
     SRC_LOG_LEVELS,
@@ -207,9 +203,6 @@ from open_webui.constants import TASKS
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
-
-
-DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
 # ---------------------------------------------------------------------------
@@ -1487,8 +1480,7 @@ def apply_params_to_form_data(form_data, model):
 
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
-    # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
-    # -> Chat Files
+    # -> (Default) Chat Tools Function Calling -> Chat Files
 
     form_data = apply_params_to_form_data(form_data, model)
 
@@ -1688,16 +1680,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if "image_generation" in features and features["image_generation"]:
             form_data = await chat_image_generation_handler(
                 request, form_data, extra_params, user
-            )
-
-        if "code_interpreter" in features and features["code_interpreter"]:
-            form_data["messages"] = add_or_update_user_message(
-                (
-                    request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
-                    if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
-                    else DEFAULT_CODE_INTERPRETER_PROMPT
-                ),
-                form_data["messages"],
             )
 
     container_prompt = await prepare_container_workspace_for_turn(
@@ -2773,217 +2755,12 @@ async def process_chat_response(
                             content = f'{content}<details type="reasoning" done="true" duration="{reasoning_duration}">\n<summary>Thought for {reasoning_duration} seconds</summary>\n{reasoning_display_content}\n</details>\n'
                         else:
                             content = f'{content}<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n{reasoning_display_content}\n</details>\n'
-
-                    elif block["type"] == "code_interpreter":
-                        attributes = block.get("attributes", {})
-                        output = block.get("output", None)
-                        lang = attributes.get("lang", "")
-
-                        content_stripped, original_whitespace = (
-                            split_content_and_whitespace(content)
-                        )
-                        if is_opening_code_block(content_stripped):
-                            # Remove trailing backticks that would open a new block
-                            content = (
-                                content_stripped.rstrip("`").rstrip()
-                                + original_whitespace
-                            )
-                        else:
-                            # Keep content as is - either closing backticks or no backticks
-                            content = content_stripped + original_whitespace
-
-                        if content and not content.endswith("\n"):
-                            content += "\n"
-
-                        if output:
-                            output = html.escape(json.dumps(output))
-                            content = f'{content}<details type="code_interpreter" done="true" output="{output}">\n<summary>Analyzed</summary>\n```{lang}\n{block["content"]}\n```\n</details>\n'
-                        else:
-                            content = f'{content}<details type="code_interpreter" done="false">\n<summary>Analyzing...</summary>\n```{lang}\n{block["content"]}\n```\n</details>\n'
-
                     else:
                         block_content = str(block["content"]).strip()
                         if block_content:
                             content = f"{content}{block['type']}: {block_content}\n"
 
                 return content.strip()
-
-            def tag_content_handler(content_type, tags, content, content_blocks):
-                end_flag = False
-
-                def extract_attributes(tag_content):
-                    """Extract attributes from a tag if they exist."""
-                    attributes = {}
-                    if not tag_content:  # Ensure tag_content is not None
-                        return attributes
-                    # Match attributes in the format: key="value" (ignores single quotes for simplicity)
-                    matches = re.findall(r'(\w+)\s*=\s*"([^"]+)"', tag_content)
-                    for key, value in matches:
-                        attributes[key] = value
-                    return attributes
-
-                if content_blocks[-1]["type"] == "text":
-                    for start_tag, end_tag in tags:
-
-                        start_tag_pattern = rf"{re.escape(start_tag)}"
-                        if start_tag.startswith("<") and start_tag.endswith(">"):
-                            # Match start tag e.g., <tag> or <tag attr="value">
-                            # remove both '<' and '>' from start_tag
-                            # Match start tag with attributes
-                            start_tag_pattern = (
-                                rf"<{re.escape(start_tag[1:-1])}(\s.*?)?>"
-                            )
-
-                        match = re.search(start_tag_pattern, content)
-                        if match:
-                            try:
-                                attr_content = (
-                                    match.group(1) if match.group(1) else ""
-                                )  # Ensure it's not None
-                            except:
-                                attr_content = ""
-
-                            attributes = extract_attributes(
-                                attr_content
-                            )  # Extract attributes safely
-
-                            # Capture everything before and after the matched tag
-                            before_tag = content[
-                                : match.start()
-                            ]  # Content before opening tag
-                            after_tag = content[
-                                match.end() :
-                            ]  # Content after opening tag
-
-                            # Remove the start tag and after from the currently handling text block
-                            content_blocks[-1]["content"] = content_blocks[-1][
-                                "content"
-                            ].replace(match.group(0) + after_tag, "")
-
-                            if before_tag:
-                                content_blocks[-1]["content"] = before_tag
-
-                            if not content_blocks[-1]["content"]:
-                                content_blocks.pop()
-
-                            # Append the new block
-                            content_blocks.append(
-                                {
-                                    "type": content_type,
-                                    "start_tag": start_tag,
-                                    "end_tag": end_tag,
-                                    "attributes": attributes,
-                                    "content": "",
-                                    "started_at": time.time(),
-                                }
-                            )
-
-                            if after_tag:
-                                content_blocks[-1]["content"] = after_tag
-                                after_tag, content_blocks, _ = tag_content_handler(
-                                    content_type, tags, after_tag, content_blocks
-                                )
-                                content = before_tag + after_tag
-                            else:
-                                content = before_tag
-
-                            break
-                elif content_blocks[-1]["type"] == content_type:
-                    start_tag = content_blocks[-1]["start_tag"]
-                    end_tag = content_blocks[-1]["end_tag"]
-
-                    if end_tag.startswith("<") and end_tag.endswith(">"):
-                        # Match end tag e.g., </tag>
-                        end_tag_pattern = rf"{re.escape(end_tag)}"
-                    else:
-                        # Handle cases where end_tag is just a tag name
-                        end_tag_pattern = rf"{re.escape(end_tag)}"
-
-                    # Check if the content has the end tag
-                    if re.search(end_tag_pattern, content):
-                        end_flag = True
-
-                        block_content = content_blocks[-1]["content"]
-                        # Strip start and end tags from the content
-                        start_tag_pattern = rf"<{re.escape(start_tag)}(.*?)>"
-                        block_content = re.sub(
-                            start_tag_pattern, "", block_content
-                        ).strip()
-
-                        end_tag_regex = re.compile(end_tag_pattern, re.DOTALL)
-                        split_content = end_tag_regex.split(block_content, maxsplit=1)
-
-                        # Content inside the tag
-                        block_content = (
-                            split_content[0].strip() if split_content else ""
-                        )
-
-                        # Leftover content (everything after `</tag>`)
-                        leftover_content = (
-                            split_content[1].strip() if len(split_content) > 1 else ""
-                        )
-
-                        if block_content:
-                            content_blocks[-1]["content"] = block_content
-                            content_blocks[-1]["ended_at"] = time.time()
-                            content_blocks[-1]["duration"] = int(
-                                content_blocks[-1]["ended_at"]
-                                - content_blocks[-1]["started_at"]
-                            )
-
-                            # Reset the content_blocks by appending a new text block
-                            if content_type != "code_interpreter":
-                                if leftover_content:
-
-                                    content_blocks.append(
-                                        {
-                                            "type": "text",
-                                            "content": leftover_content,
-                                        }
-                                    )
-                                else:
-                                    content_blocks.append(
-                                        {
-                                            "type": "text",
-                                            "content": "",
-                                        }
-                                    )
-
-                        else:
-                            # Remove the block if content is empty
-                            content_blocks.pop()
-
-                            if leftover_content:
-                                content_blocks.append(
-                                    {
-                                        "type": "text",
-                                        "content": leftover_content,
-                                    }
-                                )
-                            else:
-                                content_blocks.append(
-                                    {
-                                        "type": "text",
-                                        "content": "",
-                                    }
-                                )
-
-                        # Clean processed content
-                        start_tag_pattern = rf"{re.escape(start_tag)}"
-                        if start_tag.startswith("<") and start_tag.endswith(">"):
-                            # Match start tag e.g., <tag> or <tag attr="value">
-                            # remove both '<' and '>' from start_tag
-                            # Match start tag with attributes
-                            start_tag_pattern = (
-                                rf"<{re.escape(start_tag[1:-1])}(\s.*?)?>"
-                            )
-
-                        # Since we are already inside the block, the start tag was removed from `content`.
-                        # `content` here is just the inner text, the end_tag, and leftover_content.
-                        # So we can just set `content` to `leftover_content`!
-                        content = leftover_content
-
-                return content, content_blocks, end_flag
 
             message = Chats.get_message_by_id_and_message_id(
                 metadata["chat_id"], metadata["message_id"]
@@ -3099,19 +2876,14 @@ async def process_chat_response(
                     },
                 )
 
-            DETECT_CODE_INTERPRETER = metadata.get("features", {}).get(
-                "code_interpreter", False
-            )
-
             # Avoid copying the whole growing plain-text response on every SSE
             # chunk. Native provider reasoning fields are rendered from
             # structured `content_blocks`; legacy inline reasoning-tag scanning
             # has been removed. Hidden v2 subagent runs never need the legacy
-            # string unless code-interpreter parsing is active.
+            # string.
             track_legacy_content = not (
                 STREAM_PROTOCOL_VERSION == "v2"
                 and metadata.get("subagent_inner")
-                and not DETECT_CODE_INTERPRETER
             )
             content_parts = [content] if (track_legacy_content and content) else []
             content_dirty = False
@@ -3122,17 +2894,6 @@ async def process_chat_response(
                     return
                 content_parts.append(value)
                 content_dirty = True
-                if DETECT_CODE_INTERPRETER:
-                    content = "".join(content_parts)
-                    content_dirty = False
-
-            def reset_plain_content(value: str):
-                nonlocal content, content_parts, content_dirty
-                if not track_legacy_content:
-                    return
-                content = value or ""
-                content_parts = [content] if content else []
-                content_dirty = False
 
             last_checkpoint_at = time.monotonic()
             checkpoint_chars_since = 0
@@ -3750,20 +3511,6 @@ async def process_chat_response(
                                         )
                                         checkpoint_stream_state(char_delta=len(value))
 
-                                        if DETECT_CODE_INTERPRETER:
-                                            content, content_blocks, end = (
-                                                tag_content_handler(
-                                                    "code_interpreter",
-                                                    DEFAULT_CODE_INTERPRETER_TAGS,
-                                                    content,
-                                                    content_blocks,
-                                                )
-                                            )
-                                            reset_plain_content(content)
-
-                                            if end:
-                                                break
-
                                         if ENABLE_REALTIME_CHAT_SAVE and STREAM_PROTOCOL_VERSION != "v2":
                                             # Legacy/non-v2 realtime save path.
                                             # v2 uses the in-memory stream
@@ -4325,15 +4072,7 @@ async def process_chat_response(
                                     content_blocks.append({"type": "text", "content": ""})
                                 content_blocks[-1]["content"] += msg_content
                                 append_plain_content(msg_content)
-                                
-                                if DETECT_CODE_INTERPRETER:
-                                    while True:
-                                        prev_content = content
-                                        content, content_blocks, _ = tag_content_handler("code_interpreter", DEFAULT_CODE_INTERPRETER_TAGS, content, content_blocks)
-                                        if content == prev_content:
-                                            break
-                                    reset_plain_content(content)
-                            
+
                             # Process tool calls
                             res_tool_calls = message.get("tool_calls")
                             if res_tool_calls:
@@ -4408,294 +4147,6 @@ async def process_chat_response(
                             "data": {"error": terminal_error}
                         })
                         break
-
-                if DETECT_CODE_INTERPRETER:
-                    MAX_RETRIES = 5
-                    retries = 0
-
-                    while (
-                        content_blocks[-1]["type"] == "code_interpreter"
-                        and retries < MAX_RETRIES
-                    ):
-
-                        await event_emitter(
-                            {
-                                "type": "chat:completion",
-                                "data": {
-                                    "content": serialize_content_blocks(content_blocks),
-                                    "content_blocks": content_blocks,
-                                },
-                            }
-                        )
-
-                        retries += 1
-                        log.debug(f"Attempt count: {retries}")
-
-                        output = ""
-                        try:
-                            if content_blocks[-1]["attributes"].get("type") == "code":
-                                code = content_blocks[-1]["content"]
-                                if CODE_INTERPRETER_BLOCKED_MODULES:
-                                    blocking_code = textwrap.dedent(
-                                        f"""
-                                        import builtins
-
-                                        BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
-
-                                        _real_import = builtins.__import__
-                                        def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-                                            if name.split('.')[0] in BLOCKED_MODULES:
-                                                importer_name = globals.get('__name__') if globals else None
-                                                if importer_name == '__main__':
-                                                    raise ImportError(
-                                                        f"Direct import of module {{name}} is restricted."
-                                                    )
-                                            return _real_import(name, globals, locals, fromlist, level)
-
-                                        builtins.__import__ = restricted_import
-                                    """
-                                    )
-                                    code = blocking_code + "\n" + code
-
-                                if (
-                                    request.app.state.config.CODE_INTERPRETER_ENGINE
-                                    == "pyodide"
-                                ):
-                                    output = await event_caller(
-                                        {
-                                            "type": "execute:python",
-                                            "data": {
-                                                "id": str(uuid4()),
-                                                "code": code,
-                                                "session_id": metadata.get(
-                                                    "session_id", None
-                                                ),
-                                            },
-                                        }
-                                    )
-                                elif (
-                                    request.app.state.config.CODE_INTERPRETER_ENGINE
-                                    == "jupyter"
-                                ):
-                                    output = await execute_code_jupyter(
-                                        request.app.state.config.CODE_INTERPRETER_JUPYTER_URL,
-                                        code,
-                                        (
-                                            request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN
-                                            if request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
-                                            == "token"
-                                            else None
-                                        ),
-                                        (
-                                            request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD
-                                            if request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
-                                            == "password"
-                                            else None
-                                        ),
-                                        request.app.state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
-                                    )
-                                else:
-                                    output = {
-                                        "stdout": "Code interpreter engine not configured."
-                                    }
-
-                                log.debug(f"Code interpreter output: {output}")
-
-                                if isinstance(output, dict):
-                                    stdout = output.get("stdout", "")
-
-                                    if isinstance(stdout, str):
-                                        stdoutLines = stdout.split("\n")
-                                        for idx, line in enumerate(stdoutLines):
-
-                                            if "data:image/png;base64" in line:
-                                                image_url = get_image_url_from_base64(
-                                                    request,
-                                                    line,
-                                                    metadata,
-                                                    user,
-                                                )
-                                                if image_url:
-                                                    stdoutLines[idx] = (
-                                                        f"![Output Image]({image_url})"
-                                                    )
-
-                                        output["stdout"] = "\n".join(stdoutLines)
-
-                                    result = output.get("result", "")
-
-                                    if isinstance(result, str):
-                                        resultLines = result.split("\n")
-                                        for idx, line in enumerate(resultLines):
-                                            if "data:image/png;base64" in line:
-                                                image_url = get_image_url_from_base64(
-                                                    request,
-                                                    line,
-                                                    metadata,
-                                                    user,
-                                                )
-                                                resultLines[idx] = (
-                                                    f"![Output Image]({image_url})"
-                                                )
-                                        output["result"] = "\n".join(resultLines)
-                        except Exception as e:
-                            output = str(e)
-
-                        content_blocks[-1]["output"] = output
-
-                        content_blocks.append(
-                            {
-                                "type": "text",
-                                "content": "",
-                            }
-                        )
-
-                        await event_emitter(
-                            {
-                                "type": "chat:completion",
-                                "data": {
-                                    "content": serialize_content_blocks(content_blocks),
-                                    "content_blocks": content_blocks,
-                                },
-                            }
-                        )
-
-                        try:
-                            in_flight_assistant = {
-                                "role": "assistant",
-                                "content_blocks": content_blocks,
-                            }
-                            tool_result_bodies = get_tool_result_bodies(
-                                metadata.get("message_id")
-                            )
-                            if tool_result_bodies:
-                                in_flight_assistant["tool_result_bodies"] = tool_result_bodies
-                            new_form_data = {
-                                **form_data,
-                                "model": model_id,
-                                "stream": True,
-                                "messages": [
-                                    *form_data["messages"],
-                                    in_flight_assistant,
-                                ],
-                            }
-
-                            res = await generate_chat_completion(
-                                request,
-                                new_form_data,
-                                user,
-                            )
-
-                            if isinstance(res, StreamingResponse):
-                                await stream_body_handler(res, new_form_data)
-                            elif isinstance(res, dict) and "choices" in res and len(res["choices"]) > 0:
-                                log.debug(f"generate_chat_completion returned non-streaming response with choices")
-                                message = res["choices"][0].get("message", {})
-                                
-                                # Process reasoning
-                                reasoning_content = message.get("reasoning_content") or message.get("reasoning") or message.get("thinking")
-                                if reasoning_content:
-                                    content_blocks.append({
-                                        "type": "reasoning",
-                                        "start_tag": "<think>",
-                                        "end_tag": "</think>",
-                                        "attributes": {"type": "reasoning_content"},
-                                        "content": reasoning_content,
-                                        "started_at": time.time(),
-                                        "ended_at": time.time(),
-                                        "duration": 0
-                                    })
-                                
-                                # Process content
-                                msg_content = message.get("content")
-                                if msg_content:
-                                    if not content_blocks or content_blocks[-1]["type"] != "text":
-                                        content_blocks.append({"type": "text", "content": ""})
-                                    content_blocks[-1]["content"] += msg_content
-                                    append_plain_content(msg_content)
-                                    
-                                    if DETECT_CODE_INTERPRETER:
-                                        while True:
-                                            prev_content = content
-                                            content, content_blocks, _ = tag_content_handler("code_interpreter", DEFAULT_CODE_INTERPRETER_TAGS, content, content_blocks)
-                                            if content == prev_content:
-                                                break
-                                        reset_plain_content(content)
-                                
-                                # Process tool calls
-                                res_tool_calls = message.get("tool_calls")
-                                if res_tool_calls:
-                                    tool_calls.append({
-                                        "tool_calls": res_tool_calls,
-                                        "reasoning_details": message.get("reasoning_details")
-                                    })
-
-                                # Per-round bookkeeping for the non-streaming
-                                # branch (mirrors stream_body_handler). Append
-                                # even when empty — see
-                                # utils/REASONING_DETAILS.md §6 Bug B.
-                                round_reasoning_details.append(
-                                    message.get("reasoning_details") or []
-                                )
-
-                                usage = res.get("usage", {})
-                                if usage:
-                                    response_usage = usage
-                                    await process_token_usage(
-                                        model_id,
-                                        usage,
-                                        chat_id=_get_token_usage_chat_id(metadata),
-                                        user_id=user.id if user else None,
-                                        source_chat_id=metadata.get("chat_id"),
-                                        message_id=metadata.get("message_id"),
-                                        parent_message_id=metadata.get("parent_message_id"),
-                                        source_type="subagent" if metadata.get("subagent_inner") else "chat"
-                                    )
-                                    await event_emitter({
-                                        "type": "chat:completion",
-                                        "data": {
-                                            "usage": usage,
-                                        }
-                                    })
-
-                                # Emit completion event
-                                await event_emitter({
-                                    "type": "chat:completion",
-                                    "data": {
-                                        "content": serialize_content_blocks(content_blocks),
-                                        "content_blocks": content_blocks,
-                                    }
-                                })
-                            else:
-                                try:
-                                    # Attempt to read the error response
-                                    if hasattr(res, "body"):
-                                        error_content = res.body.decode("utf-8") if isinstance(res.body, bytes) else str(res.body)
-                                        log.error(f"Error response content: {error_content}")
-                                        
-                                        try:
-                                            error_json = json.loads(error_content)
-                                            error_msg = error_json.get("error", error_content)
-                                            if isinstance(error_msg, dict):
-                                                error_msg = error_msg.get("message", error_msg.get("detail", str(error_msg)))
-                                        except:
-                                            error_msg = error_content
-                                            
-                                        await event_emitter({
-                                            "type": "chat:message:error",
-                                            "data": {"error": {"content": str(error_msg)}}
-                                        })
-                                except Exception as read_err:
-                                    log.error(f"Could not read error response: {read_err}")
-                                break
-                        except Exception as e:
-                            log.debug(e)
-                            terminal_error = {"content": f"Error in code interpreter loop: {str(e)}"}
-                            await event_emitter({
-                                "type": "chat:message:error",
-                                "data": {"error": terminal_error}
-                            })
-                            break
 
                 if terminal_error is not None:
                     error_content = (

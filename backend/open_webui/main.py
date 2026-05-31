@@ -143,22 +143,6 @@ from open_webui.config import (
     CONTAINER_DATA_ROOT,
     CONTAINER_MCP_SERVER_ID,
     CONTAINER_SYSTEM_PROMPT,
-    # Code Execution
-    ENABLE_CODE_EXECUTION,
-    CODE_EXECUTION_ENGINE,
-    CODE_EXECUTION_JUPYTER_URL,
-    CODE_EXECUTION_JUPYTER_AUTH,
-    CODE_EXECUTION_JUPYTER_AUTH_TOKEN,
-    CODE_EXECUTION_JUPYTER_AUTH_PASSWORD,
-    CODE_EXECUTION_JUPYTER_TIMEOUT,
-    ENABLE_CODE_INTERPRETER,
-    CODE_INTERPRETER_ENGINE,
-    CODE_INTERPRETER_PROMPT_TEMPLATE,
-    CODE_INTERPRETER_JUPYTER_URL,
-    CODE_INTERPRETER_JUPYTER_AUTH,
-    CODE_INTERPRETER_JUPYTER_AUTH_TOKEN,
-    CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD,
-    CODE_INTERPRETER_JUPYTER_TIMEOUT,
     # Image
     AUTOMATIC1111_API_AUTH,
     AUTOMATIC1111_BASE_URL,
@@ -534,7 +518,47 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
-class SPAStaticFiles(StaticFiles):
+SPA_REVALIDATE_CACHE_CONTROL = "no-cache"
+SPA_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+SPA_LONG_CACHE_CONTROL = "public, max-age=31536000"
+SPA_WASM_CACHE_CONTROL = "public, max-age=86400"
+
+
+class CacheControlStaticFiles(StaticFiles):
+    def get_cache_control(self, path: str) -> Optional[str]:
+        return None
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+
+        path = os.path.relpath(full_path, self.directory).replace(os.sep, "/")
+        cache_control = self.get_cache_control(path)
+        if cache_control:
+            response.headers["Cache-Control"] = cache_control
+
+        return response
+
+
+class FrontendStaticFiles(CacheControlStaticFiles):
+    def get_cache_control(self, path: str) -> Optional[str]:
+        if path.startswith("_app/immutable/"):
+            return SPA_IMMUTABLE_CACHE_CONTROL
+
+        if path.startswith(("assets/", "audio/", "themes/")):
+            return SPA_LONG_CACHE_CONTROL
+
+        if path.startswith("wasm/"):
+            return SPA_WASM_CACHE_CONTROL
+
+        return SPA_REVALIDATE_CACHE_CONTROL
+
+
+class RevalidatingStaticFiles(CacheControlStaticFiles):
+    def get_cache_control(self, path: str) -> Optional[str]:
+        return SPA_REVALIDATE_CACHE_CONTROL
+
+
+class SPAStaticFiles(FrontendStaticFiles):
     async def get_response(self, path: str, scope):
         try:
             return await super().get_response(path, scope)
@@ -1114,36 +1138,6 @@ app.state.RERANKING_FUNCTION = get_reranking_function(
     app.state.config.RAG_RERANKING_MODEL,
     reranking_function=app.state.rf,
 )
-
-########################################
-#
-# CODE EXECUTION
-#
-########################################
-
-app.state.config.ENABLE_CODE_EXECUTION = ENABLE_CODE_EXECUTION
-app.state.config.CODE_EXECUTION_ENGINE = CODE_EXECUTION_ENGINE
-app.state.config.CODE_EXECUTION_JUPYTER_URL = CODE_EXECUTION_JUPYTER_URL
-app.state.config.CODE_EXECUTION_JUPYTER_AUTH = CODE_EXECUTION_JUPYTER_AUTH
-app.state.config.CODE_EXECUTION_JUPYTER_AUTH_TOKEN = CODE_EXECUTION_JUPYTER_AUTH_TOKEN
-app.state.config.CODE_EXECUTION_JUPYTER_AUTH_PASSWORD = (
-    CODE_EXECUTION_JUPYTER_AUTH_PASSWORD
-)
-app.state.config.CODE_EXECUTION_JUPYTER_TIMEOUT = CODE_EXECUTION_JUPYTER_TIMEOUT
-
-app.state.config.ENABLE_CODE_INTERPRETER = ENABLE_CODE_INTERPRETER
-app.state.config.CODE_INTERPRETER_ENGINE = CODE_INTERPRETER_ENGINE
-app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE = CODE_INTERPRETER_PROMPT_TEMPLATE
-
-app.state.config.CODE_INTERPRETER_JUPYTER_URL = CODE_INTERPRETER_JUPYTER_URL
-app.state.config.CODE_INTERPRETER_JUPYTER_AUTH = CODE_INTERPRETER_JUPYTER_AUTH
-app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN = (
-    CODE_INTERPRETER_JUPYTER_AUTH_TOKEN
-)
-app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD = (
-    CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD
-)
-app.state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT = CODE_INTERPRETER_JUPYTER_TIMEOUT
 
 ########################################
 #
@@ -1948,8 +1942,6 @@ async def get_app_config(request: Request):
                     "flex_auto_flip_off_peak_end_hour": app.state.config.FLEX_AUTO_FLIP_OFF_PEAK_END_HOUR,
                     "flex_auto_flip_off_peak_timezone": app.state.config.FLEX_AUTO_FLIP_OFF_PEAK_TIMEZONE,
                     "flex_auto_flip_threshold_ratio": app.state.config.FLEX_AUTO_FLIP_THRESHOLD_RATIO,
-                    "enable_code_execution": app.state.config.ENABLE_CODE_EXECUTION,
-                    "enable_code_interpreter": app.state.config.ENABLE_CODE_INTERPRETER,
                     "enable_image_generation": app.state.config.ENABLE_IMAGE_GENERATION,
                     "enable_autocomplete_generation": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
                     "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,
@@ -1978,9 +1970,6 @@ async def get_app_config(request: Request):
                 "default_models": app.state.config.DEFAULT_MODELS,
                 "default_prompt_suggestions": app.state.config.DEFAULT_PROMPT_SUGGESTIONS,
                 "user_count": user_count,
-                "code": {
-                    "engine": app.state.config.CODE_EXECUTION_ENGINE,
-                },
                 "audio": {
                     "tts": {
                         "engine": app.state.config.TTS_ENGINE,
@@ -2224,7 +2213,9 @@ async def oauth_login_callback(provider: str, request: Request, response: Respon
 
 
 @app.get("/manifest.json")
-async def get_manifest_json():
+async def get_manifest_json(response: Response):
+    response.headers["Cache-Control"] = SPA_REVALIDATE_CACHE_CONTROL
+
     if app.state.EXTERNAL_PWA_MANIFEST_URL:
         return requests.get(app.state.EXTERNAL_PWA_MANIFEST_URL).json()
     else:
@@ -2412,7 +2403,7 @@ async def healthcheck_with_db():
     return {"status": True}
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/cache/{path:path}")

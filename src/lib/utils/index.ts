@@ -948,16 +948,6 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 					out += `<details type="tool_calls" done="false" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}">\n<summary>Executing...</summary>\n</details>\n`;
 				}
 			}
-		} else if (type === 'code_interpreter') {
-			ensureNewline();
-			const lang = block?.attributes?.lang ?? '';
-			const code = block?.content ?? '';
-			const output = block?.output;
-			if (output != null) {
-				out += `<details type="code_interpreter" done="true" output="${escapeHtmlAttr(JSON.stringify(output))}">\n<summary>Analyzed</summary>\n\`\`\`${lang}\n${code}\n\`\`\`\n</details>\n`;
-			} else {
-				out += `<details type="code_interpreter" done="false">\n<summary>Analyzing...</summary>\n\`\`\`${lang}\n${code}\n\`\`\`\n</details>\n`;
-			}
 		}
 	}
 
@@ -965,7 +955,7 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 };
 
 export const processDetails = (content) => {
-	content = removeDetails(content, ['reasoning', 'code_interpreter']);
+	content = removeDetails(content, ['reasoning']);
 
 	// This regex matches <details> tags with type="tool_calls" and captures their attributes to convert them to a string
 	const detailsRegex = /<details\s+type="tool_calls"([^>]*)>([\s\S]*?)<\/details>/gis;

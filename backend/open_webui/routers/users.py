@@ -184,7 +184,6 @@ class FeaturesPermissions(BaseModel):
     direct_tool_servers: bool = True
     web_search: bool = True
     image_generation: bool = True
-    code_interpreter: bool = True
     notes: bool = True
     subagents: bool = True
 

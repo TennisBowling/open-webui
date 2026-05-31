@@ -1,7 +1,7 @@
 """Conversion between open-webui internal messages and OpenAI-compatible API messages.
 
 The internal format stores assistant messages with a typed ``content_blocks`` array
-(text / reasoning / tool_calls / code_interpreter / ...). The API format uses
+(text / reasoning / tool_calls / ...). The API format uses
 OpenAI's flat shape: separate assistant and tool messages, ``tool_calls`` field
 on the assistant message, ``tool_call_id`` on the tool message, optional
 ``reasoning_details`` for reasoning-capable providers.
@@ -48,18 +48,6 @@ def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return normalized
 
 
-def _format_code_interpreter(block: dict) -> str:
-    attrs = block.get("attributes") or {}
-    lang = attrs.get("lang", "")
-    code = block.get("content", "") or ""
-    output = block.get("output")
-
-    parts = [f"```{lang}", code, "```"]
-    if output:
-        parts.extend(["", "```output", str(output), "```"])
-    return "\n".join(parts)
-
-
 def _dedup_reasoning_against(seen: set, items: Optional[list]) -> Optional[list]:
     """Strip reasoning_details items whose ``id`` is already in ``seen``. Adds the
     surviving items' ids to ``seen`` in place. Items without an ``id`` (e.g.
@@ -92,8 +80,6 @@ def _assistant_content_from_blocks(blocks: list[dict]) -> str:
             text = (block.get("content") or "").strip()
             if text:
                 parts.append(text)
-        elif btype == "code_interpreter":
-            parts.append(_format_code_interpreter(block))
         # reasoning blocks: never enter content (the bytes the cache hashes).
         # The structured form rides on reasoning_details on the assistant message.
     return "\n".join(parts).strip()
@@ -397,6 +383,4 @@ def blocks_to_plain_text(content_blocks: Optional[list[dict]]) -> str:
             for call in block.get("content") or []:
                 name = (call.get("function") or {}).get("name") or "tool"
                 parts.append(f"[Tool: {name}]")
-        elif btype == "code_interpreter":
-            parts.append(_format_code_interpreter(block))
     return "\n\n".join(parts).strip()

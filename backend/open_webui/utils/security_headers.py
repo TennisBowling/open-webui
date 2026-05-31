@@ -9,7 +9,9 @@ from typing import Dict
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        response.headers.update(set_security_headers())
+        for name, value in set_security_headers().items():
+            if name not in response.headers:
+                response.headers[name] = value
         return response
 
 

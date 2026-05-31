@@ -167,7 +167,6 @@
 	// provider picks its own default). Otherwise: any string the provider
 	// accepts (typically `default` / `flex` / `priority`).
 	export let subagentServiceTier: string = '';
-	export let codeInterpreterEnabled = false;
 
 	// Reasoning effort functionality
 	let reasoningEffort = 'medium'; // default to medium
@@ -398,7 +397,6 @@
 		selectedFilterIds,
 		imageGenerationEnabled,
 		webSearchEnabled,
-		codeInterpreterEnabled,
 		studyModeEnabled,
 		dataVizEnabled,
 		subagentsEnabled,
@@ -743,14 +741,6 @@
 			$models.find((m) => m.id === model)?.info?.meta?.capabilities?.image_generation ?? true
 	);
 
-	let codeInterpreterCapableModels = [];
-	$: codeInterpreterCapableModels = (
-		atSelectedModel?.id ? [atSelectedModel.id] : selectedModels
-	).filter(
-		(model) =>
-			$models.find((m) => m.id === model)?.info?.meta?.capabilities?.code_interpreter ?? true
-	);
-
 	let toggleFilters = [];
 	$: {
 		const filterLists = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
@@ -831,15 +821,6 @@
 		($_user == null ||
 			$_user?.role === 'admin' ||
 			$_user?.permissions?.features?.image_generation !== false);
-
-	let showCodeInterpreterButton = false;
-	$: showCodeInterpreterButton =
-		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
-			codeInterpreterCapableModels.length &&
-		($config == null || !!$config?.features?.enable_code_interpreter) &&
-		($_user == null ||
-			$_user?.role === 'admin' ||
-			$_user?.permissions?.features?.code_interpreter !== false);
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
@@ -2360,7 +2341,7 @@
 											{/each}
 										{/if}
 
-										{#if showStudyModeButton || showDataVizButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || showContainerButton || (toggleFilters && toggleFilters.length > 0)}
+										{#if showStudyModeButton || showDataVizButton || showImageGenerationButton || showToolsButton || showContainerButton || (toggleFilters && toggleFilters.length > 0)}
 											<IntegrationsMenu
 												selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
 												{toggleFilters}
@@ -2368,14 +2349,12 @@
 												{showStudyModeButton}
 												{showDataVizButton}
 												{showImageGenerationButton}
-												{showCodeInterpreterButton}
 												bind:selectedToolIds
 												bind:selectedFilterIds
 												bind:webSearchEnabled
 												bind:studyModeEnabled
 												bind:dataVizEnabled
 												bind:imageGenerationEnabled
-												bind:codeInterpreterEnabled
 												closeOnOutsideClick={integrationsMenuCloseOnOutsideClick}
 												onShowValves={(e) => {
 													const { type, id } = e;
@@ -2583,32 +2562,6 @@
 															: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '}"
 													>
 														<Photo className="size-4" strokeWidth="1.75" />
-														<div class="hidden group-hover:block">
-															<XMark className="size-4" strokeWidth="1.75" />
-														</div>
-													</button>
-												</Tooltip>
-											{/if}
-
-											{#if codeInterpreterEnabled}
-												<Tooltip content={$i18n.t('Code Interpreter')} placement="top">
-													<button
-														aria-label={codeInterpreterEnabled
-															? $i18n.t('Disable Code Interpreter')
-															: $i18n.t('Enable Code Interpreter')}
-														aria-pressed={codeInterpreterEnabled}
-														on:click|preventDefault={() =>
-															(codeInterpreterEnabled = !codeInterpreterEnabled)}
-														type="button"
-														class=" group p-[7px] flex gap-1.5 items-center text-sm transition-colors duration-300 max-w-full overflow-hidden {codeInterpreterEnabled
-															? ' text-gray-900 dark:text-gray-100 bg-manilla/60 hover:bg-manilla/80 dark:bg-manilla-dark dark:hover:bg-manilla-dark/80 border-hairline border-book-cloth/30 dark:border-book-cloth/40'
-															: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '} {($settings?.highContrastMode ??
-														false)
-															? 'm-1'
-															: 'focus:outline-hidden rounded-full'}"
-													>
-														<Terminal className="size-3.5" strokeWidth="2" />
-
 														<div class="hidden group-hover:block">
 															<XMark className="size-4" strokeWidth="1.75" />
 														</div>

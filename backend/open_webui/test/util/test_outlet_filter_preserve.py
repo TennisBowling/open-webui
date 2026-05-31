@@ -2,7 +2,7 @@
 
 Two unconditional invariants (NO fail-safe):
   1. Structural blocks (reasoning, tool_calls, subagent_launch,
-     code_interpreter, ...) are preserved byte-identical regardless of
+     subagent_launch, ...) are preserved byte-identical regardless of
      what the filter does to their serialized markers.
   2. The filter's textual edits are ALWAYS applied — never silently
      dropped — even when the filter elides or reformats markers.
@@ -59,14 +59,6 @@ def _serialize(blocks):
                     f'result="..." files="" embeds="">\n'
                     f"<summary>Tool Executed</summary>\n</details>\n"
                 )
-        elif btype == "code_interpreter":
-            if content and not content.endswith("\n"):
-                content += "\n"
-            content += (
-                f'<details type="code_interpreter" done="true" output="x">\n'
-                f"<summary>Analyzed</summary>\n```py\n"
-                f'{block["content"]}\n```\n</details>\n'
-            )
     return content.strip()
 
 

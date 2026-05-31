@@ -266,22 +266,10 @@ class Pipe:
 	};
 
 	const submitHandler = async () => {
-		if (codeEditor) {
-			content = _content;
-			await tick();
+		content = _content;
+		await tick();
 
-			const res = await codeEditor.formatPythonCodeHandler();
-			await tick();
-
-			content = _content;
-			await tick();
-
-			if (res) {
-				console.info('Code formatted successfully');
-
-				saveHandler();
-			}
-		}
+		saveHandler();
 	};
 </script>
 

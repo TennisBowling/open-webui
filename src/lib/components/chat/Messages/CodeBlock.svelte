@@ -1,11 +1,8 @@
 <script lang="ts">
 	import hljs from 'highlight.js';
 	import { toast } from 'svelte-sonner';
-	import { getContext, onMount, tick, onDestroy } from 'svelte';
-	import { config } from '$lib/stores';
+	import { getContext, onMount, onDestroy } from 'svelte';
 
-	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
-	import { executeCode } from '$lib/apis/utils';
 	import { copyToClipboard, renderMermaidDiagram, renderVegaVisualization } from '$lib/utils';
 
 	import 'highlight.js/styles/github-dark.min.css';
@@ -13,10 +10,7 @@
 	import CodeEditor from '$lib/components/common/CodeEditor.svelte';
 	import SvgPanZoom from '$lib/components/common/SVGPanZoom.svelte';
 
-	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
 	import ChevronUpDown from '$lib/components/icons/ChevronUpDown.svelte';
-	import CommandLine from '$lib/components/icons/CommandLine.svelte';
-	import Cube from '$lib/components/icons/Cube.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -28,20 +22,17 @@
 	export let onPreview = (e) => {};
 
 	export let save = false;
-	export let run = true;
 	export let preview = false;
 	export let collapsed = false;
 
 	export let token;
 	export let lang = '';
 	export let code = '';
-	export let attributes = {};
 
 	export let className = 'mb-2';
 	export let editorClassName = '';
 	export let stickyButtonsClassName = 'top-0';
 
-	let pyodideWorker = null;
 	let codeBlockElement = null;
 	let visible = false;
 	let observer = null;
@@ -59,14 +50,6 @@
 
 	let mermaidHtml = null;
 	let vegaHtml = null;
-
-	let highlightedCode = null;
-	let executing = false;
-
-	let stdout = null;
-	let stderr = null;
-	let result = null;
-	let files = null;
 
 	let copied = false;
 	let saved = false;
@@ -97,233 +80,6 @@
 
 	const previewCode = () => {
 		onPreview(code);
-	};
-
-	const checkPythonCode = (str) => {
-		// Check if the string contains typical Python syntax characters
-		const pythonSyntax = [
-			'def ',
-			'else:',
-			'elif ',
-			'try:',
-			'except:',
-			'finally:',
-			'yield ',
-			'lambda ',
-			'assert ',
-			'nonlocal ',
-			'del ',
-			'True',
-			'False',
-			'None',
-			' and ',
-			' or ',
-			' not ',
-			' in ',
-			' is ',
-			' with '
-		];
-
-		for (let syntax of pythonSyntax) {
-			if (str.includes(syntax)) {
-				return true;
-			}
-		}
-
-		// If none of the above conditions met, it's probably not Python code
-		return false;
-	};
-
-	const executePython = async (code) => {
-		result = null;
-		stdout = null;
-		stderr = null;
-
-		executing = true;
-
-		if ($config?.code?.engine === 'jupyter') {
-			const output = await executeCode(localStorage.token, code).catch((error) => {
-				toast.error(`${error}`);
-				return null;
-			});
-
-			if (output) {
-				if (output['stdout']) {
-					stdout = output['stdout'];
-					const stdoutLines = stdout.split('\n');
-
-					for (const [idx, line] of stdoutLines.entries()) {
-						if (line.startsWith('data:image/png;base64')) {
-							if (files) {
-								files.push({
-									type: 'image/png',
-									data: line
-								});
-							} else {
-								files = [
-									{
-										type: 'image/png',
-										data: line
-									}
-								];
-							}
-
-							if (stdout.includes(`${line}\n`)) {
-								stdout = stdout.replace(`${line}\n`, ``);
-							} else if (stdout.includes(`${line}`)) {
-								stdout = stdout.replace(`${line}`, ``);
-							}
-						}
-					}
-				}
-
-				if (output['result']) {
-					result = output['result'];
-					const resultLines = result.split('\n');
-
-					for (const [idx, line] of resultLines.entries()) {
-						if (line.startsWith('data:image/png;base64')) {
-							if (files) {
-								files.push({
-									type: 'image/png',
-									data: line
-								});
-							} else {
-								files = [
-									{
-										type: 'image/png',
-										data: line
-									}
-								];
-							}
-
-							if (result.includes(`${line}\n`)) {
-								result = result.replace(`${line}\n`, ``);
-							} else if (result.includes(`${line}`)) {
-								result = result.replace(`${line}`, ``);
-							}
-						}
-					}
-				}
-
-				output['stderr'] && (stderr = output['stderr']);
-			}
-
-			executing = false;
-		} else {
-			executePythonAsWorker(code);
-		}
-	};
-
-	const executePythonAsWorker = async (code) => {
-		let packages = [
-			/\bimport\s+requests\b|\bfrom\s+requests\b/.test(code) ? 'requests' : null,
-			/\bimport\s+bs4\b|\bfrom\s+bs4\b/.test(code) ? 'beautifulsoup4' : null,
-			/\bimport\s+numpy\b|\bfrom\s+numpy\b/.test(code) ? 'numpy' : null,
-			/\bimport\s+pandas\b|\bfrom\s+pandas\b/.test(code) ? 'pandas' : null,
-			/\bimport\s+matplotlib\b|\bfrom\s+matplotlib\b/.test(code) ? 'matplotlib' : null,
-			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
-			/\bimport\s+sklearn\b|\bfrom\s+sklearn\b/.test(code) ? 'scikit-learn' : null,
-			/\bimport\s+scipy\b|\bfrom\s+scipy\b/.test(code) ? 'scipy' : null,
-			/\bimport\s+re\b|\bfrom\s+re\b/.test(code) ? 'regex' : null,
-			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
-			/\bimport\s+sympy\b|\bfrom\s+sympy\b/.test(code) ? 'sympy' : null,
-			/\bimport\s+tiktoken\b|\bfrom\s+tiktoken\b/.test(code) ? 'tiktoken' : null,
-			/\bimport\s+pytz\b|\bfrom\s+pytz\b/.test(code) ? 'pytz' : null
-		].filter(Boolean);
-
-		console.log(packages);
-
-		pyodideWorker = new PyodideWorker();
-
-		pyodideWorker.postMessage({
-			id: id,
-			code: code,
-			packages: packages
-		});
-
-		setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
-				pyodideWorker.terminate();
-			}
-		}, 60000);
-
-		pyodideWorker.onmessage = (event) => {
-			console.log('pyodideWorker.onmessage', event);
-			const { id, ...data } = event.data;
-
-			console.log(id, data);
-
-			if (data['stdout']) {
-				stdout = data['stdout'];
-				const stdoutLines = stdout.split('\n');
-
-				for (const [idx, line] of stdoutLines.entries()) {
-					if (line.startsWith('data:image/png;base64')) {
-						if (files) {
-							files.push({
-								type: 'image/png',
-								data: line
-							});
-						} else {
-							files = [
-								{
-									type: 'image/png',
-									data: line
-								}
-							];
-						}
-
-						if (stdout.includes(`${line}\n`)) {
-							stdout = stdout.replace(`${line}\n`, ``);
-						} else if (stdout.includes(`${line}`)) {
-							stdout = stdout.replace(`${line}`, ``);
-						}
-					}
-				}
-			}
-
-			if (data['result']) {
-				result = data['result'];
-				const resultLines = result.split('\n');
-
-				for (const [idx, line] of resultLines.entries()) {
-					if (line.startsWith('data:image/png;base64')) {
-						if (files) {
-							files.push({
-								type: 'image/png',
-								data: line
-							});
-						} else {
-							files = [
-								{
-									type: 'image/png',
-									data: line
-								}
-							];
-						}
-
-						if (result.startsWith(`${line}\n`)) {
-							result = result.replace(`${line}\n`, ``);
-						} else if (result.startsWith(`${line}`)) {
-							result = result.replace(`${line}`, ``);
-						}
-					}
-				}
-			}
-
-			data['stderr'] && (stderr = data['stderr']);
-			data['result'] && (result = data['result']);
-
-			executing = false;
-		};
-
-		pyodideWorker.onerror = (event) => {
-			console.log('pyodideWorker.onerror', event);
-			executing = false;
-		};
 	};
 
 	const render = async () => {
@@ -362,36 +118,6 @@
 		render();
 	}
 
-	$: if (attributes) {
-		onAttributesUpdate();
-	}
-
-	const onAttributesUpdate = () => {
-		if (attributes?.output) {
-			// Create a helper function to unescape HTML entities
-			const unescapeHtml = (html) => {
-				const textArea = document.createElement('textarea');
-				textArea.innerHTML = html;
-				return textArea.value;
-			};
-
-			try {
-				// Unescape the HTML-encoded string
-				const unescapedOutput = unescapeHtml(attributes.output);
-
-				// Parse the unescaped string into JSON
-				const output = JSON.parse(unescapedOutput);
-
-				// Assign the parsed values to variables
-				stdout = output.stdout;
-				stderr = output.stderr;
-				result = output.result;
-			} catch (error) {
-				console.error('Error:', error);
-			}
-		}
-	};
-
 	onMount(async () => {
 		observer = new IntersectionObserver((entries) => {
 			if (entries[0].isIntersecting) {
@@ -412,10 +138,6 @@
 	onDestroy(() => {
 		if (observer) {
 			observer.disconnect();
-		}
-
-		if (pyodideWorker) {
-			pyodideWorker.terminate();
 		}
 	});
 </script>
@@ -470,29 +192,6 @@
 						</div>
 					</button>
 
-					{#if ($config?.features?.enable_code_execution ?? true) && (lang.toLowerCase() === 'python' || lang.toLowerCase() === 'py' || (lang === '' && checkPythonCode(code)))}
-						{#if executing}
-							<div
-								class="run-code-button bg-none border-none p-0.5 cursor-not-allowed bg-white/70 dark:bg-gray-800"
-							>
-								{$i18n.t('Running')}
-							</div>
-						{:else if run}
-							<button
-								class="flex gap-1 items-center run-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-								on:click={async () => {
-									code = _code;
-									await tick();
-									executePython(code);
-								}}
-							>
-								<div>
-									{$i18n.t('Run')}
-								</div>
-							</button>
-						{/if}
-					{/if}
-
 					{#if save}
 						<button
 							class="save-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
@@ -509,7 +208,7 @@
 
 					{#if preview && ['html', 'svg'].includes(lang)}
 						<button
-							class="flex gap-1 items-center run-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
+							class="flex gap-1 items-center preview-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
 							on:click={previewCode}
 						>
 							<div>
@@ -523,9 +222,7 @@
 			<div
 				class="language-{lang} rounded-t-xl -mt-9 bg-manilla/60 dark:bg-manilla-dark {editorClassName
 					? editorClassName
-					: executing || stdout || stderr || result
-						? ''
-						: 'rounded-b-xl'} overflow-hidden"
+					: 'rounded-b-xl'} overflow-hidden"
 			>
 				<div class=" pt-8 bg-manilla/60 dark:bg-manilla-dark"></div>
 
@@ -545,11 +242,7 @@
 					{:else}
 						<pre
 							class=" hljs p-4 px-5 overflow-x-auto"
-							style="border-top-left-radius: 0px; border-top-right-radius: 0px; {(executing ||
-								stdout ||
-								stderr ||
-								result) &&
-								'border-bottom-left-radius: 0px; border-bottom-right-radius: 0px;'}"><code
+							style="border-top-left-radius: 0px; border-top-right-radius: 0px;"><code
 								class="language-{lang} rounded-t-none whitespace-pre text-sm"
 								>{#if visible}{@html hljs.highlightAuto(code, hljs.getLanguage(lang)?.aliases)
 										.value || code}{:else}{code}{/if}</code
@@ -567,56 +260,6 @@
 					</div>
 				{/if}
 			</div>
-
-			{#if !collapsed}
-				<div
-					id="plt-canvas-{id}"
-					class="bg-gray-50 dark:bg-gray-900 dark:text-white max-w-full overflow-x-auto scrollbar-hidden"
-				/>
-
-				{#if executing || stdout || stderr || result || files}
-					<div
-						class="bg-gray-50 dark:bg-gray-900 dark:text-white rounded-b-xl! py-4 px-4 flex flex-col gap-2"
-					>
-						{#if executing}
-							<div class=" ">
-								<div class=" text-gray-500 text-xs mb-1">{$i18n.t('STDOUT/STDERR')}</div>
-								<div class="text-sm">{$i18n.t('Running...')}</div>
-							</div>
-						{:else}
-							{#if stdout || stderr}
-								<div class=" ">
-									<div class=" text-gray-500 text-xs mb-1">{$i18n.t('STDOUT/STDERR')}</div>
-									<div
-										class="text-sm {stdout?.split('\n')?.length > 100
-											? `max-h-96`
-											: ''}  overflow-y-auto"
-									>
-										{stdout || stderr}
-									</div>
-								</div>
-							{/if}
-							{#if result || files}
-								<div class=" ">
-									<div class=" text-gray-500 text-xs mb-1">{$i18n.t('RESULT')}</div>
-									{#if result}
-										<div class="text-sm">{`${JSON.stringify(result)}`}</div>
-									{/if}
-									{#if files}
-										<div class="flex flex-col gap-2">
-											{#each files as file}
-												{#if file.type.startsWith('image')}
-													<img src={file.data} alt="Output" class=" w-full max-w-[36rem]" />
-												{/if}
-											{/each}
-										</div>
-									{/if}
-								</div>
-							{/if}
-						{/if}
-					</div>
-				{/if}
-			{/if}
 		{/if}
 	</div>
 </div>

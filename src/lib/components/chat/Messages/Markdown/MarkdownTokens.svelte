@@ -48,7 +48,6 @@
 	export let id: string;
 	export let tokens: Token[];
 	export let top = true;
-	export let attributes = {};
 
 	export let done = true;
 	export let chatId = '';
@@ -134,7 +133,6 @@
 					{token}
 					lang={token?.lang ?? ''}
 					code={token?.text ?? ''}
-					{attributes}
 					{save}
 					{preview}
 					edit={editCodeBlock}

@@ -465,7 +465,7 @@ A chat message is stored with these fields (the ones that matter for reasoning):
 
 | Field | Shape | Purpose |
 |---|---|---|
-| `content_blocks` | `list[block]` (internal carrier) | Structured assistant output: `[text \| reasoning \| tool_calls \| code_interpreter]*`. The tool_calls block carries the round's `reasoning_details` inline. **Never sent to upstream** — `blocks_to_api_messages` strips it. |
+| `content_blocks` | `list[block]` (internal carrier) | Structured assistant output: `[text \| reasoning \| tool_calls]*`. The tool_calls block carries the round's `reasoning_details` inline. **Never sent to upstream** — `blocks_to_api_messages` strips it. |
 | `reasoning_details_per_round` | `list[list[reasoning_item]]` | One entry per stream-handler invocation, in emission order. Empty rounds are stored as `[]` so `len(per_round) == emission_count`. **Never sent to upstream** — stripped by `blocks_to_api_messages`. |
 | `reasoning_details` | `list[reasoning_item]` (flat) | Concatenation of every `per_round` entry. **Sent to upstream** for legacy assistant messages that lack `content_blocks` (passthrough branch). For modern content_blocks-bearing messages, `_expand_assistant` rebuilds the per-emission slices from `per_round`. |
 
@@ -1042,7 +1042,7 @@ body via `ENABLE_API_DEBUG_LOGGING` and bisect using the playbook in §10.
   order. Indexed by emission number (0 = first emission, etc.).
 - **content_blocks** — The internal structured representation of an
   assistant message's output: a list of typed blocks (text, reasoning,
-  tool_calls, code_interpreter). Lossless, supports replay-byte-stability
+  tool_calls). Lossless, supports replay-byte-stability
   with the live tool loop. Never sent over the wire.
 - **flat `reasoning_details`** — The single concatenated array of all rounds'
   reasoning items, stored on the saved message alongside `per_round`.

@@ -249,7 +249,7 @@
 
 	const estimateBlockSize = (block: any) => {
 		if (!block || typeof block !== 'object') return 0;
-		if (['text', 'reasoning', 'code_interpreter'].includes(block.type)) {
+		if (['text', 'reasoning'].includes(block.type)) {
 			return `${block.content ?? ''}`.length;
 		}
 		try {
@@ -818,15 +818,6 @@
 											</span>
 										</div>
 									{/each}
-								</div>
-							{:else if block?.type === 'code_interpreter'}
-								<div class="rounded-lg bg-gray-50 dark:bg-gray-850 px-3 py-2 text-xs">
-									<div class="font-medium text-gray-700 dark:text-gray-300 mb-1 font-mono">
-										{block.attributes?.lang ?? 'code'}
-									</div>
-									<pre
-										class="whitespace-pre-wrap font-mono text-gray-600 dark:text-gray-400">{block.content ??
-											''}</pre>
 								</div>
 							{/if}
 						{/each}

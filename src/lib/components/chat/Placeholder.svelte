@@ -50,7 +50,6 @@
 	export let showCommands = false;
 
 	export let imageGenerationEnabled = false;
-	export let codeInterpreterEnabled = false;
 	export let webSearchEnabled = false;
 	export let studyModeEnabled = false;
 	export let dataVizEnabled = false;
@@ -248,7 +247,6 @@
 					bind:selectedToolIds
 					bind:selectedFilterIds
 					bind:imageGenerationEnabled
-					bind:codeInterpreterEnabled
 					bind:webSearchEnabled
 					bind:studyModeEnabled
 					bind:dataVizEnabled

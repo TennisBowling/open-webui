@@ -204,10 +204,6 @@
 			return toolBlockSignature(block);
 		}
 
-		if (type === 'code_interpreter') {
-			return `code:${textSig(block.content)}:${textSig(JSON.stringify(block.output ?? null))}`;
-		}
-
 		return `${type}:${textSig(JSON.stringify(block))}`;
 	};
 
