@@ -1362,7 +1362,7 @@ async def _run_inner_chat(
         inner_mcp_clients = inner_metadata.get("mcp_clients") or {}
         for server_id, client in inner_mcp_clients.items():
             try:
-                await asyncio.shield(client.disconnect())
+                await client.disconnect()
             except Exception:  # noqa: BLE001
                 log.exception(
                     "subagent mcp cleanup failed for %r", server_id

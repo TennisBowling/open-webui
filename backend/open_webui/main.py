@@ -1767,11 +1767,9 @@ async def chat_completion(
             mcp_clients = metadata.get("mcp_clients") or {}
             for server_id, client in mcp_clients.items():
                 try:
-                    # Shield disconnect so a cancel arriving during cleanup
-                    # doesn't tear down the transport mid-aclose() (which
-                    # would surface as a BaseExceptionGroup containing a
-                    # CancelledError and mask the real cancellation cause).
-                    await asyncio.shield(client.disconnect())
+                    # MCP transports create AnyIO cancel scopes that must be
+                    # closed by the same asyncio task that opened them.
+                    await client.disconnect()
                 except Exception:
                     log.exception(
                         "Error disconnecting MCP client %r during cleanup",

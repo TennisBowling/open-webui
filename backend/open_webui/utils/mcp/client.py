@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import re
 from typing import Optional
@@ -159,9 +158,10 @@ class MCPClient:
                 self.session = session
                 self.exit_stack = exit_stack.pop_all()
             except BaseException:
-                # Includes CancelledError. Shield disconnect so a cancel
-                # delivered mid-cleanup doesn't leak the transport / OS pipe.
-                await asyncio.shield(self.disconnect())
+                # Includes CancelledError. Keep cleanup in this task because
+                # AnyIO transport contexts must exit in the task that entered
+                # them.
+                await self.disconnect()
                 raise
 
     async def list_tool_specs(self) -> Optional[list[dict]]:
