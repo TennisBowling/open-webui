@@ -14,6 +14,11 @@ export type SubagentsConfig = {
 	// `default`, `flex`, `priority`). Per-chat `chat.params.subagentServiceTier`
 	// overrides this when set.
 	SUBAGENT_DEFAULT_SERVICE_TIER: string;
+	// Global admin gate. When false, subagents only get built-in web_search/fetch
+	// regardless of per-chat tool selections.
+	SUBAGENT_ALLOW_EXTERNAL_TOOLS: boolean;
+	// Appended only when subagents receive selected external tools.
+	SUBAGENT_EXTERNAL_TOOLS_PROMPT: string;
 };
 
 export type SubagentsConfigUpdate = Partial<SubagentsConfig>;

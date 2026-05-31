@@ -31,9 +31,11 @@ Event forwarding:
 
 Nesting prevention:
 
-- The inner ``features`` dict is empty and inner ``tool_ids`` only contain
-  ``builtin:web_search`` + user-selected extras. The subagent tools are NOT
-  registered for the inner run, so a subagent can't recursively spawn another.
+- The inner ``features`` dict is empty and inner ``tool_ids`` always include
+  ``builtin:web_search``. If the admin gate and per-chat opt-in are both on,
+  selected admin external tool servers are inherited too. The subagent tools
+  are NOT registered for the inner run, so a subagent can't recursively spawn
+  another.
 
 request.state save/restore:
 
@@ -154,7 +156,135 @@ def _resolve_subagent_model_id(
     return None
 
 
-def _compose_subagent_system_prompt(request: Request, subagent_model_id: str) -> str:
+def _as_tool_id_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    return []
+
+
+def _dedupe_tool_ids(tool_ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for tool_id in tool_ids:
+        if not tool_id or tool_id in seen:
+            continue
+        seen.add(tool_id)
+        deduped.append(tool_id)
+    return deduped
+
+
+def _is_inheritable_external_tool_id(tool_id: str) -> bool:
+    # Admin-added OpenAPI and MCP tool servers use the `server:` namespace.
+    # Skip direct_server ids because their specs live in the browser payload,
+    # and skip builtins so subagents cannot re-enable nested subagents/data-viz.
+    return bool(tool_id and tool_id.startswith("server:"))
+
+
+def _normalize_container_server_id(server_id: str | None) -> str:
+    server_id = (server_id or "").strip()
+    if server_id.startswith("server:mcp:"):
+        server_id = server_id[len("server:mcp:") :]
+    return server_id
+
+
+def _container_tool_id(request: Request) -> str:
+    server_id = _normalize_container_server_id(
+        getattr(request.app.state.config, "CONTAINER_MCP_SERVER_ID", "")
+    )
+    return f"server:mcp:{server_id}" if server_id else ""
+
+
+def _tool_id_matches(tool_id: str, target: str) -> bool:
+    return bool(target and (tool_id == target or tool_id.startswith(f"{target}|")))
+
+
+def _resolve_subagent_tool_ids(
+    request: Request, chat_params: dict, parent_metadata: Optional[dict] = None
+) -> list[str]:
+    tool_ids = ["builtin:web_search"]
+
+    allow_external_tools = bool(
+        getattr(request.app.state.config, "SUBAGENT_ALLOW_EXTERNAL_TOOLS", False)
+    )
+    if not allow_external_tools:
+        return tool_ids
+
+    # Back-compat/power-user hook: explicit subagent extras remain supported,
+    # but only while the admin global gate is enabled.
+    for tool_id in _as_tool_id_list(chat_params.get("subagentExtraToolIds")):
+        if tool_id != "builtin:subagent" and not tool_id.startswith("direct_server:"):
+            tool_ids.append(tool_id)
+
+    parent_metadata = parent_metadata or {}
+    metadata_params = parent_metadata.get("params") or {}
+    external_tools_enabled = metadata_params.get(
+        "subagentExternalToolsEnabled",
+        chat_params.get("subagentExternalToolsEnabled", True),
+    )
+
+    if external_tools_enabled:
+        current_tool_ids = _as_tool_id_list(parent_metadata.get("tool_ids"))
+        selected_tool_ids = current_tool_ids or _as_tool_id_list(
+            chat_params.get("selectedToolIds")
+        )
+        for tool_id in selected_tool_ids:
+            if _is_inheritable_external_tool_id(tool_id):
+                tool_ids.append(tool_id)
+
+    return _dedupe_tool_ids(tool_ids)
+
+
+def _subagent_container_shared_context(
+    request: Request,
+    parent_metadata: dict,
+    inner_tool_ids: list[str],
+    import_outputs: bool = False,
+) -> dict:
+    container_tool_id = _container_tool_id(request)
+    if not any(
+        _tool_id_matches(tool_id, container_tool_id) for tool_id in inner_tool_ids
+    ):
+        return {}
+
+    parent_chat_id = parent_metadata.get("chat_id")
+    if not parent_chat_id:
+        return {}
+
+    server_id = _normalize_container_server_id(
+        getattr(request.app.state.config, "CONTAINER_MCP_SERVER_ID", "")
+    )
+    return {
+        "container_workspace_chat_id": parent_chat_id,
+        "container_workspace_message_id": parent_metadata.get("message_id"),
+        "container_workspace_output_message_id": parent_metadata.get("message_id"),
+        "container_workspace_reuse_existing_inputs": True,
+        "container_workspace_import_outputs": import_outputs,
+        "tool_server_header_context": {
+            server_id: {
+                "chat_id": parent_chat_id,
+                "message_id": parent_metadata.get("message_id"),
+                "session_id": parent_metadata.get("session_id"),
+            }
+        },
+    }
+
+
+def _external_tools_prompt(request: Request, inner_tool_ids: list[str]) -> str:
+    has_external_tools = any(
+        tool_id != "builtin:web_search" for tool_id in inner_tool_ids
+    )
+    if not has_external_tools:
+        return ""
+    return (
+        getattr(request.app.state.config, "SUBAGENT_EXTERNAL_TOOLS_PROMPT", "") or ""
+    ).strip()
+
+
+def _compose_subagent_system_prompt(
+    request: Request, subagent_model_id: str, external_tools_prompt: str = ""
+) -> str:
     """Return the subagent's system prompt: the model's own admin-set system
     prompt with the optional SUBAGENT_SYSTEM_PROMPT_APPEND appended after a
     blank line. No admin-level preamble replaces the model's persona."""
@@ -171,15 +301,13 @@ def _compose_subagent_system_prompt(request: Request, subagent_model_id: str) ->
     except Exception as e:  # noqa: BLE001
         log.debug(f"could not load model system prompt for {subagent_model_id}: {e}")
 
-    # If the admin set a system-prompt append, tack it on after the model's
-    # own prompt (separated by a blank line so the model sees them as two
-    # distinct sections).
+    # If the admin set prompt appends, tack them on after the model's own
+    # prompt separated by blank lines so the model sees distinct sections.
     append = (
         getattr(request.app.state.config, "SUBAGENT_SYSTEM_PROMPT_APPEND", "") or ""
     ).strip()
-    if append:
-        return f"{model_prompt}\n\n{append}".strip()
-    return model_prompt
+    parts = [model_prompt, append, external_tools_prompt.strip()]
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def _subagent_tool_name_for_run(run: dict) -> str:
@@ -968,6 +1096,13 @@ def _build_forwarding_emitter(
             except Exception as e:  # noqa: BLE001
                 log.debug(f"subagent base emitter raised: {e}")
 
+        if force_fanout and etype == "files":
+            try:
+                await parent_event_emitter(event)
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"forwarding subagent files to parent UI failed: {e}")
+            return
+
         if etype not in FORWARDED_TYPES:
             return
 
@@ -1201,15 +1336,23 @@ async def _run_inner_chat(
         model_id=subagent_model_id,
     )
 
-    # 2. Compose the inner system prompt + load full history as API messages.
-    system_prompt = _compose_subagent_system_prompt(request, subagent_model_id)
+    # 2. Resolve inner tools, then compose the system prompt. The prompt can
+    # mention external tools/shared container only when those tools are really
+    # available to this subagent turn.
+    inner_tool_ids = _resolve_subagent_tool_ids(request, chat_params, parent_metadata)
+    container_shared_context = _subagent_container_shared_context(
+        request, parent_metadata, inner_tool_ids, import_outputs=force_fanout
+    )
+    system_prompt = _compose_subagent_system_prompt(
+        request,
+        subagent_model_id,
+        external_tools_prompt=_external_tools_prompt(request, inner_tool_ids),
+    )
     api_messages = _load_inner_api_messages(
         subagent_chat_id, assistant_msg_id, system_prompt
     )
 
     # 3. Build inner_form_data + inner_metadata.
-    extra_tool_ids = list(chat_params.get("subagentExtraToolIds") or [])
-    inner_tool_ids = list({"builtin:web_search", *extra_tool_ids})
 
     # Reasoning effort precedence (lowest priority first):
     #   model default (= no `reasoning_effort` sent) →
@@ -1312,6 +1455,7 @@ async def _run_inner_chat(
         # Flag so any downstream code can detect "this run is inside a
         # subagent" and avoid nesting / re-triggering features.
         "subagent_inner": True,
+        **container_shared_context,
     }
 
     inner_form_data["metadata"] = inner_metadata

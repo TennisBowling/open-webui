@@ -16,10 +16,13 @@
 	let systemPromptAppend = '';
 	let defaultReasoningEffort = '';
 	let defaultServiceTier = '';
+	let allowExternalTools = false;
+	let externalToolsPrompt = '';
 
 	// Cached default so the "Reset" button works without a round-trip.
 	let initialParentPrompt = '';
 	let initialSystemPromptAppend = '';
+	let initialExternalToolsPrompt = '';
 
 	// Common reasoning_effort values. The backend just passes the string
 	// through to the provider, so a custom value works too — admin can edit
@@ -52,7 +55,9 @@
 				SUBAGENT_SYSTEM_PROMPT_APPEND: systemPromptAppend,
 				SUBAGENT_PARENT_PROMPT: parentPrompt,
 				SUBAGENT_DEFAULT_REASONING_EFFORT: defaultReasoningEffort,
-				SUBAGENT_DEFAULT_SERVICE_TIER: defaultServiceTier
+				SUBAGENT_DEFAULT_SERVICE_TIER: defaultServiceTier,
+				SUBAGENT_ALLOW_EXTERNAL_TOOLS: allowExternalTools,
+				SUBAGENT_EXTERNAL_TOOLS_PROMPT: externalToolsPrompt
 				// Note: the subagent's INNER system prompt is intentionally the
 				// model's own admin-set system prompt verbatim (no preamble
 				// from this admin page is injected). The `SUBAGENT_SYSTEM_PROMPT`
@@ -80,6 +85,9 @@
 				initialSystemPromptAppend = systemPromptAppend;
 				defaultReasoningEffort = res.SUBAGENT_DEFAULT_REASONING_EFFORT ?? '';
 				defaultServiceTier = res.SUBAGENT_DEFAULT_SERVICE_TIER ?? '';
+				allowExternalTools = !!res.SUBAGENT_ALLOW_EXTERNAL_TOOLS;
+				externalToolsPrompt = res.SUBAGENT_EXTERNAL_TOOLS_PROMPT ?? '';
+				initialExternalToolsPrompt = externalToolsPrompt;
 			}
 		} catch (err) {
 			console.error(err);
@@ -116,6 +124,52 @@
 				</div>
 
 				{#if enableSubagents}
+					<div class="mb-2.5 flex w-full justify-between gap-4">
+						<div class="min-w-0">
+							<div class="self-center text-xs font-medium">
+								{$i18n.t('Allow external tools in subagents')}
+							</div>
+							<div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+								{$i18n.t(
+									'When enabled, chats can opt in to give subagents access to selected admin-added external tool servers, including the configured container MCP server. Subagents still cannot spawn subagents.'
+								)}
+							</div>
+						</div>
+						<div class="flex items-center relative shrink-0">
+							<Switch bind:state={allowExternalTools} />
+						</div>
+					</div>
+
+					{#if allowExternalTools}
+						<div class="mb-2.5 flex w-full flex-col">
+							<div class="flex w-full items-center mb-1">
+								<div class="self-center text-xs font-medium">
+									{$i18n.t('External tools prompt append')}
+								</div>
+								<button
+									type="button"
+									class="ml-auto text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+									on:click|preventDefault={() => {
+										externalToolsPrompt = initialExternalToolsPrompt;
+									}}
+								>
+									{$i18n.t('Reset')}
+								</button>
+							</div>
+							<div class="text-xs text-gray-500 dark:text-gray-400 mb-1">
+								{$i18n.t(
+									'Appended only when a subagent receives selected external tools. Use this to explain tool access, shared container workspace rules, and coordination with the main chat or other subagents.'
+								)}
+							</div>
+							<textarea
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
+								rows="6"
+								placeholder={$i18n.t('Append when subagents have external tools…')}
+								bind:value={externalToolsPrompt}
+							></textarea>
+						</div>
+					{/if}
+
 					<div class="mb-2.5 flex w-full flex-col">
 						<div class=" self-center text-xs font-medium mb-1 mr-auto">
 							{$i18n.t('Default subagent model')}

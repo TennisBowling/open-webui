@@ -56,6 +56,7 @@
 	export let subagentsEnabled = false;
 	export let subagentReasoningEffort: string = '';
 	export let subagentServiceTier: string = '';
+	export let subagentExternalToolsEnabled = true;
 	export let serviceTier: string = 'default';
 
 	export let onSelect = (e) => {};
@@ -253,6 +254,7 @@
 					bind:subagentsEnabled
 					bind:subagentReasoningEffort
 					bind:subagentServiceTier
+					bind:subagentExternalToolsEnabled
 					bind:serviceTier
 					bind:atSelectedModel
 					bind:showCommands

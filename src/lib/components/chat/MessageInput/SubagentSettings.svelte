@@ -5,6 +5,7 @@
 	import { flyAndScale } from '$lib/utils/transitions';
 
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
+	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Knobs from '$lib/components/icons/Knobs.svelte';
 
@@ -12,6 +13,10 @@
 
 	export let subagentReasoningEffort: string = '';
 	export let subagentServiceTier: string = '';
+	export let subagentExternalToolsEnabled = true;
+	export let allowExternalTools = false;
+	export let selectedExternalToolCount = 0;
+	export let containerWorkspaceActive = false;
 	// Resolved by the parent (MessageInput) from the effective subagent
 	// model's `info.meta.service_tiers`, falling back to the canonical set.
 	// We don't recompute it here so the dropdown stays in sync with whatever
@@ -20,7 +25,17 @@
 
 	let show = false;
 
-	$: hasOverride = !!(subagentReasoningEffort || subagentServiceTier);
+	$: hasOverride = !!(
+		subagentReasoningEffort ||
+		subagentServiceTier ||
+		(allowExternalTools && subagentExternalToolsEnabled)
+	);
+	$: externalToolsLabel = containerWorkspaceActive
+		? 'External tools and container'
+		: 'External tools';
+	$: externalToolsDescription = containerWorkspaceActive
+		? 'Give subagents access to selected admin external tools, including this chat’s shared container workspace.'
+		: 'Give subagents access to selected admin external tool servers for this chat.';
 </script>
 
 <Dropdown bind:show closeOnOutsideClick={true}>
@@ -51,6 +66,27 @@
 			<div class="text-xs font-semibold text-gray-700 dark:text-gray-200 px-1 mb-2">
 				{$i18n.t('Subagent settings')}
 			</div>
+
+			{#if allowExternalTools}
+				<div class="mb-3 px-1">
+					<div class="flex items-start justify-between gap-3">
+						<div class="min-w-0">
+							<div class="text-xs font-medium text-gray-700 dark:text-gray-300">
+								{$i18n.t(externalToolsLabel)}
+							</div>
+							<p class="text-[10px] italic text-gray-500 dark:text-gray-400 mt-1">
+								{$i18n.t(externalToolsDescription)}
+								{#if selectedExternalToolCount === 0}
+									{$i18n.t(' No external tools are selected yet.')}
+								{/if}
+							</p>
+						</div>
+						<div class="shrink-0 pt-0.5">
+							<Switch bind:state={subagentExternalToolsEnabled} />
+						</div>
+					</div>
+				</div>
+			{/if}
 
 			<div class="mb-3">
 				<label

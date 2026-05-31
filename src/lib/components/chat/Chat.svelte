@@ -179,6 +179,10 @@
 	// `priority` for OpenAI; provider-specific values otherwise).
 	let subagentServiceTier: string = '';
 	let lastPersistedSubagentServiceTier: string | null = null;
+	// Per-chat opt-in for inheriting selected admin external tool servers
+	// (including the configured container MCP server) into subagent runs.
+	let subagentExternalToolsEnabled = true;
+	let lastPersistedSubagentExternalToolsEnabled: boolean | null = null;
 
 	const sameStringArray = (a = [], b = []) =>
 		Array.isArray(a) &&
@@ -343,6 +347,32 @@
 
 		void saveChatHandler(chatIdToPersist, history, nextParams, [
 			{ op: 'set_param', key: 'subagentServiceTier', value: subagentServiceTier }
+		]);
+	}
+
+	// Same pattern for the per-chat external-tool inheritance opt-in.
+	$: if (subagentExternalToolsEnabled !== ((params as any).subagentExternalToolsEnabled ?? true)) {
+		params = { ...params, subagentExternalToolsEnabled };
+	}
+	$: if (
+		activeChatId &&
+		!loading &&
+		!$temporaryChatEnabled &&
+		lastPersistedSubagentExternalToolsEnabled !== null &&
+		subagentExternalToolsEnabled !== lastPersistedSubagentExternalToolsEnabled
+	) {
+		const nextParams = { ...params, subagentExternalToolsEnabled };
+		const chatIdToPersist = activeChatId;
+
+		params = nextParams;
+		lastPersistedSubagentExternalToolsEnabled = subagentExternalToolsEnabled;
+
+		void saveChatHandler(chatIdToPersist, history, nextParams, [
+			{
+				op: 'set_param',
+				key: 'subagentExternalToolsEnabled',
+				value: subagentExternalToolsEnabled
+			}
 		]);
 	}
 
@@ -1019,6 +1049,7 @@
 		lastPersistedSubagentsEnabled = null;
 		lastPersistedSubagentReasoningEffort = null;
 		lastPersistedSubagentServiceTier = null;
+		lastPersistedSubagentExternalToolsEnabled = null;
 
 		prompt = '';
 		messageInput?.setText('');
@@ -1031,6 +1062,7 @@
 		subagentsEnabled = false;
 		subagentReasoningEffort = '';
 		subagentServiceTier = '';
+		subagentExternalToolsEnabled = true;
 		imageGenerationEnabled = false;
 
 		// Clear the queue from the previous chat. loadChat will re-populate from
@@ -1193,6 +1225,7 @@
 		subagentsEnabled = false;
 		subagentReasoningEffort = '';
 		subagentServiceTier = '';
+		subagentExternalToolsEnabled = true;
 		subagentLiveStates.set({});
 		imageGenerationEnabled = false;
 
@@ -3268,6 +3301,11 @@
 			subagentServiceTier = params.subagentServiceTier ?? '';
 		}
 		lastPersistedSubagentServiceTier = subagentServiceTier;
+
+		if ((params as any).subagentExternalToolsEnabled !== undefined) {
+			subagentExternalToolsEnabled = !!(params as any).subagentExternalToolsEnabled;
+		}
+		lastPersistedSubagentExternalToolsEnabled = subagentExternalToolsEnabled;
 
 		// Hydrate the subagent live-state store with anything persisted on
 		// this chat's messages. This must be self-contained: after a full tab
@@ -7675,6 +7713,7 @@
 									bind:subagentsEnabled
 									bind:subagentReasoningEffort
 									bind:subagentServiceTier
+									bind:subagentExternalToolsEnabled
 									bind:serviceTier
 									bind:atSelectedModel
 									bind:showCommands
@@ -7740,6 +7779,7 @@
 									bind:subagentsEnabled
 									bind:subagentReasoningEffort
 									bind:subagentServiceTier
+									bind:subagentExternalToolsEnabled
 									bind:serviceTier
 									bind:atSelectedModel
 									bind:showCommands

@@ -306,9 +306,12 @@ from open_webui.config import (
     ENABLE_SUBAGENTS,
     SUBAGENT_DEFAULT_MODEL,
     SUBAGENT_SYSTEM_PROMPT,
+    SUBAGENT_SYSTEM_PROMPT_APPEND,
     SUBAGENT_PARENT_PROMPT,
     SUBAGENT_DEFAULT_REASONING_EFFORT,
     SUBAGENT_DEFAULT_SERVICE_TIER,
+    SUBAGENT_ALLOW_EXTERNAL_TOOLS,
+    SUBAGENT_EXTERNAL_TOOLS_PROMPT,
     # Flex auto-flip
     FLEX_AUTO_FLIP_ENABLED,
     FLEX_AUTO_FLIP_OFF_PEAK_START_HOUR,
@@ -1058,9 +1061,12 @@ app.state.config.DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT = (
 app.state.config.ENABLE_SUBAGENTS = ENABLE_SUBAGENTS
 app.state.config.SUBAGENT_DEFAULT_MODEL = SUBAGENT_DEFAULT_MODEL
 app.state.config.SUBAGENT_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT
+app.state.config.SUBAGENT_SYSTEM_PROMPT_APPEND = SUBAGENT_SYSTEM_PROMPT_APPEND
 app.state.config.SUBAGENT_PARENT_PROMPT = SUBAGENT_PARENT_PROMPT
 app.state.config.SUBAGENT_DEFAULT_REASONING_EFFORT = SUBAGENT_DEFAULT_REASONING_EFFORT
 app.state.config.SUBAGENT_DEFAULT_SERVICE_TIER = SUBAGENT_DEFAULT_SERVICE_TIER
+app.state.config.SUBAGENT_ALLOW_EXTERNAL_TOOLS = SUBAGENT_ALLOW_EXTERNAL_TOOLS
+app.state.config.SUBAGENT_EXTERNAL_TOOLS_PROMPT = SUBAGENT_EXTERNAL_TOOLS_PROMPT
 
 # Flex auto-flip
 app.state.config.FLEX_AUTO_FLIP_ENABLED = FLEX_AUTO_FLIP_ENABLED
@@ -1935,6 +1941,9 @@ async def get_app_config(request: Request):
                     # model and pick the right `service_tiers` list for its
                     # dropdown without needing an admin-only round trip.
                     "subagent_default_model": app.state.config.SUBAGENT_DEFAULT_MODEL,
+                    "subagent_allow_external_tools": (
+                        app.state.config.SUBAGENT_ALLOW_EXTERNAL_TOOLS
+                    ),
                     # Flex auto-flip policy — read by Chat.svelte's auto-flip
                     # reactive. Surfaced (non-secret) so admins can tune the
                     # off-peak window and threshold without touching code.

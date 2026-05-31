@@ -341,6 +341,7 @@ type Config = {
 		enable_web_search?: boolean;
 		enable_subagents?: boolean;
 		subagent_default_model?: string;
+		subagent_allow_external_tools?: boolean;
 		flex_auto_flip_enabled?: boolean;
 		flex_auto_flip_off_peak_start_hour?: number;
 		flex_auto_flip_off_peak_end_hour?: number;

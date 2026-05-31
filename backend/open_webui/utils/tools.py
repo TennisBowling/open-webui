@@ -59,6 +59,21 @@ _RESERVED_TOOL_SERVER_HEADERS = frozenset(
 )
 
 
+def _metadata_for_tool_server(
+    connection: Dict[str, Any], metadata: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    metadata = metadata or {}
+    contexts = metadata.get("tool_server_header_context")
+    if not isinstance(contexts, dict):
+        return metadata
+
+    server_id = str((connection.get("info") or {}).get("id") or "")
+    override = contexts.get(server_id) if server_id else None
+    if not isinstance(override, dict):
+        return metadata
+    return {**metadata, **override}
+
+
 def resolve_tool_server_headers(
     connection: Dict[str, Any],
     user: Optional[UserModel] = None,
@@ -80,7 +95,7 @@ def resolve_tool_server_headers(
     if not isinstance(raw, list):
         return {}
 
-    metadata = metadata or {}
+    metadata = _metadata_for_tool_server(connection, metadata)
     substitutions = {
         "{{CHAT_ID}}": str(metadata.get("chat_id") or ""),
         "{{MESSAGE_ID}}": str(metadata.get("message_id") or ""),

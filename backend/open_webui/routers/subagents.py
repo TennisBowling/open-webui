@@ -35,6 +35,8 @@ class SubagentConfigForm(BaseModel):
     SUBAGENT_PARENT_PROMPT: Optional[str] = None
     SUBAGENT_DEFAULT_REASONING_EFFORT: Optional[str] = None
     SUBAGENT_DEFAULT_SERVICE_TIER: Optional[str] = None
+    SUBAGENT_ALLOW_EXTERNAL_TOOLS: Optional[bool] = None
+    SUBAGENT_EXTERNAL_TOOLS_PROMPT: Optional[str] = None
 
 
 def _serialize(request: Request) -> dict:
@@ -50,6 +52,12 @@ def _serialize(request: Request) -> dict:
         "SUBAGENT_PARENT_PROMPT": config.SUBAGENT_PARENT_PROMPT,
         "SUBAGENT_DEFAULT_REASONING_EFFORT": config.SUBAGENT_DEFAULT_REASONING_EFFORT,
         "SUBAGENT_DEFAULT_SERVICE_TIER": config.SUBAGENT_DEFAULT_SERVICE_TIER,
+        "SUBAGENT_ALLOW_EXTERNAL_TOOLS": getattr(
+            config, "SUBAGENT_ALLOW_EXTERNAL_TOOLS", False
+        ),
+        "SUBAGENT_EXTERNAL_TOOLS_PROMPT": getattr(
+            config, "SUBAGENT_EXTERNAL_TOOLS_PROMPT", ""
+        ),
     }
 
 
@@ -84,6 +92,10 @@ async def update_subagents_config(
         )
     if form_data.SUBAGENT_DEFAULT_SERVICE_TIER is not None:
         config.SUBAGENT_DEFAULT_SERVICE_TIER = form_data.SUBAGENT_DEFAULT_SERVICE_TIER
+    if form_data.SUBAGENT_ALLOW_EXTERNAL_TOOLS is not None:
+        config.SUBAGENT_ALLOW_EXTERNAL_TOOLS = form_data.SUBAGENT_ALLOW_EXTERNAL_TOOLS
+    if form_data.SUBAGENT_EXTERNAL_TOOLS_PROMPT is not None:
+        config.SUBAGENT_EXTERNAL_TOOLS_PROMPT = form_data.SUBAGENT_EXTERNAL_TOOLS_PROMPT
     return _serialize(request)
 
 

@@ -119,7 +119,7 @@
 	const canceledImageUploads = new Set<string>();
 	const imageUploadAbortControllers = new Map<string, AbortController>();
 
-	export let selectedToolIds = [];
+	export let selectedToolIds: string[] = [];
 
 	$: containerFeatures = ($config as any)?.features ?? {};
 	$: containerToolId = containerFeatures?.container_mcp_server_id
@@ -167,6 +167,12 @@
 	// provider picks its own default). Otherwise: any string the provider
 	// accepts (typically `default` / `flex` / `priority`).
 	export let subagentServiceTier: string = '';
+	export let subagentExternalToolsEnabled = true;
+
+	$: subagentExternalToolsAllowed = !!$config?.features?.subagent_allow_external_tools;
+	$: selectedSubagentExternalToolIds = (selectedToolIds ?? []).filter((id) =>
+		String(id).startsWith('server:')
+	);
 
 	// Reasoning effort functionality
 	let reasoningEffort = 'medium'; // default to medium
@@ -402,6 +408,7 @@
 		subagentsEnabled,
 		subagentReasoningEffort,
 		subagentServiceTier,
+		subagentExternalToolsEnabled,
 		// Only include reasoning when the selected model is configured as a reasoning model.
 		...(showReasoningEffortSelector ? { reasoning: { effort: reasoningEffort } } : {})
 	});
@@ -2286,7 +2293,11 @@
 												<SubagentSettings
 													bind:subagentReasoningEffort
 													bind:subagentServiceTier
+													bind:subagentExternalToolsEnabled
 													allowedServiceTiers={allowedSubagentServiceTiers}
+													allowExternalTools={subagentExternalToolsAllowed}
+													selectedExternalToolCount={selectedSubagentExternalToolIds.length}
+													{containerWorkspaceActive}
 												/>
 											{/if}
 										{/if}

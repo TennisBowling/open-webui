@@ -58,7 +58,7 @@ class SubagentTools:
         __event_call__: Optional[Callable] = None,
         __model__: Optional[dict] = None,
     ) -> str:
-        """Spawn a research subagent that runs in its own isolated chat context with web search + fetch (and any tools the user enabled) and returns its synthesized final answer.
+        """Spawn a research subagent that runs in its own isolated chat context with web search + fetch, plus external tools only when the admin and chat settings allow them, and returns its synthesized final answer.
 
         :param name: Short snake_case identifier for this subagent (e.g. "berkeley_dorms"). Keep it short. Used to label the output and to reference the subagent later via subagent_continue.
         :param prompt: Detailed description of what to research. Be specific and thorough — the subagent only sees this, not our chat history.

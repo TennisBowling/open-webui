@@ -1488,7 +1488,26 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> (Default) Chat Tools Function Calling -> Chat Files
 
+    incoming_params = form_data.get("params") if isinstance(form_data, dict) else None
+    incoming_subagent_external_tools_enabled = None
+    if (
+        isinstance(incoming_params, dict)
+        and "subagentExternalToolsEnabled" in incoming_params
+    ):
+        incoming_subagent_external_tools_enabled = bool(
+            incoming_params.get("subagentExternalToolsEnabled")
+        )
+
     form_data = apply_params_to_form_data(form_data, model)
+
+    if "subagentExternalToolsEnabled" in form_data:
+        metadata.setdefault("params", {})["subagentExternalToolsEnabled"] = bool(
+            form_data.get("subagentExternalToolsEnabled")
+        )
+    elif incoming_subagent_external_tools_enabled is not None:
+        metadata.setdefault("params", {})[
+            "subagentExternalToolsEnabled"
+        ] = incoming_subagent_external_tools_enabled
 
     # Ensure stream_options.include_usage is enabled for token usage tracking
     if form_data.get("stream", False):
@@ -1703,6 +1722,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         "tool_ids": tool_ids,
     }
     form_data["metadata"] = metadata
+    extra_params["__metadata__"] = metadata
 
     # Server side tools
     tool_ids = metadata.get("tool_ids", None)

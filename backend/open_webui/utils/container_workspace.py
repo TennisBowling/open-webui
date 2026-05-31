@@ -98,6 +98,19 @@ def _safe_chat_id(raw: Any) -> Optional[str]:
     return chat_id
 
 
+def _workspace_chat_id(metadata: dict) -> Optional[str]:
+    return _safe_chat_id(
+        metadata.get("container_workspace_chat_id") or metadata.get("chat_id")
+    )
+
+
+def _workspace_message_id(metadata: dict) -> Optional[str]:
+    message_id = metadata.get("container_workspace_message_id") or metadata.get(
+        "message_id"
+    )
+    return str(message_id) if message_id else None
+
+
 def _workspace_root(data_root: str, chat_id: str) -> Path:
     return (Path(data_root).expanduser().resolve() / chat_id / "workspace").resolve()
 
@@ -117,12 +130,16 @@ def is_container_workspace_active(
     if not enabled or not data_root or not server_id:
         return False
 
-    if _safe_chat_id(metadata.get("chat_id")) is None:
+    if _workspace_chat_id(metadata) is None:
         return False
 
-    selected = _as_tool_id_list(tool_ids if tool_ids is not None else metadata.get("tool_ids"))
+    selected = _as_tool_id_list(
+        tool_ids if tool_ids is not None else metadata.get("tool_ids")
+    )
     target = f"server:mcp:{server_id}"
-    return any(tool_id == target or tool_id.startswith(f"{target}|") for tool_id in selected)
+    return any(
+        tool_id == target or tool_id.startswith(f"{target}|") for tool_id in selected
+    )
 
 
 def _safe_filename(name: str | None, fallback: str = "file") -> str:
@@ -291,7 +308,7 @@ async def prepare_container_workspace_for_turn(
         return None
 
     _, data_root, server_id = _settings(request)
-    chat_id = _safe_chat_id(metadata.get("chat_id"))
+    chat_id = _workspace_chat_id(metadata)
     if not chat_id:
         return None
 
@@ -301,7 +318,7 @@ async def prepare_container_workspace_for_turn(
     (workspace / "outputs").mkdir(parents=True, exist_ok=True)
 
     user_message_id, user_message = _current_user_message(
-        chat_id, metadata.get("message_id")
+        chat_id, _workspace_message_id(metadata)
     )
     attached_files = []
     if isinstance(user_message, dict) and isinstance(user_message.get("files"), list):
@@ -309,70 +326,81 @@ async def prepare_container_workspace_for_turn(
     elif isinstance(metadata.get("files"), list):
         attached_files = metadata.get("files") or []
 
-    used_names = {p.name for p in inputs_dir.iterdir() if p.exists()}
-    seen_file_ids: set[str] = set()
-    input_records: list[dict] = []
+    existing_input_records = []
+    if isinstance(user_message, dict) and isinstance(
+        user_message.get("container_workspace_inputs"), list
+    ):
+        existing_input_records = user_message.get("container_workspace_inputs") or []
 
-    for item in attached_files:
-        if not isinstance(item, dict):
-            continue
-        file_id = _file_id_from_item(item)
-        if not file_id or file_id in seen_file_ids:
-            continue
-        seen_file_ids.add(file_id)
+    reuse_existing_inputs = bool(
+        metadata.get("container_workspace_reuse_existing_inputs")
+    )
+    input_records: list[dict] = (
+        list(existing_input_records) if reuse_existing_inputs else []
+    )
 
-        file_record = Files.get_file_by_id(file_id)
-        if not file_record or not _user_can_read_file(file_record, user):
-            continue
-        if not file_record.path:
-            continue
+    if not reuse_existing_inputs:
+        used_names = {p.name for p in inputs_dir.iterdir() if p.exists()}
+        seen_file_ids: set[str] = set()
 
-        try:
-            source_path = Path(Storage.get_file(file_record.path))
-            if not source_path.is_file():
+        for item in attached_files:
+            if not isinstance(item, dict):
                 continue
-            original_name = _safe_filename(
-                item.get("name")
-                or ((item.get("file") or {}).get("filename"))
-                or (file_record.meta or {}).get("name")
-                or file_record.filename,
-                fallback=file_record.filename or "file",
-            )
-            workspace_name = _unique_name(inputs_dir, original_name, used_names)
-            target = inputs_dir / workspace_name
-            size, sha256 = _hash_copy(source_path, target)
-            content_type = (file_record.meta or {}).get("content_type")
-            input_records.append(
-                {
-                    "file_id": file_id,
-                    "original_name": original_name,
-                    "workspace_path": f"inputs/{workspace_name}",
-                    "size": size,
-                    "sha256": sha256,
-                    "content_type": content_type,
-                    "message_id": user_message_id,
-                }
-            )
-        except Exception as exc:
-            log.warning("failed to copy file %s into container inputs: %s", file_id, exc)
+            file_id = _file_id_from_item(item)
+            if not file_id or file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+
+            file_record = Files.get_file_by_id(file_id)
+            if not file_record or not _user_can_read_file(file_record, user):
+                continue
+            if not file_record.path:
+                continue
+
+            try:
+                source_path = Path(Storage.get_file(file_record.path))
+                if not source_path.is_file():
+                    continue
+                original_name = _safe_filename(
+                    item.get("name")
+                    or ((item.get("file") or {}).get("filename"))
+                    or (file_record.meta or {}).get("name")
+                    or file_record.filename,
+                    fallback=file_record.filename or "file",
+                )
+                workspace_name = _unique_name(inputs_dir, original_name, used_names)
+                target = inputs_dir / workspace_name
+                size, sha256 = _hash_copy(source_path, target)
+                content_type = (file_record.meta or {}).get("content_type")
+                input_records.append(
+                    {
+                        "file_id": file_id,
+                        "original_name": original_name,
+                        "workspace_path": f"inputs/{workspace_name}",
+                        "size": size,
+                        "sha256": sha256,
+                        "content_type": content_type,
+                        "message_id": user_message_id,
+                    }
+                )
+            except Exception as exc:
+                log.warning(
+                    "failed to copy file %s into container inputs: %s", file_id, exc
+                )
 
     metadata["container_workspace"] = {
         "active": True,
+        "chat_id": chat_id,
         "server_id": server_id,
         "data_root": data_root,
         "inputs": input_records,
     }
 
-    if input_records and user_message_id:
-        existing = []
-        if isinstance(user_message, dict) and isinstance(
-            user_message.get("container_workspace_inputs"), list
-        ):
-            existing = user_message.get("container_workspace_inputs") or []
+    if input_records and user_message_id and not reuse_existing_inputs:
         Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id,
             user_message_id,
-            {"container_workspace_inputs": [*existing, *input_records]},
+            {"container_workspace_inputs": [*existing_input_records, *input_records]},
         )
 
     input_context = _build_input_location_context(input_records)
@@ -744,12 +772,19 @@ async def import_changed_container_outputs(
     content: str | None = None,
     content_blocks: list | None = None,
 ) -> list[dict]:
+    if metadata.get("container_workspace_import_outputs") is False:
+        return []
+
     if not is_container_workspace_active(request, metadata):
         return []
 
     _, data_root, server_id = _settings(request)
-    chat_id = _safe_chat_id(metadata.get("chat_id"))
-    message_id = str(metadata.get("message_id") or "")
+    chat_id = _workspace_chat_id(metadata)
+    message_id = str(
+        metadata.get("container_workspace_output_message_id")
+        or metadata.get("message_id")
+        or ""
+    )
     if not chat_id or not message_id:
         return []
 

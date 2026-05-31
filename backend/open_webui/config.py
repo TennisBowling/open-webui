@@ -2975,7 +2975,7 @@ DEFAULT_SUBAGENT_SYSTEM_PROMPT = """You are a research subagent invoked by anoth
 You have access to:
 - `web_search` — find relevant pages
 - `web_fetch` — read full page content
-(Plus any additional tools the user has enabled for subagents.)
+(Plus selected external tools when the admin and chat settings allow them.)
 
 How to work:
 - Call `web_search` with focused, specific queries — not the entire request as one query.
@@ -3050,6 +3050,27 @@ SUBAGENT_DEFAULT_SERVICE_TIER = PersistentConfig(
     "SUBAGENT_DEFAULT_SERVICE_TIER",
     "subagents.default_service_tier",
     os.getenv("SUBAGENT_DEFAULT_SERVICE_TIER", ""),
+)
+
+# Global admin gate for exposing admin-configured external tool servers to
+# subagents. Per-chat opt-in still has to be enabled before selected external
+# tools are inherited by inner subagent runs.
+SUBAGENT_ALLOW_EXTERNAL_TOOLS = PersistentConfig(
+    "SUBAGENT_ALLOW_EXTERNAL_TOOLS",
+    "subagents.allow_external_tools",
+    os.getenv("SUBAGENT_ALLOW_EXTERNAL_TOOLS", "False").lower() == "true",
+)
+
+DEFAULT_SUBAGENT_EXTERNAL_TOOLS_PROMPT = """You are running as a subagent inside a parent Open WebUI chat. You may have access to selected external tools from the parent chat. Use them only when they help complete the task your parent delegated.
+
+If a container or workspace tool is available, it uses the same /workspace as the main chat and any other subagents in this chat. Treat it as shared state: inspect existing files before editing, avoid overwriting unrelated work, and save user-facing outputs under /workspace/outputs."""
+
+SUBAGENT_EXTERNAL_TOOLS_PROMPT = PersistentConfig(
+    "SUBAGENT_EXTERNAL_TOOLS_PROMPT",
+    "subagents.external_tools_prompt",
+    os.getenv(
+        "SUBAGENT_EXTERNAL_TOOLS_PROMPT", DEFAULT_SUBAGENT_EXTERNAL_TOOLS_PROMPT
+    ),
 )
 
 # Appended to the subagent model's own system prompt on every inner subagent
