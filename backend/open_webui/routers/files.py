@@ -40,7 +40,7 @@ from open_webui.utils.file_extraction import (
     extract_and_cache_file_content,
     file_needs_extraction,
 )
-from open_webui.utils.file_conversion import convert_and_cache_file_to_pdf
+from open_webui.utils.file_conversion import convert_and_cache_file_to_pdf, get_or_convert_to_pdf
 from open_webui.utils.image_conversion import convert_heif_to_jpeg, is_heif_image
 from pydantic import BaseModel
 
@@ -478,6 +478,78 @@ async def get_file_by_id(id: str, user=Depends(get_verified_user)):
 
 class ProcessModeForm(BaseModel):
     mode: str  # "text" | "pdf"
+
+
+def _file_is_pdf(file: FileModel) -> bool:
+    content_type = ((file.meta or {}).get("content_type") or "").lower()
+    return content_type == "application/pdf" or file.filename.lower().endswith(".pdf")
+
+
+def _file_can_preview_as_pdf(file: FileModel) -> bool:
+    if _file_is_pdf(file):
+        return True
+    name = ((file.meta or {}).get("name") or file.filename or "").lower()
+    ext = Path(name).suffix.lower().lstrip(".")
+    content_type = ((file.meta or {}).get("content_type") or "").lower()
+    return ext in {
+        "doc", "docx", "odt", "rtf", "ppt", "pptx", "odp", "xls", "xlsx", "ods"
+    } or content_type in {
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.oasis.opendocument.text",
+        "application/vnd.oasis.opendocument.presentation",
+        "application/vnd.oasis.opendocument.spreadsheet",
+        "application/rtf",
+    }
+
+
+@router.post("/{id}/preview")
+async def ensure_file_preview_by_id(
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+):
+    """Return or create a PDF preview for document-like files.
+
+    Used for model-produced artifacts. The original file stays the download;
+    the preview file is a cached PDF sidecar.
+    """
+    file = Files.get_file_by_id(id)
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    if not (
+        file.user_id == user.id
+        or user.role == "admin"
+        or has_access_to_file(id, "read", user)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if _file_is_pdf(file):
+        return {"status": True, "preview_file": file.model_dump()}
+
+    if not _file_can_preview_as_pdf(file):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("No PDF preview is available for this file type"),
+        )
+
+    preview_file = await get_or_convert_to_pdf(request, id, user)
+    if not preview_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Failed to create PDF preview"),
+        )
+    return {"status": True, "preview_file": preview_file.model_dump()}
 
 
 @router.post("/{id}/process-mode")

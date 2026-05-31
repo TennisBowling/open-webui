@@ -10,11 +10,13 @@
 		showArtifacts,
 		showControls,
 		showEmbeds,
+		showFilePreview,
 		showOverview
 	} from '$lib/stores';
 	import FloatingButtons from '../ContentRenderer/FloatingButtons.svelte';
 	import ToolCallsBlock from './ToolCallsBlock.svelte';
 	import { blocksToDisplayMarkdown, createMessagesList } from '$lib/utils';
+	import { streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 
 	export let id;
 	export let content;
@@ -65,11 +67,116 @@
 	/** @type {string[]} */
 	let blockProjections = [];
 	/** @type {string[]} */
+	let blockToolPayloads = [];
+	/** @type {string[]} */
 	let blockProjectionSignatures = [];
+	/** @type {WeakMap<object, { content: any; results: any; signature: string }>} */
+	let toolBlockSignatureCache = new WeakMap();
 
 	const textSig = (value) => {
 		const text = value == null ? '' : String(value);
 		return `${text.length}:${text.slice(0, 32)}:${text.slice(-32)}`;
+	};
+
+	const jsonSig = (value) => {
+		try {
+			return textSig(JSON.stringify(value ?? null));
+		} catch {
+			return textSig(value);
+		}
+	};
+
+	const listSig = (value) => {
+		if (!Array.isArray(value)) return '0';
+		return `${value.length}:${value
+			.map((item) => {
+				if (!item || typeof item !== 'object') return textSig(item);
+				return [
+					item.id ?? '',
+					item.url ?? '',
+					item.name ?? '',
+					item.type ?? '',
+					textSig(item.content)
+				].join('|');
+			})
+			.join(';')}`;
+	};
+
+	const toolBlockSignature = (block) => {
+		const cached = toolBlockSignatureCache.get(block);
+		if (cached && cached.content === block?.content && cached.results === block?.results) {
+			return cached.signature;
+		}
+
+		const calls = Array.isArray(block?.content) ? block.content : [];
+		const results = Array.isArray(block?.results) ? block.results : [];
+
+		const signature = [
+			'tool_calls',
+			calls
+				.map((call) => {
+					const fn = call?.function ?? {};
+					return [call?.id ?? '', call?.tool_call_id ?? '', fn.name ?? '', textSig(fn.arguments)].join(
+						','
+					);
+				})
+				.join(';'),
+			results
+				.map((result) =>
+					[
+						result?.tool_call_id ?? '',
+						textSig(result?.content),
+						result?.result_ref ?? '',
+						result?.result_lazy ? '1' : '0',
+						result?.size ?? '',
+						result?.sha256 ?? '',
+						jsonSig(result?.summary),
+						listSig(result?.files),
+						listSig(result?.embeds),
+						result?.subagent_id ?? ''
+					].join(',')
+				)
+				.join(';')
+		].join(':');
+
+		if (block && typeof block === 'object') {
+			toolBlockSignatureCache.set(block, {
+				content: block.content,
+				results: block.results,
+				signature
+			});
+		}
+
+		return signature;
+	};
+
+	const toolBlockPayload = (block) => {
+		const calls = Array.isArray(block?.content)
+			? block.content.map((call) => ({
+					id: call?.id ?? '',
+					tool_call_id: call?.tool_call_id ?? '',
+					function: {
+						name: call?.function?.name ?? '',
+						arguments: call?.function?.arguments ?? ''
+					}
+				}))
+			: [];
+		const results = Array.isArray(block?.results)
+			? block.results.map((result) => ({
+					tool_call_id: result?.tool_call_id ?? '',
+					content: result?.content ?? '',
+					result_ref: result?.result_ref ?? '',
+					result_lazy: result?.result_lazy === true,
+					size: result?.size ?? '',
+					sha256: result?.sha256 ?? '',
+					summary: result?.summary ?? null,
+					files: Array.isArray(result?.files) ? result.files : [],
+					embeds: Array.isArray(result?.embeds) ? result.embeds : [],
+					subagent_id: result?.subagent_id ?? ''
+				}))
+			: [];
+
+		return JSON.stringify({ content: calls, results });
 	};
 
 	const blockProjectionSignature = (block) => {
@@ -91,8 +198,10 @@
 		}
 
 		if (type === 'tool_calls') {
-			// Tool calls render structurally via <ToolCallsBlock>, not markdown.
-			return 'tool_calls:direct';
+			// Tool calls render structurally via <ToolCallsBlock>. Keep a stable
+			// string payload for unchanged blocks so completed calls do not receive
+			// fresh object props on every token streamed after them.
+			return toolBlockSignature(block);
 		}
 
 		if (type === 'code_interpreter') {
@@ -103,14 +212,18 @@
 	};
 
 	$: {
+		const perf = streamPerfStart();
 		/** @type {any[]} */
 		const blocks = Array.isArray(content_blocks) ? content_blocks : [];
 		if (blocks.length === 0) {
 			if (blockProjections.length !== 0) blockProjections = [];
+			if (blockToolPayloads.length !== 0) blockToolPayloads = [];
 			if (blockProjectionSignatures.length !== 0) blockProjectionSignatures = [];
 		} else {
 			/** @type {string[]} */
 			const next = [];
+			/** @type {string[]} */
+			const nextToolPayloads = [];
 			/** @type {string[]} */
 			const nextSignatures = [];
 			for (let i = 0; i < blocks.length; i++) {
@@ -118,15 +231,23 @@
 				nextSignatures[i] = signature;
 				if (blocks[i]?.type === 'tool_calls') {
 					next[i] = '';
+					nextToolPayloads[i] =
+						signature !== blockProjectionSignatures[i] || blockToolPayloads[i] == null
+							? toolBlockPayload(blocks[i])
+							: blockToolPayloads[i];
 				} else if (signature !== blockProjectionSignatures[i] || blockProjections[i] == null) {
 					next[i] = blocksToDisplayMarkdown([blocks[i]]);
+					nextToolPayloads[i] = '';
 				} else {
 					next[i] = blockProjections[i];
+					nextToolPayloads[i] = '';
 				}
 			}
 			blockProjectionSignatures = nextSignatures;
 			blockProjections = next;
+			blockToolPayloads = nextToolPayloads;
 		}
+		streamPerfEnd('render.content_projection', perf, blocks.length || 1);
 	}
 
 	// Single render path: per-block projections when `content_blocks` is
@@ -140,6 +261,46 @@
 	// id}` to tear down and rebuild the rendered DOM).
 	$: structuredBlocks = Array.isArray(content_blocks) ? content_blocks : [];
 	$: structuredMode = structuredBlocks.length > 0;
+	/** @type {string[]} */
+	let sourceIds = [];
+
+	/** @param {any[]} sourceList */
+	const getSourceIds = (sourceList = []) =>
+		(sourceList ?? []).reduce((acc, source) => {
+			const currentModel = /** @type {any} */ (model);
+			/** @type {string[]} */
+			let ids = [];
+			source.document.forEach((document, index) => {
+				if (currentModel?.info?.meta?.capabilities?.citations == false) {
+					ids.push('N/A');
+					return ids;
+				}
+
+				const metadata = source.metadata?.[index];
+				const id = metadata?.source ?? 'N/A';
+
+				if (metadata?.name) {
+					ids.push(metadata.name);
+					return ids;
+				}
+
+				if (id.startsWith('http://') || id.startsWith('https://')) {
+					ids.push(id);
+				} else {
+					ids.push(source?.source?.name ?? id);
+				}
+
+				return ids;
+			});
+
+			acc = [...acc, ...ids];
+			return acc.filter((item, index) => acc.indexOf(item) === index);
+		}, []);
+
+	$: {
+		model;
+		sourceIds = getSourceIds(sources ?? []);
+	}
 
 	const updateButtonPosition = (event) => {
 		const buttonsContainerElement = document.getElementById(`floating-buttons-${id}`);
@@ -235,7 +396,7 @@
 	{#if structuredMode}
 		{#each structuredBlocks as block, i (i)}
 			{#if block?.type === 'tool_calls'}
-				<ToolCallsBlock id={`${id}-b${i}`} {block} {chatId} {messageId} />
+				<ToolCallsBlock id={`${id}-b${i}`} blockJson={blockToolPayloads[i] ?? ''} {chatId} {messageId} />
 			{:else}
 				<Markdown
 					id={`${id}-b${i}`}
@@ -250,36 +411,7 @@
 					{messageId}
 					{dataVizOverrides}
 					{sandboxFiles}
-					sourceIds={(sources ?? []).reduce((acc, source) => {
-						let ids = [];
-						source.document.forEach((document, index) => {
-							if (model?.info?.meta?.capabilities?.citations == false) {
-								ids.push('N/A');
-								return ids;
-							}
-
-							const metadata = source.metadata?.[index];
-							const id = metadata?.source ?? 'N/A';
-
-							if (metadata?.name) {
-								ids.push(metadata.name);
-								return ids;
-							}
-
-							if (id.startsWith('http://') || id.startsWith('https://')) {
-								ids.push(id);
-							} else {
-								ids.push(source?.source?.name ?? id);
-							}
-
-							return ids;
-						});
-
-						acc = [...acc, ...ids];
-
-						// remove duplicates
-						return acc.filter((item, index) => acc.indexOf(item) === index);
-					}, [])}
+					{sourceIds}
 					{onSourceClick}
 					{onTaskClick}
 					{onSave}
@@ -293,6 +425,7 @@
 							chatId
 						) {
 							showArtifacts.set(true);
+							showFilePreview.set(false);
 							showControls.set(true);
 						}
 					}}
@@ -303,6 +436,7 @@
 						await showArtifacts.set(true);
 						await showOverview.set(false);
 						await showEmbeds.set(false);
+						await showFilePreview.set(false);
 					}}
 				/>
 			{/if}
@@ -321,35 +455,7 @@
 			{messageId}
 			{dataVizOverrides}
 			{sandboxFiles}
-			sourceIds={(sources ?? []).reduce((acc, source) => {
-				let ids = [];
-				source.document.forEach((document, index) => {
-					if (model?.info?.meta?.capabilities?.citations == false) {
-						ids.push('N/A');
-						return ids;
-					}
-
-					const metadata = source.metadata?.[index];
-					const id = metadata?.source ?? 'N/A';
-
-					if (metadata?.name) {
-						ids.push(metadata.name);
-						return ids;
-					}
-
-					if (id.startsWith('http://') || id.startsWith('https://')) {
-						ids.push(id);
-					} else {
-						ids.push(source?.source?.name ?? id);
-					}
-
-					return ids;
-				});
-
-				acc = [...acc, ...ids];
-
-				return acc.filter((item, index) => acc.indexOf(item) === index);
-			}, [])}
+			{sourceIds}
 			{onSourceClick}
 			{onTaskClick}
 			{onSave}
@@ -363,6 +469,7 @@
 					chatId
 				) {
 					showArtifacts.set(true);
+					showFilePreview.set(false);
 					showControls.set(true);
 				}
 			}}
@@ -373,6 +480,7 @@
 				await showArtifacts.set(true);
 				await showOverview.set(false);
 				await showEmbeds.set(false);
+				await showFilePreview.set(false);
 			}}
 		/>
 	{/if}

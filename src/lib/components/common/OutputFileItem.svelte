@@ -3,9 +3,17 @@
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 	import { formatFileSize } from '$lib/utils';
-	import OutputFileModal from './OutputFileModal.svelte';
 	import DocumentPage from '../icons/DocumentPage.svelte';
 	import Tooltip from './Tooltip.svelte';
+	import {
+		previewFile,
+		showArtifacts,
+		showCallOverlay,
+		showControls,
+		showEmbeds,
+		showFilePreview,
+		showOverview
+	} from '$lib/stores';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 	const dispatch = createEventDispatcher();
@@ -13,23 +21,23 @@
 	export let item: any;
 	export let className = 'w-72 min-h-20';
 
-	let showModal = false;
-
 	$: name = item?.name ?? item?.file?.meta?.name ?? item?.file?.filename ?? 'file';
 	$: size = item?.size ?? item?.file?.meta?.size;
 	$: workspacePath = item?.container_workspace?.workspace_path ?? item?.file?.data?.container_workspace?.workspace_path;
 	$: version = item?.container_workspace?.version ?? item?.file?.data?.container_workspace?.version;
 </script>
 
-{#if item}
-	<OutputFileModal bind:show={showModal} bind:item />
-{/if}
-
 <button
 	type="button"
 	class="relative group p-3 {className} flex items-center gap-3 bg-white dark:bg-gray-850 border border-gray-100 dark:border-gray-800 rounded-2xl text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition"
 	on:click={() => {
-		showModal = true;
+		previewFile.set(item);
+		showOverview.set(false);
+		showArtifacts.set(false);
+		showEmbeds.set(false);
+		showCallOverlay.set(false);
+		showFilePreview.set(true);
+		showControls.set(true);
 		dispatch('click');
 	}}
 >

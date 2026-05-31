@@ -50,6 +50,7 @@
 	import { bestMatchingLanguage } from '$lib/utils';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
 	import { applySidebarEvent, SIDEBAR_EVENT_TYPES } from '$lib/utils/sidebarSync';
+	import { streamPerfCount, streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
 
@@ -329,8 +330,19 @@
 	]);
 
 	const chatEventHandler = async (event, cb) => {
+		const perf = streamPerfStart();
 		const eventType = event?.data?.type ?? null;
 		const streamScoped = STREAM_SCOPED_EVENT_TYPES.has(eventType);
+
+		// Chat.svelte is the only component that owns live stream rendering. The
+		// global layout listener used to recursively unpack stream batches too,
+		// doubling async handler work for long generations without mutating chat UI.
+		if (streamScoped) {
+			streamPerfCount(`layout.stream_ignored.${eventType ?? 'unknown'}`);
+			streamPerfEnd('layout.stream_ignored', perf);
+			return;
+		}
+
 		// Re-broadcast to sibling tabs of the same user so the backend can emit
 		// stream events to a single elected primary session per user. The
 		// non-primary tabs receive the same payload via BroadcastChannel and
@@ -349,41 +361,6 @@
 			} catch (err) {
 				console.error('owui-events broadcast failed', err);
 			}
-		}
-
-		// Stream v2 batching: the backend coalesces consecutive chat:delta /
-		// tool_call:result emits per asyncio tick into a single envelope to
-		// reduce socket I/O at high concurrency. Unpack inline so downstream
-		// handlers (and stores) see each inner event as if it had arrived
-		// individually. Re-broadcast (above) forwards the outer batch so
-		// non-primary tabs unpack the same way here.
-		if (eventType === 'chat:delta:batch') {
-			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
-			const prevSuppress = suppressBroadcast;
-			// Don't re-broadcast each inner event individually — the outer
-			// batch was already forwarded above (or this IS a replay from
-			// the BroadcastChannel and suppress is already on).
-			suppressBroadcast = true;
-			try {
-				for (const inner of batch) {
-					if (!inner || typeof inner !== 'object') continue;
-					try {
-						await chatEventHandler(
-							{
-								chat_id: inner.chat_id ?? event.chat_id,
-								message_id: inner.message_id ?? event.message_id,
-								data: inner.data
-							},
-							cb
-						);
-					} catch (err) {
-						console.error('chat:delta:batch inner dispatch failed', err);
-					}
-				}
-			} finally {
-				suppressBroadcast = prevSuppress;
-			}
-			return;
 		}
 
 		const visibleChatId = getVisibleChatId();

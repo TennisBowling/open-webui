@@ -3,6 +3,7 @@
 
 	export let id = '';
 	export let block: any = {};
+	export let blockJson = '';
 	export let chatId = '';
 	export let messageId = '';
 
@@ -24,12 +25,31 @@
 		return m ? m[1] : name;
 	};
 
-	$: calls = Array.isArray(block?.content) ? block.content : [];
-	$: results = Array.isArray(block?.results) ? block.results : [];
+	let parsedBlock: any = {};
+	let parsedBlockJson = '';
+
+	$: if (blockJson !== parsedBlockJson) {
+		parsedBlockJson = blockJson;
+		try {
+			parsedBlock = blockJson ? JSON.parse(blockJson) : {};
+		} catch {
+			parsedBlock = {};
+		}
+	}
+
+	$: renderBlock = blockJson ? parsedBlock : block;
+	$: calls = Array.isArray(renderBlock?.content) ? renderBlock.content : [];
+	$: results = Array.isArray(renderBlock?.results) ? renderBlock.results : [];
+	let resultByCallId: Map<string, any> = new Map();
+	$: resultByCallId = new Map<string, any>(
+		results
+			.filter((result: any) => result?.tool_call_id)
+			.map((result: any) => [result.tool_call_id, result])
+	);
 
 	const getResultForCall = (call: any) => {
 		const callId = call?.id ?? call?.tool_call_id ?? '';
-		return results.find((result: any) => result?.tool_call_id === callId);
+		return resultByCallId.get(callId);
 	};
 
 	const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key);

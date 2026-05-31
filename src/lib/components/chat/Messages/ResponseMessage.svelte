@@ -116,7 +116,7 @@
 	export let selectedModels = [];
 
 	let message: MessageType = history.messages[messageId];
-	$: if (history.messages?.[messageId]) {
+	$: if (history.messages?.[messageId] && message !== history.messages[messageId]) {
 		message = history.messages[messageId];
 	}
 
@@ -237,13 +237,23 @@
 			.join('\n')
 			.trim();
 
+	const getLatestStructuredTextContent = (blocks: any[] = []) => {
+		for (let i = blocks.length - 1; i >= 0; i -= 1) {
+			const block = blocks[i];
+			if (block?.type === 'text') return (block?.content ?? '').toString();
+		}
+		return '';
+	};
+
 	$: hasStructuredContent =
 		Array.isArray(message?.content_blocks) && message.content_blocks.length > 0;
 	// For structured messages, ContentRenderer renders content_blocks directly.
 	// Keep this as plain assistant text for copy/TTS/edit/image prompts; do not
 	// stringify tool results here or heavy research turns become O(huge) per tick.
 	$: messageTextContent = hasStructuredContent
-		? getStructuredTextContent(message.content_blocks)
+		? (message?.done ?? false) || message?.error
+			? getStructuredTextContent(message.content_blocks)
+			: getLatestStructuredTextContent(message.content_blocks)
 		: getMessageTextContent(message?.content);
 
 	const playAudio = (idx: number) => {

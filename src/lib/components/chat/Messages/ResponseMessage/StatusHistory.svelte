@@ -16,14 +16,13 @@
 
 	let history = [];
 	let status = null;
+	const EXPANDED_STATUS_LIMIT = 50;
 
-	$: if (history && history.length > 0) {
-		status = history.at(-1);
-	}
-
-	$: if (JSON.stringify(statusHistory) !== JSON.stringify(history)) {
-		history = statusHistory;
-	}
+	$: history = Array.isArray(statusHistory) ? statusHistory : [];
+	$: status = history.length > 0 ? history.at(-1) : null;
+	$: expandedHistory = showHistory
+		? history.slice(Math.max(0, history.length - EXPANDED_STATUS_LIMIT), Math.max(0, history.length - 1))
+		: [];
 </script>
 
 {#if history && history.length > 0}
@@ -33,8 +32,8 @@
 				<div class="flex flex-row">
 					{#if history.length > 1}
 						<div class="w-full">
-							{#each history as status, idx}
-								{#if idx !== history.length - 1}
+							{#each expandedHistory as status}
+								{#if status}
 									<div class="flex items-stretch gap-2 mb-1">
 										<div class=" ">
 											<div class="pt-3 px-1 mb-1.5">

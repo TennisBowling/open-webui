@@ -29,6 +29,8 @@
 		socket,
 		showControls,
 		showCallOverlay,
+		showFilePreview,
+		previewFile,
 		temporaryChatEnabled,
 		mobile,
 		showOverview,
@@ -64,6 +66,7 @@
 		mergeToolResultEntries,
 		normalizeToolResultEntry
 	} from '$lib/utils/toolResults';
+	import { streamPerfCount, streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 
 	import {
 		createNewChat,
@@ -480,8 +483,10 @@
 	};
 
 	const flushStreamingMessage = (messageId: string, force = false) => {
+		const perf = streamPerfStart();
 		const state = streamFlushes.get(messageId);
 		if (!state) {
+			streamPerfEnd('chat.flush_missing', perf);
 			return;
 		}
 
@@ -494,6 +499,7 @@
 		if (!message) {
 			streamFlushes.delete(messageId);
 			streamTTSPartCounts.delete(messageId);
+			streamPerfEnd('chat.flush_no_message', perf);
 			return;
 		}
 
@@ -504,6 +510,7 @@
 		) {
 			streamFlushes.delete(messageId);
 			streamTTSPartCounts.delete(messageId);
+			streamPerfEnd('chat.flush_stale_owner', perf);
 			return;
 		}
 
@@ -518,6 +525,8 @@
 		if (autoScroll) {
 			scrollToBottom();
 		}
+
+		streamPerfEnd('chat.flushStreamingMessage', perf);
 	};
 
 	const scheduleStreamingMessageFlush = (
@@ -1634,7 +1643,9 @@
 		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
 			// Handled by caller (sets fields on the run object).
 		}
-		normalizeStreamingContentBlocks(mirror.content_blocks);
+		if (op !== 'text_append' && op !== 'tool_call_args_append') {
+			normalizeStreamingContentBlocks(mirror.content_blocks);
+		}
 	};
 
 	const mergeSubagentPendingIntoRun = (existing: any, pending: PendingSubagentUpdate) => {
@@ -1860,16 +1871,48 @@
 		pendingSubagentUpdates.clear();
 	};
 
-	const chatEventHandler = async (event, cb) => {
+	const applyBatchedStreamEvent = (event: any) => {
+		const type = event?.data?.type ?? null;
+		const data = event?.data?.data ?? null;
+
+		if (type === 'chat:subagent:update') {
+			const sd = data ?? {};
+			queueSubagentUpdate(sd, sd.inner_event ?? {});
+			return true;
+		}
+
+		if (type !== 'chat:delta' && type !== 'tool_call:result') {
+			return false;
+		}
+
+		const resolvedMessageId = resolveChatEventMessageId(event.message_id);
+		const message = resolvedMessageId ? history.messages[resolvedMessageId] : null;
+		if (!message || message.retrying) return true;
+
+		if (type === 'chat:delta') {
+			chatDeltaHandler(data, message, event.chat_id);
+		} else {
+			toolCallResultHandler(data, message);
+		}
+
+		return true;
+	};
+
+	const chatEventHandler = async (event, cb, options: { skipTick?: boolean } = {}) => {
+		const perf = streamPerfStart();
 		if (!isVisibleChatEvent(event.chat_id)) {
+			streamPerfEnd('chat.event_ignored_not_visible', perf);
 			return;
 		}
 
-		await tick();
+		if (!options.skipTick) {
+			await tick();
+		}
 
 		const visibleChatId = getVisibleChatId();
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
+		streamPerfCount(`chat.event.${type ?? 'unknown'}`);
 
 		// Stream-v2 batching: socket.main may coalesce consecutive chat:delta /
 		// tool_call:result envelopes into one chat:delta:batch. Chat.svelte owns
@@ -1877,17 +1920,18 @@
 		// layout handler cannot mutate this component's history.
 		if (type === 'chat:delta:batch') {
 			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
+			streamPerfCount('chat.event.batch_inner', batch.length);
 			for (const inner of batch) {
 				if (!inner || typeof inner !== 'object') continue;
-				await chatEventHandler(
-					{
-						chat_id: inner.chat_id ?? event.chat_id,
-						message_id: inner.message_id ?? event.message_id,
-						data: inner.data
-					},
-					cb
-				);
+				const innerEvent = {
+					chat_id: inner.chat_id ?? event.chat_id,
+					message_id: inner.message_id ?? event.message_id,
+					data: inner.data
+				};
+				if (applyBatchedStreamEvent(innerEvent)) continue;
+				await chatEventHandler(innerEvent, cb, { skipTick: true });
 			}
+			streamPerfEnd('chat.event_handler', perf, batch.length || 1);
 			return;
 		}
 
@@ -3771,6 +3815,18 @@
 		}
 	};
 
+	const openGeneratedFilePreview = (files: any[] = []) => {
+		const file = files.find((item) => item?.type === 'file' && item?.id) ?? files[0];
+		if (!file) return;
+		previewFile.set(file);
+		showOverview.set(false);
+		showArtifacts.set(false);
+		showEmbeds.set(false);
+		showCallOverlay.set(false);
+		showFilePreview.set(true);
+		showControls.set(true);
+	};
+
 	const chatCompletionEventHandler = async (data, message, chatId) => {
 		const {
 			id,
@@ -3948,6 +4004,10 @@
 		}
 
 		if (done) {
+			if (Array.isArray(event_files) && event_files.length > 0) {
+				openGeneratedFilePreview(event_files);
+			}
+
 			message = { ...message };
 			emitPendingTTSParts(message, { done: true });
 			cancelStreamingMessageFlush(message.id);
@@ -4139,7 +4199,13 @@
 		} else {
 			console.warn('[chat:delta] unknown op', op, payload);
 		}
-		normalizeStreamingContentBlocks(mirror.content_blocks);
+		if (
+			op !== 'text_append' &&
+			op !== 'tool_call_args_append' &&
+			op !== 'reasoning_detail_merge'
+		) {
+			normalizeStreamingContentBlocks(mirror.content_blocks);
+		}
 	};
 
 	const writeMirrorToMessage = (mirror: StreamMirror, message: any) => {
@@ -4254,6 +4320,7 @@
 		message: any,
 		chatId: string | null
 	) => {
+		const perf = streamPerfStart();
 		const op = delta.op || '';
 		const version = typeof delta.version === 'number' ? delta.version : 0;
 		const mirror = getOrCreateStreamMirror(message.id);
@@ -4292,6 +4359,7 @@
 		writeMirrorToMessage(mirror, message);
 		history.messages[message.id] = message;
 		scheduleStreamingMessageFlush(message.id, { runTTS: false, ownerId: message.id });
+		streamPerfEnd(`chat.delta.${op || 'unknown'}`, perf);
 	};
 
 	const toolCallResultHandler = (
@@ -4310,6 +4378,7 @@
 		},
 		message: any
 	) => {
+		const perf = streamPerfStart();
 		if (!data?.tool_call_id) return;
 		const mirror = getOrCreateStreamMirror(message.id);
 		const resultEntry = normalizeToolResultEntry(data.tool_call_id, {
@@ -4350,14 +4419,15 @@
 		// block.results[], while some live components also look at tc.result.
 		for (const block of mirror.content_blocks) {
 			if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
-			block.results = Array.isArray(block.results) ? block.results : [];
+			const nextResults = Array.isArray(block.results) ? block.results.slice() : [];
 			const mergedResult =
-				mergeToolResultEntries([resultEntry], mirror.tool_results, block.results)[0] ?? resultEntry;
-			const existingIdx = block.results.findIndex(
+				mergeToolResultEntries([resultEntry], mirror.tool_results, nextResults)[0] ?? resultEntry;
+			const existingIdx = nextResults.findIndex(
 				(r: any) => r?.tool_call_id === data.tool_call_id
 			);
-			if (existingIdx >= 0) block.results[existingIdx] = mergedResult;
-			else block.results.push(mergedResult);
+			if (existingIdx >= 0) nextResults[existingIdx] = mergedResult;
+			else nextResults.push(mergedResult);
+			block.results = nextResults;
 			for (const tc of block.content) {
 				if (tc?.id === data.tool_call_id || tc?.tool_call_id === data.tool_call_id) {
 					tc.result = data.result;
@@ -4367,6 +4437,7 @@
 		writeMirrorToMessage(mirror, message);
 		history.messages[message.id] = message;
 		scheduleStreamingMessageFlush(message.id, { runTTS: false, ownerId: message.id });
+		streamPerfEnd('chat.tool_result', perf);
 	};
 
 	const chatDoneHandler = async (
@@ -4386,6 +4457,12 @@
 			await requestStreamSnapshot(message.id, chatId);
 		}
 		writeMirrorToMessage(mirror, message);
+		const generatedFiles = (message.files ?? []).filter(
+			(file: any) => file?.container_workspace
+		);
+		if (generatedFiles.length > 0) {
+			openGeneratedFilePreview(generatedFiles);
+		}
 		if (data?.usage) {
 			message.usage = data.usage;
 			applyUsageToChatTokenStats(chatId, message.id, data.usage);

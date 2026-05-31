@@ -17,16 +17,21 @@
 	import TextToken from './MarkdownInlineTokens/TextToken.svelte';
 	import CodespanToken from './MarkdownInlineTokens/CodespanToken.svelte';
 	import MentionToken from './MarkdownInlineTokens/MentionToken.svelte';
-	import FileItemModal from '$lib/components/common/FileItemModal.svelte';
+	import {
+		previewFile,
+		showArtifacts,
+		showCallOverlay,
+		showControls,
+		showEmbeds,
+		showFilePreview,
+		showOverview
+	} from '$lib/stores';
 
 	export let id: string;
 	export let done = true;
 	export let tokens: Token[];
 	export let sandboxFiles: any[] = [];
 	export let onSourceClick: Function = () => {};
-
-	let showSandboxFileModal = false;
-	let sandboxFileModalItem: any = null;
 
 	const normalizeSandboxPath = (value: string) => {
 		try {
@@ -40,8 +45,11 @@
 			.replace(/^\/+/, '');
 	};
 
+	const isSandboxHref = (href: string) =>
+		href?.startsWith('sandbox:/workspace') || href?.startsWith('sandbox://workspace');
+
 	const resolveSandboxFile = (href: string) => {
-		if (!href?.startsWith('sandbox:/workspace')) return null;
+		if (!isSandboxHref(href)) return null;
 		const rel = normalizeSandboxPath(href);
 		const candidates = new Set([rel]);
 		if (rel && !rel.startsWith('outputs/')) candidates.add(`outputs/${rel}`);
@@ -53,14 +61,24 @@
 	};
 
 	const openSandboxFile = (file: any) => {
-		sandboxFileModalItem = file;
-		showSandboxFileModal = true;
+		previewFile.set(file);
+		showOverview.set(false);
+		showArtifacts.set(false);
+		showEmbeds.set(false);
+		showCallOverlay.set(false);
+		showFilePreview.set(true);
+		showControls.set(true);
+	};
+
+	const handleSandboxClick = (href: string) => {
+		const file = resolveSandboxFile(href);
+		if (file) {
+			openSandboxFile(file);
+			return;
+		}
+		toast.error('This sandbox file is not available as a preview yet.');
 	};
 </script>
-
-{#if sandboxFileModalItem}
-	<FileItemModal bind:show={showSandboxFileModal} item={sandboxFileModalItem} />
-{/if}
 
 {#each tokens as token}
 	{#if token.type === 'escape'}
@@ -68,13 +86,12 @@
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
 	{:else if token.type === 'link'}
-		{@const sandboxFile = resolveSandboxFile(token.href)}
-		{#if sandboxFile}
+		{#if isSandboxHref(token.href)}
 			<button
 				type="button"
 				class="underline text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300"
 				title={token.title}
-				on:click={() => openSandboxFile(sandboxFile)}
+				on:click={() => handleSandboxClick(token.href)}
 			>
 				{#if token.tokens}
 					<svelte:self id={`${id}-a`} tokens={token.tokens} {sandboxFiles} {onSourceClick} {done} />
