@@ -68,6 +68,10 @@
 		},
 		features: {
 			direct_tool_servers: true,
+			mcp_remote_custom: true,
+			mcp_static_secrets: true,
+			mcp_stdio_templates: true,
+			mcp_stdio_custom: false,
 			web_search: true,
 			image_generation: true,
 			code_interpreter: true,

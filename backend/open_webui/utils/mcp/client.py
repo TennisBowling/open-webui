@@ -9,6 +9,7 @@ import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.auth import OAuthClientProvider, TokenStorage
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
@@ -69,6 +70,7 @@ def build_mcp_connect_kwargs(
     command = mcp_config.get("command")
     args = mcp_config.get("args")
     env = mcp_config.get("env")
+    cwd = mcp_config.get("cwd")
 
     headers: dict = {}
     if bearer_token:
@@ -89,11 +91,14 @@ def build_mcp_connect_kwargs(
             "command": command,
             "args": args,
             "env": env,
+            "cwd": cwd,
+            "transport": "stdio",
         }
 
     return {
         "url": connection.get("url", "") or None,
         "headers": headers or None,
+        "transport": connection.get("transport") or "remote_http",
     }
 
 
@@ -109,7 +114,10 @@ class MCPClient:
         command: Optional[str] = None,
         args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None,
+        transport: Optional[str] = None,
     ):
+        transport_type = transport or "remote_http"
         async with AsyncExitStack() as exit_stack:
             try:
                 if command:
@@ -117,24 +125,28 @@ class MCPClient:
                         command=command,
                         args=args or [],
                         env=env,
+                        cwd=cwd,
                     )
                     streams_context = stdio_client(server_params)
                 elif url:
-                    streams_context = streamablehttp_client(url, headers=headers)
+                    if transport_type == "remote_sse":
+                        streams_context = sse_client(url, headers=headers)
+                    else:
+                        streams_context = streamablehttp_client(url, headers=headers)
                 else:
                     raise ValueError("Either url or command must be provided")
 
-                transport = await exit_stack.enter_async_context(streams_context)
+                transport_result = await exit_stack.enter_async_context(streams_context)
 
-                if command:
-                    read_stream, write_stream = transport
+                if command or transport_type == "remote_sse":
+                    read_stream, write_stream = transport_result
                 else:
                     # `streamablehttp_client()` return signature has changed across MCP
                     # releases (either 2-tuple or 3-tuple). Handle both.
                     try:
-                        read_stream, write_stream = transport
+                        read_stream, write_stream = transport_result
                     except ValueError:
-                        read_stream, write_stream, _ = transport
+                        read_stream, write_stream, _ = transport_result
 
                 session = await exit_stack.enter_async_context(
                     ClientSession(read_stream, write_stream)
@@ -173,12 +185,18 @@ class MCPClient:
 
                     inputSchema = tool.inputSchema
 
-                    # TODO: handle outputSchema if needed
                     outputSchema = getattr(tool, "outputSchema", None)
+                    annotations = getattr(tool, "annotations", None)
+                    title = getattr(tool, "title", None)
 
-                    tool_specs.append(
-                        {"name": name, "description": description, "parameters": inputSchema}
-                    )
+                    spec = {"name": name, "description": description, "parameters": inputSchema}
+                    if outputSchema:
+                        spec["outputSchema"] = outputSchema
+                    if annotations:
+                        spec["annotations"] = annotations.model_dump(mode="json") if hasattr(annotations, "model_dump") else annotations
+                    if title:
+                        spec["title"] = title
+                    tool_specs.append(spec)
 
                 next_cursor = getattr(result, "nextCursor", None)
                 if not next_cursor or next_cursor == cursor:
@@ -200,11 +218,12 @@ class MCPClient:
 
         result_dict = result.model_dump(mode="json")
         result_content = result_dict.get("content", {})
-
         if result.isError:
-            raise Exception(result_content)
-        else:
-            return result_content
+            return {
+                "isError": True,
+                "content": result_content,
+            }
+        return result_content
 
     async def list_resources(self, cursor: Optional[str] = None) -> Optional[dict]:
         if not self.session:

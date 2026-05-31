@@ -17,6 +17,8 @@ from open_webui.models.tools import (
     ToolUserResponse,
     Tools,
 )
+from open_webui.models.mcp import MCPConnections
+from open_webui.utils.mcp.connections import personal_mcp_tool_id
 from open_webui.utils.plugin import (
     load_tool_module_by_id,
     replace_imports,
@@ -141,6 +143,38 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
                     }
                 )
             )
+
+    # Personal MCP connections
+    for connection in MCPConnections.get_connections_by_user_id(user.id, include_secrets=True, enabled_only=True):
+        auth_type = connection.auth_type or "none"
+        oauth_tokens = (getattr(connection, "oauth", {}) or {}).get("tokens") or {}
+        tools.append(
+            ToolUserResponse(
+                **{
+                    "id": personal_mcp_tool_id(connection.id),
+                    "user_id": user.id,
+                    "name": connection.name,
+                    "meta": {
+                        "description": connection.description or "",
+                        "manifest": {
+                            "type": "mcp",
+                            "scope": "personal",
+                            "transport": connection.transport,
+                            "auth_type": auth_type,
+                            "policy": connection.policy or {},
+                        },
+                    },
+                    "access_control": {},
+                    "updated_at": connection.updated_at,
+                    "created_at": connection.created_at,
+                    **(
+                        {"authenticated": bool(oauth_tokens.get("access_token"))}
+                        if auth_type == "oauth_2.1"
+                        else {}
+                    ),
+                }
+            )
+        )
 
     if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
         # Admin can see all tools

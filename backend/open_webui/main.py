@@ -92,6 +92,7 @@ from open_webui.routers import (
     functions,
     memories,
     models,
+    mcp,
     prompts,
     evaluations,
     tools,
@@ -1407,6 +1408,8 @@ app.include_router(notes.router, prefix="/api/v1/notes", tags=["notes"])
 
 
 app.include_router(models.router, prefix="/api/v1/models", tags=["models"])
+app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["mcp"])
+app.include_router(mcp.oauth_router, prefix="/oauth/mcp", tags=["mcp-oauth"])
 app.include_router(prompts.router, prefix="/api/v1/prompts", tags=["prompts"])
 app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
 

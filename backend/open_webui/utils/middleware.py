@@ -179,7 +179,13 @@ from open_webui.utils.filter import (
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
+from open_webui.models.mcp import MCPConnections
 from open_webui.utils.mcp.client import MCPClient, mcp_tool_alias, build_mcp_connect_kwargs
+from open_webui.utils.mcp.connections import (
+    build_personal_mcp_connect_kwargs,
+    parse_personal_mcp_tool_id,
+    tool_allowed_by_policy,
+)
 from open_webui.utils.container_workspace import (
     import_changed_container_outputs,
     prepare_container_workspace_for_turn,
@@ -1732,6 +1738,89 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     if tool_ids:
         for tool_id in tool_ids:
+            personal_connection_id = parse_personal_mcp_tool_id(tool_id)
+            if personal_connection_id:
+                original_server_id = f"user:{personal_connection_id}"
+                personal_connection = None
+                try:
+                    personal_connection = MCPConnections.get_connection_by_id_and_user_id(
+                        personal_connection_id, user.id, include_secrets=True
+                    )
+                    if not personal_connection or not personal_connection.enabled:
+                        mcp_failures.append(
+                            {
+                                "server_id": original_server_id,
+                                "name": personal_connection_id,
+                                "reason": "Personal MCP connection not found",
+                            }
+                        )
+                        continue
+
+                    mcp_clients[original_server_id] = MCPClient()
+                    connect_kwargs = await build_personal_mcp_connect_kwargs(
+                        personal_connection,
+                        user=user,
+                        metadata=metadata,
+                    )
+                    await mcp_clients[original_server_id].connect(**connect_kwargs)
+
+                    tool_specs = await mcp_clients[original_server_id].list_tool_specs()
+                    for tool_spec in tool_specs or []:
+                        if not tool_allowed_by_policy(tool_spec, personal_connection):
+                            continue
+
+                        def make_tool_function(client, function_name):
+                            async def tool_function(**kwargs):
+                                return await client.call_tool(
+                                    function_name,
+                                    function_args=kwargs,
+                                )
+
+                            return tool_function
+
+                        tool_function = make_tool_function(
+                            mcp_clients[original_server_id], tool_spec["name"]
+                        )
+                        alias = mcp_tool_alias(original_server_id, tool_spec["name"])
+                        if alias in mcp_tools_dict:
+                            alias = mcp_tool_alias(
+                                f"{original_server_id}:{tool_spec['name']}",
+                                tool_spec["name"],
+                            )
+                        mcp_tools_dict[alias] = {
+                            "spec": {
+                                **tool_spec,
+                                "name": alias,
+                            },
+                            "callable": tool_function,
+                            "type": "mcp",
+                            "client": mcp_clients[original_server_id],
+                            "direct": False,
+                            "metadata": {
+                                "annotations": tool_spec.get("annotations", {}),
+                                "outputSchema": tool_spec.get("outputSchema"),
+                                "parallelizable": bool(
+                                    (personal_connection.policy or {}).get(
+                                        "parallelizable", False
+                                    )
+                                ),
+                            },
+                        }
+                except Exception as e:
+                    log.exception(
+                        "Personal MCP connection %r failed during connect/list_tool_specs",
+                        original_server_id,
+                    )
+                    mcp_clients.pop(original_server_id, None)
+                    mcp_failures.append(
+                        {
+                            "server_id": original_server_id,
+                            "name": getattr(personal_connection, "name", personal_connection_id),
+                            "reason": f"{type(e).__name__}: {e}",
+                        }
+                    )
+                    continue
+
             if tool_id.startswith("server:mcp:"):
                 # Snapshot the original id BEFORE the oauth_2.1 branch mutates
                 # `server_id` to its trailing colon-segment. Use the original
@@ -1833,6 +1922,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         # 400s the entire request. The callable above still
                         # invokes the ORIGINAL tool name on the MCP server.
                         alias = mcp_tool_alias(original_server_id, tool_spec["name"])
+                        if alias in mcp_tools_dict:
+                            alias = mcp_tool_alias(
+                                f"{original_server_id}:{tool_spec['name']}",
+                                tool_spec["name"],
+                            )
                         log.debug(
                             "MCP tool alias: %s -> server=%s tool=%s",
                             alias,
@@ -1850,6 +1944,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             "client": mcp_clients[original_server_id],
                             "direct": False,
                             "metadata": {
+                                "annotations": tool_spec.get("annotations", {}),
+                                "outputSchema": tool_spec.get("outputSchema"),
                                 "parallelizable": bool(
                                     mcp_server_connection.get(
                                         "parallelizable", False
@@ -1958,7 +2054,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             # If the function calling is native, then call the tools function calling handler
             metadata["tools"] = tools_dict
             form_data["tools"] = [
-                {"type": "function", "function": tool.get("spec", {})}
+                {
+                    "type": "function",
+                    "function": {
+                        key: value
+                        for key, value in (tool.get("spec", {}) or {}).items()
+                        if key in {"name", "description", "parameters"}
+                    },
+                }
                 for tool in tools_dict.values()
             ]
         else:

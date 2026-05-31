@@ -11,6 +11,7 @@
 	import { config, user, tools as _tools, mobile, settings, toolServers } from '$lib/stores';
 
 	import { getOAuthClientAuthorizationUrl } from '$lib/apis/configs';
+	import { startMCPConnectionOAuth } from '$lib/apis/mcp';
 	import { getTools } from '$lib/apis/tools';
 
 	import Knobs from '$lib/components/icons/Knobs.svelte';
@@ -537,7 +538,13 @@
 										)
 									);
 
-									const authUrl = getOAuthClientAuthorizationUrl(serverId, 'mcp');
+									let authUrl = '';
+									if (toolId.startsWith('user:mcp:')) {
+										const res = await startMCPConnectionOAuth(localStorage.token, serverId);
+										authUrl = res?.authorization_url;
+									} else {
+										authUrl = getOAuthClientAuthorizationUrl(serverId, 'mcp');
+									}
 									window.open(authUrl, '_self', 'noopener');
 								} else {
 									tools[toolId].enabled = !tools[toolId].enabled;

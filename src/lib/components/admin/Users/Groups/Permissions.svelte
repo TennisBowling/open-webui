@@ -41,6 +41,10 @@
 		},
 		features: {
 			direct_tool_servers: true,
+			mcp_remote_custom: true,
+			mcp_static_secrets: true,
+			mcp_stdio_templates: true,
+			mcp_stdio_custom: false,
 			web_search: true,
 			image_generation: true,
 			code_interpreter: true,
@@ -540,6 +544,42 @@
 					</div>
 				</div>
 			{/if}
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-medium">
+					{$i18n.t('MCP Remote Servers')}
+				</div>
+				<Switch bind:state={permissions.features.mcp_remote_custom} />
+			</div>
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-medium">
+					{$i18n.t('MCP Static Secrets')}
+				</div>
+				<Switch bind:state={permissions.features.mcp_static_secrets} />
+			</div>
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-medium">
+					{$i18n.t('MCP Stdio Templates')}
+				</div>
+				<Switch bind:state={permissions.features.mcp_stdio_templates} />
+			</div>
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-medium">
+					{$i18n.t('MCP Custom Stdio')}
+				</div>
+				<Switch bind:state={permissions.features.mcp_stdio_custom} />
+			</div>
 		</div>
 
 		<div class="flex flex-col w-full">
