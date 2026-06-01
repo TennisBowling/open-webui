@@ -551,20 +551,31 @@ def assemble_conversation_from_leaf(
             for f in files
         )
 
-        text_prefix = build_text_file_blocks(files) if is_user and not container_workspace_active else ""
+        should_attach_images = is_user and has_images and model_supports_vision
+        should_send_files_to_model = is_user and not container_workspace_active
+        # PDFs use OpenRouter's native file-parser path, so container mode still
+        # sends them to the model while also copying them into /workspace/inputs.
+        should_attach_pdf_files = is_user and has_pdf and model_supports_vision
+        should_attach_extractable_files = should_send_files_to_model and has_extractable
+
+        text_prefix = build_text_file_blocks(files) if should_send_files_to_model else ""
         base_text = (message.get("merged") or {}).get("content") or message.get("content") or ""
 
-        if is_user and not container_workspace_active and (
-            ((has_images or has_pdf) and model_supports_vision) or has_extractable
+        if is_user and (
+            should_attach_images
+            or should_attach_pdf_files
+            or should_attach_extractable_files
         ):
             parts: list = [{"type": "text", "text": text_prefix + base_text}]
 
-            if model_supports_vision:
+            if should_attach_images:
                 for f in files:
                     if f.get("type") == "image":
                         parts.append(
                             {"type": "image_url", "image_url": {"url": f.get("url")}}
                         )
+
+            if should_attach_pdf_files:
                 for f in files:
                     if f.get("type") == "file" and (
                         (f.get("name") or "").lower().endswith(".pdf")
@@ -585,23 +596,26 @@ def assemble_conversation_from_leaf(
                             }
                         )
 
-            for f in files:
-                if f.get("type") == "file" and _file_ext(f) in _EXTRACTABLE_EXTS:
-                    parts.append(
-                        {
-                            "type": "file",
-                            "file": {
-                                "filename": f.get("name")
-                                or (f.get("file") or {}).get("filename")
-                                or "document",
-                                "file_data": f.get("url")
-                                or f"/api/v1/files/{f.get('id')}/content",
-                                "processing_mode": "pdf"
-                                if f.get("processing_mode") == "pdf"
-                                else "text",
-                            },
-                        }
-                    )
+            if should_attach_extractable_files:
+                for f in files:
+                    if f.get("type") == "file" and _file_ext(f) in _EXTRACTABLE_EXTS:
+                        parts.append(
+                            {
+                                "type": "file",
+                                "file": {
+                                    "filename": f.get("name")
+                                    or (f.get("file") or {}).get("filename")
+                                    or "document",
+                                    "file_data": f.get("url")
+                                    or f"/api/v1/files/{f.get('id')}/content",
+                                    "processing_mode": (
+                                        "pdf"
+                                        if f.get("processing_mode") == "pdf"
+                                        else "text"
+                                    ),
+                                },
+                            }
+                        )
 
             prepared.append({"role": message.get("role"), "content": parts})
             continue

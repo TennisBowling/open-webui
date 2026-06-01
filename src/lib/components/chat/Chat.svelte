@@ -5647,6 +5647,12 @@
 						// images/PDFs these don't gate on vision capability — extracted
 						// text works on every model.
 						const hasExtractableFiles = message.files?.some(isExtractableFile);
+						const shouldAttachImages = isUser && hasImages && modelSupportsVision;
+						const shouldSendFilesToModel = isUser && !containerWorkspaceActive;
+						// PDFs use OpenRouter's native file-parser path, so container mode
+						// still sends them to the model while also copying them into /workspace/inputs.
+						const shouldAttachPdfFiles = isUser && hasPdfFiles && modelSupportsVision;
+						const shouldAttachExtractableFiles = shouldSendFilesToModel && hasExtractableFiles;
 
 						const textPrefix = isUser && !containerWorkspaceActive
 							? await buildTextFileBlocks(message.files)
@@ -5655,8 +5661,7 @@
 
 						if (
 							isUser &&
-							!containerWorkspaceActive &&
-							(((hasImages || hasPdfFiles) && modelSupportsVision) || hasExtractableFiles)
+							(shouldAttachImages || shouldAttachPdfFiles || shouldAttachExtractableFiles)
 						) {
 							return {
 								role: message.role,
@@ -5666,7 +5671,7 @@
 										text: textPrefix + baseText
 									},
 									// Add image content parts (vision-capable models only).
-									...(modelSupportsVision
+									...(shouldAttachImages
 										? message.files
 												.filter((file) => file.type === 'image')
 												.map((file) => ({
@@ -5678,7 +5683,7 @@
 										: []),
 									// PDF file parts for OpenRouter's file-parser plugin
 									// (vision-capable models only; existing behavior).
-									...(modelSupportsVision
+									...(shouldAttachPdfFiles
 										? message.files
 												.filter(
 													(file) =>
@@ -5698,14 +5703,16 @@
 									// replaces this part with either a <document> text part
 									// (mode == 'text') or a PDF binary part routed through
 									// the file-parser plugin (mode == 'pdf').
-									...message.files.filter(isExtractableFile).map((file) => ({
-										type: 'file',
-										file: {
-											filename: file.name || file.file?.filename || 'document',
-											file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`,
-											processing_mode: file.processing_mode === 'pdf' ? 'pdf' : 'text'
-										}
-									}))
+									...(shouldAttachExtractableFiles
+										? message.files.filter(isExtractableFile).map((file) => ({
+												type: 'file',
+												file: {
+													filename: file.name || file.file?.filename || 'document',
+													file_data: file.url || `${WEBUI_API_BASE_URL}/files/${file.id}/content`,
+													processing_mode: file.processing_mode === 'pdf' ? 'pdf' : 'text'
+												}
+											}))
+										: [])
 								]
 							};
 						}
