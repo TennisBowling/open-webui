@@ -9,22 +9,18 @@ message for the next request.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
-import ipaddress
 import logging
 import mimetypes
 import os
 import re
-import socket
 import uuid
 from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
-from aiohttp.abc import AbstractResolver
 from fastapi import Request
 from pydantic import BaseModel
 
@@ -147,81 +143,7 @@ def _validate_web_image_url(url: str) -> None:
         raise ViewImageError("image URL is missing a host")
     if parsed.username or parsed.password:
         raise ViewImageError("image URL must not include credentials")
-    _validate_public_host_literal(parsed.hostname)
-
-
-def _ip_is_public(address: str) -> bool:
-    try:
-        return ipaddress.ip_address(address.strip("[]")).is_global
-    except ValueError:
-        return False
-
-
-def _validate_public_host_literal(host: str) -> None:
-    normalized = (host or "").strip().strip("[]").lower().rstrip(".")
-    if not normalized:
-        raise ViewImageError("image URL is missing a host")
-    if normalized in _LOCAL_HOSTNAMES or normalized.endswith(".local"):
-        raise ViewImageError("image URL host must be public")
-    try:
-        ip = ipaddress.ip_address(normalized)
-    except ValueError:
-        return
-    if not ip.is_global:
-        raise ViewImageError("image URL host must be public")
-
-
-def _resolve_public_addresses(host: str, port: int, family: socket.AddressFamily):
-    _validate_public_host_literal(host)
-    try:
-        infos = socket.getaddrinfo(
-            host,
-            port,
-            family=family or socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-        )
-    except socket.gaierror as exc:
-        raise ViewImageError(f"could not resolve image URL host: {host}") from exc
-
-    results = []
-    seen = set()
-    for info_family, _type, proto, _canonname, sockaddr in infos:
-        address = sockaddr[0]
-        if not _ip_is_public(address):
-            continue
-        key = (info_family, proto, address)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(
-            {
-                "hostname": host,
-                "host": address,
-                "port": port,
-                "family": info_family,
-                "proto": proto,
-                "flags": socket.AI_NUMERICHOST,
-            }
-        )
-
-    if not results:
-        raise ViewImageError("image URL host did not resolve to a public address")
-    return results
-
-
-class _PublicResolver(AbstractResolver):
-    """Resolver that pins aiohttp to public addresses it validated itself."""
-
-    async def resolve(
-        self,
-        host: str,
-        port: int = 0,
-        family: socket.AddressFamily = socket.AF_INET,
-    ):
-        return await asyncio.to_thread(_resolve_public_addresses, host, port, family)
-
-    async def close(self) -> None:
-        return None
+    validate_url(url)
 
 
 async def _read_response_limited(response: aiohttp.ClientResponse) -> bytes:
@@ -253,17 +175,13 @@ async def _fetch_web_image_bytes(
     current_url = source.strip()
     _validate_web_image_url(current_url)
 
-    timeout = aiohttp.ClientTimeout(total=VIEW_IMAGE_FETCH_TIMEOUT_SECONDS)
-    connector = aiohttp.TCPConnector(
-        resolver=_PublicResolver(),
-        family=socket.AF_UNSPEC,
-        use_dns_cache=False,
-    )
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-        trust_env=False,
-    ) as session:
+    session = getattr(request.app.state, "http_session", None)
+    owns_session = session is None
+    if owns_session:
+        timeout = aiohttp.ClientTimeout(total=VIEW_IMAGE_FETCH_TIMEOUT_SECONDS)
+        session = aiohttp.ClientSession(timeout=timeout, trust_env=True)
+
+    try:
         for _ in range(VIEW_IMAGE_MAX_REDIRECTS + 1):
             async with session.get(
                 current_url,
@@ -290,6 +208,9 @@ async def _fetch_web_image_bytes(
                 return data, content_type or None, _guess_name_from_url(current_url)
 
         raise ViewImageError("image URL redirected too many times")
+    finally:
+        if owns_session:
+            await session.close()
 
 
 def _store_image_file(
