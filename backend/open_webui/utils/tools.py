@@ -180,6 +180,16 @@ async def get_tools(
                     tools_dict[tool_name] = tool_spec
             continue
 
+        # Handle built-in image viewing tool. This is auto-enabled by the
+        # chat middleware only when web search or the container workspace is
+        # active and the selected model supports vision.
+        if tool_id == "builtin:view_image":
+            view_image_tools = get_view_image_tool_specs(extra_params)
+            if view_image_tools:
+                for tool_name, tool_spec in view_image_tools.items():
+                    tools_dict[tool_name] = tool_spec
+            continue
+
         # Handle built-in data visualization tool
         if tool_id == "builtin:data_viz":
             data_viz_tools = get_data_viz_tool_specs(extra_params)
@@ -1005,6 +1015,59 @@ def get_web_search_tool_specs(extra_params: dict) -> dict:
         }
 
     return tools
+
+
+def get_view_image_tool_specs(extra_params: dict) -> dict:
+    """
+    Generate the built-in view_image tool spec.
+
+    Args:
+        extra_params: Extra parameters to inject (__request__, __user__, etc.)
+    """
+    from open_webui.utils.view_image_tool import get_view_image_tools_instance
+
+    tool_instance = get_view_image_tools_instance()
+    specs = get_tool_specs(tool_instance)
+
+    if not specs:
+        return {}
+
+    spec_map = {}
+    for spec in specs:
+        if "function" in spec:
+            name = spec["function"].get("name")
+        else:
+            name = spec.get("name")
+        if name:
+            spec_map[name] = spec
+
+    for spec in spec_map.values():
+        target = spec.get("function", spec)
+        params = target.get("parameters", {})
+        properties = params.get("properties", {}) or {}
+        target["parameters"]["properties"] = {
+            k: v for k, v in properties.items() if not k.startswith("__")
+        }
+        if "required" in params:
+            target["parameters"]["required"] = [
+                r for r in params["required"] if not r.startswith("__")
+            ]
+
+    if "view_image" not in spec_map:
+        return {}
+
+    callable_view_image = get_async_tool_function_and_apply_extra_params(
+        tool_instance.view_image, extra_params
+    )
+    return {
+        "view_image": {
+            "id": "builtin:view_image",
+            "name": "view_image",
+            "spec": spec_map["view_image"],
+            "callable": callable_view_image,
+            "metadata": {"parallelizable": True},
+        }
+    }
 
 
 def get_data_viz_tool_specs(extra_params: dict) -> dict:

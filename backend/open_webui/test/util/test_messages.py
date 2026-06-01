@@ -320,8 +320,14 @@ def test_cancel_mid_tool_keeps_tool_call_emission_only():
     _assert_no_dups(out)
     assert out[0]["role"] == "assistant"
     assert _ids(out[0]) == ["rs_A"]
-    # no tool message because no results were captured
-    assert not any(m["role"] == "tool" for m in out)
+    # The converter guarantees a non-empty placeholder tool message for every
+    # assistant tool_call so OpenAI-compatible upstreams accept the replayed
+    # history even when cancellation happened before a real tool result landed.
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "c1"
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "[No output was produced for this tool call.]"}
+    ]
 
 
 def test_cancel_before_any_reasoning_emits_clean_message():
@@ -447,6 +453,149 @@ def test_tool_result_is_text_part_list_for_cache_control_compatibility():
     tool_msg = next(m for m in out if m["role"] == "tool")
     assert tool_msg["tool_call_id"] == "c1"
     assert tool_msg["content"] == [{"type": "text", "text": "weather: sunny"}]
+
+
+def test_view_image_tool_result_adds_synthetic_user_image_message():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "call_img",
+                                "type": "function",
+                                "function": {
+                                    "name": "view_image",
+                                    "arguments": '{"source":"https://example.com/chart.png"}',
+                                },
+                            }
+                        ],
+                        "results": [
+                            {
+                                "tool_call_id": "call_img",
+                                "content": "Image attached for visual inspection: chart.png",
+                                "vision_attachments": [
+                                    {
+                                        "url": "/api/v1/files/file-1/content",
+                                        "detail": "high",
+                                        "source": "https://example.com/chart.png",
+                                        "file_id": "file-1",
+                                        "mime_type": "image/png",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert [m["role"] for m in out] == ["assistant", "tool", "user"]
+    assert out[1]["content"] == [
+        {"type": "text", "text": "Image attached for visual inspection: chart.png"}
+    ]
+    assert out[2]["name"] == "view_image_tool"
+    assert out[2]["content"][0]["type"] == "text"
+    assert out[2]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "/api/v1/files/file-1/content", "detail": "high"},
+    }
+
+
+def test_view_image_multiple_tool_calls_emit_all_tool_outputs_before_image_message():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "call_fetch",
+                                "type": "function",
+                                "function": {"name": "web_fetch", "arguments": "{}"},
+                            },
+                            {
+                                "id": "call_img",
+                                "type": "function",
+                                "function": {"name": "view_image", "arguments": "{}"},
+                            },
+                        ],
+                        "results": [
+                            {"tool_call_id": "call_fetch", "content": "page body"},
+                            {
+                                "tool_call_id": "call_img",
+                                "content": "Image attached for visual inspection: plot.png",
+                                "vision_attachments": [
+                                    {
+                                        "url": "/api/v1/files/file-2/content",
+                                        "detail": "auto",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    _text_block("The plot shows growth."),
+                ],
+            }
+        ]
+    )
+
+    assert [m["role"] for m in out] == ["assistant", "tool", "tool", "user", "assistant"]
+    assert out[1]["tool_call_id"] == "call_fetch"
+    assert out[2]["tool_call_id"] == "call_img"
+    assert out[3]["content"][1]["image_url"]["url"] == "/api/v1/files/file-2/content"
+    assert out[4]["content"] == "The plot shows growth."
+
+
+def test_view_image_attachment_hydrates_from_tool_result_body_store():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "call_img",
+                                "type": "function",
+                                "function": {"name": "view_image", "arguments": "{}"},
+                            }
+                        ],
+                        "results": [
+                            {
+                                "tool_call_id": "call_img",
+                                "result_ref": "call_img",
+                                "result_lazy": True,
+                                "content": "",
+                            }
+                        ],
+                    }
+                ],
+                "tool_result_bodies": {
+                    "call_img": {
+                        "tool_call_id": "call_img",
+                        "content": "Image attached for visual inspection: hydrated.png",
+                        "vision_attachments": [
+                            {"url": "/api/v1/files/file-3/content", "detail": "low"}
+                        ],
+                    }
+                },
+            }
+        ]
+    )
+
+    assert [m["role"] for m in out] == ["assistant", "tool", "user"]
+    assert out[2]["content"][1]["image_url"] == {
+        "url": "/api/v1/files/file-3/content",
+        "detail": "low",
+    }
 
 
 # -- Non-reasoning models: dedup is a no-op -----------------------------------

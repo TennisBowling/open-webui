@@ -185,6 +185,7 @@ from open_webui.utils.mcp.connections import (
     tool_allowed_by_policy,
 )
 from open_webui.utils.container_workspace import (
+    is_container_workspace_active,
     import_changed_container_outputs,
     prepare_container_workspace_for_turn,
 )
@@ -228,6 +229,33 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 WEB_TOOL_NAMES = {"web_search", "web_fetch"}
 WEB_TOOL_INLINE_RESULT_MAX = 2048
+
+
+def _as_tool_id_list(tool_ids) -> list[str]:
+    if isinstance(tool_ids, str):
+        return [tool_ids]
+    if isinstance(tool_ids, list):
+        return [str(tool_id) for tool_id in tool_ids if tool_id is not None]
+    return []
+
+
+def _model_supports_vision(model: dict | None) -> bool:
+    if not isinstance(model, dict):
+        return True
+    caps = (((model.get("info") or {}).get("meta") or {}).get("capabilities")) or {}
+    return caps.get("vision", True) is not False
+
+
+def _should_enable_view_image_tool(request, model, metadata: dict, tool_ids) -> bool:
+    """Return true when view_image should be present in the model tool list."""
+    if not _model_supports_vision(model):
+        return False
+
+    selected = _as_tool_id_list(tool_ids)
+    if "builtin:web_search" in selected:
+        return True
+
+    return is_container_workspace_active(request, metadata, selected)
 
 
 def _tool_call_name_by_id(block):
@@ -687,6 +715,21 @@ def process_tool_result(
     user=None,
 ):
     tool_result_embeds = []
+    tool_result_vision_attachments = []
+
+    if isinstance(tool_result, dict) and isinstance(
+        tool_result.get("vision_attachments"), list
+    ):
+        tool_result_vision_attachments = [
+            attachment
+            for attachment in tool_result.get("vision_attachments") or []
+            if isinstance(attachment, dict) and attachment.get("url")
+        ]
+        tool_result = (
+            tool_result.get("content")
+            or tool_result.get("message")
+            or "Image attached for visual inspection."
+        )
 
     if isinstance(tool_result, HTMLResponse):
         content_disposition = tool_result.headers.get("Content-Disposition", "")
@@ -817,7 +860,12 @@ def process_tool_result(
     if isinstance(tool_result, dict) or isinstance(tool_result, list):
         tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
 
-    return tool_result, tool_result_files, tool_result_embeds
+    return (
+        tool_result,
+        tool_result_files,
+        tool_result_embeds,
+        tool_result_vision_attachments,
+    )
 
 
 async def chat_completion_tools_handler(
@@ -955,7 +1003,12 @@ async def chat_completion_tools_handler(
                 except Exception as e:
                     tool_result = str(e)
 
-                tool_result, tool_result_files, tool_result_embeds = (
+                (
+                    tool_result,
+                    tool_result_files,
+                    tool_result_embeds,
+                    tool_result_vision_attachments,
+                ) = (
                     process_tool_result(
                         request,
                         tool_function_name,
@@ -973,6 +1026,7 @@ async def chat_completion_tools_handler(
                     "tool_result": tool_result,
                     "tool_result_files": tool_result_files,
                     "tool_result_embeds": tool_result_embeds,
+                    "tool_result_vision_attachments": tool_result_vision_attachments,
                 }
 
             async def _apply_tool_call_result(handler_result):
@@ -1714,6 +1768,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         form_data["messages"] = add_or_update_system_message(
             container_prompt, form_data["messages"], append=True
         )
+
+    if _should_enable_view_image_tool(request, model, metadata, tool_ids):
+        if tool_ids is None:
+            tool_ids = []
+        if "builtin:view_image" not in tool_ids:
+            tool_ids.append("builtin:view_image")
+        metadata.setdefault("params", {})["function_calling"] = "native"
+        log.info("Auto-enabled view_image tool with native function calling")
 
     prompt = get_last_user_message(form_data["messages"])
 
@@ -3894,7 +3956,12 @@ async def process_chat_response(
                                 sorted(tools.keys()),
                             )
 
-                        tool_result, tool_result_files, tool_result_embeds = (
+                        (
+                            tool_result,
+                            tool_result_files,
+                            tool_result_embeds,
+                            tool_result_vision_attachments,
+                        ) = (
                             process_tool_result(
                                 request,
                                 tool_function_name,
@@ -3933,6 +4000,11 @@ async def process_chat_response(
                             **(
                                 {"embeds": tool_result_embeds}
                                 if tool_result_embeds
+                                else {}
+                            ),
+                            **(
+                                {"vision_attachments": tool_result_vision_attachments}
+                                if tool_result_vision_attachments
                                 else {}
                             ),
                             **(
