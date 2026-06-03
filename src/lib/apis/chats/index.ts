@@ -793,6 +793,60 @@ export const getChatMessagesBranch = async (
 	return res;
 };
 
+export const stitchChatFromMetaAndMessages = (meta: any, branchPage: any) => {
+	if (!meta) return null;
+
+	const messagesMap: Record<string, any> = {};
+	for (const stub of meta?.history?.sibling_stubs ?? []) {
+		if (!stub?.id) continue;
+		messagesMap[stub.id] = {
+			id: stub.id,
+			parentId: stub.parentId ?? null,
+			childrenIds: Array.isArray(stub.childrenIds) ? stub.childrenIds : [],
+			role: stub.role,
+			content: '',
+			_stub: true
+		};
+	}
+
+	const branchMessages = Array.isArray(branchPage)
+		? branchPage
+		: Array.isArray(branchPage?.messages)
+			? branchPage.messages
+			: [];
+	for (const msg of branchMessages) {
+		if (!msg?.id) continue;
+		messagesMap[msg.id] = { ...(messagesMap[msg.id] ?? {}), ...msg, _stub: false };
+	}
+
+	return {
+		...meta,
+		chat: {
+			id: meta.id,
+			title: meta.title,
+			params: meta.params ?? {},
+			models: meta.models ?? [],
+			files: meta.files ?? [],
+			queue: meta.queue ?? [],
+			history: {
+				currentId: meta?.history?.currentId ?? null,
+				messages: messagesMap
+			},
+			messages: Object.values(messagesMap)
+		}
+	};
+};
+
+export const getChatByIdTail = async (token: string, id: string, limit = 25) => {
+	const meta = await getChatMeta(token, id);
+	const leafId = meta?.history?.currentId;
+	const branchPage = leafId
+		? await getChatMessagesBranch(token, id, { leaf: leafId, limit }).catch(() => null)
+		: [];
+
+	return stitchChatFromMetaAndMessages(meta, branchPage);
+};
+
 // Sibling-branch lazy load — hits GET /chats/{id}/messages/{message_id}/siblings.
 // Returns full-content messages sharing the given message's parent_id (used when
 // the user clicks a branch-switch arrow and the target branch wasn't paginated in).

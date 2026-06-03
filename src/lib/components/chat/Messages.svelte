@@ -64,6 +64,7 @@
 	export let topPadding = false;
 	export let bottomPadding = false;
 	export let autoScroll;
+	export let allowPagination = true;
 
 	export let onSelect = (e) => {};
 
@@ -752,7 +753,7 @@
 								? document.getElementById('messages-container')
 								: null}
 							on:visible={() => {
-								if (!messagesLoading && frontier.kind !== 'error') {
+								if (allowPagination && !messagesLoading && frontier.kind !== 'error') {
 									advanceFrontier(frontier);
 								}
 							}}

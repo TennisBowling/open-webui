@@ -160,3 +160,26 @@ def test_non_container_workspace_keeps_existing_image_and_file_parts(monkeypatch
     assert parts[2]["file"]["filename"] == "paper.pdf"
     assert parts[3]["file"]["filename"] == "report.docx"
     assert parts[3]["file"]["processing_mode"] == "text"
+
+
+def test_image_parts_fall_back_to_file_id_when_url_missing(monkeypatch):
+    out = _assemble(
+        monkeypatch,
+        [
+            {
+                "type": "image",
+                "id": "image-file",
+                "name": "plot.png",
+            },
+        ],
+        container_workspace_active=False,
+    )
+
+    parts = out[0]["content"]
+    assert parts == [
+        {"type": "text", "text": "inspect these files"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "/api/v1/files/image-file/content"},
+        },
+    ]

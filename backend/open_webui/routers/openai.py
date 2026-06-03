@@ -63,8 +63,6 @@ from open_webui.utils.file_extraction import (
 )
 from open_webui.utils.file_conversion import get_or_convert_to_pdf
 from open_webui.utils.image_conversion import (
-    SUPPORTED_IMAGE_MIME_TYPES,
-    normalize_image_mime_type,
     prepare_image_data_for_provider,
 )
 from open_webui.config import (
@@ -96,6 +94,10 @@ def user_can_read_file(file, user: UserModel) -> bool:
         return has_access(user.id, type="read", access_control=access_control)
 
     return False
+
+
+def image_input_error(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(message))
 
 
 async def send_get_request(url, key=None, user: UserModel = None):
@@ -1054,36 +1056,49 @@ async def generate_chat_completion(
     if "messages" in payload:
         for message in payload["messages"]:
             if isinstance(message.get("content"), list):
-                parts_to_remove = []
-                for part_idx, part in enumerate(message["content"]):
+                for part in message["content"]:
+                    if not isinstance(part, dict):
+                        continue
+
                     if part.get("type") == "image_url":
-                        url = part["image_url"]["url"]
+                        image_url = part.get("image_url") or {}
+                        url = image_url.get("url")
+                        if not isinstance(url, str) or not url:
+                            raise image_input_error(
+                                "Image input is missing a valid URL"
+                            )
                         
                         # If already a data URL, keep provider-supported image
                         # formats as-is. Normalize unsupported data:image/*
                         # payloads (notably HEIC/HEIF from Apple devices) so
                         # they don't make upstream providers fail request parsing.
                         if url.startswith("data:"):
-                            data_url_match = re.match(r"data:([^;,]+);base64,(.*)$", url, re.S)
-                            if data_url_match:
-                                data_mime = data_url_match.group(1)
-                                normalized_data_mime = normalize_image_mime_type(data_mime)
-                                if normalized_data_mime not in SUPPORTED_IMAGE_MIME_TYPES:
-                                    try:
-                                        raw = base64.b64decode(data_url_match.group(2), validate=False)
-                                        raw, provider_mime = prepare_image_data_for_provider(
-                                            raw,
-                                            data_mime,
-                                            None,
-                                        )
-                                        part["image_url"]["url"] = (
-                                            f"data:{provider_mime};base64,{base64.b64encode(raw).decode('utf-8')}"
-                                        )
-                                    except Exception as e:
-                                        log.error(
-                                            f"Error normalizing image data URL: {e}. Removing image from message."
-                                        )
-                                        parts_to_remove.append(part_idx)
+                            data_url_match = re.match(
+                                r"data:([^;,]+);base64,(.*)$", url, re.S
+                            )
+                            if not data_url_match:
+                                raise image_input_error(
+                                    "Image data URL must be base64 encoded"
+                                )
+
+                            data_mime = data_url_match.group(1)
+                            try:
+                                raw = base64.b64decode(
+                                    data_url_match.group(2), validate=False
+                                )
+                                raw, provider_mime = prepare_image_data_for_provider(
+                                    raw,
+                                    data_mime,
+                                    None,
+                                )
+                                part["image_url"]["url"] = (
+                                    f"data:{provider_mime};base64,{base64.b64encode(raw).decode('utf-8')}"
+                                )
+                            except Exception as e:
+                                log.error(f"Error normalizing image data URL: {e}")
+                                raise image_input_error(
+                                    "Could not normalize image data for provider"
+                                )
                             continue
                             
                         # Check if it's a local file URL (e.g. /api/v1/files/{id} or /api/v1/files/{id}/content)
@@ -1096,22 +1111,24 @@ async def generate_chat_completion(
                             log.debug(f"Resolving local file URL to base64: file_id={file_id}")
                             file = Files.get_file_by_id(file_id)
                             if not file:
-                                log.warning(f"File not found in database: {file_id}. Removing image from message.")
-                                parts_to_remove.append(part_idx)
-                                continue
+                                log.warning(f"File not found in database: {file_id}")
+                                raise image_input_error("Uploaded image file was not found")
                             if not user_can_read_file(file, user):
-                                log.warning(f"User {user.id} does not have permission to read file {file_id}. Removing image from message.")
-                                parts_to_remove.append(part_idx)
-                                continue
+                                log.warning(
+                                    f"User {user.id} does not have permission to read file {file_id}"
+                                )
+                                raise image_input_error(
+                                    "Uploaded image file is not accessible"
+                                )
+                            file_path = None
                             try:
                                 file_path = Storage.get_file(file.path)
                                 log.debug(f"Reading file from storage: {file_path}")
                                 with open(file_path, "rb") as f:
                                     image_data = f.read()
                                     if not image_data:
-                                        log.warning(f"File is empty: {file_path}. Removing image from message.")
-                                        parts_to_remove.append(part_idx)
-                                        continue
+                                        log.warning(f"File is empty: {file_path}")
+                                        raise image_input_error("Uploaded image file is empty")
                                     image_data, mime_type = prepare_image_data_for_provider(
                                         image_data,
                                         (file.meta or {}).get("content_type"),
@@ -1121,22 +1138,27 @@ async def generate_chat_completion(
                                     part["image_url"]["url"] = f"data:{mime_type};base64,{base64_image}"
                                     log.debug(f"Successfully converted image to base64: mime_type={mime_type}, size={len(image_data)} bytes")
                             except FileNotFoundError as e:
-                                log.error(f"File not found on disk: {file_path}. Removing image from message. Error: {e}")
-                                parts_to_remove.append(part_idx)
+                                log.error(
+                                    f"File not found on disk: {file_path}. Error: {e}"
+                                )
+                                raise image_input_error(
+                                    "Uploaded image file was not found in storage"
+                                )
                             except Exception as e:
-                                log.error(f"Error resolving image URL {url}: {e}. Removing image from message.")
-                                parts_to_remove.append(part_idx)
+                                if isinstance(e, HTTPException):
+                                    raise
+                                log.error(f"Error resolving image URL {url}: {e}")
+                                raise image_input_error("Could not prepare uploaded image for provider")
                         # If it's a non-local URL (http/https), keep it as-is - provider may be able to fetch it
                         elif not url.startswith(("http://", "https://")):
-                            # Unknown URL format that's not a public URL - remove to prevent issues
-                            log.warning(f"Unknown image URL format (not data:, http:, https:, or local file): {url[:100]}. Removing image from message.")
-                            parts_to_remove.append(part_idx)
-                
-                # Remove failed images in reverse order to preserve indices
-                for remove_idx in reversed(parts_to_remove):
-                    message["content"].pop(remove_idx)
-                    log.debug(f"Removed image part at index {remove_idx}")
-                
+                            # Unknown URL format that's not a public URL.
+                            log.warning(
+                                "Unknown image URL format (not data:, http:, https:, or local file): "
+                                f"{url[:100]}"
+                            )
+                            raise image_input_error(
+                                "Image URL is not accessible to the provider"
+                            )
                 # Process file parts (separate loop after image processing).
                 # Tri-modal dispatch:
                 #   PDF or processing_mode=="pdf" → base64 + has_pdf_files flag
@@ -1145,6 +1167,9 @@ async def generate_chat_completion(
                 #   else (default mode=="text") → run Loader, replace with a text
                 #     content part containing a <document filename="..."> envelope.
                 for part in message["content"]:
+                    if not isinstance(part, dict):
+                        continue
+
                     if part.get("type") == "file":
                         file_obj = part.get("file") or {}
                         file_data = file_obj.get("file_data")

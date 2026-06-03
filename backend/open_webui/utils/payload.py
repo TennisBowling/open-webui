@@ -85,17 +85,24 @@ def apply_model_params_to_body(
 
 
 def _with_cache_control(message: dict) -> dict:
-    """Return a copy of ``message`` whose final content part carries an ephemeral
-    cache_control marker. String content is reshaped into a single text-part list to
-    accommodate the marker. Pure: does not mutate ``message``."""
+    """Return a copy of ``message`` whose last text content part carries an
+    ephemeral cache_control marker.
+
+    Some OpenAI-compatible providers accept cache markers only on text parts.
+    Attaching provider-specific metadata to image/file parts makes multimodal
+    requests more fragile, especially when OpenRouter routes across providers.
+    Pure: does not mutate ``message``.
+    """
     content = message.get("content")
 
     if isinstance(content, list) and content:
         new_parts = list(content)
-        last_part = new_parts[-1]
-        if isinstance(last_part, dict):
-            new_parts[-1] = {**last_part, "cache_control": {"type": "ephemeral"}}
-        return {**message, "content": new_parts}
+        for idx in range(len(new_parts) - 1, -1, -1):
+            part = new_parts[idx]
+            if isinstance(part, dict) and part.get("type") == "text":
+                new_parts[idx] = {**part, "cache_control": {"type": "ephemeral"}}
+                return {**message, "content": new_parts}
+        return message
 
     if isinstance(content, str):
         return {

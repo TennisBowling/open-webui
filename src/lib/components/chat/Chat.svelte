@@ -71,9 +71,7 @@
 	import {
 		createNewChat,
 		getAllTags,
-		getChatById,
-		getChatMeta,
-		getChatMessagesBranch,
+		getChatByIdTail,
 		getChatMessageToolResult,
 		getTagsById,
 		updateChatFolderIdById,
@@ -126,6 +124,7 @@
 	export let preloadedDataPromise: Promise<any> | null = null;
 
 	let loading = true;
+	let initialScrollSettled = false;
 	let navigateGeneration = 0; // Incremented on each navigation; stale loadChat calls abort before touching state
 
 	const eventTarget = new EventTarget();
@@ -1040,6 +1039,7 @@
 	const navigateHandler = async () => {
 		const myGeneration = ++navigateGeneration;
 		loading = true;
+		initialScrollSettled = false;
 		stopSubagentUpdateBatching();
 		stopResumeTaskPolling();
 		lastPersistedSelectedToolIds = null;
@@ -1090,14 +1090,17 @@
 			}
 			// Belt-and-suspenders: also schedule a delayed scroll for late-rendering content
 			window.setTimeout(() => {
+				if (myGeneration !== navigateGeneration) return;
 				if (messagesContainerElement) {
 					messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
 				}
 			}, 50);
 			window.setTimeout(() => {
+				if (myGeneration !== navigateGeneration) return;
 				if (messagesContainerElement) {
 					messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
 				}
+				initialScrollSettled = true;
 			}, 200);
 
 			await tick();
@@ -3023,68 +3026,13 @@
 			_taskRes,
 			_activeStreamsRes = _subscribeRes?.streams ? _subscribeRes : null;
 
-		// Stitches the paginated `?meta_only=true` response + a branch-message page
-		// back into the legacy `{id, title, chat: {...}}` shape that downstream code
-		// (subagent hydration, message rendering, save handler) reads. sibling_stubs
-		// fill in id-only placeholders for every message in the chat so branch arrows
-		// and parent/child traversal keep working; full bodies are lazy-loaded on demand.
-		const stitchPaginatedChat = (meta: any, branchPage: any) => {
-			if (!meta) return null;
-			const messagesMap: Record<string, any> = {};
-			for (const stub of meta?.history?.sibling_stubs ?? []) {
-				if (!stub?.id) continue;
-				messagesMap[stub.id] = {
-					id: stub.id,
-					parentId: stub.parentId ?? null,
-					childrenIds: Array.isArray(stub.childrenIds) ? stub.childrenIds : [],
-					role: stub.role,
-					content: '',
-					_stub: true
-				};
-			}
-			// GET /chats/{id}/messages returns a raw array, not {messages: [...]}.
-			// Accept both shapes so we're resilient to API drift.
-			const branchMessages = Array.isArray(branchPage)
-				? branchPage
-				: Array.isArray(branchPage?.messages)
-					? branchPage.messages
-					: [];
-			for (const msg of branchMessages) {
-				if (!msg?.id) continue;
-				messagesMap[msg.id] = { ...(messagesMap[msg.id] ?? {}), ...msg, _stub: false };
-			}
-			return {
-				...meta,
-				chat: {
-					id: meta.id,
-					title: meta.title,
-					params: meta.params ?? {},
-					models: meta.models ?? [],
-					files: meta.files ?? [],
-					queue: meta.queue ?? [],
-					history: {
-						currentId: meta?.history?.currentId ?? null,
-						messages: messagesMap
-					},
-					messages: Object.values(messagesMap)
-				}
-			};
-		};
-
 		const loadPaginatedChat = async () => {
-			const meta = await getChatMeta(localStorage.token, currentChatId).catch(async (error) => {
+			const chat = await getChatByIdTail(localStorage.token, currentChatId).catch(async (error) => {
 				await goto('/');
 				return null;
 			});
-			if (!meta) return null;
-			const leafId = meta?.history?.currentId;
-			const branchPage = leafId
-				? await getChatMessagesBranch(localStorage.token, currentChatId, {
-						leaf: leafId,
-						limit: 25
-					}).catch(() => null)
-				: [];
-			return stitchPaginatedChat(meta, branchPage);
+
+			return chat;
 		};
 
 		if (preloadedDataPromise) {
@@ -4890,9 +4838,9 @@
 												role: 'user',
 												content: [
 													{ type: 'text', text: userMessage.content },
-													...userImages.map((f) => ({
+													...userImages.filter(getFileContentUrl).map((f: any) => ({
 														type: 'image_url',
-														image_url: { url: f.url }
+														image_url: { url: getFileContentUrl(f) }
 													}))
 												]
 											}
@@ -5306,6 +5254,11 @@
 		return features;
 	};
 
+	const getFileContentUrl = (file: any) => {
+		if (file?.url) return file.url;
+		return file?.id ? `${WEBUI_API_BASE_URL}/files/${file.id}/content` : '';
+	};
+
 	const sendMessageSocket = async (
 		model,
 		_messages,
@@ -5673,11 +5626,11 @@
 									// Add image content parts (vision-capable models only).
 									...(shouldAttachImages
 										? message.files
-												.filter((file) => file.type === 'image')
-												.map((file) => ({
+												.filter((file: any) => file.type === 'image' && getFileContentUrl(file))
+												.map((file: any) => ({
 													type: 'image_url',
 													image_url: {
-														url: file.url
+														url: getFileContentUrl(file)
 													}
 												}))
 										: []),
@@ -7638,6 +7591,7 @@
 										chatId={activeChatId}
 										bind:history
 										bind:autoScroll
+										allowPagination={initialScrollSettled}
 										bind:prompt
 										setInputText={(text) => {
 											messageInput?.setText(text);

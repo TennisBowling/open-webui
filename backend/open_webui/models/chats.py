@@ -2137,86 +2137,128 @@ class ChatTable:
         without shipping the full message bodies. ``childrenIds`` is derived
         from ``parent_id`` when not stored directly on the message.
         """
-        chat = self.get_chat_by_id_and_user_id(id, user_id)
-        if chat is None:
-            return None
-        chat_dict = chat.chat if isinstance(chat.chat, dict) else {}
-        history = chat_dict.get("history") or {}
-        messages_map = history.get("messages") if isinstance(history, dict) else None
+        with get_db() as db:
+            chat = db.query(Chat).filter_by(id=id, user_id=user_id).first()
+            if chat is None:
+                return None
 
-        sibling_stubs: list[dict] = []
-        orphan_parent_count = 0
-        if isinstance(messages_map, dict):
-            children_index: dict[str, list[str]] = {}
-            for mid, m in messages_map.items():
-                if not isinstance(m, dict):
-                    continue
-                pid = m.get("parentId")
-                if pid is not None:
-                    children_index.setdefault(pid, []).append(mid)
-            for mid, m in messages_map.items():
-                if not isinstance(m, dict):
-                    continue
-                pid = m.get("parentId")
-                # Integrity check: parentId references a row not in messages_map.
-                # The frontend's new `orphan` frontier kind handles this by
-                # re-fetching from the missing id, but we want to know when it
-                # happens server-side so we can correlate with save-race logs.
-                if pid is not None and pid not in messages_map:
-                    orphan_parent_count += 1
-                stored_children = m.get("childrenIds")
-                children = (
-                    stored_children
-                    if isinstance(stored_children, list) and stored_children
-                    else children_index.get(mid, [])
-                )
-                sibling_stubs.append(
-                    {
-                        "id": mid,
-                        "parentId": pid,
-                        "childrenIds": children,
-                        "role": m.get("role"),
-                    }
-                )
+            chat_dict = chat.chat if isinstance(chat.chat, dict) else {}
+            history = chat_dict.get("history") or {}
+            current_id = history.get("currentId") if isinstance(history, dict) else None
 
-        if orphan_parent_count:
-            log.warning(
-                "Chat %s has %d message(s) with parentId pointing to a missing row",
-                id, orphan_parent_count,
+            sibling_stubs: list[dict] = []
+            orphan_parent_count = 0
+            migrated = bool(
+                _chat_message_table_supported(db)
+                and getattr(chat, "messages_migrated", 0)
             )
 
-        # Dangling-currentId repair for the legacy path (migrated chats are
-        # already repaired in _hydrate_chat_messages). Belt-and-suspenders for
-        # chats whose JSON blob carries a stale currentId from a save race.
-        current_id = history.get("currentId") if isinstance(history, dict) else None
-        if (
-            isinstance(messages_map, dict)
-            and messages_map
-            and (current_id is None or current_id not in messages_map)
-        ):
-            fallback = _pick_fallback_leaf(messages_map)
-            if fallback is not None:
-                if current_id is not None:
-                    log.warning(
-                        "Repaired dangling currentId=%s for chat=%s → %s (meta)",
-                        current_id, id, fallback,
-                    )
-                current_id = fallback
+            if migrated:
+                try:
+                    rows = db.execute(
+                        text(
+                            "SELECT message_id, parent_id, role "
+                            "FROM chat_message WHERE chat_id = :cid ORDER BY sequence"
+                        ),
+                        {"cid": id},
+                    ).fetchall()
+                except Exception:
+                    rows = []
 
-        return {
-            "id": chat.id,
-            "title": chat.title,
-            "updated_at": chat.updated_at,
-            "created_at": chat.created_at,
-            "params": chat_dict.get("params") or {},
-            "models": chat_dict.get("models") or [],
-            "files": chat_dict.get("files") or [],
-            "queue": chat_dict.get("queue") or [],
-            "history": {
-                "currentId": current_id,
-                "sibling_stubs": sibling_stubs,
-            },
-        }
+                message_ids = [r[0] for r in rows]
+                message_id_set = set(message_ids)
+                children_index: dict[str, list[str]] = {}
+                for mid, pid, _role in rows:
+                    if pid is not None:
+                        children_index.setdefault(pid, []).append(mid)
+                        if pid not in message_id_set:
+                            orphan_parent_count += 1
+
+                for mid, pid, role in rows:
+                    sibling_stubs.append(
+                        {
+                            "id": mid,
+                            "parentId": pid,
+                            "childrenIds": children_index.get(mid, []),
+                            "role": role,
+                        }
+                    )
+
+                if message_ids and (current_id is None or current_id not in message_id_set):
+                    fallback = None
+                    parents_with_children = set(children_index.keys())
+                    for mid in message_ids:
+                        if mid not in parents_with_children:
+                            fallback = mid
+                    fallback = fallback or message_ids[-1]
+                    if current_id is not None and current_id != fallback:
+                        log.warning(
+                            "Repaired dangling currentId=%s for chat=%s -> %s (meta)",
+                            current_id, id, fallback,
+                        )
+                    current_id = fallback
+            else:
+                messages_map = history.get("messages") if isinstance(history, dict) else None
+
+                if isinstance(messages_map, dict):
+                    children_index: dict[str, list[str]] = {}
+                    for mid, m in messages_map.items():
+                        if not isinstance(m, dict):
+                            continue
+                        pid = m.get("parentId")
+                        if pid is not None:
+                            children_index.setdefault(pid, []).append(mid)
+                    for mid, m in messages_map.items():
+                        if not isinstance(m, dict):
+                            continue
+                        pid = m.get("parentId")
+                        if pid is not None and pid not in messages_map:
+                            orphan_parent_count += 1
+                        stored_children = m.get("childrenIds")
+                        children = (
+                            stored_children
+                            if isinstance(stored_children, list) and stored_children
+                            else children_index.get(mid, [])
+                        )
+                        sibling_stubs.append(
+                            {
+                                "id": mid,
+                                "parentId": pid,
+                                "childrenIds": children,
+                                "role": m.get("role"),
+                            }
+                        )
+
+                    if messages_map and (current_id is None or current_id not in messages_map):
+                        fallback = _pick_fallback_leaf(messages_map)
+                        if fallback is not None:
+                            if current_id is not None and current_id != fallback:
+                                log.warning(
+                                    "Repaired dangling currentId=%s for chat=%s -> %s (meta)",
+                                    current_id, id, fallback,
+                                )
+                            current_id = fallback
+
+            if orphan_parent_count:
+                log.warning(
+                    "Chat %s has %d message(s) with parentId pointing to a missing row",
+                    id, orphan_parent_count,
+                )
+
+            return {
+                "id": chat.id,
+                "title": chat.title,
+                "updated_at": chat.updated_at,
+                "created_at": chat.created_at,
+                "params": chat_dict.get("params") or {},
+                "models": chat_dict.get("models") or [],
+                "files": chat_dict.get("files") or [],
+                "queue": chat_dict.get("queue") or [],
+                "history": {
+                    "currentId": current_id,
+                    "sibling_stubs": sibling_stubs,
+                },
+            }
 
     def get_chat_messages_branch(
         self,
@@ -2234,6 +2276,44 @@ class ChatTable:
         immediately older than that anchor (exclusive) — used for upward
         scroll pagination.
         """
+        with get_db() as db:
+            if _is_chat_migrated(db, chat_id):
+                max_count = max(1, int(limit)) if limit and limit > 0 else 10000
+
+                def fetch_message(message_id: Optional[str]) -> Optional[dict]:
+                    if not message_id:
+                        return None
+                    row = db.execute(
+                        text(
+                            f"SELECT {_CHAT_MESSAGE_SELECT_COLS} "
+                            "FROM chat_message WHERE chat_id = :cid AND message_id = :mid"
+                        ),
+                        {"cid": chat_id, "mid": message_id},
+                    ).fetchone()
+                    return _row_to_message_dict(row) if row is not None else None
+
+                cursor = leaf_message_id
+                if before_message_id:
+                    before_message = fetch_message(before_message_id)
+                    cursor = (
+                        before_message.get("parentId")
+                        if isinstance(before_message, dict)
+                        else leaf_message_id
+                    )
+
+                chain: list[dict] = []
+                seen: set[str] = set()
+                while cursor and cursor not in seen and len(chain) < max_count:
+                    seen.add(cursor)
+                    msg = fetch_message(cursor)
+                    if not isinstance(msg, dict):
+                        break
+                    chain.append(msg)
+                    cursor = msg.get("parentId")
+
+                chain.reverse()
+                return chain
+
         messages_map = self.get_messages_map_by_chat_id(chat_id) or {}
         if not messages_map:
             return []

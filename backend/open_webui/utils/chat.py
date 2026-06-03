@@ -102,6 +102,18 @@ def _file_ext(file: dict) -> str:
     return name[dot + 1 :] if dot >= 0 else ""
 
 
+def _file_content_url(file: dict) -> str:
+    url = file.get("url")
+    if isinstance(url, str) and url:
+        return url
+
+    file_id = file.get("id") or (file.get("file") or {}).get("id")
+    if file_id:
+        return f"/api/v1/files/{file_id}/content"
+
+    return ""
+
+
 def _is_text_file(file: dict) -> bool:
     if not file or file.get("type") != "file":
         return False
@@ -570,9 +582,10 @@ def assemble_conversation_from_leaf(
 
             if should_attach_images:
                 for f in files:
-                    if f.get("type") == "image":
+                    image_url = _file_content_url(f)
+                    if f.get("type") == "image" and image_url:
                         parts.append(
-                            {"type": "image_url", "image_url": {"url": f.get("url")}}
+                            {"type": "image_url", "image_url": {"url": image_url}}
                         )
 
             if should_attach_pdf_files:
@@ -590,8 +603,7 @@ def assemble_conversation_from_leaf(
                                     "filename": f.get("name")
                                     or (f.get("file") or {}).get("filename")
                                     or "document.pdf",
-                                    "file_data": f.get("url")
-                                    or f"/api/v1/files/{f.get('id')}/content",
+                                    "file_data": _file_content_url(f),
                                 },
                             }
                         )
@@ -606,8 +618,7 @@ def assemble_conversation_from_leaf(
                                     "filename": f.get("name")
                                     or (f.get("file") or {}).get("filename")
                                     or "document",
-                                    "file_data": f.get("url")
-                                    or f"/api/v1/files/{f.get('id')}/content",
+                                    "file_data": _file_content_url(f),
                                     "processing_mode": (
                                         "pdf"
                                         if f.get("processing_mode") == "pdf"

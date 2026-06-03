@@ -1,5 +1,5 @@
 import { browser } from '$app/environment';
-import { getChatById } from '$lib/apis/chats';
+import { getChatByIdTail } from '$lib/apis/chats';
 import { getTaskIdsByChatId } from '$lib/apis';
 
 export const load = ({ params }) => {
@@ -8,7 +8,7 @@ export const load = ({ params }) => {
 
 		return {
 			chatId: currentChatId,
-			chatPromise: getChatById(localStorage.token, currentChatId).catch(() => null),
+			chatPromise: getChatByIdTail(localStorage.token, currentChatId).catch(() => null),
 			taskResPromise: getTaskIdsByChatId(localStorage.token, currentChatId).catch(() => null)
 		};
 	}
