@@ -6,7 +6,7 @@ from open_webui.utils.misc import (
 )
 
 from typing import Callable, Optional
-import json
+from open_webui.utils import fast_json as json
 from datetime import datetime
 
 try:

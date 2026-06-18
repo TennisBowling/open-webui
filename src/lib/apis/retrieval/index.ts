@@ -9,6 +9,8 @@ type YoutubeConfigForm = {
 type WebSearchConfigForm = {
 	ENABLE_WEB_SEARCH?: boolean;
 	EXA_API_KEY?: string;
+	EXA_API_KEY_2?: string;
+	EXA_KEY_STATUS?: Record<string, { error?: string; at?: number }>;
 	EXA_SEARCH_NUM_RESULTS?: number;
 	EXA_SEARCH_TYPE?: string;
 	EXA_INCLUDE_DOMAINS?: string[];

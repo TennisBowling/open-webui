@@ -11,7 +11,6 @@
 
 	import AdvancedParams from '$lib/components/chat/Settings/Advanced/AdvancedParams.svelte';
 	import Tags from '$lib/components/common/Tags.svelte';
-	import ToolsSelector from '$lib/components/workspace/Models/ToolsSelector.svelte';
 	import FiltersSelector from '$lib/components/workspace/Models/FiltersSelector.svelte';
 	import ActionsSelector from '$lib/components/workspace/Models/ActionsSelector.svelte';
 	import Capabilities from '$lib/components/workspace/Models/Capabilities.svelte';
@@ -21,7 +20,7 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import DefaultFiltersSelector from './DefaultFiltersSelector.svelte';
-	import DefaultFeatures from './DefaultFeatures.svelte';
+	import DefaultToolsAndFeatures from './DefaultToolsAndFeatures.svelte';
 	import OpenRouterProviderSelector from './OpenRouterProviderSelector.svelte';
 
 	const i18n = getContext('i18n');
@@ -805,10 +804,6 @@
 					<hr class=" border-gray-100 dark:border-gray-850 my-1.5" />
 
 					<div class="my-2">
-						<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools} />
-					</div>
-
-					<div class="my-2">
 						<FiltersSelector
 							bind:selectedFilterIds={filterIds}
 							filters={$functions.filter((func) => func.type === 'filter')}
@@ -968,20 +963,16 @@
 						</div>
 					{/if}
 
-					{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
-						{@const availableFeatures = Object.entries(capabilities)
-				.filter(
-					([key, value]) =>
-						value && ['web_search', 'image_generation'].includes(key)
-				)
-							.map(([key, value]) => key)}
+					<hr class=" border-gray-100 dark:border-gray-850 my-1.5" />
 
-						{#if availableFeatures.length > 0}
-							<div class="my-2">
-								<DefaultFeatures {availableFeatures} bind:featureIds={defaultFeatureIds} />
-							</div>
-						{/if}
-					{/if}
+					<div class="my-2">
+						<DefaultToolsAndFeatures
+							tools={$tools}
+							bind:selectedToolIds={toolIds}
+							{capabilities}
+							bind:featureIds={defaultFeatureIds}
+						/>
+					</div>
 
 					<div class="my-2 text-gray-300 dark:text-gray-700">
 						<div class="flex w-full justify-between mb-2">

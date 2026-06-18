@@ -48,6 +48,7 @@
 	export let id;
 	export let title;
 
+	export let active = false;
 	export let selected = false;
 	export let shiftKey = false;
 
@@ -386,17 +387,20 @@
 	{:else}
 		<a
 			id="sidebar-chat-item"
-			class=" w-full flex justify-between rounded-xl px-[11px] py-[6px] relative {id === $chatId ||
+			class=" w-full flex justify-between rounded-xl px-[11px] py-[6px] relative {active ||
 			confirmEdit
-				? 'bg-manilla/40 dark:bg-manilla-dark selected before:content-[\'\'] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r'
+				? "bg-manilla/40 dark:bg-manilla-dark selected before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r"
 				: selected
 					? 'bg-manilla/40 dark:bg-manilla-dark selected'
 					: 'hover:bg-manilla/20 dark:hover:bg-manilla-dark/50'}  whitespace-nowrap text-ellipsis"
 			style="-webkit-tap-highlight-color: transparent;"
 			href="/c/{id}"
-			on:click={() => {
-				chatId.set(id);
-				dispatch('select');
+			on:click={(event) => {
+				if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+					return;
+				}
+
+				dispatch('activate', id);
 
 				if ($selectedFolder) {
 					selectedFolder.set(null);
@@ -438,7 +442,7 @@
 	<div
 		id="sidebar-chat-item-menu"
 		class="
-		      {id === $chatId || confirmEdit || selected
+		      {active || selected || confirmEdit
 			? 'from-manilla/40 dark:from-manilla-dark selected'
 			: `${$mobile ? '' : 'invisible group-hover:visible'} from-gray-50 dark:from-gray-950`}
 		          absolute {className === 'pr-2'

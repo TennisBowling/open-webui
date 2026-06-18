@@ -20,7 +20,6 @@ bugs the current design replaces.
 """
 
 from typing import Optional
-import copy
 
 
 def _dedupe_repeated_tool_name(name: Optional[str]) -> str:
@@ -120,11 +119,47 @@ def _image_observation_message(attachments: list[dict]) -> Optional[dict]:
     return {"role": "user", "name": "view_image_tool", "content": parts}
 
 
+def _subagent_final_text_lookup(subagent_runs) -> tuple[dict, dict]:
+    """Build ``(by_tool_call, by_subagent)`` maps of a subagent's final answer
+    text, used to recover a tool result whose persisted ``content`` is empty.
+
+    The parent message's ``block["results"]`` (what the model reads) and the
+    durable ``subagent_runs`` map are two separate stores that can diverge when
+    a parent turn is interrupted mid-fan-out (the results array is written by
+    several racing writers; ``subagent_runs`` is written independently and
+    durably per completion). ``final_text`` here is the source of truth.
+
+    Only runs that genuinely FINISHED with a non-empty answer are indexed — a
+    run that is error/cancelled/running, or has empty ``final_text``, is left
+    out so it still falls through to the ``[No output...]`` placeholder."""
+    by_tool_call: dict = {}
+    by_subagent: dict = {}
+    if not isinstance(subagent_runs, dict):
+        return by_tool_call, by_subagent
+    for run in subagent_runs.values():
+        if not isinstance(run, dict):
+            continue
+        if run.get("status") != "done":
+            continue
+        text = run.get("final_text")
+        if not (isinstance(text, str) and text.strip()):
+            continue
+        text = text.strip()
+        tcid = str(run.get("tool_call_id") or "")
+        if tcid:
+            by_tool_call[tcid] = text
+        sid = str(run.get("subagent_id") or run.get("chat_id") or "")
+        if sid:
+            by_subagent[sid] = text
+    return by_tool_call, by_subagent
+
+
 def _expand_assistant(
     content_blocks: list[dict],
     reasoning_details_per_round: Optional[list] = None,
     fallback_reasoning_details: Optional[list] = None,
     seen_reasoning_ids: Optional[set] = None,
+    subagent_runs: Optional[dict] = None,
 ) -> list[dict]:
     """Expand one open-webui assistant message (with structured ``content_blocks``)
     into the per-tool-call-round sequence of API messages OpenAI-compatible upstreams
@@ -142,6 +177,9 @@ def _expand_assistant(
     if seen_reasoning_ids is None:
         seen_reasoning_ids = set()
     legacy_fallback_consumed = False
+    subagent_text_by_tool_call, subagent_text_by_subagent = (
+        _subagent_final_text_lookup(subagent_runs)
+    )
 
     def take_per_round(idx: int) -> Optional[list]:
         if reasoning_details_per_round and idx < len(reasoning_details_per_round):
@@ -249,10 +287,26 @@ def _expand_assistant(
                 # otherwise be a string when it isn't the last on replay).
                 result_content = result.get("content", "") or ""
                 if not (isinstance(result_content, str) and result_content.strip()):
-                    # Empty/missing output — emit a non-empty placeholder so the
-                    # message validates. Surfaces the subagent's terminal state
-                    # (e.g. cancelled with no final text) to the parent model.
-                    result_content = "[No output was produced for this tool call.]"
+                    # Empty/missing result content. Before falling back to the
+                    # placeholder, try to recover the subagent's real answer from
+                    # the durable ``subagent_runs`` mirror (the results array and
+                    # that mirror can diverge when a parent turn is interrupted
+                    # mid-fan-out). Match by tool_call_id first — it disambiguates
+                    # WHICH turn (launch vs a later continue share a subagent_id)
+                    # and is the only key available when the result dict is
+                    # entirely missing (no subagent_id on it). Then by subagent_id.
+                    recovered = subagent_text_by_tool_call.get(call_id) or ""
+                    if not recovered:
+                        sid = str(result.get("subagent_id") or "")
+                        if sid:
+                            recovered = subagent_text_by_subagent.get(sid) or ""
+                    if recovered:
+                        result_content = recovered
+                    else:
+                        # Genuinely no output (cancelled / no final text) — emit a
+                        # non-empty placeholder so the message validates and the
+                        # parent model sees the subagent's terminal state.
+                        result_content = "[No output was produced for this tool call.]"
                 api_messages.append(
                     {
                         "role": "tool",
@@ -280,6 +334,20 @@ def _expand_assistant(
     for block in content_blocks:
         if block.get("type") == "tool_calls":
             flush(block)
+        elif block.get("type") == "user_steer":
+            # A mid-task user interjection (steering): the user sent this while
+            # the agent was working and it was injected at a tool-call boundary
+            # (see utils/middleware.py). Emit any accumulated assistant text as
+            # its own turn FIRST, then a real user-role message — so upstream
+            # sees ...assistant, user(steer), assistant... in conversation order
+            # and treats it as genuine new user input mid-task. A steer is NOT a
+            # tool round, so it must not advance emission_index / consume a
+            # reasoning slot — flush(None) only emits when there is pending text.
+            if pending_blocks:
+                flush(None)
+            steer_text = (block.get("content") or "").strip()
+            if steer_text:
+                api_messages.append({"role": "user", "content": steer_text})
         else:
             pending_blocks.append(block)
 
@@ -312,24 +380,53 @@ def _expand_assistant(
 def _hydrate_tool_result_refs(
     content_blocks: list[dict], bodies: Optional[dict]
 ) -> list[dict]:
-    hydrated = copy.deepcopy(content_blocks)
-    for block in hydrated:
+    """Merge large tool-result bodies (stored out-of-line under ``result_ref``)
+    back into the inline result dicts for outbound conversion.
+
+    Copy-on-write: the caller's ``content_blocks`` must never be mutated, but a
+    blanket ``deepcopy`` of the whole (possibly huge, possibly N-round) block
+    list ran on every conversion — the agentic hot path. Instead, pass blocks
+    through by reference and only shallow-copy the specific ``tool_calls`` block
+    (its results list, and each result dict) that actually receives a body.
+    Downstream (``_expand_assistant`` / ``_normalize_tool_calls``) only reads
+    these structures and builds fresh output, so sharing references for the
+    untouched blocks is safe. ``bodies`` is never mutated."""
+    bodies_is_dict = isinstance(bodies, dict)
+    out: list[dict] = []
+    for block in content_blocks:
         if not isinstance(block, dict) or block.get("type") != "tool_calls":
+            out.append(block)
             continue
-        for result in block.get("results") or []:
-            if not isinstance(result, dict):
-                continue
-            if result.get("content"):
+        results = block.get("results")
+        if not isinstance(results, list) or not results:
+            out.append(block)
+            continue
+
+        # Lazily clone the results list the first time a body is merged.
+        new_results: Optional[list] = None
+        for idx, result in enumerate(results):
+            if not isinstance(result, dict) or result.get("content"):
                 continue
             ref = result.get("result_ref") or result.get("tool_call_id")
-            body = bodies.get(ref) if isinstance(bodies, dict) else None
+            body = bodies.get(ref) if bodies_is_dict else None
             if isinstance(body, dict) and "content" in body:
-                result.update(body)
+                if new_results is None:
+                    new_results = list(results)
+                merged = dict(result)
+                merged.update(body)
+                new_results[idx] = merged
             elif result.get("result_ref"):
                 raise ValueError(
                     f"Missing tool result body for ref {result.get('result_ref')}"
                 )
-    return hydrated
+
+        if new_results is None:
+            out.append(block)
+        else:
+            new_block = dict(block)
+            new_block["results"] = new_results
+            out.append(new_block)
+    return out
 
 
 def blocks_to_api_messages(messages: list[dict]) -> list[dict]:
@@ -363,6 +460,11 @@ def blocks_to_api_messages(messages: list[dict]) -> list[dict]:
                     reasoning_details_per_round=msg.get("reasoning_details_per_round"),
                     fallback_reasoning_details=msg.get("reasoning_details"),
                     seen_reasoning_ids=seen_reasoning_ids,
+                    subagent_runs=(
+                        msg.get("subagent_runs")
+                        if isinstance(msg.get("subagent_runs"), dict)
+                        else None
+                    ),
                 )
             )
         else:
@@ -434,4 +536,11 @@ def blocks_to_plain_text(content_blocks: Optional[list[dict]]) -> str:
             for call in block.get("content") or []:
                 name = (call.get("function") or {}).get("name") or "tool"
                 parts.append(f"[Tool: {name}]")
+        elif btype == "user_steer":
+            steer = block.get("content") or ""
+            if steer:
+                parts.append(
+                    "**User:**\n"
+                    + "\n".join(f"> {line}" for line in steer.splitlines())
+                )
     return "\n\n".join(parts).strip()

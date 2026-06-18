@@ -46,6 +46,7 @@
 
 	export let selectedToolIds = [];
 	export let selectedFilterIds = [];
+	export let onSelectionTouched: () => void = () => {};
 
 	export let showCommands = false;
 
@@ -242,6 +243,7 @@
 					bind:this={messageInput}
 					{history}
 					{selectedModels}
+					{onSelectionTouched}
 					bind:files
 					bind:prompt
 					bind:autoScroll

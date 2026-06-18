@@ -1,7 +1,7 @@
 import logging
 import sys
 import inspect
-import json
+from open_webui.utils import fast_json as json
 import asyncio
 
 from pydantic import BaseModel

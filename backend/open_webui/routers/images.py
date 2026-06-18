@@ -21,7 +21,7 @@ from fastapi import (
 from open_webui.config import CACHE_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS, SRC_LOG_LEVELS
-from open_webui.routers.files import upload_file_handler
+from open_webui.routers.files import upload_file_handler, uploaded_file_id
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.images.comfyui import (
     ComfyUIGenerateImageForm,
@@ -489,7 +489,9 @@ def upload_image(request, image_data, content_type, metadata, user):
         process=False,
         user=user,
     )
-    url = request.app.url_path_for("get_file_content_by_id", id=file_item.id)
+    url = request.app.url_path_for(
+        "get_file_content_by_id", id=uploaded_file_id(file_item)
+    )
     return url
 
 

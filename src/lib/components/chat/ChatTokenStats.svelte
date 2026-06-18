@@ -16,6 +16,14 @@
 	let lastTrigger = 0;
 	let trackedChatId = '';
 	let lastTrackedChatId = '';
+	// Trailing-debounce timer for refresh-trigger fetches. The trigger bumps once
+	// per usage delta (i.e. once per tool-call round), so a 300-round agentic run
+	// would otherwise fire a steady stream of backend fetches. A trailing debounce
+	// collapses each burst into a SINGLE reconciliation fetch after activity
+	// settles. The live per-round numbers are already shown via tokenUsageGroups;
+	// this backend fetch is only the authoritative reconciliation.
+	let refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	const REFRESH_DEBOUNCE_MS = 1200;
 
 	// Retry-on-failure state. A transient failure (network blip, backend indexing
 	// lag for a freshly persisted chat, momentary auth window during boot) used to
@@ -64,7 +72,8 @@
 		}
 	});
 
-	// Reactive fetch when refresh trigger changes (debounced)
+	// Reactive fetch when refresh trigger changes (trailing-debounced so a burst
+	// of per-round usage deltas collapses into one fetch after activity settles).
 	$: if (
 		$chatTokenStatsRefreshTrigger > lastTrigger &&
 		trackedChatId &&
@@ -73,12 +82,15 @@
 		lastTrigger = $chatTokenStatsRefreshTrigger;
 		clearRetry();
 		retryCount = 0;
-		// Debounce the refresh slightly to allow backend to process
-		setTimeout(() => {
+		if (refreshDebounceTimer !== null) {
+			clearTimeout(refreshDebounceTimer);
+		}
+		refreshDebounceTimer = setTimeout(() => {
+			refreshDebounceTimer = null;
 			if (trackedChatId && !trackedChatId.startsWith('local:')) {
 				fetchTokenStats(trackedChatId);
 			}
-		}, 500);
+		}, REFRESH_DEBOUNCE_MS);
 	}
 
 	function scheduleRetry(id: string) {
@@ -216,6 +228,10 @@
 
 	onDestroy(() => {
 		clearRetry();
+		if (refreshDebounceTimer !== null) {
+			clearTimeout(refreshDebounceTimer);
+			refreshDebounceTimer = null;
+		}
 		// Intentionally do NOT clear the store on destroy. If a new ChatTokenStats
 		// instance has already mounted and started fetching for a different chat,
 		// `set(null)` here would race-clobber its loading state and the box would

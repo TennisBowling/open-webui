@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext, onDestroy, onMount } from 'svelte';
+	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { slide } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 	import { toast } from 'svelte-sonner';
@@ -7,7 +7,7 @@
 	import { chatId, socket, subagentLiveStates } from '$lib/stores';
 	import { rerunSubagent, type SubagentRerunScope } from '$lib/apis/subagents';
 	import { getChatById } from '$lib/apis/chats';
-	import { blocksToDisplayMarkdown } from '$lib/utils';
+	import { blocksToDisplayMarkdown, formatDuration } from '$lib/utils';
 	import Markdown from '../Markdown.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
@@ -50,6 +50,10 @@
 	$: attrToolCallId = (attributes?.tool_call_id || '') as string;
 	$: attrSubagentId = (attributes?.id || '') as string;
 	$: attrArgs = parseArgs(attributes?.arguments);
+	// The persisted placeholder stamps done="true" once the tool call returned.
+	// Used as a terminal-state fallback when no live/seeded run exists for this
+	// block (e.g. a malformed subagent call that errored before creating a run).
+	$: attrDone = String(attributes?.done) === 'true';
 	$: directRunEntry =
 		attrToolCallId && $subagentLiveStates[attrToolCallId]
 			? ([attrToolCallId, $subagentLiveStates[attrToolCallId]] as [string, any])
@@ -123,7 +127,14 @@
 					? run.status
 					: run?.final_text
 						? 'done'
-						: (run?.status ?? 'running')
+						: // No usable run state. If the persisted placeholder says the
+							// call already returned (done="true") and we have neither a
+							// run nor any final text, this is a terminal call with no
+							// subagent output (e.g. a malformed launch that errored) —
+							// surface 'error' instead of spinning on 'running' forever.
+							!run && attrDone
+							? 'error'
+							: (run?.status ?? 'running')
 	) as 'running' | 'done' | 'error' | 'cancelled';
 
 	$: displayName = run?.name || attrArgs?.name || '';
@@ -131,6 +142,67 @@
 	$: subagentChatId = run?.chat_id || run?.subagent_id || attrSubagentId || '';
 	$: continuation = run?.continuation === true || attributes?.name === 'subagent_continue';
 	$: stale = run?.stale === true;
+
+	// --- Elapsed-time timer ---------------------------------------------------
+	// Timing lives on the run object as `started_at` / `ended_at` (UNIX seconds,
+	// stamped by the backend at every lifecycle point and mirrored client-side;
+	// both survive reload via the persisted `subagent_runs` map). A stale card
+	// (orphaned by a `from_launch` redo) mirrors its launch sibling's timing,
+	// exactly like the status / final-text logic above.
+	$: timingRun = stale ? (effectiveRun ?? run) : run;
+	$: startedAt = typeof timingRun?.started_at === 'number' ? timingRun.started_at : null;
+	$: endedAt = typeof timingRun?.ended_at === 'number' ? timingRun.ended_at : null;
+
+	// A single self-managing 1s ticker, held ONLY while this block is actively
+	// running. `nowTs` is deliberately isolated so a tick recomputes just the
+	// timer string — never the heavy contentBlocks / hydration reactives.
+	let nowTs = Math.floor(Date.now() / 1000);
+	let timerInterval: ReturnType<typeof setInterval> | null = null;
+	$: if (typeof window !== 'undefined') {
+		const shouldTick = status === 'running' && startedAt != null;
+		if (shouldTick && !timerInterval) {
+			nowTs = Math.floor(Date.now() / 1000);
+			timerInterval = setInterval(() => {
+				nowTs = Math.floor(Date.now() / 1000);
+			}, 1000);
+		} else if (!shouldTick && timerInterval) {
+			clearInterval(timerInterval);
+			timerInterval = null;
+		}
+	}
+
+	// Running -> ticks off `nowTs`; terminal -> frozen at `ended_at`. A terminal
+	// run with no `ended_at` (only possible via a hard crash mid-flight) yields
+	// no duration rather than a runaway clock. Clamp ≥ 0 for sub-second skew
+	// between the server's time.time() and the client's Date.now().
+	$: elapsedSeconds =
+		startedAt == null
+			? null
+			: status === 'running'
+				? Math.max(0, nowTs - startedAt)
+				: endedAt != null
+					? Math.max(0, endedAt - startedAt)
+					: null;
+	$: timerText = elapsedSeconds == null ? '' : formatDuration(elapsedSeconds);
+
+	// Header line. While running we keep the "Researching…" badge and show the
+	// ticking timer beside it (template). When terminal, the duration phrase
+	// replaces the badge text; the colored icon still conveys state. Falls back
+	// to a bare label when no timing is available (e.g. placeholder-only run).
+	$: headerStatusText =
+		status === 'running'
+			? $i18n.t('Researching…')
+			: status === 'done'
+				? timerText
+					? $i18n.t('Researched for {{duration}}', { duration: timerText })
+					: $i18n.t('Done')
+				: status === 'cancelled'
+					? timerText
+						? $i18n.t('Stopped after {{duration}}', { duration: timerText })
+						: $i18n.t('Stopped')
+					: timerText
+						? $i18n.t('Failed after {{duration}}', { duration: timerText })
+						: $i18n.t('Error');
 
 	// Subagent body renders the structured `content_blocks` directly via a
 	// keyed `{#each}` (see template below). We deliberately do NOT compute a
@@ -151,11 +223,22 @@
 	// are the OLD turn that the relaunch replaced — ignore them and render the
 	// hidden chat's current content (fetched into fallbackBlocks) instead, so
 	// the card shows the new run's thinking / tool calls / answer.
+	// Structured blocks to render (work + answer). Priority: the live/seeded
+	// run's own content_blocks, else the on-demand fetched subagent chat blocks
+	// (fallbackBlocks). IMPORTANT: the parent's persisted `subagent_runs` entry
+	// stores ONLY `final_text` (not content_blocks — that would bloat every parent
+	// message with every subagent's full transcript), so after reload `run` has
+	// final_text but NO content_blocks. We must still pull in `fallbackBlocks` for
+	// the WORK transcript — previously a present `final_text` short-circuited to
+	// `[]`, which is why opened cards showed the answer but none of the searches /
+	// fetches / bash / thinking.
 	$: contentBlocks = (
 		open
 			? stale
 				? (effectiveRun?.content_blocks ?? fallbackBlocks ?? [])
-				: (run?.content_blocks ?? (run?.final_text ? [] : fallbackBlocks) ?? [])
+				: ((run?.content_blocks && run.content_blocks.length
+						? run.content_blocks
+						: fallbackBlocks) ?? [])
 			: []
 	) as any[];
 	$: hasContent = contentBlocks.length > 0;
@@ -163,6 +246,44 @@
 	// Final answer text to show when there are no structured blocks to render.
 	// Stale cards mirror their launch sibling's answer.
 	$: displayFinalText = (stale ? effectiveRun?.final_text : run?.final_text) || '';
+
+	// Index of the subagent's FINAL answer text block (the last non-empty text
+	// block, only once the run is terminal). The final answer is the single most
+	// important thing a user opens the card to see, but it is the LAST block in a
+	// possibly-huge transcript — the block window below renders from the START, so
+	// without special handling the answer is hidden behind slow progressive
+	// hydration (or entirely, if the main thread never goes idle). We therefore
+	// pull it OUT of the windowed transcript and render it as a dedicated,
+	// always-visible section. While running, the trailing text is still streaming
+	// and stays inline in the transcript (idx = -1).
+	$: finalTextIdx = doneRendering
+		? (() => {
+				for (let i = contentBlocks.length - 1; i >= 0; i--) {
+					const b = contentBlocks[i];
+					if (b?.type === 'text' && `${b.content ?? ''}`.trim()) return i;
+					// Stop scanning once we hit the work (tool calls): a final answer
+					// only ever trails the last tool_calls block. Reasoning is skipped.
+					if (b?.type === 'tool_calls') return -1;
+				}
+				return -1;
+			})()
+		: -1;
+	// The authoritative final answer. Prefer the actual trailing text block; if the
+	// transcript somehow lacks it (a live-delivery gap), fall back to run.final_text
+	// (what the parent model received) and then the reload fallback. This guarantees
+	// the answer is shown even when content_blocks is incomplete.
+	$: finalAnswerText = doneRendering
+		? (finalTextIdx >= 0
+				? `${contentBlocks[finalTextIdx].content ?? ''}`
+				: displayFinalText || fallbackContent || '')
+		: '';
+	// Transcript = the work (reasoning + tool calls + any interstitial text),
+	// excluding the trailing final-answer block which is rendered separately.
+	$: transcriptBlocks =
+		doneRendering && finalTextIdx >= 0
+			? contentBlocks.filter((_, i) => i !== finalTextIdx)
+			: contentBlocks;
+	$: hasTranscript = transcriptBlocks.length > 0;
 
 	// Default collapsed in every state (running / done / error / cancelled).
 	// The user clicks the header (or the redo button) to expand and watch
@@ -302,12 +423,12 @@
 	let fallbackBlocks: any[] | null = null;
 
 	$: visibleContentBlocks = doneRendering
-		? contentBlocks.slice(0, Math.min(bodyBlockLimit, contentBlocks.length))
-		: contentBlocks;
-	$: hasMoreContentBlocks = doneRendering && bodyBlockLimit < contentBlocks.length;
-	$: richTarget = hasContent
-		? Math.min(bodyBlockLimit, contentBlocks.length)
-		: displayFinalText || fallbackContent
+		? transcriptBlocks.slice(0, Math.min(bodyBlockLimit, transcriptBlocks.length))
+		: transcriptBlocks;
+	$: hasMoreContentBlocks = doneRendering && bodyBlockLimit < transcriptBlocks.length;
+	$: richTarget = hasTranscript
+		? Math.min(bodyBlockLimit, transcriptBlocks.length)
+		: finalAnswerText || displayFinalText || fallbackContent
 			? 1
 			: 0;
 
@@ -317,7 +438,7 @@
 		runWhenIdle(() => {
 			blockHydrationScheduled = false;
 			if (!open || !bodyReady || !doneRendering) return;
-			bodyBlockLimit = Math.min(contentBlocks.length, bodyBlockLimit + BLOCK_HYDRATION_BATCH);
+			bodyBlockLimit = Math.min(transcriptBlocks.length, bodyBlockLimit + BLOCK_HYDRATION_BATCH);
 		}, 350);
 	};
 
@@ -388,22 +509,26 @@
 		}
 	}
 
-	// Trigger fallback fetch when user expands and content is missing. This is a
-	// reload safety net: if the parent run row/placeholder is stale, the hidden
-	// subagent chat itself is still the source of truth for the answer.
+	// Trigger fallback fetch when user expands and the WORK transcript is missing.
+	// The parent's persisted `subagent_runs` carries only `final_text`, so after
+	// reload we have the answer (`finalAnswerText`) but no content_blocks — we must
+	// still fetch the subagent chat to show the searches/fetches/bash/thinking.
+	// Gate on the absence of structured work blocks, NOT on the answer.
 	//
 	// Never fetch while the run is actively in flight (`running`): the hidden
 	// chat is mid-rewrite (a redo wipes it), so a fetch would surface the old
 	// "(empty response)" the rerun is replacing. Live updates arrive via the
 	// socket instead.
+	$: hasRunContentBlocks = !!(
+		(stale ? effectiveRun?.content_blocks : run?.content_blocks)?.length
+	);
 	$: if (
 		open &&
 		status !== 'running' &&
 		subagentChatId &&
-		!hasContent &&
-		!displayFinalText &&
+		!hasRunContentBlocks &&
+		!fallbackBlocks &&
 		!fallbackFetching &&
-		!fallbackContent &&
 		!fallbackError
 	) {
 		fetchFallbackContent();
@@ -423,12 +548,58 @@
 		fallbackFetching = false;
 	}
 
+	// Root element + the scrollable messages container, used to keep this card
+	// anchored under the cursor when toggling. Expanding a long subagent grows
+	// the page; the chat's global auto-scroll (and natural reflow) would otherwise
+	// yank the viewport to the bottom. We pin the card's on-screen position across
+	// the expand so the user stays exactly where they were reading.
+	let rootEl: HTMLDivElement | null = null;
+
+	const getScrollContainer = (): HTMLElement | null => {
+		if (typeof document === 'undefined') return null;
+		return document.getElementById('messages-container');
+	};
+
 	const toggle = () => {
+		const container = getScrollContainer();
+		// Capture where the card's top sits in the viewport BEFORE the toggle.
+		const beforeTop = rootEl?.getBoundingClientRect().top ?? null;
+
 		open = !open;
 		if (open) {
 			scheduleBodyReady();
+			// Tell the chat the user is reading this card, so its auto-scroll /
+			// ResizeObserver stops yanking the viewport to the bottom while the
+			// expanded body (and any ongoing parent stream) grows the page.
+			rootEl?.dispatchEvent(
+				new CustomEvent('subagent:expand', { bubbles: true })
+			);
 		} else {
 			resetHydration();
+		}
+
+		// After the DOM settles (body mount + slide start), restore the card to
+		// the same viewport offset by adjusting the container's scrollTop by the
+		// delta. Two rAFs so we run after Svelte's flush and the browser's layout.
+		if (container && beforeTop != null && typeof window !== 'undefined') {
+			const restore = () => {
+				if (!rootEl) return;
+				const afterTop = rootEl.getBoundingClientRect().top;
+				const delta = afterTop - beforeTop;
+				if (Math.abs(delta) > 0.5) {
+					container.scrollTop += delta;
+				}
+			};
+			tick().then(() => {
+				requestAnimationFrame(() => {
+					restore();
+					// A second correction on the next frame catches the slide
+					// transition's first measured height (the body grows over a
+					// frame or two), keeping the anchor stable without chasing the
+					// whole animation.
+					requestAnimationFrame(restore);
+				});
+			});
 		}
 	};
 
@@ -442,21 +613,6 @@
 	const previewText = (value: unknown, max = 6000) => {
 		const text = `${value ?? ''}`;
 		return text.length > max ? `${text.slice(0, max).trimEnd()}\n\n…` : text;
-	};
-
-	const statusBadgeText = (s: typeof status) => {
-		switch (s) {
-			case 'running':
-				return $i18n.t('Researching…');
-			case 'done':
-				return $i18n.t('Done');
-			case 'error':
-				return $i18n.t('Error');
-			case 'cancelled':
-				return $i18n.t('Cancelled');
-			default:
-				return s;
-		}
 	};
 
 	// Redo menu state — anchored to the redo button in the header. The
@@ -488,6 +644,10 @@
 	}
 	onDestroy(() => {
 		resetHydration();
+		if (timerInterval) {
+			clearInterval(timerInterval);
+			timerInterval = null;
+		}
 		if (typeof document !== 'undefined') {
 			document.removeEventListener('click', onDocClick);
 			document.removeEventListener('keydown', onDocKey);
@@ -569,9 +729,10 @@
 </script>
 
 <div
-	class="my-2 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white/40 dark:bg-gray-900/40 overflow-hidden subagent-block"
+	class="my-2 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white/40 dark:bg-gray-900/40 subagent-block"
 	data-tool-call-id={attributes?.tool_call_id ?? ''}
 	data-subagent-id={attributes?.id ?? ''}
+	bind:this={rootEl}
 >
 	<div class="flex items-center gap-2 px-3 py-2">
 		<button
@@ -640,9 +801,9 @@
 				{/if}
 			</div>
 
-			<!-- Status badge -->
+			<!-- Status badge + elapsed timer -->
 			<span
-				class="shrink-0 text-xs font-medium uppercase tracking-wide {status === 'done'
+				class="shrink-0 text-xs font-medium {status === 'done'
 					? 'text-green-600 dark:text-green-500'
 					: status === 'error'
 						? 'text-red-600 dark:text-red-500'
@@ -650,8 +811,13 @@
 							? 'text-gray-500'
 							: 'text-blue-600 dark:text-blue-400'}"
 			>
-				{statusBadgeText(status)}
+				{headerStatusText}
 			</span>
+			{#if status === 'running' && timerText}
+				<span class="shrink-0 text-xs tabular-nums text-gray-400 dark:text-gray-500">
+					{timerText}
+				</span>
+			{/if}
 
 			<!-- Caret -->
 			<svg
@@ -763,7 +929,7 @@
 					</div>
 				{/if}
 
-				{#if hasContent}
+				{#if hasTranscript}
 					<div class="subagent-inner space-y-2">
 						{#each visibleContentBlocks as block, i (i)}
 							{#if block?.type === 'text'}
@@ -804,42 +970,56 @@
 								<div class="space-y-1">
 									{#each block.content ?? [] as call, j (call?.id ?? `tc-${i}-${j}`)}
 										{@const result = findToolResult(block.results, call?.id)}
+										{@const callErrored = result?.error === true}
 										<div
-											class="flex items-baseline gap-2 text-xs text-gray-600 dark:text-gray-400 font-mono"
+											class="flex items-baseline gap-2 text-xs font-mono {callErrored
+												? 'text-red-600 dark:text-red-400'
+												: 'text-gray-600 dark:text-gray-400'}"
 										>
 											<span class="shrink-0 w-3 text-center">
-												{result !== undefined ? '✓' : '·'}
+												{result === undefined ? '·' : callErrored ? '✗' : '✓'}
 											</span>
-											<span class="font-medium text-gray-800 dark:text-gray-300">
+											<span
+												class="shrink-0 whitespace-nowrap font-medium {callErrored
+													? 'text-red-600 dark:text-red-400'
+													: 'text-gray-800 dark:text-gray-300'}"
+											>
 												{call?.function?.name ?? 'tool'}
 											</span>
-											<span class="truncate text-gray-500 dark:text-gray-500">
-												{call?.function?.arguments ?? ''}
+											<span class="min-w-0 truncate {callErrored
+													? 'text-red-500/80 dark:text-red-400/80'
+													: 'text-gray-500 dark:text-gray-500'}">
+												{callErrored && result?.error_reason
+													? result.error_reason
+													: (call?.function?.arguments ?? '')}
 											</span>
 										</div>
 									{/each}
 								</div>
 							{/if}
 						{/each}
+						{#if hasMoreContentBlocks}
+							<div class="text-xs text-gray-400 dark:text-gray-500 italic">
+								{$i18n.t('Loading earlier steps…')}
+							</div>
+						{/if}
 					</div>
-				{:else if displayFinalText}
-					{#if richBlockLimit >= 1}
-						<div class="markdown-prose">
-							<Markdown
-								id={`subagent-${stateKey}-final`}
-								content={displayFinalText}
-								done={true}
-								editCodeBlock={false}
-							/>
-						</div>
-					{:else}
-						<div
-							class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
-						>
-							{previewText(displayFinalText)}
-						</div>
-					{/if}
-				{:else if fallbackContent}
+				{/if}
+
+				<!-- The subagent's FINAL answer. Always rendered (when terminal) as a
+				     dedicated, immediately-visible section so it is never hidden behind
+				     the transcript window's progressive hydration. Falls back to
+				     run.final_text / the reload fetch when the transcript lacks it. -->
+				{#if finalAnswerText}
+					<div class="markdown-prose" class:mt-3={hasTranscript} class:pt-3={hasTranscript} class:border-t={hasTranscript} class:border-gray-100={hasTranscript} class:dark:border-gray-800={hasTranscript}>
+						<Markdown
+							id={`subagent-${stateKey}-final`}
+							content={finalAnswerText}
+							done={true}
+							editCodeBlock={false}
+						/>
+					</div>
+				{:else if !hasTranscript && fallbackContent}
 					{#if richBlockLimit >= 1}
 						<div class="markdown-prose">
 							<Markdown
@@ -856,15 +1036,19 @@
 							{previewText(fallbackContent)}
 						</div>
 					{/if}
-				{:else if fallbackFetching}
+				{:else if !hasTranscript && fallbackFetching}
 					<div class="text-sm text-gray-500 dark:text-gray-400 italic">
 						{$i18n.t('Loading subagent results…')}
 					</div>
-				{:else if fallbackError}
+				{:else if !hasTranscript && fallbackError}
 					<div class="text-sm text-red-500 italic">{fallbackError}</div>
-				{:else if status === 'running'}
+				{:else if !hasTranscript && status === 'running'}
 					<div class="text-sm text-gray-500 dark:text-gray-400 italic">
 						{$i18n.t('Subagent is starting up…')}
+					</div>
+				{:else if !hasTranscript && status === 'error'}
+					<div class="text-sm text-red-500 italic">
+						{$i18n.t('Subagent did not produce any output.')}
 					</div>
 				{/if}
 

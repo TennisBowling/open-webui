@@ -59,6 +59,7 @@ def _chat_row_payload(chat) -> dict:
 def _skip_sid(request: Request) -> Optional[str]:
     return request.headers.get("x-session-id") if request else None
 
+
 ############################
 # GetChatList
 ############################
@@ -186,7 +187,9 @@ async def create_new_chat(
             {"type": "chat:created", "data": _chat_row_payload(chat)},
             skip_sid=_skip_sid(request),
         )
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -222,7 +225,9 @@ async def import_chat(
                 skip_sid=_skip_sid(request),
             )
 
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -337,7 +342,10 @@ async def get_user_pinned_chats(request: Request, user=Depends(get_verified_user
 @router.get("/all", response_model=list[ChatResponse])
 async def get_user_chats(user=Depends(get_verified_user)):
     # Export endpoint — needs full chat JSON.
-    return [ChatResponse(**chat.model_dump()) for chat in Chats.get_chats_with_data_by_user_id(user.id)]
+    return [
+        ChatResponse(**chat.model_dump())
+        for chat in Chats.get_chats_with_data_by_user_id(user.id)
+    ]
 
 
 ############################
@@ -489,7 +497,9 @@ async def get_shared_chat_by_id(share_id: str, user=Depends(get_optional_user)):
         chat = Chats.get_chat_by_share_id(share_id)
 
     if chat:
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
 
     else:
         raise HTTPException(
@@ -514,7 +524,9 @@ async def get_shared_chat_message_tool_result(
                 detail=ERROR_MESSAGES.NOT_FOUND,
             )
         if user.role == "admin" and ENABLE_ADMIN_CHAT_ACCESS:
-            chat = Chats.get_chat_by_id(share_id) or Chats.get_chat_by_share_id(share_id)
+            chat = Chats.get_chat_by_id(share_id) or Chats.get_chat_by_share_id(
+                share_id
+            )
         else:
             chat = Chats.get_chat_by_share_id(share_id)
     else:
@@ -538,9 +550,7 @@ async def get_shared_chat_message_tool_result(
     if isinstance(body, dict):
         return body
 
-    for block in (
-        message.get("content_blocks", []) if isinstance(message, dict) else []
-    ):
+    for block in message.get("content_blocks", []) if isinstance(message, dict) else []:
         if block.get("type") != "tool_calls":
             continue
         for result in block.get("results") or []:
@@ -603,7 +613,9 @@ async def get_chat_by_id(
     chat = Chats.get_chat_by_id_and_user_id(id, user.id)
 
     if chat:
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
 
     else:
         raise HTTPException(
@@ -630,15 +642,13 @@ async def update_chat_by_id(
                 user.id,
                 {
                     "type": "chat:renamed",
-                    "data": {
-                        "id": chat.id,
-                        "title": chat.title,
-                        "updated_at": chat.updated_at,
-                    },
+                    "data": _chat_row_payload(chat),
                 },
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -700,9 +710,7 @@ async def get_chat_messages_paginated(
         )
     else:
         offset_limit = limit if limit and limit > 0 else 100
-        messages = Chats.get_chat_messages_paginated(
-            id, skip=skip, limit=offset_limit
-        )
+        messages = Chats.get_chat_messages_paginated(id, skip=skip, limit=offset_limit)
 
     if not slim:
         return [strip_tool_result_bodies_from_message(m) for m in messages]
@@ -712,8 +720,7 @@ async def get_chat_messages_paginated(
         _project_message_slim(
             m,
             is_current_leaf=(
-                leaf_for_projection is not None
-                and m.get("id") == leaf_for_projection
+                leaf_for_projection is not None and m.get("id") == leaf_for_projection
             ),
             is_current_branch=True,
         )
@@ -770,9 +777,7 @@ async def get_chat_message_tool_result(
         return body
 
     # Backward compatibility: old rows may still have full result bodies inline.
-    for block in (
-        message.get("content_blocks", []) if isinstance(message, dict) else []
-    ):
+    for block in message.get("content_blocks", []) if isinstance(message, dict) else []:
         if block.get("type") != "tool_calls":
             continue
         for result in block.get("results") or []:
@@ -801,7 +806,10 @@ async def get_chat_message_siblings(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    return [strip_tool_result_bodies_from_message(m) for m in Chats.get_message_siblings(id, message_id)]
+    return [
+        strip_tool_result_bodies_from_message(m)
+        for m in Chats.get_message_siblings(id, message_id)
+    ]
 
 
 ############################
@@ -914,6 +922,7 @@ async def send_chat_message_event_by_id(
 async def delete_chat_by_id(request: Request, id: str, user=Depends(get_verified_user)):
     if user.role == "admin":
         chat = Chats.get_chat_by_id(id)
+        payload = _chat_row_payload(chat) if chat else {"id": id}
         for tag in chat.meta.get("tags", []):
             if Chats.count_chats_by_tag_name_and_user_id(tag, user.id) == 1:
                 Tags.delete_tag_by_name_and_user_id(tag, user.id)
@@ -923,7 +932,7 @@ async def delete_chat_by_id(request: Request, id: str, user=Depends(get_verified
         if result:
             await broadcast_sidebar_event(
                 user.id,
-                {"type": "chat:deleted", "data": {"id": id}},
+                {"type": "chat:deleted", "data": payload},
                 skip_sid=_skip_sid(request),
             )
 
@@ -938,6 +947,7 @@ async def delete_chat_by_id(request: Request, id: str, user=Depends(get_verified
             )
 
         chat = Chats.get_chat_by_id(id)
+        payload = _chat_row_payload(chat) if chat else {"id": id}
         for tag in chat.meta.get("tags", []):
             if Chats.count_chats_by_tag_name_and_user_id(tag, user.id) == 1:
                 Tags.delete_tag_by_name_and_user_id(tag, user.id)
@@ -946,7 +956,7 @@ async def delete_chat_by_id(request: Request, id: str, user=Depends(get_verified
         if result:
             await broadcast_sidebar_event(
                 user.id,
-                {"type": "chat:deleted", "data": {"id": id}},
+                {"type": "chat:deleted", "data": payload},
                 skip_sid=_skip_sid(request),
             )
         return result
@@ -983,7 +993,7 @@ async def pin_chat_by_id(request: Request, id: str, user=Depends(get_verified_us
                 user.id,
                 {
                     "type": "chat:pinned",
-                    "data": {"id": chat.id, "pinned": bool(chat.pinned)},
+                    "data": _chat_row_payload(chat),
                 },
                 skip_sid=_skip_sid(request),
             )
@@ -1035,7 +1045,9 @@ async def clone_chat_by_id(
                 skip_sid=_skip_sid(request),
             )
 
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1082,7 +1094,9 @@ async def clone_shared_chat_by_id(
                 {"type": "chat:created", "data": _chat_row_payload(chat)},
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1124,7 +1138,9 @@ async def archive_chat_by_id(
             skip_sid=_skip_sid(request),
         )
 
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1153,7 +1169,9 @@ async def share_chat_by_id(request: Request, id: str, user=Depends(get_verified_
     if chat:
         if chat.share_id:
             shared_chat = Chats.update_shared_chat_by_chat_id(chat.id)
-            return ChatResponse(**strip_tool_result_bodies_from_chat_model(shared_chat).model_dump())
+            return ChatResponse(
+                **strip_tool_result_bodies_from_chat_model(shared_chat).model_dump()
+            )
 
         shared_chat = Chats.insert_shared_chat_by_chat_id(chat.id)
         if not shared_chat:
@@ -1161,7 +1179,9 @@ async def share_chat_by_id(request: Request, id: str, user=Depends(get_verified_
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(shared_chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(shared_chat).model_dump()
+        )
 
     else:
         raise HTTPException(
@@ -1211,6 +1231,7 @@ async def update_chat_folder_id_by_id(
 ):
     chat = Chats.get_chat_by_id_and_user_id(id, user.id)
     if chat:
+        previous_folder_id = chat.folder_id
         chat = Chats.update_chat_folder_id_by_id_and_user_id(
             id, user.id, form_data.folder_id
         )
@@ -1219,11 +1240,16 @@ async def update_chat_folder_id_by_id(
                 user.id,
                 {
                     "type": "chat:folder",
-                    "data": {"id": chat.id, "folder_id": chat.folder_id},
+                    "data": {
+                        **_chat_row_payload(chat),
+                        "previous_folder_id": previous_folder_id,
+                    },
                 },
                 skip_sid=_skip_sid(request),
             )
-        return ChatResponse(**strip_tool_result_bodies_from_chat_model(chat).model_dump())
+        return ChatResponse(
+            **strip_tool_result_bodies_from_chat_model(chat).model_dump()
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.DEFAULT()
@@ -1364,6 +1390,8 @@ class PatchOp(BaseModel):
         "set_models",
         "set_files",
         "set_queue",
+        "append_queue_item",
+        "remove_queue_item",
         "set_tags",
         "set_history_current_id",
         "append_message",
@@ -1380,6 +1408,8 @@ class PatchOp(BaseModel):
     files: Any = None
     models: Optional[list] = None
     queue: Optional[list] = None
+    item: Optional[dict] = None
+    item_id: Optional[str] = None
     tags: Optional[list] = None
     current_id: Optional[str] = None
     model: Optional[str] = None
@@ -1448,10 +1478,12 @@ async def patch_chat_by_id(
     # single update_chat_by_id at the end when any body op ran.
     chat_body = json.loads(json.dumps(chat.chat)) if chat.chat else {}
     body_dirty = False
+    message_body_dirty = False
 
     # Title routes through the O(1) helper that skips the full message
     # table re-sync update_chat_by_id performs.
     title_change: Optional[str] = None
+    tags_changed = False
 
     sidebar_events: list[dict] = []
     ops_applied: list[str] = []
@@ -1505,10 +1537,34 @@ async def patch_chat_by_id(
             chat_body["queue"] = queue if isinstance(queue, list) else []
             body_dirty = True
 
+        elif op.op == "append_queue_item":
+            # Atomic single-item append (avoids the whole-array clobber two tabs
+            # would cause with set_queue). Writes directly via the model's
+            # read-modify-write helper rather than the chat_body flush path.
+            if not isinstance(op.item, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="append_queue_item requires 'item'",
+                )
+            Chats.append_queue_item_by_id(id, op.item)
+            ops_applied.append(op.op)
+            continue
+
+        elif op.op == "remove_queue_item":
+            if not op.item_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="remove_queue_item requires 'item_id'",
+                )
+            Chats.remove_queue_item_by_id(id, op.item_id)
+            ops_applied.append(op.op)
+            continue
+
         elif op.op == "set_tags":
             tags = op.tags if isinstance(op.tags, list) else op.value
             chat_body["tags"] = tags if isinstance(tags, list) else []
             body_dirty = True
+            tags_changed = True
 
         elif op.op == "set_history_current_id":
             history = chat_body.get("history") or {"messages": {}, "currentId": None}
@@ -1580,6 +1636,7 @@ async def patch_chat_by_id(
             history["messages"] = messages
             chat_body["history"] = history
             body_dirty = True
+            message_body_dirty = True
 
         elif op.op == "update_message_content":
             if not op.message_id:
@@ -1629,9 +1686,7 @@ async def patch_chat_by_id(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="set_message_annotation requires 'message_id'",
                 )
-            deferred_row_writes.append(
-                (op.message_id, {"annotation": op.annotation})
-            )
+            deferred_row_writes.append((op.message_id, {"annotation": op.annotation}))
 
         elif op.op == "delete_message":
             if not op.message_id:
@@ -1650,6 +1705,7 @@ async def patch_chat_by_id(
             history["messages"] = messages
             chat_body["history"] = history
             body_dirty = True
+            message_body_dirty = True
 
         ops_applied.append(op.op)
 
@@ -1659,13 +1715,26 @@ async def patch_chat_by_id(
     # Pure currentId pointer changes shouldn't reorder the sidebar; every
     # other body / row mutation bumps updated_at and the other tabs need
     # to know so the chat row moves to the top.
-    non_pointer_mutation = (
-        any(op != "set_history_current_id" for op in ops_applied)
-        or bool(deferred_row_writes)
-    )
+    non_pointer_mutation = any(
+        op != "set_history_current_id" for op in ops_applied
+    ) or bool(deferred_row_writes)
 
     if body_dirty:
-        updated = Chats.update_chat_by_id(id, chat_body)
+        body_to_update = chat_body
+        # ``get_chat_by_id_and_user_id`` hydrates migrated chat messages into
+        # ``chat.chat.history.messages`` for callers. Body-only patches such as
+        # set_queue/set_models/set_history_current_id must not feed that hydrated
+        # snapshot back into update_chat_by_id, because update_chat_by_id treats a
+        # messages dict as authoritative and re-syncs the chat_message table. A
+        # delayed queue save could otherwise overwrite newer streamed rows or a
+        # just-appended queued turn.
+        if getattr(chat, "messages_migrated", 0) and not message_body_dirty:
+            body_to_update = json.loads(json.dumps(chat_body))
+            history = body_to_update.get("history")
+            if isinstance(history, dict):
+                history.pop("messages", None)
+
+        updated = Chats.update_chat_by_id(id, body_to_update)
         if updated is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1674,7 +1743,7 @@ async def patch_chat_by_id(
         updated_at = updated.updated_at
 
     for message_id, partial in deferred_row_writes:
-        Chats.upsert_message_to_chat_by_id_and_message_id(id, message_id, partial)
+        Chats.upsert_message_to_chat_by_id_and_message_id(id, message_id, partial, return_model=False)
 
     if title_change is not None:
         renamed = Chats.update_chat_title_by_id(id, title_change)
@@ -1683,13 +1752,12 @@ async def patch_chat_by_id(
             _queue_sidebar(
                 {
                     "type": "chat:renamed",
-                    "data": {
-                        "id": id,
-                        "title": renamed.title,
-                        "updated_at": renamed.updated_at,
-                    },
+                    "data": _chat_row_payload(renamed),
                 }
             )
+
+    if tags_changed:
+        _queue_sidebar({"type": "chat:tags", "data": {"id": id}})
 
     # Emit a generic chat:updated for body-mutating ops so other tabs
     # reorder the sidebar even when no title change happened. Skip when
@@ -1699,10 +1767,15 @@ async def patch_chat_by_id(
     # sidebar UX matches the rest of the codebase which doesn't reorder
     # on pointer-only changes.
     if non_pointer_mutation and (body_dirty or deferred_row_writes):
+        updated_chat_for_payload = Chats.get_chat_by_id(id)
         _queue_sidebar(
             {
                 "type": "chat:updated",
-                "data": {"id": id, "updated_at": updated_at},
+                "data": (
+                    _chat_row_payload(updated_chat_for_payload)
+                    if updated_chat_for_payload
+                    else {"id": id, "updated_at": updated_at}
+                ),
             }
         )
 

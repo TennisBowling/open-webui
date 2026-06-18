@@ -44,6 +44,7 @@
 	} from '$lib/apis/chats';
 	import { createNewFolder, getFolders, updateFolderParentIdById } from '$lib/apis/folders';
 	import { consumeBootstrap } from '$lib/utils/bootstrap';
+	import { getTimeRange } from '$lib/utils';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import {
 		clearLocalStorageCache,
@@ -87,7 +88,12 @@
 	let navElement;
 	let shiftKey = false;
 
-	let selectedChatId = null;
+	let selectedChatId: string | null = null;
+	let pendingChatId: string | null = null;
+	$: activeChatId = pendingChatId ?? $chatId;
+	$: if (pendingChatId && $chatId === pendingChatId) {
+		pendingChatId = null;
+	}
 	let showPinnedChat = true;
 
 	let showCreateChannel = false;
@@ -108,9 +114,8 @@
 
 	const getSidebarCacheKey = (name: string) => buildSidebarCacheKey($user?.id, name);
 
-	const applyFolderList = (folderList: any[]) => {
+	const buildFolderTree = (folderList: any[]) => {
 		const sortedFolderList = [...folderList].sort((a, b) => b.updated_at - a.updated_at);
-		_folders.set(sortedFolderList);
 
 		folders = {};
 
@@ -144,6 +149,12 @@
 				});
 			}
 		}
+	};
+
+	const applyFolderList = (folderList: any[]) => {
+		const sortedFolderList = [...folderList].sort((a, b) => b.updated_at - a.updated_at);
+		_folders.set(sortedFolderList);
+		buildFolderTree(sortedFolderList);
 	};
 
 	const hydrateSidebarDataFromCache = () => {
@@ -330,7 +341,7 @@
 					console.log('Init pinned chats');
 					const bootstrapPinned = consumeBootstrap<any[]>('pinned');
 					const _pinnedChats = Array.isArray(bootstrapPinned)
-						? bootstrapPinned
+						? bootstrapPinned.map((c) => ({ ...c, time_range: getTimeRange(c.updated_at) }))
 						: await getPinnedChatList(localStorage.token);
 					pinnedChats.set(_pinnedChats);
 					writeLocalStorageCache(
@@ -344,7 +355,7 @@
 					console.log('Init chat list');
 					const bootstrapChats = consumeBootstrap<any[]>('chats');
 					const _chats = Array.isArray(bootstrapChats)
-						? bootstrapChats
+						? bootstrapChats.map((c) => ({ ...c, time_range: getTimeRange(c.updated_at) }))
 						: await getChatList(localStorage.token, firstPage);
 					await chats.set(_chats);
 					writeLocalStorageCache(
@@ -535,6 +546,11 @@
 		await showSidebar.set(!$mobile ? localStorage.sidebar === 'true' : false);
 
 		unsubscribers = [
+			_folders.subscribe((value) => {
+				if (Array.isArray(value)) {
+					buildFolderTree(value);
+				}
+			}),
 			mobile.subscribe((value) => {
 				if ($showSidebar && value) {
 					showSidebar.set(false);
@@ -619,6 +635,7 @@
 
 	const newChatHandler = async () => {
 		selectedChatId = null;
+		pendingChatId = null;
 		selectedFolder.set(null);
 
 		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
@@ -636,6 +653,7 @@
 
 	const itemClickHandler = async () => {
 		selectedChatId = null;
+		pendingChatId = null;
 		chatId.set('');
 
 		if ($mobile) {
@@ -1062,7 +1080,7 @@
 				</div>
 
 				{#if ($models ?? []).length > 0 && ($settings?.pinnedModels ?? []).length > 0}
-					<PinnedModelList bind:selectedChatId {shiftKey} />
+					<PinnedModelList bind:selectedChatId bind:pendingChatId {shiftKey} />
 				{/if}
 
 				{#if $config?.features?.enable_channels && ($user?.role === 'admin' || $channels.length > 0)}
@@ -1127,9 +1145,14 @@
 							bind:folderRegistry
 							{folders}
 							{shiftKey}
+							{activeChatId}
 							onDelete={(folderId) => {
 								selectedFolder.set(null);
 								initChatList();
+							}}
+							on:activate={(e) => {
+								pendingChatId = e.detail;
+								selectedChatId = null;
 							}}
 							on:update={() => {
 								initChatList();
@@ -1275,7 +1298,12 @@
 												id={chat.id}
 												title={chat.title}
 												{shiftKey}
+												active={activeChatId === chat.id}
 												selected={selectedChatId === chat.id}
+												on:activate={(e) => {
+													pendingChatId = e.detail;
+													selectedChatId = null;
+												}}
 												on:select={() => {
 													selectedChatId = chat.id;
 												}}
@@ -1335,7 +1363,12 @@
 										id={chat.id}
 										title={chat.title}
 										{shiftKey}
+										active={activeChatId === chat.id}
 										selected={selectedChatId === chat.id}
+										on:activate={(e) => {
+											pendingChatId = e.detail;
+											selectedChatId = null;
+										}}
 										on:select={() => {
 											selectedChatId = chat.id;
 										}}

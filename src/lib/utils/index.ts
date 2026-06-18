@@ -943,7 +943,17 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 					const resultContent = result?.content ?? null;
 					const resultFiles = result?.files ?? null;
 					const resultEmbeds = result?.embeds ?? '';
-					out += `<details type="tool_calls" done="true" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}" result="${escapeHtmlAttr(JSON.stringify(resultContent))}" files="${resultFiles ? escapeHtmlAttr(JSON.stringify(resultFiles)) : ''}" embeds="${escapeHtmlAttr(JSON.stringify(resultEmbeds))}">\n<summary>Tool Executed</summary>\n</details>\n`;
+					// Mirror the backend serialize_content_blocks error/notice
+					// attributes so a reactive re-render of this client-side
+					// projection does not clobber the error UI on the collapsed row.
+					const errorAttr = result?.error ? ' error="true"' : '';
+					const errorReasonAttr = result?.error_reason
+						? ` error_reason="${escapeHtmlAttr(result.error_reason)}"`
+						: '';
+					const noticeAttr = result?.notice
+						? ` notice="${escapeHtmlAttr(result.notice)}"`
+						: '';
+					out += `<details type="tool_calls" done="true" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}" result="${escapeHtmlAttr(JSON.stringify(resultContent))}" files="${resultFiles ? escapeHtmlAttr(JSON.stringify(resultFiles)) : ''}" embeds="${escapeHtmlAttr(JSON.stringify(resultEmbeds))}"${errorAttr}${errorReasonAttr}${noticeAttr}>\n<summary>Tool Executed</summary>\n</details>\n`;
 				} else {
 					out += `<details type="tool_calls" done="false" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}">\n<summary>Executing...</summary>\n</details>\n`;
 				}
@@ -1117,6 +1127,18 @@ export const titleGenerationTemplate = (template: string, prompt: string): strin
 	);
 
 	return template;
+};
+
+// Compact elapsed time. Seconds in, e.g. 45 -> "45s", 83 -> "1m 23s", 3840 -> "1h 4m".
+// Drops the seconds segment once we're at the hour scale (matches the subagent timer UX).
+export const formatDuration = (totalSeconds: number): string => {
+	const s = Math.max(0, Math.floor(totalSeconds || 0));
+	const hours = Math.floor(s / 3600);
+	const minutes = Math.floor((s % 3600) / 60);
+	const seconds = s % 60;
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	if (minutes > 0) return `${minutes}m ${seconds}s`;
+	return `${seconds}s`;
 };
 
 export const approximateToHumanReadable = (nanoseconds: number) => {

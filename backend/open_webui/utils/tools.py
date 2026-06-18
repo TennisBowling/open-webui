@@ -100,6 +100,17 @@ def resolve_tool_server_headers(
         "{{CHAT_ID}}": str(metadata.get("chat_id") or ""),
         "{{MESSAGE_ID}}": str(metadata.get("message_id") or ""),
         "{{SESSION_ID}}": str(metadata.get("session_id") or ""),
+        # Per-AGENT browser session token. Distinct from SESSION_ID (which is the
+        # socket/tab session). This identifies the AGENT so the container browser
+        # daemon can give each agent its own page/tab while they share the chat's
+        # one container + logged-in browser context. The PARENT has no override and
+        # resolves to "main" — a STABLE token so the parent keeps ONE browser page
+        # across all its turns (matching the pre-parallel single-page behavior). A
+        # SUBAGENT sets browser_session = its subagent_id via
+        # tool_server_header_context (see _subagent_container_shared_context), so
+        # each subagent routes to its OWN page. "main" is also the daemon's default
+        # when no X-Browser-Session header is configured at all (zero regression).
+        "{{BROWSER_SESSION}}": str(metadata.get("browser_session") or "main"),
         "{{USER_ID}}": str(getattr(user, "id", "") or ""),
         "{{USER_NAME}}": str(getattr(user, "name", "") or ""),
     }

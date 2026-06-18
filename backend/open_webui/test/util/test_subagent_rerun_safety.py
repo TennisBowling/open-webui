@@ -71,7 +71,9 @@ def test_sync_placeholder_matches_tool_call_id_field(monkeypatch):
             return message
 
         @staticmethod
-        def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, update):
+        def upsert_message_to_chat_by_id_and_message_id(
+            chat_id, message_id, update, return_model=True
+        ):
             updates.append(update)
             message.update(update)
 
@@ -107,7 +109,9 @@ def test_sync_placeholder_can_disable_append_for_rerun(monkeypatch):
             return message
 
         @staticmethod
-        def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, update):
+        def upsert_message_to_chat_by_id_and_message_id(
+            chat_id, message_id, update, return_model=True
+        ):
             updates.append(update)
 
     monkeypatch.setattr(subagent_module, "Chats", FakeChats)

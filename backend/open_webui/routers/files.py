@@ -41,7 +41,12 @@ from open_webui.utils.file_extraction import (
     file_needs_extraction,
 )
 from open_webui.utils.file_conversion import convert_and_cache_file_to_pdf, get_or_convert_to_pdf
-from open_webui.utils.image_conversion import convert_heif_to_jpeg, is_heif_image
+from open_webui.utils.image_conversion import (
+    convert_heif_to_jpeg,
+    is_heif_image,
+    sniff_image_mime_type,
+    HEIF_MIME_TYPES,
+)
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -100,6 +105,26 @@ def upload_file(
         user=user,
         background_tasks=background_tasks,
     )
+
+
+def uploaded_file_id(file_item) -> str:
+    """Pull the file id from an upload_file_handler result.
+
+    upload_file_handler returns a dict ({"status": True, **file_item.model_dump()})
+    rather than a FileModel. Callers that pre-dated that change (upload_image,
+    upload_audio) did `file_item.id` and crashed with
+    'dict' object has no attribute 'id'. Accept either shape.
+    """
+    if file_item is None:
+        raise ValueError("file upload returned no result")
+    fid = (
+        file_item.get("id")
+        if isinstance(file_item, dict)
+        else getattr(file_item, "id", None)
+    )
+    if not fid:
+        raise ValueError("uploaded file has no id")
+    return fid
 
 
 def upload_file_handler(
@@ -209,7 +234,7 @@ def upload_file_handler(
             pass
 
         try:
-            header = file.file.read(64)
+            header = file.file.read(512)
         except Exception:
             header = b""
         finally:
@@ -217,6 +242,22 @@ def upload_file_handler(
                 file.file.seek(0)
             except Exception:
                 pass
+
+        # Trust the actual image magic bytes over the browser-reported MIME and
+        # the extension. Safari/iOS Photos and some share sheets attach images
+        # with a wrong/empty content_type; the stored value drives both the
+        # served Content-Type and the inline-vs-attachment disposition below, so
+        # a wrong value renders images as broken/download-only. sniff only ever
+        # returns a real image type (or None for non-images), so this never
+        # mislabels documents. HEIF is left to the dedicated branch that follows
+        # (it converts to JPEG and sets content_type itself).
+        sniffed_content_type = sniff_image_mime_type(header)
+        if (
+            sniffed_content_type
+            and sniffed_content_type not in HEIF_MIME_TYPES
+            and sniffed_content_type != content_type
+        ):
+            content_type = sniffed_content_type
 
         if is_heif_image(content_type, filename, header):
             original_name = filename

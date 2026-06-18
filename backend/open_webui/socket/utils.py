@@ -1,4 +1,4 @@
-import json
+from open_webui.utils import fast_json as json
 import uuid
 from open_webui.utils.redis import get_redis_connection
 from open_webui.env import REDIS_KEY_PREFIX

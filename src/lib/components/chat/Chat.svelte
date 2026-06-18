@@ -45,7 +45,11 @@
 		chatTokenStats,
 		chatTokenStatsRefreshTrigger,
 		subagentLiveStates,
+		browserLiveStates,
+		showBrowserPanel,
+		browserPanelDismissed,
 		isLastActiveTab,
+		folderChatListInvalidation,
 		tokenUsageGroups as tokenUsageGroupsStore
 	} from '$lib/stores';
 	import {
@@ -79,7 +83,7 @@
 		type PatchChatOp
 	} from '$lib/apis/chats';
 	import { decorate, upsertSorted } from '$lib/utils/sidebarSync';
-	import { chatCompletion, generateOpenAIChatCompletion } from '$lib/apis/openai';
+	import { chatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation } from '$lib/apis/users';
 	import {
@@ -89,7 +93,8 @@
 		stopTask,
 		getTaskIdsByChatId,
 		getActiveStreamsByChatId,
-		getStreamSnapshot
+		getStreamSnapshot,
+		getBrowserFrame
 	} from '$lib/apis';
 	import type { ReasoningEffort } from '$lib/apis';
 	import {
@@ -125,6 +130,11 @@
 
 	let loading = true;
 	let initialScrollSettled = false;
+	// Gates the reveal of the messages content on navigation. Defaults to true so
+	// new/temporary chats (where navigateHandler never runs) are always visible;
+	// navigateHandler flips it false only while it pins an existing chat to the
+	// bottom during initial load, then reveals it already-at-bottom.
+	let messagesReady = true;
 	let navigateGeneration = 0; // Incremented on each navigation; stale loadChat calls abort before touching state
 
 	const eventTarget = new EventTarget();
@@ -157,6 +167,11 @@
 
 	let selectedToolIds = [];
 	let lastPersistedSelectedToolIds: string[] | null = null;
+	// Becomes true once the user has explicitly touched ANY tool/feature toggle
+	// in this chat (or a saved chat is loaded with a non-default selection). While
+	// dirty, switching models keeps the user's selection instead of clobbering it
+	// with the new model's defaults.
+	let toolSelectionDirty = false;
 	let selectedFilterIds = [];
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
@@ -389,6 +404,95 @@
 	// Set inside stopResponse() so the stream-side aborted handler can tell the
 	// difference between user-clicked-stop (graceful) and a stray abort.
 	let userInitiatedStop = false;
+	let userStoppedMessageIds = new Set<string>();
+	let userStoppedTaskIds = new Set<string>();
+	let lastPersistedSelectedModelsKey = '';
+
+	const rememberBoundedSetValue = (
+		set: Set<string>,
+		value: string | null | undefined,
+		max = 200
+	) => {
+		if (!value) return;
+		set.add(value);
+		while (set.size > max) {
+			const oldest = set.values().next().value;
+			if (!oldest) break;
+			set.delete(oldest);
+		}
+	};
+
+	const selectedModelsPersistKey = (
+		chatId: string | null | undefined,
+		modelIds = selectedModels
+	) => (chatId ? `${chatId}:${JSON.stringify(modelIds ?? [])}` : '');
+
+	const rememberPersistedSelectedModels = (chatId: string | null | undefined) => {
+		const key = selectedModelsPersistKey(chatId);
+		if (key) lastPersistedSelectedModelsKey = key;
+	};
+
+	const markUserStoppedTaskId = (taskId: string | null | undefined) => {
+		rememberBoundedSetValue(userStoppedTaskIds, taskId);
+	};
+
+	const isUserStoppedTaskId = (taskId: string | null | undefined) =>
+		!!taskId && userStoppedTaskIds.has(taskId);
+
+	const markUserStoppedMessageId = (
+		messageId: string | null | undefined,
+		messages = history?.messages
+	) => {
+		if (!messageId) return;
+		rememberBoundedSetValue(userStoppedMessageIds, messageId);
+		const message = messages?.[messageId];
+		if (message) {
+			message.done = true;
+			message.userStopped = true;
+		}
+	};
+
+	const clearUserStoppedMessageId = (
+		messageId: string | null | undefined,
+		messages = history?.messages
+	) => {
+		if (!messageId) return false;
+		let hadMarker = userStoppedMessageIds.delete(messageId);
+		const message = messages?.[messageId];
+		if (message?.userStopped === true) {
+			hadMarker = true;
+			message.userStopped = false;
+		}
+		return hadMarker;
+	};
+
+	const isUserStoppedMessageId = (
+		messageId: string | null | undefined,
+		messages = history?.messages
+	) =>
+		!!messageId &&
+		(userStoppedMessageIds.has(messageId) || messages?.[messageId]?.userStopped === true);
+
+	const mergeStreamedString = (
+		existing: string | null | undefined,
+		chunk: string | null | undefined
+	) => {
+		if (!chunk) return existing ?? '';
+		existing = existing ?? '';
+		if (!existing) return chunk;
+		if (chunk === existing) return existing;
+		if (chunk.startsWith(existing)) return chunk;
+		if (existing.endsWith(chunk)) return existing;
+
+		const maxOverlap = Math.min(existing.length, chunk.length);
+		for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+			if (existing.endsWith(chunk.slice(0, overlap))) {
+				return existing + chunk.slice(overlap);
+			}
+		}
+
+		return existing + chunk;
+	};
 
 	// Clear `generationController` only if the event/handler claiming the clear
 	// matches the in-flight controller's owner — stale events for prior messages
@@ -460,6 +564,16 @@
 		return mirror;
 	};
 
+	const contentBlocksAnswerTextLength = (blocks: any[] = []) =>
+		blocks.reduce((total, block) => {
+			if (block?.type !== 'text' || typeof block?.content !== 'string') return total;
+			return total + block.content.trim().length;
+		}, 0);
+
+	const shouldKeepRicherLiveContentBlocks = (liveBlocks: any[] = [], snapBlocks: any[] = []) =>
+		contentBlocksAnswerTextLength(liveBlocks) > 0 &&
+		contentBlocksAnswerTextLength(snapBlocks) === 0;
+
 	const emitPendingTTSParts = (message: any, { done = false }: { done?: boolean } = {}) => {
 		if (!message?.content) {
 			return;
@@ -510,6 +624,16 @@
 		streamTTSPartCounts.delete(messageId);
 	};
 
+	// Release the per-message stream mirror (content_blocks snapshot +
+	// tool_results Map + buffered deltas) on ANY terminal state. Previously the
+	// mirror was deleted only on chat:done, so a stopped or errored generation
+	// leaked its mirror — including a potentially large tool_results Map — for
+	// the lifetime of the Chat component. Safe to call repeatedly.
+	const releaseStreamMirror = (messageId: string) => {
+		if (!messageId) return;
+		streamMirrors.delete(messageId);
+	};
+
 	const flushStreamingMessage = (messageId: string, force = false) => {
 		const perf = streamPerfStart();
 		const state = streamFlushes.get(messageId);
@@ -547,6 +671,12 @@
 		}
 
 		(history.messages as Record<string, any>)[messageId] = { ...message };
+		// Reassign history so bound consumers (ResponseMessage reads
+		// history.messages[messageId]) re-evaluate and the streaming leaf
+		// repaints. This does NOT bump messageStructureRevision, and
+		// Messages.svelte's chain walk is gated on a content-independent
+		// structural key — so this per-frame flush repaints only the streaming
+		// leaf instead of re-walking + re-rendering the entire message list.
 		history = { ...history };
 		streamFlushes.delete(messageId);
 
@@ -689,6 +819,17 @@
 		currentId: null
 	};
 
+	// Structure revision: bumped ONLY when the message graph changes shape
+	// (a message is added/removed, the current branch pointer changes, or the
+	// history is rebuilt on load/reattach) — never on a per-frame streaming
+	// content flush. Messages.svelte rebuilds its rendered chain only when this
+	// (or currentId / pagination state) changes, so streaming deltas no longer
+	// force an O(chat-length) chain walk + full re-render every animation frame.
+	let messageStructureRevision = 0;
+	const bumpMessageStructure = () => {
+		messageStructureRevision += 1;
+	};
+
 	let taskIds = null;
 	let resumeTaskPollInterval: ReturnType<typeof setInterval> | null = null;
 	let resumeTaskPollInFlight = false;
@@ -709,7 +850,9 @@
 			resumeTaskPollInFlight = true;
 			try {
 				const res = await getTaskIdsByChatId(localStorage.token, chatIdToWatch).catch(() => null);
-				const activeTaskIds = res?.task_ids ?? [];
+				const activeTaskIds = (res?.task_ids ?? []).filter(
+					(taskId) => !isUserStoppedTaskId(taskId)
+				);
 				if (activeTaskIds.length === 0) {
 					stopResumeTaskPolling();
 					taskIds = null;
@@ -734,25 +877,72 @@
 	let params = {};
 
 	// Queue of follow-up messages submitted while a response was streaming.
-	// Persists into chat.chat.queue via saveChatHandler so it survives tab
-	// close / reload.
+	// Each item is SELF-CONTAINED: it snapshots everything the backend needs to
+	// drive the send autonomously (server-driven drain), because the drain may
+	// run with zero browser tabs open. The backend pops the head on clean
+	// completion and starts the next generation via start_generation().
 	//
-	// Per-message fields only — text, attached files, and the optional
-	// `@`-mentioned model. The other toggles (web search, tools, reasoning
-	// effort, etc.) deliberately use the live UI state at dequeue time
-	// because the user can SEE that state in the toolbar and changes between
-	// queue-time and send-time should be respected. Snapshotting them would
-	// silently revert the user's mid-wait adjustments on auto-send.
+	// Time-sensitive context (current date/time prompt variables) is NOT
+	// snapshotted — the backend recomputes those from `timezone` at drain time so
+	// a message queued at 2pm and drained at 3pm gets the right "current time".
 	type QueuedMessage = {
 		id: string;
+		// Display fields (shown in the queued-message chip strip).
 		prompt: string;
 		files: any[];
 		atSelectedModelId?: string | null;
 		createdAt: number;
+		// Delivery mode:
+		//   'after_final' → deliver as a fresh turn after the whole response
+		//                   finishes (the server-driven drain; default).
+		//   'steer'       → inject at the next tool-call boundary mid-task (the
+		//                   backend agentic loop pops these via
+		//                   pop_steer_items_by_id; never goes through the drain).
+		mode?: 'after_final' | 'steer';
+		// Self-contained send spec consumed by the backend drain. Snapshotted at
+		// enqueue time from the live toolbar/settings state.
+		sendSpec?: {
+			model: string;
+			models: string[];
+			content: string;
+			files: any[];
+			params?: any;
+			tool_ids?: string[];
+			tool_servers?: any[];
+			filter_ids?: string[];
+			features?: any;
+			variables?: any;
+			reasoning?: any;
+			service_tier?: string;
+			background_tasks?: any;
+			model_item?: any;
+			stream_options?: any;
+			timezone?: string;
+		};
 	};
 	let queue: QueuedMessage[] = [];
+	let queueSending = false;
+	let queueSavePromise: Promise<void> = Promise.resolve();
 	// Falling-edge tracker for auto-send-on-complete.
 	let _wasGenerating = false;
+
+	const persistQueue = async () => {
+		const _chatId = getVisibleChatId();
+		if (!_chatId) return;
+
+		const queueSnapshot = structuredClone(queue ?? []);
+		const save = queueSavePromise
+			.catch(() => undefined)
+			.then(async () => {
+				await saveChatHandler(_chatId, history, params, [
+					{ op: 'set_queue', queue: queueSnapshot }
+				]);
+			});
+
+		queueSavePromise = save.catch(() => undefined);
+
+		await save;
+	};
 
 	// Token usage tracking — backend pushes `token-usage:update` socket events;
 	// the local mirror reads the store so existing references continue to work.
@@ -1082,26 +1272,21 @@
 		if (chatIdProp && (await loadChat(myGeneration))) {
 			await tick();
 			loading = false;
+			// Keep the messages content invisible while it lays out and we pin it
+			// to the bottom; gate the pagination loader until settled.
+			messagesReady = false;
+			initialScrollSettled = false;
 
-			// Wait for messages DOM to render, then force scroll to bottom
+			// Let #messages-container + messagesContentElement mount, then run a
+			// layout-driven settle loop that re-pins to the true bottom as each
+			// band of content-visibility:auto messages realizes its real height.
 			await tick();
-			if (messagesContainerElement) {
-				messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
-			}
-			// Belt-and-suspenders: also schedule a delayed scroll for late-rendering content
-			window.setTimeout(() => {
-				if (myGeneration !== navigateGeneration) return;
-				if (messagesContainerElement) {
-					messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
-				}
-			}, 50);
-			window.setTimeout(() => {
-				if (myGeneration !== navigateGeneration) return;
-				if (messagesContainerElement) {
-					messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
-				}
-				initialScrollSettled = true;
-			}, 200);
+			await settleAtBottom(myGeneration);
+			if (myGeneration !== navigateGeneration) return;
+
+			messagesReady = true; // reveal — already at the bottom, no visible motion
+			initialScrollSettled = true; // allow the pagination loader to grow the window
+			autoScroll = true; // streaming / late additions stay pinned to bottom
 
 			await tick();
 
@@ -1196,6 +1381,37 @@
 		console.log('saveSessionSelectedModels', selectedModels, sessionStorage.selectedModels);
 	};
 
+	const persistSelectedModelsForChat = () => {
+		const visibleChatId = getVisibleChatId();
+		if (
+			loading ||
+			$temporaryChatEnabled ||
+			!visibleChatId ||
+			visibleChatId.startsWith('local:') ||
+			selectedModels.length === 0 ||
+			selectedModels.some((id) => !id)
+		) {
+			return;
+		}
+
+		const key = selectedModelsPersistKey(visibleChatId);
+		if (!key || key === lastPersistedSelectedModelsKey) return;
+
+		lastPersistedSelectedModelsKey = key;
+		void saveChatHandler(visibleChatId, history, params, [
+			{ op: 'set_models', models: structuredClone(selectedModels ?? []) }
+		]).catch((error) => {
+			console.error('Failed to persist selected models', error);
+			if (lastPersistedSelectedModelsKey === key) {
+				lastPersistedSelectedModelsKey = '';
+			}
+		});
+	};
+
+	$: if (selectedModels && selectedModels.length > 0) {
+		persistSelectedModelsForChat();
+	}
+
 	const arraysEqual = (a: string[], b: string[]) =>
 		a.length === b.length && a.every((v, i) => v === b[i]);
 
@@ -1204,15 +1420,50 @@
 		onSelectedModelIdsChange();
 	}
 
-	const onSelectedModelIdsChange = () => {
-		if (oldSelectedModelIds.filter((id) => id).length > 0) {
-			const _webSearchEnabled = webSearchEnabled;
-			resetInput();
+	// Called from the message-input toggles whenever the USER explicitly turns a
+	// tool/feature on or off. This is the dependable signal that the selection is
+	// intentional (vs. inferring from state diffs, which can't tell a user toggle
+	// from a programmatic default-apply).
+	const markToolSelectionDirty = () => {
+		toolSelectionDirty = true;
+	};
 
-			if (_webSearchEnabled) {
+	const onSelectedModelIdsChange = () => {
+		// While a chat is loading/navigating, `selectedModels` is being set from
+		// the persisted chat and the toolSelectionDirty flag + selection are
+		// restored separately. Re-applying model defaults here would race that
+		// restore (and run against a stale dirty flag carried over from the
+		// previous chat), so only react to genuine user-driven model switches in
+		// an already-loaded chat.
+		if (loading) {
+			oldSelectedModelIds = selectedModelIds;
+			return;
+		}
+		if (oldSelectedModelIds.filter((id) => id).length > 0) {
+			if (toolSelectionDirty) {
+				// The user has curated their tools/features for this chat. Keep
+				// their selection across the model switch — only turn OFF the
+				// capability-gated features the new model can't do, so we never
+				// send a feature the model doesn't support.
 				const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
-				if (model?.info?.meta?.capabilities?.web_search ?? true) {
-					webSearchEnabled = true;
+				const caps = model?.info?.meta?.capabilities ?? {};
+				if (webSearchEnabled && (caps.web_search ?? true) === false) {
+					webSearchEnabled = false;
+				}
+				if (imageGenerationEnabled && (caps.image_generation ?? true) === false) {
+					imageGenerationEnabled = false;
+				}
+			} else {
+				// No manual curation yet — apply the newly selected model's
+				// defaults (preserving the prior web-search behavior).
+				const _webSearchEnabled = webSearchEnabled;
+				resetInput();
+
+				if (_webSearchEnabled) {
+					const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
+					if (model?.info?.meta?.capabilities?.web_search ?? true) {
+						webSearchEnabled = true;
+					}
 				}
 			}
 		}
@@ -1222,6 +1473,7 @@
 	const resetInput = () => {
 		selectedToolIds = [];
 		selectedFilterIds = [];
+		toolSelectionDirty = false;
 		webSearchEnabled = false;
 		studyModeEnabled = false;
 		dataVizEnabled = false;
@@ -1230,6 +1482,9 @@
 		subagentServiceTier = '';
 		subagentExternalToolsEnabled = true;
 		subagentLiveStates.set({});
+		browserLiveStates.set({});
+		showBrowserPanel.set(false);
+		browserPanelDismissed.set(false);
 		imageGenerationEnabled = false;
 
 		flexAutoFlipUndoneForChat = false;
@@ -1276,8 +1531,7 @@
 				if (model.info?.meta?.capabilities?.['web_search']) {
 					webSearchEnabled = model.info.meta.defaultFeatureIds.includes('web_search');
 				}
-
-	}
+			}
 		}
 	};
 
@@ -1383,6 +1637,20 @@
 		const pendingAssistantMessageIds = getPendingAssistantMessageIds();
 
 		return pendingAssistantMessageIds.length === 1 ? pendingAssistantMessageIds[0] : null;
+	};
+
+	// Human-friendly label for a browser session tab. The parent agent's session
+	// is "main"; a subagent's session is its subagent_id, so look it up in
+	// subagentLiveStates to show the subagent's name. Returns '' when we can't
+	// resolve a nicer label (the panel then falls back to the raw session id).
+	const browserSessionLabel = (session: string | undefined): string => {
+		if (!session) return '';
+		if (session === 'main') return $i18n.t('Main');
+		const run = get(subagentLiveStates)?.[session];
+		if (run?.name) {
+			return run.num ? `${run.name} (#${run.num})` : run.name;
+		}
+		return '';
 	};
 
 	const markPendingAssistantMessagesDone = () => {
@@ -1637,12 +1905,20 @@
 				block.content.push(payload.tool_call);
 			}
 		} else if (op === 'tool_call_args_append') {
-			for (const block of mirror.content_blocks) {
+			// Reverse scan, stop at first match — see the parent applyDeltaOp
+			// copy for rationale (O(1) common case vs O(blocks × calls)).
+			const blocks = mirror.content_blocks;
+			let found = false;
+			for (let bi = blocks.length - 1; bi >= 0 && !found; bi--) {
+				const block = blocks[bi];
 				if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
-				for (const tc of block.content) {
+				for (let ci = block.content.length - 1; ci >= 0; ci--) {
+					const tc = block.content[ci];
 					if (tc?.id === payload.tool_call_id || tc?.tool_call_id === payload.tool_call_id) {
 						const fn = tc.function || (tc.function = {});
 						fn.arguments = (fn.arguments || '') + (payload.args_delta || '');
+						found = true;
+						break;
 					}
 				}
 			}
@@ -1731,7 +2007,10 @@
 					content: tr.result ?? '',
 					...(Array.isArray(tr.files) && tr.files.length > 0 ? { files: tr.files } : {}),
 					...(Array.isArray(tr.embeds) && tr.embeds.length > 0 ? { embeds: tr.embeds } : {}),
-					...(tr.subagent_id ? { subagent_id: tr.subagent_id } : {})
+					...(tr.subagent_id ? { subagent_id: tr.subagent_id } : {}),
+					...(tr.error ? { error: true } : {}),
+					...(tr.error_reason ? { error_reason: tr.error_reason } : {}),
+					...(tr.notice ? { notice: tr.notice } : {})
 				});
 				for (const block of blocks) {
 					if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
@@ -1966,7 +2245,111 @@
 		}
 
 		if (type === 'chat:title') {
-			chatTitle.set(data);
+			const title = typeof data === 'string' ? data : (data?.title ?? '');
+			if (title) {
+				chatTitle.set(title);
+			}
+			if (data?.id && title) {
+				const updatedAt =
+					typeof data?.updated_at === 'number' ? data.updated_at : Math.floor(Date.now() / 1000);
+				const row = decorate({
+					id: data.id,
+					title,
+					updated_at: updatedAt,
+					created_at: updatedAt,
+					pinned: data.pinned ?? false,
+					archived: data.archived ?? false,
+					folder_id: data.folder_id ?? null
+				});
+				chats.update((arr) => upsertSorted(arr, row));
+			}
+			return;
+		}
+
+		if (type === 'browser:frame') {
+			// Live browser progress frame (fire-and-forget). Handled EARLY and
+			// independently of history.messages: the state lives in a side store
+			// keyed by per-agent browser SESSION (so parallel-browsing agents each
+			// get their own tab, and per-frame churn never re-renders the message
+			// list), and it must NOT be gated behind the in-flight `message` lookup
+			// / retry guard below — a frame can arrive before the assistant message
+			// row materializes (headless drain / reattach).
+			//
+			// Key precedence: the per-agent `session` id (the parent is "main";
+			// each subagent is its subagent_id) so concurrent browsers don't
+			// overwrite each other. Legacy frames without a session fall back to the
+			// message id (single-tab behavior, unchanged).
+			const bid =
+				data?.session ||
+				resolveChatEventMessageId(event.message_id) ||
+				event.message_id;
+			if (bid) {
+				// Derive startedAt from the daemon's elapsedMs so the timer (a)
+				// resets per browser call within a turn and (b) is immune to
+				// container/client clock skew. Falls back to now when absent.
+				const elapsed = Number(data?.elapsedMs ?? 0) || 0;
+				const startedAt = Date.now() - elapsed;
+				const isDone = data?.done === true;
+				const label = browserSessionLabel(data?.session);
+				browserLiveStates.update((s) => ({
+					...s,
+					[bid]: {
+						...(s[bid] ?? {}),
+						...data,
+						startedAt,
+						done: isDone,
+						...(label ? { label } : {})
+					}
+				}));
+				// Auto-open only on a LIVE (non-done) frame, when nothing else owns
+				// the side pane, and only if the user hasn't dismissed the panel this
+				// turn. Never steal focus from an open Artifact/Embed/FilePreview/
+				// Overview/Call. A done-only frame (very fast action) is still stored
+				// above so the panel is populated if opened manually, but it won't pop
+				// open on its own after the action already finished.
+				if (
+					!isDone &&
+					!get(browserPanelDismissed) &&
+					!get(showBrowserPanel) &&
+					!get(showCallOverlay) &&
+					!get(showArtifacts) &&
+					!get(showEmbeds) &&
+					!get(showFilePreview) &&
+					!get(showOverview)
+				) {
+					showBrowserPanel.set(true);
+					showControls.set(true);
+				}
+			}
+			return;
+		}
+
+				// Server-driven queue reflection. The backend owns draining for DB chats;
+		// these events let every tab (and a later-opened tab) mirror the queue
+		// state and attach to a generation it didn't start.
+		if (type === 'chat:queue:updated') {
+			// Plain queue mutation (enqueue/remove/edit from another tab, or the
+			// head popped). Mirror the authoritative server queue into local state.
+			if (Array.isArray(data?.queue)) {
+				queue = data.queue;
+			}
+			return;
+		}
+
+		if (type === 'chat:queue:drained') {
+			// A queued item just started generating server-side. Sync the queue
+			// and reload so the new user message + assistant placeholder (created
+			// by the backend, with ids this tab never saw) show up and the stream
+			// gets subscribed via the normal active-stream/snapshot path.
+			if (Array.isArray(data?.queue)) {
+				queue = data.queue;
+			}
+			if (visibleChatId && !$temporaryChatEnabled) {
+				// loadChat re-fetches history + active streams, flips `generating`,
+				// and starts resume polling — i.e. it attaches this tab to the
+				// headless generation exactly like a reload would.
+				await loadChat();
+			}
 			return;
 		}
 
@@ -2257,7 +2640,9 @@
 			message.files = data.files;
 		} else if (type === 'files') {
 			const seen = new Set(
-				(message.files ?? []).map((file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file))
+				(message.files ?? []).map(
+					(file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file)
+				)
 			);
 			const nextFiles = [...(message.files ?? [])];
 			for (const file of data.files ?? []) {
@@ -2293,6 +2678,7 @@
 			taskIds = null;
 			generating = false;
 			clearGenerationControllerIfOwned(resolvedMessageId);
+			releaseStreamMirror(resolvedMessageId);
 		} else if (type === 'chat:message:follow_ups') {
 			message.followUps = data.follow_ups;
 
@@ -2558,7 +2944,7 @@
 					if (!chatIdProp) {
 						webSearchEnabled = input.webSearchEnabled;
 					}
-				imageGenerationEnabled = input.imageGenerationEnabled;
+					imageGenerationEnabled = input.imageGenerationEnabled;
 					studyModeEnabled = input.studyModeEnabled ?? false;
 					dataVizEnabled = input.dataVizEnabled ?? false;
 				}
@@ -2606,6 +2992,9 @@
 			for (const messageId of streamFlushes.keys()) {
 				cancelStreamingMessageFlush(messageId);
 			}
+			// Release any remaining stream mirrors (content_blocks + tool_results
+			// Maps) so they don't outlive the component on unmount/navigation.
+			streamMirrors.clear();
 			pageSubscribe();
 			showControlsSubscribe();
 			selectedFolderSubscribe();
@@ -2999,6 +3388,19 @@
 			}
 		}
 
+		// A new chat is "user-curated" (and therefore must survive a model switch
+		// without being reset to model defaults) when an explicit source — URL
+		// params, the user's global default tools, or a preserved temp-chat
+		// toggle — populated the selection. A bare new chat stays non-dirty so
+		// switching models still applies the newly chosen model's defaults.
+		toolSelectionDirty =
+			Boolean($settings?.defaultToolIds && $settings.defaultToolIds.length > 0) ||
+			Boolean($page.url.searchParams.get('tools')) ||
+			Boolean($page.url.searchParams.get('tool-ids')) ||
+			$page.url.searchParams.get('web-search') === 'true' ||
+			$page.url.searchParams.get('image-generation') === 'true' ||
+			Boolean(preserveState && preservedWebSearch);
+
 		if (!$mobile) {
 			const chatInput = document.getElementById('chat-input');
 			setTimeout(() => chatInput?.focus(), 0);
@@ -3174,6 +3576,7 @@
 			selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
 		}
 
+		rememberPersistedSelectedModels(currentChatId);
 		oldSelectedModelIds = selectedModels;
 
 		if (loadedHistory.currentId) {
@@ -3184,12 +3587,30 @@
 			}
 		}
 
+		for (const [messageId, message] of Object.entries(loadedHistory.messages ?? {}) as [
+			string,
+			any
+		][]) {
+			if (message?.userStopped === true) {
+				markUserStoppedMessageId(messageId, loadedHistory.messages);
+			}
+		}
+
 		history = loadedHistory;
+		// Full history rebuild on chat load — force the rendered chain to
+		// recompute even if the id-count / currentId happen to coincide with a
+		// prior chat (e.g. reloading the same chat).
+		bumpMessageStructure();
 
 		const activeStreamMessageIds = Array.isArray(_activeStreamsRes?.streams)
 			? _activeStreamsRes.streams
 					.map((stream: any) => stream?.message_id)
-					.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+					.filter(
+						(id: unknown): id is string =>
+							typeof id === 'string' &&
+							id.length > 0 &&
+							!isUserStoppedMessageId(id, loadedHistory.messages)
+					)
 			: [];
 		for (const mid of activeStreamMessageIds) {
 			const message = (history.messages as Record<string, any>)?.[mid];
@@ -3255,6 +3676,18 @@
 		}
 		lastPersistedSubagentExternalToolsEnabled = subagentExternalToolsEnabled;
 
+		// A saved chat that already carries a non-empty tool/feature selection is
+		// treated as user-curated: switching models in it must NOT wipe that
+		// selection back to the model's defaults.
+		toolSelectionDirty =
+			(Array.isArray(selectedToolIds) && selectedToolIds.length > 0) ||
+			webSearchEnabled ||
+			imageGenerationEnabled ||
+			studyModeEnabled ||
+			dataVizEnabled ||
+			subagentsEnabled ||
+			(Array.isArray(selectedFilterIds) && selectedFilterIds.length > 0);
+
 		// Hydrate the subagent live-state store with anything persisted on
 		// this chat's messages. This must be self-contained: after a full tab
 		// reload there are no live socket events left, and the parent message's
@@ -3309,8 +3742,19 @@
 				const m = msg as any;
 				const runs = m?.subagent_runs;
 				if (runs && typeof runs === 'object') {
+					// A subagent runs synchronously inside its parent's generation, so a
+					// terminal parent implies the subagent already returned (and stamped
+					// `ended_at`). A still-`running` run with no `ended_at` under a finished
+					// parent is a crash orphan — downgrade it to `cancelled` so the timer
+					// freezes (no `ended_at` => no bogus duration) instead of ticking forever.
+					const parentTerminal = m?.done === true || !!m?.error || m?.userStopped === true;
 					for (const [entryKey, run] of Object.entries(runs)) {
-						seedRun(run as any, m, entryKey);
+						const r = run as any;
+						const seedRunValue =
+							parentTerminal && r?.status === 'running' && r?.ended_at == null
+								? { ...r, status: 'cancelled' }
+								: r;
+						seedRun(seedRunValue, m, entryKey);
 					}
 				}
 
@@ -3330,8 +3774,7 @@
 						// for a cancelled / no-final-text run persists an EMPTY result
 						// that must NOT be read as success — otherwise the header shows
 						// a green "done" for a subagent that never produced anything.
-						const resultContent =
-							typeof result?.content === 'string' ? result.content : '';
+						const resultContent = typeof result?.content === 'string' ? result.content : '';
 						const resultHasAnswer = resultContent.trim().length > 0;
 						const existing =
 							(callId && seeded[callId]) ||
@@ -3384,9 +3827,53 @@
 			await Promise.all(
 				activeStreamMessageIds.map((mid) => requestStreamSnapshot(mid, currentChatId))
 			);
+
+			// Live browser frames are fire-and-forget (not in the stream snapshot),
+			// so seed the panel from the host workspace for any active stream that
+			// currently has one. The reattach endpoint returns a `sessions` array
+			// (one entry per concurrent browser tab) so we restore every tab, keyed
+			// by its session id — matching how live socket frames are keyed. Legacy
+			// single-frame responses (no `sessions`) fall back to message-id keying.
+			// Best-effort; the next socket frame supersedes it.
+			void Promise.all(
+				activeStreamMessageIds.map(async (mid) => {
+					try {
+						const f = await getBrowserFrame(localStorage.token, mid, currentChatId);
+						if (!f) return;
+						const sessions =
+							Array.isArray(f.sessions) && f.sessions.length ? f.sessions : null;
+						const entries = sessions ?? (f.frame ? [{ ...f, session: undefined }] : []);
+						let anyLive = false;
+						for (const entry of entries) {
+							if (!entry?.frame) continue;
+							const key = entry.session || mid;
+							const label = browserSessionLabel(entry.session);
+							browserLiveStates.update((s) => ({
+								...s,
+								[key]: {
+									...(s[key] ?? {}),
+									...entry,
+									startedAt: s[key]?.startedAt ?? entry?.startedAt ?? Date.now(),
+									...(label ? { label } : {})
+								}
+							}));
+							if (!entry.done) anyLive = true;
+						}
+						if (anyLive && !get(showBrowserPanel)) {
+							showBrowserPanel.set(true);
+							showControls.set(true);
+						}
+					} catch (e) {
+						// ignore — panel simply has no seed frame
+					}
+				})
+			);
 		}
 
-		taskIds = _taskRes?.task_ids ?? null;
+		const activeTaskIds = (_taskRes?.task_ids ?? []).filter(
+			(taskId) => !isUserStoppedTaskId(taskId)
+		);
+		taskIds = activeTaskIds.length > 0 ? activeTaskIds : null;
 
 		// If a task is still running on the backend (we reloaded mid-stream),
 		// flip `generating` to true and poll task status. The original socket
@@ -3474,12 +3961,44 @@
 
 		if (!element || typeof ResizeObserver === 'undefined') return;
 		messagesResizeObserver = new ResizeObserver(() => {
-			if (autoScroll) scrollToBottom();
+			// During the initial settle phase the content is hidden and the settle
+			// loop owns scroll position — don't fight it. After reveal, this keeps
+			// the view pinned to the bottom while streaming / late content grows.
+			if (messagesReady && autoScroll) scrollToBottom();
 		});
 		messagesResizeObserver.observe(element);
 	};
 
 	$: observeMessagesContent(messagesContentElement);
+
+	// Initial-load bottom anchoring. The messages content is revealed (opacity)
+	// only once this resolves, so the user never sees the intermediate scroll
+	// positions caused by content-visibility:auto messages realizing their real
+	// heights, async markdown/code highlight, katex, etc. We re-pin to the bottom
+	// every frame until the scroll height is stable for 2 consecutive frames or a
+	// time budget elapses, then do a final pin. A newer navigation aborts via the
+	// generation guard so stale settles can't move the new chat.
+	const settleAtBottom = (generation: number, maxMs = 350) =>
+		new Promise<void>((resolve) => {
+			const el = messagesContainerElement;
+			if (!el) return resolve();
+			const start = performance.now();
+			let stableFrames = 0;
+			let lastHeight = -1;
+			const step = () => {
+				if (generation !== navigateGeneration) return resolve();
+				el.scrollTop = el.scrollHeight;
+				const h = el.scrollHeight;
+				stableFrames = h === lastHeight ? stableFrames + 1 : 0;
+				lastHeight = h;
+				if (stableFrames >= 2 || performance.now() - start >= maxMs) {
+					el.scrollTop = el.scrollHeight;
+					return resolve();
+				}
+				requestAnimationFrame(step);
+			};
+			requestAnimationFrame(step);
+		});
 
 	onDestroy(() => {
 		if (scrollToBottomFrame !== null) cancelAnimationFrame(scrollToBottomFrame);
@@ -3800,6 +4319,15 @@
 		let shouldRunTTS = false;
 		let shouldFlushStreamingUpdate = false;
 
+		if (isUserStoppedMessageId(message.id)) {
+			cancelStreamingMessageFlush(message.id);
+			message.done = true;
+			releaseStreamMirror(message.id);
+			history.messages[message.id] = message;
+			history = { ...history };
+			return;
+		}
+
 		if (error) {
 			await handleOpenAIError(error, message, 'chatCompletionEventHandler:data.error');
 			// Error takes priority — do NOT fall through to the `done`
@@ -3863,9 +4391,10 @@
 						}
 
 						if (existing) {
-							if (detail.text) existing.text = (existing.text || '') + detail.text;
-							if (detail.data) existing.data = (existing.data || '') + detail.data;
-							if (detail.summary) existing.summary = (existing.summary || '') + detail.summary;
+							if (detail.text) existing.text = mergeStreamedString(existing.text, detail.text);
+							if (detail.data) existing.data = mergeStreamedString(existing.data, detail.data);
+							if (detail.summary)
+								existing.summary = mergeStreamedString(existing.summary, detail.summary);
 							// `type` is matched on, so it can't have changed; never overwrite.
 							if (detail.id) existing.id = detail.id;
 							if (detail.signature) existing.signature = detail.signature;
@@ -3945,7 +4474,9 @@
 
 		if (Array.isArray(event_files) && event_files.length > 0) {
 			const seen = new Set(
-				(message.files ?? []).map((file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file))
+				(message.files ?? []).map(
+					(file: any) => file?.id ?? file?.url ?? file?.content ?? JSON.stringify(file)
+				)
 			);
 			const nextFiles = [...(message.files ?? [])];
 			for (const file of event_files) {
@@ -3967,6 +4498,7 @@
 			emitPendingTTSParts(message, { done: true });
 			cancelStreamingMessageFlush(message.id);
 			message.done = true;
+			releaseStreamMirror(message.id);
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -4084,12 +4616,23 @@
 				block.content.push(payload.tool_call);
 			}
 		} else if (op === 'tool_call_args_append') {
-			for (const block of mirror.content_blocks) {
+			// Tool-call argument fragments always append to the most-recently
+			// added tool call, so scan from the END (newest block / newest call
+			// first) and stop at the first match. This turns the common case into
+			// O(1) instead of O(blocks × calls-per-block) on every args chunk —
+			// the latter is quadratic across a 100–300 tool-call response.
+			const blocks = mirror.content_blocks;
+			let found = false;
+			for (let bi = blocks.length - 1; bi >= 0 && !found; bi--) {
+				const block = blocks[bi];
 				if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
-				for (const tc of block.content) {
+				for (let ci = block.content.length - 1; ci >= 0; ci--) {
+					const tc = block.content[ci];
 					if (tc?.id === payload.tool_call_id || tc?.tool_call_id === payload.tool_call_id) {
 						const fn = tc.function || (tc.function = {});
 						fn.arguments = (fn.arguments || '') + (payload.args_delta || '');
+						found = true;
+						break;
 					}
 				}
 			}
@@ -4108,9 +4651,10 @@
 						: d.type === detail.type && (d.index ?? 0) === (detail.index ?? 0)
 				);
 				if (existing) {
-					if (detail.text) existing.text = (existing.text || '') + detail.text;
-					if (detail.data) existing.data = (existing.data || '') + detail.data;
-					if (detail.summary) existing.summary = (existing.summary || '') + detail.summary;
+					if (detail.text) existing.text = mergeStreamedString(existing.text, detail.text);
+					if (detail.data) existing.data = mergeStreamedString(existing.data, detail.data);
+					if (detail.summary)
+						existing.summary = mergeStreamedString(existing.summary, detail.summary);
 					if (detail.id) existing.id = detail.id;
 					if (detail.signature) existing.signature = detail.signature;
 					if (detail.format) existing.format = detail.format;
@@ -4154,11 +4698,7 @@
 		} else {
 			console.warn('[chat:delta] unknown op', op, payload);
 		}
-		if (
-			op !== 'text_append' &&
-			op !== 'tool_call_args_append' &&
-			op !== 'reasoning_detail_merge'
-		) {
+		if (op !== 'text_append' && op !== 'tool_call_args_append' && op !== 'reasoning_detail_merge') {
 			normalizeStreamingContentBlocks(mirror.content_blocks);
 		}
 	};
@@ -4169,9 +4709,27 @@
 		message.content_blocks = mirror.content_blocks;
 	};
 
-	const requestStreamSnapshot = async (messageId: string, chatId: string | null) => {
+	const requestStreamSnapshot = async (
+		messageId: string,
+		chatId: string | null,
+		{ force = false }: { force?: boolean } = {}
+	) => {
+		if (isUserStoppedMessageId(messageId)) {
+			const message = history.messages[messageId];
+			if (message) {
+				cancelStreamingMessageFlush(messageId);
+				message.done = true;
+				history.messages[messageId] = message;
+				history = { ...history };
+			}
+			return;
+		}
+
 		const mirror = getOrCreateStreamMirror(messageId);
-		if (mirror.snapshotPromise) return mirror.snapshotPromise;
+		if (mirror.snapshotPromise) {
+			if (!force) return mirror.snapshotPromise;
+			await mirror.snapshotPromise.catch(() => undefined);
+		}
 
 		mirror.snapshotting = true;
 		mirror.snapshotPromise = (async () => {
@@ -4187,8 +4745,50 @@
 				return;
 			}
 
-			const message = history.messages[messageId];
+			let message = history.messages[messageId];
 			if (!message) {
+				// The server has an in-flight (or just-finished) stream for a
+				// message this tab never created — e.g. a queued follow-up drained
+				// server-side, and loadChat() either raced the persistence or this
+				// tab attached late. Materialize a minimal assistant row from the
+				// snapshot so the response renders live, instead of bailing (which
+				// left the user staring at an empty date divider until the terminal
+				// reload). Only do this for a still-active stream; a terminal
+				// snapshot for an unknown row is handled by the resume-poll/reload.
+				if (snap.status === 'done' || snap.status === 'cancelled' || snap.status === 'error') {
+					return;
+				}
+				const parentId = history.currentId ?? null;
+				message = {
+					id: messageId,
+					parentId,
+					childrenIds: [],
+					role: 'assistant',
+					content: '',
+					content_blocks: [],
+					model: snap.model ?? snap.selected_model_id ?? selectedModels?.[0] ?? '',
+					modelName: undefined,
+					done: false,
+					timestamp: Math.floor(Date.now() / 1000)
+				};
+				history.messages[messageId] = message;
+				const parent = parentId ? history.messages[parentId] : null;
+				if (parent) {
+					if (!Array.isArray(parent.childrenIds)) parent.childrenIds = [];
+					if (!parent.childrenIds.includes(messageId)) parent.childrenIds.push(messageId);
+				}
+				history.currentId = messageId;
+				history = { ...history };
+				// Structure changed (new node + currentId); bump so Messages.svelte
+				// re-walks the chain and the row actually paints.
+				bumpMessageStructure();
+			}
+
+			if (isUserStoppedMessageId(messageId)) {
+				cancelStreamingMessageFlush(messageId);
+				message.done = true;
+				history.messages[messageId] = message;
+				history = { ...history };
 				return;
 			}
 
@@ -4199,9 +4799,24 @@
 					mirror.tool_results.set(k, normalizeToolResultEntry(k, v));
 				}
 			}
-			mirror.content_blocks = Array.isArray(snap.content_blocks)
+			const snapshotContentBlocks = Array.isArray(snap.content_blocks)
 				? hydrateToolResultsInBlocks(snap.content_blocks.slice(), mirror.tool_results)
 				: [];
+			const liveContentBlocks = Array.isArray(message.content_blocks)
+				? message.content_blocks
+				: mirror.content_blocks;
+
+			if (shouldKeepRicherLiveContentBlocks(liveContentBlocks, snapshotContentBlocks)) {
+				chatStreamDebug('[chat-stream] snapshot kept richer live content blocks', {
+					messageId,
+					liveAnswerChars: contentBlocksAnswerTextLength(liveContentBlocks),
+					snapshotAnswerChars: contentBlocksAnswerTextLength(snapshotContentBlocks),
+					snapshotStatus: snap.status,
+					snapshotVersion: snap.version
+				});
+			} else {
+				mirror.content_blocks = snapshotContentBlocks;
+			}
 
 			const buffered = mirror.pending_deltas;
 			mirror.pending_deltas = [];
@@ -4220,7 +4835,9 @@
 				message.arena = true;
 			}
 			if (snap.status === 'error' && snap.error) message.error = snap.error;
-			if (snap.status === 'done') message.done = true;
+			if (snap.status === 'done' || snap.status === 'cancelled' || snap.status === 'error') {
+				message.done = true;
+			}
 
 			for (const d of buffered) {
 				if (d.version <= mirror.version) continue;
@@ -4257,11 +4874,20 @@
 		const streams = Array.isArray(active?.streams) ? active.streams : [];
 		const messageIds = streams
 			.map((stream: any) => stream?.message_id)
-			.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0);
+			.filter(
+				(id: unknown): id is string =>
+					typeof id === 'string' && id.length > 0 && !isUserStoppedMessageId(id)
+			);
 
 		for (const mid of messageIds) {
 			const message = history?.messages?.[mid];
-			if (message && message.role === 'assistant') {
+			if (
+				message &&
+				message.role === 'assistant' &&
+				message.done !== true &&
+				message.userStopped !== true &&
+				!message.error
+			) {
 				message.done = false;
 			}
 		}
@@ -4275,6 +4901,15 @@
 		message: any,
 		chatId: string | null
 	) => {
+		if (isUserStoppedMessageId(message.id)) {
+			cancelStreamingMessageFlush(message.id);
+			message.done = true;
+			releaseStreamMirror(message.id);
+			history.messages[message.id] = message;
+			history = { ...history };
+			return;
+		}
+
 		const perf = streamPerfStart();
 		const op = delta.op || '';
 		const version = typeof delta.version === 'number' ? delta.version : 0;
@@ -4293,6 +4928,12 @@
 
 		if (version !== 0 && version <= mirror.version) {
 			// Stale/duplicate replay (e.g. snapshot already covered it).
+			return;
+		}
+
+		if (op === 'snapshot') {
+			if (version !== 0) mirror.version = version;
+			void requestStreamSnapshot(message.id, chatId, { force: true });
 			return;
 		}
 
@@ -4330,9 +4971,21 @@
 			files?: any[];
 			embeds?: any[];
 			subagent_id?: string;
+			error?: boolean;
+			error_reason?: string;
+			notice?: string;
 		},
 		message: any
 	) => {
+		if (isUserStoppedMessageId(message.id)) {
+			cancelStreamingMessageFlush(message.id);
+			message.done = true;
+			releaseStreamMirror(message.id);
+			history.messages[message.id] = message;
+			history = { ...history };
+			return;
+		}
+
 		const perf = streamPerfStart();
 		if (!data?.tool_call_id) return;
 		const mirror = getOrCreateStreamMirror(message.id);
@@ -4346,7 +4999,10 @@
 			...(data.summary ? { summary: data.summary } : {}),
 			...(Array.isArray(data.files) && data.files.length > 0 ? { files: data.files } : {}),
 			...(Array.isArray(data.embeds) && data.embeds.length > 0 ? { embeds: data.embeds } : {}),
-			...(data.subagent_id ? { subagent_id: data.subagent_id } : {})
+			...(data.subagent_id ? { subagent_id: data.subagent_id } : {}),
+			...(data.error ? { error: true } : {}),
+			...(data.error_reason ? { error_reason: data.error_reason } : {}),
+			...(data.notice ? { notice: data.notice } : {})
 		});
 		mirror.tool_results.set(data.tool_call_id, resultEntry);
 		if (Array.isArray(data.files) && data.files.length > 0) {
@@ -4372,14 +5028,23 @@
 		// Inline the tool result into the matching tool_calls block so the
 		// renderer keeps working unchanged. blocksToDisplayMarkdown reads
 		// block.results[], while some live components also look at tc.result.
-		for (const block of mirror.content_blocks) {
+		// Only the block that actually CONTAINS this tool_call_id should get the
+		// result — scan from the end (newest first) and stop at the first match.
+		// The previous code looped every block and pushed the result into each
+		// tool_calls block, which both leaked the result into unrelated blocks
+		// and was O(blocks) per result.
+		const blocks = mirror.content_blocks;
+		for (let bi = blocks.length - 1; bi >= 0; bi--) {
+			const block = blocks[bi];
 			if (block?.type !== 'tool_calls' || !Array.isArray(block.content)) continue;
+			const ownsCall = block.content.some(
+				(tc: any) => tc?.id === data.tool_call_id || tc?.tool_call_id === data.tool_call_id
+			);
+			if (!ownsCall) continue;
 			const nextResults = Array.isArray(block.results) ? block.results.slice() : [];
 			const mergedResult =
 				mergeToolResultEntries([resultEntry], mirror.tool_results, nextResults)[0] ?? resultEntry;
-			const existingIdx = nextResults.findIndex(
-				(r: any) => r?.tool_call_id === data.tool_call_id
-			);
+			const existingIdx = nextResults.findIndex((r: any) => r?.tool_call_id === data.tool_call_id);
 			if (existingIdx >= 0) nextResults[existingIdx] = mergedResult;
 			else nextResults.push(mergedResult);
 			block.results = nextResults;
@@ -4388,6 +5053,7 @@
 					tc.result = data.result;
 				}
 			}
+			break;
 		}
 		writeMirrorToMessage(mirror, message);
 		history.messages[message.id] = message;
@@ -4400,21 +5066,42 @@
 		message: any,
 		chatId: string | null
 	) => {
-		const mirror = getOrCreateStreamMirror(message.id);
-		if (typeof data?.version === 'number' && data.version > mirror.version + 1) {
-			// Final version is ahead — snapshot to converge before finalizing.
-			await requestStreamSnapshot(message.id, chatId);
+		// Stop the live browser panel's timer (leave the last frame visible). The
+		// poller already emits a terminal done frame per session when each browser
+		// call ends, but on chat completion freeze the parent's "main" tab (and any
+		// legacy message-id-keyed entry) as a belt-and-suspenders so the timer never
+		// keeps ticking after the turn ends. Subagent tabs are frozen by their own
+		// terminal frames.
+		const _freezeKeys = [message?.id, 'main'].filter(Boolean) as string[];
+		browserLiveStates.update((s) => {
+			let changed = false;
+			const next = { ...s };
+			for (const k of _freezeKeys) {
+				if (next[k] && !next[k].done) {
+					next[k] = { ...next[k], done: true };
+					changed = true;
+				}
+			}
+			return changed ? next : s;
+		});
+		if (isUserStoppedMessageId(message.id)) {
+			cancelStreamingMessageFlush(message.id);
+			message.done = true;
+			releaseStreamMirror(message.id);
+			history.messages[message.id] = message;
+			history = { ...history };
+			return;
 		}
-		// Final authoritative reconciliation. Live deltas optimize perceived
-		// streaming, but the server's final row is the source of truth and avoids
-		// any duplicated prefix artifacts from provider/full-prefix delta quirks.
-		if (chatId) {
-			await requestStreamSnapshot(message.id, chatId);
+
+		const mirror = getOrCreateStreamMirror(message.id);
+		const shouldFetchTerminalSnapshot =
+			!!chatId || (typeof data?.version === 'number' && data.version > mirror.version + 1);
+
+		if (shouldFetchTerminalSnapshot) {
+			await requestStreamSnapshot(message.id, chatId, { force: true });
 		}
 		writeMirrorToMessage(mirror, message);
-		const generatedFiles = (message.files ?? []).filter(
-			(file: any) => file?.container_workspace
-		);
+		const generatedFiles = (message.files ?? []).filter((file: any) => file?.container_workspace);
 		if (generatedFiles.length > 0) {
 			openGeneratedFilePreview(generatedFiles);
 		}
@@ -4459,6 +5146,7 @@
 			const ts =
 				typeof data?.updated_at === 'number' ? data.updated_at : Math.floor(Date.now() / 1000);
 			patchSidebarUpdatedAt(chatId, ts);
+			invalidateFolderChatLists([data?.folder_id, chat?.folder_id], 'chat:done:origin');
 
 			await chatCompletedHandler(
 				chatId,
@@ -4475,6 +5163,10 @@
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
 		console.log('submitPrompt', userPrompt, getVisibleChatId());
+
+		// A new turn may start a fresh browser session; allow the panel to auto-open
+		// again even if the user dismissed it on a previous turn.
+		browserPanelDismissed.set(false);
 
 		const _selectedModels = selectedModels.map((modelId) =>
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
@@ -4562,8 +5254,8 @@
 			: '';
 		const containerWorkspaceActive = Boolean(
 			containerFeatures?.enable_container_workspace_sync &&
-			containerToolId &&
-			(selectedToolIds ?? []).includes(containerToolId)
+				containerToolId &&
+				(selectedToolIds ?? []).includes(containerToolId)
 		);
 		const _files = structuredClone(files).map((file) =>
 			containerWorkspaceActive ? { ...file, container_mode: true } : file
@@ -4803,241 +5495,9 @@
 						let responseMessageId =
 							responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`];
 
-						if (hasImages && !hasNativeVision && hasPreprocessor) {
-							const preprocessorId = model.info.meta.vision_preprocessor_model_id;
-							const preprocessorModel = $models.find((m) => m.id === preprocessorId);
-							if (!preprocessorModel) {
-								toast.error(`Vision preprocessor model not found: ${preprocessorId}`);
-							} else {
-								const userMessage = _history.messages[parentId];
-								const userImages = userMessage.files?.filter((f) => f.type === 'image') || [];
-
-								if (userImages.length > 0) {
-									let responseMessage = _history.messages[responseMessageId];
-									responseMessage.statusHistory = responseMessage.statusHistory || [];
-									responseMessage.statusHistory.push({
-										done: false,
-										action: '🖼️',
-										description: 'Preprocessing images with vision model...'
-									});
-									_history.messages[responseMessageId] = responseMessage;
-									history.messages[responseMessageId] = responseMessage;
-									history = { ...history };
-
-									const visionPrompt =
-										model.info.meta.vision_preprocessor_prompt ||
-										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
-
-									try {
-										const visionMessages = [
-											{
-												role: 'system',
-												content: visionPrompt.replace('{query}', userMessage.content)
-											},
-											{
-												role: 'user',
-												content: [
-													{ type: 'text', text: userMessage.content },
-													...userImages.filter(getFileContentUrl).map((f: any) => ({
-														type: 'image_url',
-														image_url: { url: getFileContentUrl(f) }
-													}))
-												]
-											}
-										];
-										const visionRes = await generateOpenAIChatCompletion(
-											localStorage.token,
-											{
-												model: preprocessorModel.id,
-												messages: visionMessages,
-												stream: false,
-												params: { max_tokens: 2048 }
-											},
-											`${WEBUI_BASE_URL}/api`
-										);
-										const visionResponse = visionRes?.choices?.[0]?.message?.content ?? '';
-
-										responseMessage = _history.messages[responseMessageId];
-										responseMessage.statusHistory.push({
-											done: true,
-											action: '🖼️',
-											description: 'Vision analysis complete',
-											vision_prompt: visionPrompt.replace('{query}', userMessage.content),
-											vision_response: visionResponse
-										});
-										_history.messages[responseMessageId] = responseMessage;
-										history.messages[responseMessageId] = responseMessage;
-
-										userMessage.content = `[Vision Analysis:\n${visionResponse}\n]\n\n${userMessage.content}`;
-										userMessage.vision_processed = true;
-
-										_history.messages[parentId] = userMessage;
-										history.messages[parentId] = userMessage;
-										history = { ...history };
-
-										await saveChatHandler(_chatId, _history, params, [
-											{
-												op: 'update_message_content',
-												message_id: parentId,
-												content: userMessage.content
-											}
-										]);
-									} catch (visionError: any) {
-										console.error('Vision preprocessing failed:', visionError);
-										toast.error('Vision preprocessing failed. Sending without analysis.');
-
-										responseMessage = _history.messages[responseMessageId];
-										responseMessage.statusHistory.push({
-											done: true,
-											action: '🖼️❌',
-											description: 'Vision preprocessing failed (text-only mode)'
-										});
-										_history.messages[responseMessageId] = responseMessage;
-										history.messages[responseMessageId] = responseMessage;
-
-										userMessage.vision_processed = false;
-										_history.messages[parentId] = userMessage;
-										history.messages[parentId] = userMessage;
-										history = { ...history };
-									}
-								}
-							}
-						}
-
-						// PDF Preprocessing for non-vision models
-						const hasPdfs = createMessagesList(_history, parentId).some((message) =>
-							message.files?.some(
-								(file) =>
-									file.type === 'file' &&
-									(file.name?.toLowerCase().endsWith('.pdf') ||
-										file.file?.filename?.toLowerCase().endsWith('.pdf'))
-							)
-						);
-
-						if (hasPdfs && !hasNativeVision && hasPreprocessor) {
-							const preprocessorId = model.info.meta.vision_preprocessor_model_id;
-							const preprocessorModel = $models.find((m) => m.id === preprocessorId);
-							if (!preprocessorModel) {
-								toast.error(`Vision preprocessor model not found: ${preprocessorId}`);
-							} else {
-								const userMessage = _history.messages[parentId];
-								const userPdfs =
-									userMessage.files?.filter(
-										(f) =>
-											f.type === 'file' &&
-											(f.name?.toLowerCase().endsWith('.pdf') ||
-												f.file?.filename?.toLowerCase().endsWith('.pdf'))
-									) || [];
-
-								if (userPdfs.length > 0) {
-									let responseMessage = _history.messages[responseMessageId];
-									responseMessage.statusHistory = responseMessage.statusHistory || [];
-									responseMessage.statusHistory.push({
-										done: false,
-										action: '📄',
-										description: 'Preprocessing PDF with vision model...'
-									});
-									_history.messages[responseMessageId] = responseMessage;
-									history.messages[responseMessageId] = responseMessage;
-									history = { ...history };
-
-									const visionPrompt =
-										model.info.meta.vision_preprocessor_prompt ||
-										'Perform OCR on this image and describe its contents in the context of the user query: {query}';
-
-									try {
-										const visionMessages = [
-											{
-												role: 'system',
-												content: visionPrompt.replace('{query}', userMessage.content)
-											},
-											{
-												role: 'user',
-												content: [
-													{
-														type: 'text',
-														text: `I have uploaded ${userPdfs.length} PDF document(s). Please analyze them:\n\n${userMessage.content}`
-													},
-													...userPdfs.map((f) => ({
-														type: 'file',
-														file: {
-															filename: f.name || f.file?.filename || 'document.pdf',
-															file_data: f.url || `${WEBUI_API_BASE_URL}/files/${f.id}/content`
-														}
-													}))
-												]
-											}
-										];
-										const visionRes = await generateOpenAIChatCompletion(
-											localStorage.token,
-											{
-												model: preprocessorModel.id,
-												messages: visionMessages,
-												stream: false,
-												params: { max_tokens: 4096 }
-											},
-											`${WEBUI_BASE_URL}/api`
-										);
-										const visionResponse = visionRes?.choices?.[0]?.message?.content ?? '';
-										const pages = userPdfs.length;
-
-										responseMessage = _history.messages[responseMessageId];
-										responseMessage.statusHistory.push({
-											done: true,
-											action: '📄',
-											description: `PDF analysis complete (${pages} pages)`,
-											vision_prompt: visionPrompt.replace('{query}', userMessage.content),
-											vision_response: visionResponse
-										});
-										_history.messages[responseMessageId] = responseMessage;
-										history.messages[responseMessageId] = responseMessage;
-
-										userMessage.content = `[PDF Analysis (${pages} pages):\n${visionResponse}\n]\n\n${userMessage.content}`;
-										userMessage.pdf_processed = true;
-
-										_history.messages[parentId] = userMessage;
-										history.messages[parentId] = userMessage;
-										history = { ...history };
-
-										await saveChatHandler(_chatId, _history, params, [
-											{
-												op: 'update_message_content',
-												message_id: parentId,
-												content: userMessage.content
-											}
-										]);
-									} catch (pdfError: any) {
-										console.error('PDF preprocessing failed:', pdfError);
-
-										responseMessage = _history.messages[responseMessageId];
-										responseMessage.statusHistory.push({
-											done: true,
-											action: '📄❌',
-											description: `PDF preprocessing failed: ${pdfError?.message ?? pdfError}`
-										});
-										responseMessage.error = {
-											content: `PDF preprocessing failed: ${pdfError?.message ?? pdfError}\n\nThe selected model does not support vision natively, and PDF preprocessing could not be completed.`
-										};
-										responseMessage.done = true;
-										_history.messages[responseMessageId] = responseMessage;
-										history.messages[responseMessageId] = responseMessage;
-										history = { ...history };
-
-										await saveChatHandler(_chatId, _history, params, [
-											{
-												op: 'update_message_content',
-												message_id: responseMessageId,
-												content: responseMessage.content,
-												statusHistory: responseMessage.statusHistory,
-												error: responseMessage.error,
-												done: true
-											}
-										]);
-										return; // Stop processing this model
-									}
-								}
-							}
-						}
+						// Vision/PDF preprocessing for non-vision models now runs
+						// server-side in assemble_conversation_from_leaf, so it works
+						// identically for normal sends and the zero-tab queue drain.
 
 						scrollToBottom();
 
@@ -5092,10 +5552,50 @@
 							{
 								const msg = history.messages[responseMessageId];
 								if (!msg?.done && !msg?.error) {
+									let lastKnownActiveAt = Date.now();
+									let lastPollAt = 0;
 									while (true) {
-										await new Promise((r) => setTimeout(r, 100));
+										await new Promise((r) => setTimeout(r, 250));
 										const m = history.messages[responseMessageId];
 										if (m?.done || m?.error) break;
+
+										if (_chatId && Date.now() - lastPollAt > 3000) {
+											lastPollAt = Date.now();
+											const [taskRes, activeStreams] = await Promise.all([
+												getTaskIdsByChatId(localStorage.token, _chatId).catch(() => null),
+												getActiveStreamsByChatId(localStorage.token, _chatId).catch(() => null)
+											]);
+											const hasActiveTask = (taskRes?.task_ids ?? []).some(
+												(taskId) => !isUserStoppedTaskId(taskId)
+											);
+											const hasActiveStream = (activeStreams?.streams ?? []).some(
+												(stream) => stream?.message_id === responseMessageId
+											);
+
+											if (hasActiveTask || hasActiveStream) {
+												lastKnownActiveAt = Date.now();
+											} else if (Date.now() - lastKnownActiveAt > 12000) {
+												// No active task/stream for 12s: the generation ended. It
+												// may have COMPLETED with a lost terminal `chat:done` event
+												// (reconnect / stale session_id / navigation), so reconcile
+												// from the snapshot before erroring — done/cancelled resolve
+												// to done, a real failure resolves to error. Erroring here
+												// unconditionally was the primary "sent but no response" bug.
+												await requestStreamSnapshot(responseMessageId, _chatId, {
+													force: true
+												}).catch(() => undefined);
+												const reconciled = history.messages[responseMessageId];
+												if (reconciled?.done || reconciled?.error) {
+													break;
+												}
+												await handleOpenAIError(
+													{ message: 'Chat request is not active on the backend.' },
+													reconciled ?? m,
+													'response-wait-no-active-task'
+												);
+												break;
+											}
+										}
 									}
 								}
 							}
@@ -5254,6 +5754,69 @@
 		return features;
 	};
 
+	// Snapshot the full send context for a queued message so the backend can
+	// drive the send autonomously (zero tabs open). Mirrors the payload
+	// construction in sendMessageSocket: resolves selectedToolIds into
+	// tool_ids + tool_servers, captures features/params/reasoning/service_tier/
+	// model. The chosen model is the @-mentioned one (if any) else the primary
+	// selected model. Time-sensitive prompt variables are intentionally omitted
+	// — the backend recomputes them from `timezone` at drain time.
+	const captureQueueSendSpec = async (
+		userPrompt: string,
+		itemFiles: any[],
+		atModelId: string | null
+	) => {
+		const modelId = atModelId || selectedModels[0];
+		const model = $models.find((m) => m.id === modelId);
+		if (!model) return null;
+
+		const toolIds: string[] = [];
+		const toolServerIds: any[] = [];
+		for (const toolId of selectedToolIds) {
+			if (toolId.startsWith('direct_server:')) {
+				const serverId = toolId.replace('direct_server:', '');
+				toolServerIds.push(!isNaN(parseInt(serverId)) ? parseInt(serverId) : serverId);
+			} else {
+				toolIds.push(toolId);
+			}
+		}
+
+		let selectedToolServers: any[] = [];
+		if (toolServerIds.length > 0) {
+			await loadToolServers().catch(() => undefined);
+			selectedToolServers = ($toolServers ?? []).filter(
+				(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+			);
+		}
+
+		const usesUsage = model.info?.meta?.capabilities?.usage ?? false;
+		const serviceTierDisabled = (model?.info?.meta as any)?.service_tier?.enabled === false;
+
+		return {
+			model: model.id,
+			models: atModelId ? [atModelId] : selectedModels,
+			content: userPrompt,
+			files: structuredClone(itemFiles ?? []),
+			params: { ...$settings?.params, ...params },
+			tool_ids: toolIds.length > 0 ? toolIds : undefined,
+			tool_servers: selectedToolServers,
+			filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+			features: getFeatures(),
+			variables: {
+				// Location is resolved per-send in sendMessageSocket and isn't in
+				// scope here; the backend recomputes time-sensitive variables from
+				// `timezone` at drain time, so snapshotting name-only is fine.
+				...getPromptVariables($user?.name, undefined)
+			},
+			reasoning: reasoning,
+			...(serviceTierDisabled ? {} : { service_tier: serviceTier }),
+			background_tasks: { follow_up_generation: $settings?.autoFollowUps ?? true },
+			model_item: $models.find((m) => m.id === model.id),
+			...(usesUsage ? { stream_options: { include_usage: true } } : {}),
+			timezone: Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.timeZone
+		};
+	};
+
 	const getFileContentUrl = (file: any) => {
 		if (file?.url) return file.url;
 		return file?.id ? `${WEBUI_API_BASE_URL}/files/${file.id}/content` : '';
@@ -5268,11 +5831,51 @@
 		opts = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
+		const hadUserStoppedMarker =
+			clearUserStoppedMessageId(responseMessageId, _history.messages) ||
+			clearUserStoppedMessageId(responseMessageId, history.messages);
+
+		if (hadUserStoppedMarker) {
+			responseMessage.userStopped = false;
+			const liveMessage = history.messages[responseMessageId];
+			if (liveMessage) {
+				liveMessage.userStopped = false;
+				history.messages[responseMessageId] = liveMessage;
+				history = { ...history };
+			}
+
+			if (_chatId && !_chatId.startsWith('local:') && !$temporaryChatEnabled) {
+				void saveChatHandler(_chatId, history, params, [
+					{
+						op: 'update_message_content',
+						message_id: responseMessageId,
+						content: responseMessage.content ?? '',
+						done: responseMessage.done === true,
+						userStopped: false
+					}
+				]).catch((error) => {
+					console.error('Failed to clear stopped response marker', error);
+				});
+			}
+		}
+
 		// Same assistant id can be reused by continue/retry flows; a new request
 		// must be allowed to count a fresh usage payload even if numbers match.
 		lastAppliedUsageByMessage.delete(responseMessageId);
 		const userMessage = _history.messages[responseMessage.parentId];
 		const leafMessageId = (opts as any)?.leafMessageId ?? responseMessage.parentId;
+		const v2NewUserMessage =
+			userMessage?.role === 'user'
+				? {
+						id: userMessage.id,
+						parentId: userMessage.parentId ?? null,
+						role: 'user',
+						content: userMessage.content ?? '',
+						files: userMessage.files ?? [],
+						models: userMessage.models ?? [],
+						timestamp: userMessage.timestamp
+					}
+				: null;
 
 		const chatMessageFiles = _messages
 			.filter((message) => message.files)
@@ -5326,8 +5929,8 @@
 			: '';
 		const containerWorkspaceActive = Boolean(
 			containerFeatures?.enable_container_workspace_sync &&
-			containerToolId &&
-			(selectedToolIds ?? []).includes(containerToolId)
+				containerToolId &&
+				(selectedToolIds ?? []).includes(containerToolId)
 		);
 
 		// v2 body shape: backend assembles the conversation by walking
@@ -5607,9 +6210,8 @@
 						const shouldAttachPdfFiles = isUser && hasPdfFiles && modelSupportsVision;
 						const shouldAttachExtractableFiles = shouldSendFilesToModel && hasExtractableFiles;
 
-						const textPrefix = isUser && !containerWorkspaceActive
-							? await buildTextFileBlocks(message.files)
-							: '';
+						const textPrefix =
+							isUser && !containerWorkspaceActive ? await buildTextFileBlocks(message.files) : '';
 						const baseText = message?.merged?.content ?? message.content ?? '';
 
 						if (
@@ -5630,7 +6232,8 @@
 												.map((file: any) => ({
 													type: 'image_url',
 													image_url: {
-														url: getFileContentUrl(file)
+														url: getFileContentUrl(file),
+														full_quality: file.fullQuality === true
 													}
 												}))
 										: []),
@@ -5743,7 +6346,8 @@
 				model: model.id,
 				...(useV2Body
 					? {
-							leaf_message_id: leafMessageId
+							leaf_message_id: leafMessageId,
+							...(v2NewUserMessage ? { new_user_message: v2NewUserMessage } : {})
 						}
 					: { messages: messages }),
 				params: {
@@ -5868,6 +6472,14 @@
 					});
 					await handleOpenAIError(errorPayload, responseMessage, `http-${res.status}`);
 				} else if (res.body) {
+					if (isUserStoppedMessageId(responseMessageId)) {
+						cancelStreamingMessageFlush(responseMessageId);
+						responseMessage.done = true;
+						history.messages[responseMessageId] = responseMessage;
+						history = { ...history };
+						return;
+					}
+
 					responseMessage.done = false;
 					history.messages[responseMessageId] = responseMessage;
 					history = { ...history };
@@ -6001,6 +6613,15 @@
 							});
 							await handleOpenAIError(payload.error, responseMessage, 'async-task-payload-error');
 						} else if (payload?.task_id) {
+							if (isUserStoppedMessageId(responseMessageId)) {
+								markUserStoppedTaskId(payload.task_id);
+								await stopTask(localStorage.token, payload.task_id).catch((error) => {
+									console.error('Failed to stop late task after response stop', error);
+									return null;
+								});
+								return;
+							}
+
 							const currentMessage = history.messages[responseMessageId];
 							if (currentMessage && !currentMessage.done) {
 								if (taskIds) {
@@ -6009,6 +6630,16 @@
 									taskIds = [payload.task_id];
 								}
 							}
+						} else {
+							chatStreamDebug('[chat-stream] async-task missing task_id', {
+								responseMessageId,
+								payload
+							});
+							await handleOpenAIError(
+								{ message: 'Chat request did not start a backend task.' },
+								responseMessage,
+								'async-task-missing-task-id'
+							);
 						}
 					}
 				} else {
@@ -6027,6 +6658,15 @@
 					});
 					await handleOpenAIError(data.error, responseMessage, 'non-streaming-data-error');
 				} else {
+					if (data?.task_id && isUserStoppedMessageId(responseMessageId)) {
+						markUserStoppedTaskId(data.task_id);
+						await stopTask(localStorage.token, data.task_id).catch((error) => {
+							console.error('Failed to stop late task after response stop', error);
+							return null;
+						});
+						return;
+					}
+
 					const currentMessage = history.messages[responseMessageId];
 					if (currentMessage && !currentMessage.done) {
 						if (taskIds) {
@@ -6159,6 +6799,7 @@
 
 	const stopResponse = async () => {
 		const taskIdsToStop = new Set<string>(taskIds ?? []);
+		const stoppedMessageIds = new Set<string>();
 		const visibleChatId = getVisibleChatId();
 
 		// Stop all tasks associated with this chat, not only the IDs this tab
@@ -6169,6 +6810,10 @@
 			for (const taskId of taskRes?.task_ids ?? []) {
 				if (taskId) taskIdsToStop.add(taskId);
 			}
+		}
+
+		for (const taskId of taskIdsToStop) {
+			markUserStoppedTaskId(taskId);
 		}
 
 		if (taskIdsToStop.size > 0) {
@@ -6189,20 +6834,67 @@
 			// Mark current response(s) as done immediately so the UI can finish.
 			if (responseMessage.parentId !== null && history.messages[responseMessage.parentId]) {
 				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-					if (history.messages[messageId]) {
+					const message = history.messages[messageId];
+					if (message) {
 						cancelStreamingMessageFlush(messageId);
-						history.messages[messageId].done = true;
-						history.messages[messageId] = { ...history.messages[messageId] };
+						releaseStreamMirror(messageId);
+						if (message.done !== true) {
+							stoppedMessageIds.add(messageId);
+							markUserStoppedMessageId(messageId);
+						}
+						message.done = true;
+						history.messages[messageId] = { ...message };
 					}
 				}
 			} else {
 				if (history.currentId) {
 					cancelStreamingMessageFlush(history.currentId);
+					releaseStreamMirror(history.currentId);
+					stoppedMessageIds.add(history.currentId);
+					markUserStoppedMessageId(history.currentId);
 				}
 				responseMessage.done = true;
 				history.messages[history.currentId] = { ...responseMessage };
 			}
 			history = { ...history };
+		}
+
+		if (
+			stoppedMessageIds.size > 0 &&
+			visibleChatId &&
+			!visibleChatId.startsWith('local:') &&
+			!$temporaryChatEnabled
+		) {
+			const ops = Array.from(stoppedMessageIds)
+				.map((messageId) => {
+					const message = history.messages[messageId];
+					if (!message) return null;
+					return {
+						op: 'update_message_content',
+						message_id: messageId,
+						content: message.content ?? '',
+						done: true,
+						userStopped: true,
+						...(Array.isArray(message.content_blocks)
+							? { content_blocks: message.content_blocks }
+							: {}),
+						...(message.statusHistory !== undefined
+							? { statusHistory: message.statusHistory }
+							: {}),
+						...(message.sources !== undefined ? { sources: message.sources } : {}),
+						...(message.usage !== undefined ? { usage: message.usage } : {}),
+						...(message.selectedModelId !== undefined
+							? { selectedModelId: message.selectedModelId }
+							: {})
+					} as PatchChatOp;
+				})
+				.filter((op): op is PatchChatOp => op !== null);
+
+			if (ops.length > 0) {
+				void saveChatHandler(visibleChatId, history, params, ops).catch((error) => {
+					console.error('Failed to persist stopped response state', error);
+				});
+			}
 		}
 
 		chatStreamDebug('[chat-stream] stopResponse — user clicked stop, aborting controller');
@@ -7038,6 +7730,7 @@
 			);
 
 			_chatId = chat.id;
+			rememberPersistedSelectedModels(_chatId);
 
 			// Order matters here: update the URL FIRST, then $chatId. The
 			// `activeChatId` reactive falls back to `isPersistentChatView()`
@@ -7073,6 +7766,7 @@
 					chats.update((arr) => upsertSorted(arr, row));
 				}
 			}
+			invalidateFolderChatLists([chat?.folder_id], 'chat:created:origin');
 
 			selectedFolder.set(null);
 		} else {
@@ -7087,18 +7781,39 @@
 		return _chatId;
 	};
 
+	// True when the visible chat is backed by the DB (server-driven drain
+	// applies). Temp / local: chats have no DB queue and keep the client-side
+	// drain (dequeueAndSend) as their only mechanism.
+	const isServerDrainChat = () => {
+		const _chatId = getVisibleChatId();
+		return !!_chatId && !_chatId.startsWith('local:') && !$temporaryChatEnabled;
+	};
+
 	// Append a queue item with the text + currently-attached files + any
-	// `@`-mention. Clears the input afterwards so the user can keep typing.
-	// `chatFiles` is NOT moved here (it gets moved during the normal send path
-	// in submitPrompt) — the queue item carries its own per-message files
-	// which dequeueAndSend hands back to `files` at flush time.
-	const enqueueMessage = async (userPrompt: string) => {
+	// `@`-mention, plus a self-contained send spec the backend drain consumes.
+	// Clears the input afterwards so the user can keep typing. `chatFiles` is NOT
+	// moved here (it gets moved during the normal send path in submitPrompt) —
+	// the queue item carries its own per-message files.
+	const enqueueMessage = async (
+		userPrompt: string,
+		mode: 'after_final' | 'steer' = 'after_final'
+	) => {
+		const itemFiles = structuredClone(files);
+		const atModelId = atSelectedModel?.id ?? null;
+		const sendSpec = await captureQueueSendSpec(userPrompt, itemFiles, atModelId);
+
 		const item: QueuedMessage = {
 			id: uuidv4(),
 			prompt: userPrompt,
-			files: structuredClone(files),
-			atSelectedModelId: atSelectedModel?.id ?? null,
-			createdAt: Date.now()
+			files: itemFiles,
+			atSelectedModelId: atModelId,
+			createdAt: Date.now(),
+			// `mode` lives at the TOP level of the item (not just inside sendSpec)
+			// because the backend reads it there: pop_steer_items_by_id filters on
+			// item["mode"] == "steer" and the drain ignores those, while
+			// after_final items flow through the normal drain.
+			mode,
+			...(sendSpec ? { sendSpec } : {})
 		};
 		queue = [...queue, item];
 
@@ -7106,30 +7821,87 @@
 		prompt = '';
 		messageInput?.setText('');
 
-		toast.success($i18n.t('Message queued — will send when the current response finishes'));
-
-		// Persist the queue change immediately so it survives reload / tab
-		// close. saveChatHandler is a no-op for temp chats / missing chat id,
-		// which is fine — in-memory state is the source of truth for those.
-		const _chatId = getVisibleChatId();
-		if (_chatId) {
-			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
+		// Persist immediately so it survives reload / tab close / zero-tab drain.
+		// DB chats use the atomic append_queue_item op (no whole-array clobber if
+		// two tabs enqueue concurrently); temp chats fall back to the in-memory
+		// queue + set_queue snapshot (which persistQueue no-ops for local: ids).
+		if (isServerDrainChat()) {
+			const _chatId = getVisibleChatId();
+			void patchChat(localStorage.token, _chatId, [
+				{ op: 'append_queue_item', item: structuredClone(item) }
+			]).catch((error) => {
+				console.error('Failed to persist queued message', error);
+			});
+		} else {
+			void persistQueue().catch((error) => {
+				console.error('Failed to persist queued message', error);
+			});
 		}
 	};
 
+	// STEER: enqueue a message the backend agentic loop injects at its next
+	// tool-call boundary (mid-task), rather than after the whole response. The
+	// durable queue item (mode:'steer') IS the signal — the loop polls
+	// pop_steer_items_by_id each round — so this survives reload / tab close /
+	// zero open tabs by construction, exactly like an after_final queue item.
+	// Steering only makes sense for server-driven (DB) chats; temp/local chats
+	// have no backend loop to inject into, so we degrade to after_final there.
+	const steerMessage = async (userPrompt: string) => {
+		// A steer is delivered as a `user_steer` content block built purely from
+		// TEXT (the backend skips empty-text steers). A files-only "steer" (image
+		// dragged in, no text) would be popped but never injected → files lost.
+		// Route those to after_final instead, where the normal follow-up pipeline
+		// carries the attachments. Same for temp/local chats (no backend loop).
+		if (!isServerDrainChat() || userPrompt.trim() === '') {
+			await enqueueMessage(userPrompt, 'after_final');
+			return;
+		}
+		await enqueueMessage(userPrompt, 'steer');
+	};
+
 	const editQueuedMessage = (id: string, nextText: string) => {
-		queue = queue.map((q) => (q.id === id ? { ...q, prompt: nextText } : q));
-		const _chatId = getVisibleChatId();
-		if (_chatId) {
-			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
+		queue = queue.map((q) =>
+			q.id === id
+				? {
+						...q,
+						prompt: nextText,
+						...(q.sendSpec ? { sendSpec: { ...q.sendSpec, content: nextText } } : {})
+					}
+				: q
+		);
+		if (isServerDrainChat()) {
+			// Edit = remove + re-append the updated item atomically so the
+			// persisted spec's content matches what will be sent.
+			const _chatId = getVisibleChatId();
+			const updated = queue.find((q) => q.id === id);
+			if (updated) {
+				void patchChat(localStorage.token, _chatId, [
+					{ op: 'remove_queue_item', item_id: id },
+					{ op: 'append_queue_item', item: structuredClone(updated) }
+				]).catch((error) => {
+					console.error('Failed to persist queued message edit', error);
+				});
+			}
+		} else {
+			void persistQueue().catch((error) => {
+				console.error('Failed to persist queued message edit', error);
+			});
 		}
 	};
 
 	const removeQueuedMessage = (id: string) => {
 		queue = queue.filter((q) => q.id !== id);
-		const _chatId = getVisibleChatId();
-		if (_chatId) {
-			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
+		if (isServerDrainChat()) {
+			const _chatId = getVisibleChatId();
+			void patchChat(localStorage.token, _chatId, [
+				{ op: 'remove_queue_item', item_id: id }
+			]).catch((error) => {
+				console.error('Failed to persist queued message removal', error);
+			});
+		} else {
+			void persistQueue().catch((error) => {
+				console.error('Failed to persist queued message removal', error);
+			});
 		}
 	};
 
@@ -7144,103 +7916,139 @@
 	// the next one." Multiple queued messages drain one at a time: the reactive
 	// fires again on each subsequent natural completion.
 	const dequeueAndSend = async () => {
+		if (queueSending) return;
 		if (queue.length === 0) return;
-		const next = queue[0];
-		queue = queue.slice(1);
-
-		const _chatId = getVisibleChatId();
-		if (_chatId) {
-			void saveChatHandler(_chatId, history, params, [{ op: 'set_queue', queue: queue ?? [] }]);
-		}
-
-		const itemFiles = Array.isArray(next.files) ? structuredClone(next.files) : [];
-
-		// Validate model selection is still sensible. If selected models drifted
-		// to invalid ids (model deleted, etc.), drop the queued send rather than
-		// silently failing in sendMessage.
-		const _selectedModels = selectedModels.map((modelId) =>
-			$models.map((m) => m.id).includes(modelId) ? modelId : ''
-		);
-		if (!arraysEqual(selectedModels, _selectedModels)) {
-			selectedModels = _selectedModels;
-		}
-		if (selectedModels.includes('')) {
-			toast.error($i18n.t('Model not selected — queued message dropped'));
-			return;
-		}
-
-		// Mirror submitPrompt's chatFiles accumulation: move text-extraction
-		// kinds onto the chat-wide files list so subsequent turns see them.
-		chatFiles.push(
-			...itemFiles.filter((item) =>
-				['doc', 'text', 'file', 'note', 'chat', 'folder', 'collection'].includes(item.type)
-			)
-		);
-		chatFiles = chatFiles.filter(
-			(item, index, array) =>
-				array.findIndex((i) => JSON.stringify(i) === JSON.stringify(item)) === index
-		);
-
-		// Build the user message from the snapshot. Parented to the current
-		// head of the chat so the queued message lands right after the just-
-		// completed assistant turn (which is what the user expected when they
-		// pressed Enter).
-		const messages = createMessagesList(history, history.currentId);
-		const userMessageId = uuidv4();
-		// If the user @-mentioned a specific model at queue time, the user
-		// message records THAT model only — mirrors submitPrompt's normal path
-		// where `models: selectedModels` reflects atSelectedModel's effect.
-		const messageModels = next.atSelectedModelId ? [next.atSelectedModelId] : selectedModels;
-		const userMessage = {
-			id: userMessageId,
-			parentId: messages.length !== 0 ? messages.at(-1).id : null,
-			childrenIds: [],
-			role: 'user',
-			content: next.prompt,
-			files: itemFiles.length > 0 ? itemFiles : undefined,
-			timestamp: Math.floor(Date.now() / 1000),
-			models: messageModels
-		};
-		history.messages[userMessageId] = userMessage;
-		history.currentId = userMessageId;
-		if (messages.length !== 0) {
-			history.messages[messages.at(-1).id].childrenIds.push(userMessageId);
-		}
-
-		await tick();
-
-		// `newChat: true` is fine: sendMessage only fires initChatHandler when
-		// the message has no parent, which only happens on the very first send
-		// in a chat. Queued sends always have a parent (the just-completed
-		// assistant turn).
-		//
-		// If the queued message had no @-mention, the user might have set one
-		// AFTER queueing (for their next manual send). sendMessage prefers
-		// atSelectedModel over selectedModels when modelId isn't passed, so
-		// that stale @-mention would leak in and route the queued send to the
-		// wrong model. Temporarily detach atSelectedModel for the duration of
-		// the call.
-		const restoreAtSelected = !next.atSelectedModelId ? atSelectedModel : undefined;
-		if (!next.atSelectedModelId) atSelectedModel = undefined;
+		queueSending = true;
+		let allowFollowUpDrain = false;
 		try {
-			await sendMessage(history, userMessageId, {
-				newChat: true,
-				...(next.atSelectedModelId ? { modelId: next.atSelectedModelId } : {})
-			});
+			const next = queue[0];
+			queue = queue.slice(1);
+
+			try {
+				await persistQueue();
+				allowFollowUpDrain = true;
+			} catch (error) {
+				queue = [next, ...queue];
+				console.error('Failed to persist queued message removal before send', error);
+				toast.error($i18n.t('Failed to send queued message. Please try again.'));
+				return;
+			}
+
+			const itemFiles = Array.isArray(next.files) ? structuredClone(next.files) : [];
+
+			// Validate model selection is still sensible. If selected models drifted
+			// to invalid ids (model deleted, etc.), drop the queued send rather than
+			// silently failing in sendMessage.
+			const _selectedModels = selectedModels.map((modelId) =>
+				$models.map((m) => m.id).includes(modelId) ? modelId : ''
+			);
+			if (!arraysEqual(selectedModels, _selectedModels)) {
+				selectedModels = _selectedModels;
+			}
+			if (selectedModels.includes('')) {
+				toast.error($i18n.t('Model not selected — queued message dropped'));
+				return;
+			}
+
+			// Mirror submitPrompt's chatFiles accumulation: move text-extraction
+			// kinds onto the chat-wide files list so subsequent turns see them.
+			chatFiles.push(
+				...itemFiles.filter((item) =>
+					['doc', 'text', 'file', 'note', 'chat', 'folder', 'collection'].includes(item.type)
+				)
+			);
+			chatFiles = chatFiles.filter(
+				(item, index, array) =>
+					array.findIndex((i) => JSON.stringify(i) === JSON.stringify(item)) === index
+			);
+
+			// Build the user message from the snapshot. Parented to the current
+			// head of the chat so the queued message lands right after the just-
+			// completed assistant turn (which is what the user expected when they
+			// pressed Enter).
+			const messages = createMessagesList(history, history.currentId);
+			const userMessageId = uuidv4();
+			// If the user @-mentioned a specific model at queue time, the user
+			// message records THAT model only — mirrors submitPrompt's normal path
+			// where `models: selectedModels` reflects atSelectedModel's effect.
+			const messageModels = next.atSelectedModelId ? [next.atSelectedModelId] : selectedModels;
+			const userMessage = {
+				id: userMessageId,
+				parentId: messages.length !== 0 ? messages.at(-1).id : null,
+				childrenIds: [],
+				role: 'user',
+				content: next.prompt,
+				files: itemFiles.length > 0 ? itemFiles : undefined,
+				timestamp: Math.floor(Date.now() / 1000),
+				models: messageModels
+			};
+			history.messages[userMessageId] = userMessage;
+			history.currentId = userMessageId;
+			if (messages.length !== 0) {
+				history.messages[messages.at(-1).id].childrenIds.push(userMessageId);
+			}
+
+			await tick();
+
+			// `newChat: true` is fine: sendMessage only fires initChatHandler when
+			// the message has no parent, which only happens on the very first send
+			// in a chat. Queued sends always have a parent (the just-completed
+			// assistant turn).
+			//
+			// If the queued message had no @-mention, the user might have set one
+			// AFTER queueing (for their next manual send). sendMessage prefers
+			// atSelectedModel over selectedModels when modelId isn't passed, so
+			// that stale @-mention would leak in and route the queued send to the
+			// wrong model. Temporarily detach atSelectedModel for the duration of
+			// the call.
+			const restoreAtSelected = !next.atSelectedModelId ? atSelectedModel : undefined;
+			if (!next.atSelectedModelId) atSelectedModel = undefined;
+			try {
+				await sendMessage(history, userMessageId, {
+					newChat: true,
+					...(next.atSelectedModelId ? { modelId: next.atSelectedModelId } : {})
+				});
+			} finally {
+				if (restoreAtSelected !== undefined) atSelectedModel = restoreAtSelected;
+			}
 		} finally {
-			if (restoreAtSelected !== undefined) atSelectedModel = restoreAtSelected;
+			queueSending = false;
+			await tick();
+			const lastMsg = history?.currentId ? history.messages[history.currentId] : null;
+			const finishedCleanly = lastMsg?.done === true && !lastMsg?.error;
+			if (
+				allowFollowUpDrain &&
+				!isServerDrainChat() &&
+				queue.length > 0 &&
+				!generating &&
+				$isLastActiveTab &&
+				!loading &&
+				finishedCleanly &&
+				!userInitiatedStop
+			) {
+				void dequeueAndSend();
+			}
 		}
 	};
 
-	// Falling-edge watcher: when `generating` transitions from true to false
-	// and the just-completed response landed cleanly (done=true, no error,
-	// not user-stopped), auto-send the head of the queue. Gated on
-	// $isLastActiveTab so that opening the same chat in two tabs doesn't fire
-	// two sends.
+	// Falling-edge watcher: TEMP/LOCAL CHATS ONLY. DB-backed chats are drained
+	// server-side (the backend pops the queue on clean completion and starts the
+	// next generation, surviving reloads / closed tabs), so this client-side
+	// fallback would double-send for them. Temp chats have no DB queue, so they
+	// still need this: when `generating` goes true→false and the response landed
+	// cleanly, auto-send the head of the queue. Gated on $isLastActiveTab so two
+	// tabs don't both fire.
 	$: {
 		const justFinished = _wasGenerating && !generating;
 		_wasGenerating = generating;
-		if (justFinished && queue.length > 0 && $isLastActiveTab && !loading) {
+		if (
+			justFinished &&
+			!isServerDrainChat() &&
+			queue.length > 0 &&
+			!queueSending &&
+			$isLastActiveTab &&
+			!loading
+		) {
 			const lastMsg = history?.currentId ? history.messages[history.currentId] : null;
 			const finishedCleanly = lastMsg?.done === true && !lastMsg?.error;
 			if (finishedCleanly && !userInitiatedStop) {
@@ -7290,6 +8098,19 @@
 			arr ? [...arr].map(patch).sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)) : arr
 		);
 		pinnedChats.update((arr) => (arr ? arr.map(patch) : arr));
+	};
+
+	const invalidateFolderChatLists = (
+		folderIds: Array<string | null | undefined>,
+		reason: string
+	) => {
+		const ids = Array.from(new Set(folderIds.filter((id): id is string => !!id)));
+		if (ids.length === 0) return;
+		folderChatListInvalidation.update((state) => ({
+			folderIds: ids,
+			seq: state.seq + 1,
+			reason
+		}));
 	};
 
 	const saveChatHandler = async (
@@ -7359,6 +8180,7 @@
 		const updatedAt = res?.updated_at;
 		if (updatedAt != null) {
 			patchSidebarUpdatedAt(_chatId, updatedAt);
+			invalidateFolderChatLists([chat?.folder_id], 'chat:updated:origin');
 		}
 	};
 
@@ -7391,6 +8213,11 @@
 
 	const moveChatHandler = async (chatId, folderId) => {
 		if (chatId && folderId) {
+			const previousFolderId =
+				get(chats)?.find((c) => c.id === chatId)?.folder_id ??
+				get(pinnedChats)?.find((c) => c.id === chatId)?.folder_id ??
+				chat?.folder_id ??
+				null;
 			const res = await updateChatFolderIdById(localStorage.token, chatId, folderId).catch(
 				(error) => {
 					toast.error(`${error}`);
@@ -7405,6 +8232,7 @@
 				pinnedChats.update((arr) =>
 					arr.map((c) => (c.id === chatId ? { ...c, folder_id: folderId } : c))
 				);
+				invalidateFolderChatLists([previousFolderId, folderId], 'chat:folder:origin');
 
 				toast.success($i18n.t('Chat moved successfully'));
 			}
@@ -7585,13 +8413,26 @@
 								style="overflow-anchor: none;"
 								bind:this={messagesContainerElement}
 								on:scroll={onScroll}
+								on:subagent:expand={() => {
+									// User expanded a subagent card to read it — stop following
+									// the stream so the ResizeObserver / auto-scroll doesn't yank
+									// the viewport to the bottom as the body (and any ongoing
+									// generation) grows the page.
+									autoScroll = false;
+								}}
 							>
-								<div class=" h-full w-full flex flex-col" bind:this={messagesContentElement}>
+								<div
+									class=" h-full w-full flex flex-col"
+									style="opacity: {messagesReady ? 1 : 0}; transition: opacity 80ms ease;"
+									bind:this={messagesContentElement}
+								>
 									<Messages
 										chatId={activeChatId}
 										bind:history
+										structureRevision={messageStructureRevision}
 										bind:autoScroll
 										allowPagination={initialScrollSettled}
+										scrollReady={messagesReady}
 										bind:prompt
 										setInputText={(text) => {
 											messageInput?.setText(text);
@@ -7662,6 +8503,7 @@
 									{history}
 									{taskIds}
 									{selectedModels}
+									onSelectionTouched={markToolSelectionDirty}
 									bind:files
 									bind:prompt
 									bind:autoScroll
@@ -7713,6 +8555,20 @@
 											submitPrompt(e.detail.replaceAll('\n\n', '\n'));
 										}
 									}}
+									on:steer={async (e) => {
+										clearDraft(getDraftChatId());
+										if (e.detail || files.length > 0) {
+											await tick();
+											steerMessage(e.detail.replaceAll('\n\n', '\n'));
+										}
+									}}
+									on:queueAfterFinal={async (e) => {
+										clearDraft(getDraftChatId());
+										if (e.detail || files.length > 0) {
+											await tick();
+											enqueueMessage(e.detail.replaceAll('\n\n', '\n'));
+										}
+									}}
 								/>
 
 								<div
@@ -7727,6 +8583,7 @@
 									{relevantGroups}
 									{history}
 									{selectedModels}
+									onSelectionTouched={markToolSelectionDirty}
 									bind:messageInput
 									bind:files
 									bind:prompt

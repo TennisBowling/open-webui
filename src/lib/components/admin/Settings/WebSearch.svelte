@@ -18,6 +18,12 @@
 
 	// Exa powers search result discovery.
 	let exaApiKey = '';
+	let exaApiKey2 = '';
+	// Per-key health from the backend: { "1": { error, at }, "2": {...} }.
+	// An absent slot means the key is healthy. Editing/clearing a key locally
+	// drops its slot so the badge disappears immediately; the backend also clears
+	// a slot when its key value changes on save.
+	let exaKeyStatus: Record<string, { error?: string; at?: number }> = {};
 	let exaNumResults = 10;
 	let exaSearchType = 'auto';
 	let exaIncludeDomains = '';
@@ -60,6 +66,34 @@
 		return Number.isFinite(parsed) ? parsed : fallback;
 	};
 
+	// Track the key values as loaded so we can drop a key's error badge the
+	// moment the admin edits that key (a rotated key hasn't failed yet).
+	let loadedExaApiKey = '';
+	let loadedExaApiKey2 = '';
+
+	$: if (exaApiKey !== loadedExaApiKey && exaKeyStatus['1']) {
+		const { ['1']: _omit, ...rest } = exaKeyStatus;
+		exaKeyStatus = rest;
+	}
+	$: if (exaApiKey2 !== loadedExaApiKey2 && exaKeyStatus['2']) {
+		const { ['2']: _omit, ...rest } = exaKeyStatus;
+		exaKeyStatus = rest;
+	}
+
+	const clearExaKeyStatus = (slot: string) => {
+		const { [slot]: _omit, ...rest } = exaKeyStatus;
+		exaKeyStatus = rest;
+	};
+
+	const formatStatusTime = (at?: number) => {
+		if (!at) return '';
+		try {
+			return new Date(at * 1000).toLocaleString();
+		} catch {
+			return '';
+		}
+	};
+
 	const submitHandler = async () => {
 		// Convert domain strings to arrays
 		const includeDomains = exaIncludeDomains
@@ -79,6 +113,8 @@
 			web: {
 				ENABLE_WEB_SEARCH: enableWebSearch,
 				EXA_API_KEY: exaApiKey,
+				EXA_API_KEY_2: exaApiKey2,
+				EXA_KEY_STATUS: exaKeyStatus,
 				EXA_SEARCH_NUM_RESULTS: toNumber(exaNumResults, 10),
 				EXA_SEARCH_TYPE: exaSearchType,
 				EXA_INCLUDE_DOMAINS: includeDomains,
@@ -105,6 +141,11 @@
 			loadedJinaApiKey = jinaApiKey;
 			loadedJinaReaderTokenUsage = Math.max(0, Math.floor(toNumber(jinaReaderTokenUsage, 0)));
 			lastObservedJinaApiKey = jinaApiKey;
+			loadedExaApiKey = exaApiKey;
+			loadedExaApiKey2 = exaApiKey2;
+			if (res.web && res.web.EXA_KEY_STATUS) {
+				exaKeyStatus = res.web.EXA_KEY_STATUS;
+			}
 			toast.success($i18n.t('Settings saved successfully'));
 		}
 	};
@@ -115,6 +156,10 @@
 		if (res && res.web) {
 			enableWebSearch = res.web.ENABLE_WEB_SEARCH ?? false;
 			exaApiKey = res.web.EXA_API_KEY ?? '';
+			exaApiKey2 = res.web.EXA_API_KEY_2 ?? '';
+			exaKeyStatus = res.web.EXA_KEY_STATUS ?? {};
+			loadedExaApiKey = exaApiKey;
+			loadedExaApiKey2 = exaApiKey2;
 			exaNumResults = res.web.EXA_SEARCH_NUM_RESULTS ?? 10;
 			exaSearchType = res.web.EXA_SEARCH_TYPE ?? 'auto';
 			exaIncludeDomains = (res.web.EXA_INCLUDE_DOMAINS ?? []).join(', ');
@@ -174,6 +219,69 @@
 								bind:value={exaApiKey}
 								required
 							/>
+
+							{#if exaKeyStatus['1']}
+								<div
+									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
+								>
+									<div class="min-w-0">
+										<span class="font-medium">{$i18n.t('Errors received for this key')}</span>
+										{#if exaKeyStatus['1'].error}
+											<span class="opacity-90"> · {exaKeyStatus['1'].error}</span>
+										{/if}
+										{#if formatStatusTime(exaKeyStatus['1'].at)}
+											<span class="opacity-70"> · {formatStatusTime(exaKeyStatus['1'].at)}</span>
+										{/if}
+									</div>
+									<button
+										type="button"
+										class="shrink-0 font-medium underline-offset-2 hover:underline"
+										on:click={() => clearExaKeyStatus('1')}
+									>
+										{$i18n.t('Clear')}
+									</button>
+								</div>
+							{/if}
+						</div>
+
+						<div class="mb-2.5 flex w-full flex-col">
+							<div class=" self-center text-xs font-medium mb-1">
+								<Tooltip
+									content={$i18n.t(
+										'Optional fallback key. web_search automatically switches to this when the primary key returns a credit/auth error.'
+									)}
+								>
+									{$i18n.t('Exa API Key 2 (fallback)')}
+								</Tooltip>
+							</div>
+
+							<SensitiveInput
+								placeholder={$i18n.t('Enter fallback Exa API Key (optional)')}
+								bind:value={exaApiKey2}
+							/>
+
+							{#if exaKeyStatus['2']}
+								<div
+									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
+								>
+									<div class="min-w-0">
+										<span class="font-medium">{$i18n.t('Errors received for this key')}</span>
+										{#if exaKeyStatus['2'].error}
+											<span class="opacity-90"> · {exaKeyStatus['2'].error}</span>
+										{/if}
+										{#if formatStatusTime(exaKeyStatus['2'].at)}
+											<span class="opacity-70"> · {formatStatusTime(exaKeyStatus['2'].at)}</span>
+										{/if}
+									</div>
+									<button
+										type="button"
+										class="shrink-0 font-medium underline-offset-2 hover:underline"
+										on:click={() => clearExaKeyStatus('2')}
+									>
+										{$i18n.t('Clear')}
+									</button>
+								</div>
+							{/if}
 						</div>
 
 						<div class="mb-2.5 flex w-full flex-col">

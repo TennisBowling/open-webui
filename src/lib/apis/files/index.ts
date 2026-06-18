@@ -413,6 +413,86 @@ export const getFileContentById = async (id: string) => {
 	return res;
 };
 
+// Authenticated image loading.
+//
+// A bare <img src="/api/v1/files/{id}/content"> can only authenticate via the
+// HttpOnly `token` cookie, which is frequently absent on reverse-proxy /
+// separate-domain / iOS-PWA / Safari-ITP deployments — producing the broken
+// "blue square with a ?" placeholder. The rest of the app authenticates with an
+// `Authorization: Bearer` header, which <img> cannot send. These helpers fetch
+// the bytes with the Bearer header and hand back an object URL that <img> can
+// render unconditionally.
+//
+// The object URL is cached per file id at module scope so the same image shown
+// in the composer, message history, and the lightbox is fetched once, and so
+// streaming re-renders reuse it instead of refetching. In-flight requests are
+// deduped so N concurrent mounts share a single network round-trip.
+const fileObjectUrlCache = new Map<string, string>();
+const fileObjectUrlInflight = new Map<string, Promise<string>>();
+
+export const getFileObjectUrlById = async (
+	token: string,
+	id: string,
+	signal?: AbortSignal
+): Promise<string> => {
+	const cached = fileObjectUrlCache.get(id);
+	if (cached) return cached;
+
+	if (signal?.aborted) {
+		throw new DOMException('Image load aborted', 'AbortError');
+	}
+
+	// The shared network fetch intentionally runs WITHOUT any single caller's
+	// abort signal: when several components show the same image, one unmounting
+	// must not cancel the request the others are still waiting on. The fetch
+	// always completes and populates the cache (a useful side effect).
+	let shared = fileObjectUrlInflight.get(id);
+	if (!shared) {
+		shared = (async () => {
+			const res = await fetch(`${WEBUI_API_BASE_URL}/files/${id}/content`, {
+				method: 'GET',
+				headers: {
+					...(token && { authorization: `Bearer ${token}` })
+				}
+			});
+			if (!res.ok) {
+				throw new Error(`Failed to load image (HTTP ${res.status})`);
+			}
+			const objectUrl = URL.createObjectURL(await res.blob());
+			fileObjectUrlCache.set(id, objectUrl);
+			return objectUrl;
+		})();
+
+		fileObjectUrlInflight.set(id, shared);
+		shared.finally(() => {
+			if (fileObjectUrlInflight.get(id) === shared) {
+				fileObjectUrlInflight.delete(id);
+			}
+		});
+	}
+
+	// Each caller can independently give up via its own signal without killing
+	// the shared fetch for the others.
+	if (!signal) {
+		return shared;
+	}
+	return new Promise<string>((resolve, reject) => {
+		const onAbort = () => reject(new DOMException('Image load aborted', 'AbortError'));
+		signal.addEventListener('abort', onAbort, { once: true });
+		shared!.then(resolve, reject).finally(() => {
+			signal.removeEventListener('abort', onAbort);
+		});
+	});
+};
+
+export const revokeFileObjectUrlById = (id: string) => {
+	const objectUrl = fileObjectUrlCache.get(id);
+	if (objectUrl) {
+		URL.revokeObjectURL(objectUrl);
+		fileObjectUrlCache.delete(id);
+	}
+};
+
 export const deleteFileById = async (token: string, id: string) => {
 	let error = null;
 

@@ -49,7 +49,7 @@
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import { settings } from '$lib/stores';
-	import { getToolCallSummary, isWebToolName } from '$lib/utils/toolResults';
+	import { getToolCallSummary, isRichToolName } from '$lib/utils/toolResults';
 
 	export let open = false;
 
@@ -69,19 +69,41 @@
 
 	export let onChange: Function = () => {};
 
+	let reasoningUserToggled = false;
+	let reasoningIdentity = '';
+
+	$: {
+		const nextReasoningIdentity = attributes?.type === 'reasoning' ? `${id}:reasoning` : '';
+		if (nextReasoningIdentity !== reasoningIdentity) {
+			reasoningIdentity = nextReasoningIdentity;
+			reasoningUserToggled = false;
+		}
+	}
+
 	$: onChange(open);
 
 	// Auto-expand reasoning blocks during streaming when setting is enabled
-	$: if (attributes?.type === 'reasoning' && $settings?.autoExpandReasoningDuringStreaming) {
-		// Expand while streaming, collapse when done
+	$: if (
+		attributes?.type === 'reasoning' &&
+		$settings?.autoExpandReasoningDuringStreaming &&
+		!reasoningUserToggled
+	) {
+		// Expand while streaming, collapse when done only until the user chooses.
 		open = attributes?.done !== 'true';
+	}
+
+	function setOpenFromUser(nextOpen: boolean) {
+		if (attributes?.type === 'reasoning') {
+			reasoningUserToggled = true;
+		}
+		open = nextOpen;
 	}
 
 	const collapsibleId = uuidv4();
 	const loadToolCallResult = loadToolCallResultModule;
 
 	function preloadToolCallResult() {
-		if (isWebToolName(attributes?.name)) {
+		if (isRichToolName(attributes?.name)) {
 			void loadToolCallResult();
 		}
 	}
@@ -90,7 +112,7 @@
 		if (disabled) return;
 
 		if (open) {
-			open = false;
+			setOpenFromUser(false);
 			return;
 		}
 
@@ -98,7 +120,7 @@
 		// trees. If the slide transition starts while the chunk is still resolving,
 		// it measures the tiny loading shell and then visibly grows a second time.
 		// Resolve the chunk before opening so the transition measures the real body.
-		if (isWebToolName(attributes?.name)) {
+		if (isRichToolName(attributes?.name)) {
 			try {
 				await loadToolCallResult();
 			} catch {
@@ -106,11 +128,11 @@
 			}
 		}
 
-		open = true;
+		setOpenFromUser(true);
 	}
 
 	onMount(() => {
-		if (!isWebToolName(attributes?.name)) return;
+		if (!isRichToolName(attributes?.name)) return;
 
 		const idleWindow = window as any;
 		if (typeof idleWindow.requestIdleCallback === 'function') {
@@ -163,6 +185,9 @@
 		{@const embeds = parseJSONString(decode(attributes?.embeds ?? ''))}
 		{@const summary = parseJSONString(decode(attributes?.summary ?? ''))}
 		{@const toolDone = attributes?.done === 'true'}
+		{@const toolErrored = toolDone && attributes?.error === 'true'}
+		{@const toolErrorReason = decode(attributes?.error_reason ?? '')}
+		{@const toolNotice = !toolErrored && toolDone ? decode(attributes?.notice ?? '') : ''}
 		{@const toolSummary = getToolCallSummary(
 			attributes?.name ?? '',
 			args,
@@ -211,35 +236,80 @@
 						</div>
 					{/if}
 
-					<div class="min-w-0">
-						{#if isWebToolName(attributes?.name)}
-							<div class="min-w-0 text-left">
-								<div class="flex min-w-0 items-center gap-1.5">
-									<span class="truncate text-gray-700 dark:text-gray-300">{toolSummary.title}</span>
-								</div>
-								{#if toolSummary.subtitle}
-									<div class="mt-0.5 truncate text-xs font-normal text-gray-500 dark:text-gray-500">
-										{toolSummary.subtitle}
-									</div>
-								{/if}
-							</div>
-						{:else if attributes?.done === 'true'}
-							<Markdown
-								id={`${collapsibleId}-tool-calls-${attributes?.id}`}
-								parseImmediately={true}
-								content={$i18n.t('View Result from **{{NAME}}**', {
-									NAME: attributes.name
-								})}
-							/>
-						{:else}
-							<Markdown
-								id={`${collapsibleId}-tool-calls-${attributes?.id}-executing`}
-								parseImmediately={true}
-								content={$i18n.t('Executing **{{NAME}}**...', {
-									NAME: attributes.name
-								})}
-							/>
+					<div class="min-w-0 flex items-start gap-1.5">
+						{#if toolErrored}
+							<!-- circle-slash: tool call failed; visible without expanding -->
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 20 20"
+								fill="currentColor"
+								class="size-4 shrink-0 mt-0.5 text-red-600 dark:text-red-400"
+								aria-hidden="true"
+							>
+								<path
+									fill-rule="evenodd"
+									d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16ZM5.5 5.5l9 9-1 1-9-9 1-1Z"
+									clip-rule="evenodd"
+								/>
+							</svg>
 						{/if}
+						<div class="min-w-0">
+							{#if isRichToolName(attributes?.name)}
+								<div class="min-w-0 text-left">
+									<div class="flex min-w-0 items-center gap-1.5">
+										<span
+											class="truncate {toolErrored
+												? 'text-red-600 dark:text-red-400'
+												: 'text-gray-700 dark:text-gray-300'}">{toolSummary.title}</span
+										>
+									</div>
+									{#if toolSummary.subtitle}
+										<div class="mt-0.5 truncate text-xs font-normal text-gray-500 dark:text-gray-500">
+											{toolSummary.subtitle}
+										</div>
+									{/if}
+								</div>
+							{:else if attributes?.done === 'true'}
+								<div class={toolErrored ? 'text-red-600 dark:text-red-400' : ''}>
+									<Markdown
+										id={`${collapsibleId}-tool-calls-${attributes?.id}`}
+										parseImmediately={true}
+										content={toolErrored
+											? $i18n.t('Error from **{{NAME}}**', { NAME: attributes.name })
+											: $i18n.t('View Result from **{{NAME}}**', {
+													NAME: attributes.name
+												})}
+									/>
+								</div>
+							{:else}
+								<Markdown
+									id={`${collapsibleId}-tool-calls-${attributes?.id}-executing`}
+									parseImmediately={true}
+									content={$i18n.t('Executing **{{NAME}}**...', {
+										NAME: attributes.name
+									})}
+								/>
+							{/if}
+
+							{#if toolErrored}
+								<div
+									class="mt-0.5 truncate text-xs font-normal text-red-600 dark:text-red-400"
+									title={toolErrorReason}
+								>
+									{toolErrorReason
+										? $i18n.t('Tool error · {{REASON}}', { REASON: toolErrorReason })
+										: $i18n.t('Tool call failed')}
+								</div>
+							{:else if toolNotice}
+								<div
+									class="mt-0.5 flex items-center gap-1 truncate text-xs font-normal text-amber-600 dark:text-amber-500"
+									title={toolNotice}
+								>
+									<span aria-hidden="true">⤳</span>
+									<span class="truncate">{toolNotice}</span>
+								</div>
+							{/if}
+						</div>
 					</div>
 
 					<div class="flex self-center translate-y-[1px]">
@@ -256,7 +326,7 @@
 				{#if open && !hide}
 					<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
 						{#if attributes?.type === 'tool_calls'}
-							{#if isWebToolName(attributes?.name)}
+							{#if isRichToolName(attributes?.name)}
 								{#await loadToolCallResult()}
 									<div
 										class="my-2 overflow-hidden rounded-2xl border border-gray-100 bg-gray-50/70 text-sm dark:border-gray-800 dark:bg-gray-950/40"
@@ -273,6 +343,7 @@
 										</div>
 									</div>
 								{:then ToolCallResult}
+									{@const toolFiles = parseJSONString(decode(rawFiles))}
 									<svelte:component
 										this={ToolCallResult.default}
 										id={`${collapsibleId}-tool-calls-${attributes?.id}-result`}
@@ -284,6 +355,9 @@
 										messageId={attributes?.message_id ?? ''}
 										toolCallId={attributes?.tool_call_id ?? attributes?.id ?? ''}
 										done={toolDone}
+										files={Array.isArray(toolFiles) ? toolFiles : []}
+										error={toolErrored}
+										errorReason={toolErrorReason}
 									/>
 								{/await}
 							{:else if attributes?.done === 'true'}
@@ -313,7 +387,7 @@
 			{/if}
 		{/if}
 
-		{#if attributes?.done === 'true'}
+		{#if attributes?.done === 'true' && !isRichToolName(attributes?.name)}
 			{@const files = parseJSONString(decode(rawFiles))}
 			{#if typeof files === 'object'}
 				{#each files ?? [] as file, idx}
@@ -345,7 +419,7 @@
 				class="{buttonClassName} cursor-pointer"
 				on:pointerup={() => {
 					if (!disabled) {
-						open = !open;
+						setOpenFromUser(!open);
 					}
 				}}
 			>
@@ -403,7 +477,7 @@
 				}}
 				on:pointerup={(e) => {
 					if (!disabled) {
-						open = !open;
+						setOpenFromUser(!open);
 					}
 				}}
 			>

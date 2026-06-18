@@ -5,7 +5,7 @@ Handles queuing of chat messages when a chat is already processing a response.
 Messages are stored in Redis (if available) with in-memory fallback.
 """
 
-import json
+from open_webui.utils import fast_json as json
 import logging
 import time
 from typing import Optional, Dict, Any, List

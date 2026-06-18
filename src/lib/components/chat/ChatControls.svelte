@@ -10,6 +10,7 @@
 		showCallOverlay,
 		showOverview,
 		showArtifacts,
+		showBrowserPanel,
 		showEmbeds,
 		showFilePreview
 	} from '$lib/stores';
@@ -18,6 +19,7 @@
 	import CallOverlay from './MessageInput/CallOverlay.svelte';
 	import Drawer from '../common/Drawer.svelte';
 	import Artifacts from './Artifacts.svelte';
+	import BrowserPanel from './BrowserPanel.svelte';
 	import Embeds from './ChatControls/Embeds.svelte';
 	import FilePreview from './ChatControls/FilePreview.svelte';
 
@@ -141,6 +143,7 @@
 		showControls.set(false);
 		showOverview.set(false);
 		showArtifacts.set(false);
+		showBrowserPanel.set(false);
 		showEmbeds.set(false);
 		showFilePreview.set(false);
 
@@ -187,6 +190,8 @@
 					<Embeds />
 				{:else if $showFilePreview}
 					<FilePreview />
+				{:else if $showBrowserPanel}
+					<BrowserPanel {history} />
 				{:else if $showArtifacts}
 					<Artifacts {history} {chatId} />
 				{:else if $showOverview}
@@ -279,6 +284,8 @@
 						<Embeds overlay={dragged} />
 					{:else if $showFilePreview}
 						<FilePreview />
+					{:else if $showBrowserPanel}
+						<BrowserPanel {history} />
 					{:else if $showArtifacts}
 						<Artifacts {history} {chatId} overlay={dragged} />
 					{:else if $showOverview}

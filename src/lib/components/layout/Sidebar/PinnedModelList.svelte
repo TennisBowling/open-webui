@@ -9,6 +9,7 @@
 	import PinnedModelItem from './PinnedModelItem.svelte';
 
 	export let selectedChatId = null;
+	export let pendingChatId = null;
 	export let shiftKey = false;
 
 	const initPinnedModelsSortable = () => {
@@ -47,6 +48,7 @@
 				{shiftKey}
 				onClick={() => {
 					selectedChatId = null;
+					pendingChatId = null;
 					chatId.set('');
 					if ($mobile) {
 						showSidebar.set(false);

@@ -109,10 +109,25 @@ async def create_task(redis, coroutine, id=None):
     task_id = str(uuid4())  # Generate a unique ID for the task
     task = asyncio.create_task(coroutine)  # Create the task
 
-    # Add a done callback for cleanup
-    task.add_done_callback(
-        lambda t: asyncio.create_task(cleanup_task(redis, task_id, id))
-    )
+    # Add a done callback for cleanup. Also surface a non-cancellation failure:
+    # otherwise an exception in a detached task (e.g. a headless queue-drain
+    # generation) vanishes silently, leaving callers to wonder why nothing ran.
+    def _on_task_done(t: asyncio.Task):
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            exc = None
+        if exc is not None:
+            log.error(
+                "background task %s (id=%s) failed: %r",
+                task_id,
+                id,
+                exc,
+                exc_info=exc,
+            )
+        asyncio.create_task(cleanup_task(redis, task_id, id))
+
+    task.add_done_callback(_on_task_done)
     tasks[task_id] = task
 
     # If an ID is provided, associate the task with that ID

@@ -1,6 +1,6 @@
 import copy
 import logging
-import json
+from open_webui.utils import fast_json as json
 import time
 import uuid
 from typing import Optional
@@ -1446,6 +1446,281 @@ class ChatTable:
             self.add_chat_tag_by_id_and_user_id_and_tag_name(id, user.id, tag_name)
         return self.get_chat_by_id(id)
 
+    # --- Message queue (autonomous server-driven drain) --------------------
+    # The follow-up message queue lives at chat.chat["queue"] (a list of
+    # self-contained send specs) and an in-flight marker at
+    # chat.chat["draining"]. These helpers do targeted blob-field writes that
+    # do NOT touch the chat_message table, mirroring update_chat_title_by_id,
+    # so they are O(1) regardless of chat size. Callers serialize concurrent
+    # access with a per-chat lock (see utils/chat_queue.py); these methods only
+    # guarantee a consistent single read-modify-write of the JSON body.
+
+    def _write_queue_fields(
+        self, db, id: str, chat_item, queue: list, draining
+    ) -> None:
+        """Persist queue + draining onto the chat blob without re-syncing the
+        message table. SQLite uses json_set; other dialects round-trip the
+        dict (rare)."""
+        if db.bind.dialect.name == "sqlite":
+            db.execute(
+                text(
+                    "UPDATE chat SET "
+                    "  chat = json_set("
+                    "    json_set(chat, '$.queue', json(:q)), "
+                    "    '$.draining', json(:d)"
+                    "  ) "
+                    "WHERE id = :id"
+                ),
+                {
+                    "q": json.dumps(queue if isinstance(queue, list) else []),
+                    "d": json.dumps(draining),
+                    "id": id,
+                },
+            )
+            db.commit()
+            db.refresh(chat_item)
+        else:
+            cur = (
+                copy.deepcopy(chat_item.chat)
+                if isinstance(chat_item.chat, dict)
+                else {}
+            )
+            cur["queue"] = queue if isinstance(queue, list) else []
+            cur["draining"] = draining
+            chat_item.chat = cur
+            db.commit()
+            db.refresh(chat_item)
+
+    def get_queue_state_by_id(self, id: str) -> Optional[dict]:
+        """Return {"queue": [...], "draining": <marker|None>} for a chat, or
+        None if the chat doesn't exist. Reads the raw blob without hydrating
+        the message table."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                return {
+                    "queue": queue if isinstance(queue, list) else [],
+                    "draining": blob.get("draining"),
+                }
+        except Exception:
+            return None
+
+    def append_queue_item_by_id(self, id: str, item: dict) -> Optional[dict]:
+        """Atomically append one item to the queue (read-modify-write of the
+        blob). Avoids the whole-array clobber two tabs would cause with
+        set_queue. Returns the new queue state."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                queue = list(queue) if isinstance(queue, list) else []
+                queue.append(item)
+                self._write_queue_fields(
+                    db, id, chat_item, queue, blob.get("draining")
+                )
+                return {"queue": queue, "draining": blob.get("draining")}
+        except Exception:
+            log.exception("append_queue_item_by_id failed for %s", id)
+            return None
+
+    def remove_queue_item_by_id(self, id: str, item_id: str) -> Optional[dict]:
+        """Atomically remove a queue item by its id. Returns the new queue
+        state."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                queue = [
+                    q
+                    for q in (queue if isinstance(queue, list) else [])
+                    if isinstance(q, dict) and q.get("id") != item_id
+                ]
+                self._write_queue_fields(
+                    db, id, chat_item, queue, blob.get("draining")
+                )
+                return {"queue": queue, "draining": blob.get("draining")}
+        except Exception:
+            log.exception("remove_queue_item_by_id failed for %s", id)
+            return None
+
+    def pop_steer_items_by_id(self, id: str) -> list[dict]:
+        """Atomically remove and return the queue items marked as steering
+        (``mode == "steer"``), leaving every other item (``after_final``, or
+        unmarked legacy items) in place and in order.
+
+        Steering items are consumed by the agentic loop at a tool-call boundary
+        (utils/middleware.py) to inject a mid-task user turn — NOT by the
+        post-completion drain. Returning them in queue order preserves the order
+        the user sent multiple rapid steers. The ``draining`` marker is left
+        untouched: steering is orthogonal to drain ownership.
+
+        Returns the popped steer items (possibly empty). Never raises — a failure
+        here must not break the generation that polls it each round.
+        """
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return []
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                queue = list(queue) if isinstance(queue, list) else []
+                steer = [
+                    q
+                    for q in queue
+                    if isinstance(q, dict) and q.get("mode") == "steer"
+                ]
+                if not steer:
+                    return []
+                remaining = [
+                    q
+                    for q in queue
+                    if not (isinstance(q, dict) and q.get("mode") == "steer")
+                ]
+                self._write_queue_fields(
+                    db, id, chat_item, remaining, blob.get("draining")
+                )
+                return steer
+        except Exception:
+            log.exception("pop_steer_items_by_id failed for %s", id)
+            return []
+
+    def convert_steer_items_to_after_final_by_id(self, id: str) -> int:
+        """Re-tag any queued ``mode == "steer"`` items as ``after_final`` in
+        place (order preserved), returning the count converted.
+
+        Called when a generation is STOPPED/cancelled mid-flight: a steer was
+        meant to be injected at a tool-call boundary of *that* response, but the
+        response is over. Rather than (a) silently dropping the user's typed text
+        or (b) leaving it as a steer that would leak into whatever UNRELATED
+        response runs next, we downgrade it to a normal follow-up — the same
+        place an unconsumed steer lands when the model simply finishes with no
+        further tools. The user sees it as a pending follow-up they can edit or
+        remove. Never raises."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return 0
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                queue = list(queue) if isinstance(queue, list) else []
+                converted = 0
+                new_queue = []
+                for q in queue:
+                    if isinstance(q, dict) and q.get("mode") == "steer":
+                        q = {**q, "mode": "after_final"}
+                        converted += 1
+                    new_queue.append(q)
+                if converted:
+                    self._write_queue_fields(
+                        db, id, chat_item, new_queue, blob.get("draining")
+                    )
+                return converted
+        except Exception:
+            log.exception(
+                "convert_steer_items_to_after_final_by_id failed for %s", id
+            )
+            return 0
+
+    def pop_queue_head_and_mark_draining_by_id(
+        self, id: str, draining_marker_builder, expected_finished_response_id=None
+    ) -> Optional[dict]:
+        """Atomically advance the queue for a finishing generation.
+
+        Ownership rule (single read-modify-write transaction):
+
+        * If a ``draining`` marker exists AND it belongs to a DIFFERENT in-flight
+          generation (``response_message_id`` != ``expected_finished_response_id``),
+          do nothing — another generation owns the chat right now. This is the
+          idempotency guard: a duplicate/stale completion of an already-superseded
+          turn cannot pop a second item.
+        * Otherwise (no marker, or the marker is the finishing generation's own),
+          the finishing generation is allowed to advance: pop the head item, set a
+          fresh marker via ``draining_marker_builder(item)``, and persist. If the
+          queue is empty, clear the marker instead.
+
+        Cross-worker serialization is the caller's job (a per-chat Redis lock);
+        this method only guarantees a consistent single-connection RMW.
+
+        Returns {"item": <popped|None>, "queue": [...], "draining": <marker|None>}.
+        ``item`` is None when nothing was popped.
+        """
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                draining = blob.get("draining")
+                queue = blob.get("queue")
+                queue = list(queue) if isinstance(queue, list) else []
+
+                # A marker owned by a different in-flight generation → bail.
+                if (
+                    isinstance(draining, dict)
+                    and draining.get("response_message_id")
+                    != expected_finished_response_id
+                ):
+                    return {"item": None, "queue": queue, "draining": draining}
+
+                if not queue:
+                    # Nothing to start next. Clear our own marker (if any) so the
+                    # chat isn't left flagged as draining.
+                    if draining is not None:
+                        self._write_queue_fields(db, id, chat_item, queue, None)
+                    return {"item": None, "queue": [], "draining": None}
+
+                item = queue.pop(0)
+                marker = draining_marker_builder(item)
+                self._write_queue_fields(db, id, chat_item, queue, marker)
+                return {"item": item, "queue": queue, "draining": marker}
+        except Exception:
+            log.exception(
+                "pop_queue_head_and_mark_draining_by_id failed for %s", id
+            )
+            return None
+
+    def clear_draining_by_id(
+        self, id: str, expected_finished_response_id=None
+    ) -> Optional[dict]:
+        """Clear the in-flight draining marker. If ``expected_finished_response_id``
+        is given, only clear when the marker belongs to that generation (so an
+        errored/cancelled turn doesn't wipe a newer turn's marker). Idempotent.
+        Returns the new queue state."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                queue = blob.get("queue")
+                queue = list(queue) if isinstance(queue, list) else []
+                draining = blob.get("draining")
+                if (
+                    expected_finished_response_id is not None
+                    and isinstance(draining, dict)
+                    and draining.get("response_message_id")
+                    != expected_finished_response_id
+                ):
+                    # Marker belongs to a newer generation — leave it.
+                    return {"queue": queue, "draining": draining}
+                self._write_queue_fields(db, id, chat_item, queue, None)
+                return {"queue": queue, "draining": None}
+        except Exception:
+            log.exception("clear_draining_by_id failed for %s", id)
+            return None
+
     def get_chat_title_by_id(self, id: str) -> Optional[str]:
         chat = self.get_chat_by_id(id)
         if chat is None:
@@ -1498,8 +1773,21 @@ class ChatTable:
         return chat.chat.get("history", {}).get("messages", {}).get(message_id)
 
     def upsert_message_to_chat_by_id_and_message_id(
-        self, id: str, message_id: str, message: dict
+        self, id: str, message_id: str, message: dict, return_model: bool = True
     ) -> Optional[ChatModel]:
+        """Insert or merge a single message into a chat.
+
+        ``return_model=True`` (default) returns the full refreshed ``ChatModel``.
+        Building that return value requires re-reading EVERY message row and
+        re-validating the whole chat (``_hydrate_chat_messages`` →
+        ``_normalize_message_graph`` is up to O(N²)), which is pure waste on the
+        streaming/agentic hot path where the caller discards the result. The
+        agentic tool loop calls this 2× per round plus per checkpoint, so at N
+        rounds the discarded hydration is O(N²)/O(N³) of dead work. Those callers
+        pass ``return_model=False`` to commit and return ``None`` immediately.
+        Exactly one caller in the codebase (the non-streaming message-edit
+        endpoint in ``routers/chats.py``) uses the return value and keeps the
+        default."""
         # Sanitize message content for null characters before upserting
         if isinstance(message.get("content"), str):
             message["content"] = message["content"].replace("\x00", "")
@@ -1642,6 +1930,12 @@ class ChatTable:
                     db.rollback()
                     return None
 
+                if not return_model:
+                    # Hot path: skip the full re-hydration + Pydantic validation
+                    # (the caller discards the model). This is the O(N²) the
+                    # agentic loop pays per write.
+                    return None
+
                 refreshed = db.get(Chat, id)
                 _hydrate_chat_messages(db, refreshed)
                 try:
@@ -1684,6 +1978,9 @@ class ChatTable:
                     db.commit()
                 except Exception:
                     pass
+
+                if not return_model:
+                    return None
 
                 return ChatModel.model_validate(chat_obj)
             except Exception:

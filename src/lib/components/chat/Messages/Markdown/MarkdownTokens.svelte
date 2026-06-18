@@ -45,6 +45,15 @@
 		}
 	};
 
+	const normalizeReasoningDetailsText = (raw: unknown) => {
+		const text = typeof raw === 'string' ? unescapeHtml(raw) : String(raw ?? '');
+		return text
+			.split('\n')
+			.map((line) => line.replace(/^\s*>\s?/, ''))
+			.join('\n')
+			.trim();
+	};
+
 	export let id: string;
 	export let tokens: Token[];
 	export let top = true;
@@ -347,18 +356,35 @@
 			dir="auto"
 		>
 			<div class=" mb-1.5" slot="content">
-				<svelte:self
-					id={`${id}-${tokenIdx}-d`}
-					tokens={marked.lexer(token.text)}
-					attributes={token?.attributes}
-					{done}
-					{editCodeBlock}
-					{chatId}
-					{messageId}
-					{dataVizOverrides}
-					{onTaskClick}
-					{onSourceClick}
-				/>
+				{#if token?.attributes?.type === 'reasoning'}
+					<div class="text-sm text-gray-600 dark:text-gray-400">
+						<svelte:self
+							id={`${id}-${tokenIdx}-d`}
+							tokens={marked.lexer(normalizeReasoningDetailsText(token.text))}
+							attributes={token?.attributes}
+							{done}
+							{editCodeBlock}
+							{chatId}
+							{messageId}
+							{dataVizOverrides}
+							{onTaskClick}
+							{onSourceClick}
+						/>
+					</div>
+				{:else}
+					<svelte:self
+						id={`${id}-${tokenIdx}-d`}
+						tokens={marked.lexer(token.text)}
+						attributes={token?.attributes}
+						{done}
+						{editCodeBlock}
+						{chatId}
+						{messageId}
+						{dataVizOverrides}
+						{onTaskClick}
+						{onSourceClick}
+					/>
+				{/if}
 			</div>
 		</Collapsible>
 	{:else if token.type === 'html'}

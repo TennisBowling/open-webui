@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-import json
+from open_webui.utils import fast_json as json
 import logging
 from typing import Optional
 
@@ -30,6 +30,7 @@ from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
+    AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     BYPASS_MODEL_ACCESS_CONTROL,
 )
@@ -51,7 +52,7 @@ from open_webui.utils.misc import (
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
-from open_webui.socket.main import process_token_usage
+from open_webui.socket.main import broadcast_sidebar_event, process_token_usage
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
 from open_webui.storage.provider import Storage
@@ -76,11 +77,41 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OPENAI"])
 
 
+def _provider_stream_override(metadata: dict | None) -> Optional[bool]:
+    if isinstance(metadata, dict) and "provider_stream" in metadata:
+        return bool(metadata.get("provider_stream"))
+    return None
+
+
+def _apply_provider_stream_override(payload: dict, metadata: dict | None) -> Optional[bool]:
+    provider_stream = _provider_stream_override(metadata)
+    if provider_stream is None:
+        return None
+    payload["stream"] = provider_stream
+    if not provider_stream:
+        payload.pop("stream_options", None)
+    return provider_stream
+
+
+
+def _chat_row_payload(chat) -> dict:
+    return {
+        "id": chat.id,
+        "title": chat.title,
+        "updated_at": chat.updated_at,
+        "created_at": chat.created_at,
+        "pinned": bool(getattr(chat, "pinned", False) or False),
+        "archived": bool(getattr(chat, "archived", False) or False),
+        "folder_id": getattr(chat, "folder_id", None),
+    }
+
+
 ##########################################
 #
 # Utility functions
 #
 ##########################################
+
 
 def user_can_read_file(file, user: UserModel) -> bool:
     if not file or not user:
@@ -154,7 +185,9 @@ def _get_user_ui_settings(user: Optional[UserModel]) -> dict:
     return ui_settings if isinstance(ui_settings, dict) else {}
 
 
-def _get_connection_api_config(connection_configs: Optional[dict], idx: int, url: str) -> dict:
+def _get_connection_api_config(
+    connection_configs: Optional[dict], idx: int, url: str
+) -> dict:
     if not isinstance(connection_configs, dict):
         return {}
 
@@ -765,7 +798,7 @@ async def get_model_endpoints(
     bare_model_id = model_id
     prefix_id = api_config.get("prefix_id", None)
     if prefix_id and bare_model_id.startswith(f"{prefix_id}."):
-        bare_model_id = bare_model_id[len(f"{prefix_id}."):]
+        bare_model_id = bare_model_id[len(f"{prefix_id}.") :]
 
     if "/" not in bare_model_id:
         return {"data": {"endpoints": []}}
@@ -973,7 +1006,13 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
             # Clean up title similar to frontend logic
             title = title.strip().replace('"', "")
             # Update DB
-            Chats.update_chat_by_id(chat.id, {"title": title})
+            updated_chat = Chats.update_chat_title_by_id(chat.id, title)
+            if updated_chat:
+                await broadcast_sidebar_event(
+                    user.id,
+                    {"type": "chat:renamed", "data": _chat_row_payload(updated_chat)},
+                    skip_sid=request.headers.get("x-session-id"),
+                )
 
         # Tags generation (server-side parity with frontend)
         try:
@@ -1001,7 +1040,9 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
             if isinstance(tags_response, dict) and "choices" in tags_response:
                 if len(tags_response.get("choices", [])) >= 1:
                     resp_msg = tags_response["choices"][0].get("message", {})
-                    tags_string = resp_msg.get("content") or resp_msg.get("reasoning_content", "")
+                    tags_string = resp_msg.get("content") or resp_msg.get(
+                        "reasoning_content", ""
+                    )
 
             if tags_string:
                 # Extract JSON object from the model output (frontend does the same)
@@ -1014,6 +1055,14 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
                         tags = tags_json.get("tags", [])
                         if tags:
                             Chats.update_chat_tags_by_id(chat_id, tags, user)
+                            await broadcast_sidebar_event(
+                                user.id,
+                                {
+                                    "type": "chat:tags",
+                                    "data": {"id": chat_id, "tags": tags},
+                                },
+                                skip_sid=request.headers.get("x-session-id"),
+                            )
                     except Exception:
                         log.debug("Could not parse tags response")
         except Exception as e:
@@ -1021,6 +1070,93 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
 
     except Exception as e:
         log.error(f"Error generating title: {e}")
+
+
+def _image_conversion_cache(request: Request) -> dict:
+    """Per-request cache of resolved provider-ready image ``data:`` URLs.
+
+    The agentic loop re-calls ``generate_chat_completion`` once per tool round
+    with the SAME input images. Without a cache, every round re-reads each image
+    from disk and re-runs the (synchronous, CPU-heavy) PIL recompression — on the
+    event loop — re-encoding identical bytes up to N times and stalling every
+    other chat on the single worker. Keyed by content+compression params so the
+    output is byte-identical to recomputing it."""
+    cache = getattr(request.state, "_image_conversion_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            request.state._image_conversion_cache = cache
+        except Exception:
+            pass
+    return cache
+
+
+def _prepare_image_data_url_blocking(
+    raw: bytes,
+    mime_type: Optional[str],
+    filename: Optional[str],
+    *,
+    optimize: bool,
+    quality: int,
+    min_bytes: int,
+    max_dimension: int = 0,
+) -> str:
+    """Pure CPU: normalize/recompress image bytes and return a ``data:`` URL.
+    Runs in a worker thread (see callers) because PIL decode/encode is blocking."""
+    prepared, provider_mime = prepare_image_data_for_provider(
+        raw,
+        mime_type,
+        filename,
+        optimize=optimize,
+        quality=quality,
+        min_bytes=min_bytes,
+        max_dimension=max_dimension,
+    )
+    return f"data:{provider_mime};base64,{base64.b64encode(prepared).decode('utf-8')}"
+
+
+async def _resolve_local_file_image_data_url(
+    request: Request,
+    file,
+    file_path: str,
+    *,
+    optimize: bool,
+    quality: int,
+    min_bytes: int,
+    max_dimension: int = 0,
+) -> str:
+    """Resolve a local file image to a provider-ready ``data:`` URL, cached
+    per-request and with the blocking read+recompress offloaded to a thread."""
+    cache = _image_conversion_cache(request)
+    key = (
+        "file",
+        getattr(file, "id", None) or file_path,
+        optimize,
+        quality,
+        min_bytes,
+        max_dimension,
+    )
+    if key in cache:
+        return cache[key]
+
+    def _work() -> str:
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            raise image_input_error("Uploaded image file is empty")
+        return _prepare_image_data_url_blocking(
+            raw,
+            (file.meta or {}).get("content_type"),
+            getattr(file, "filename", None),
+            optimize=optimize,
+            quality=quality,
+            min_bytes=min_bytes,
+            max_dimension=max_dimension,
+        )
+
+    data_url = await asyncio.to_thread(_work)
+    cache[key] = data_url
+    return data_url
 
 
 @router.post("/chat/completions")
@@ -1044,10 +1180,34 @@ async def generate_chat_completion(
 
     # Normalize internal content_blocks → API shape. Single source of truth for the
     # internal-message → upstream-API conversion (shared with the live tool-call loop).
+    # Offloaded to a worker thread: in the agentic tool-call loop this runs once per
+    # round on an ever-growing conversation (O(history) per round), so doing it inline
+    # blocks the single event loop for every other concurrent stream. The function is
+    # pure (builds a fresh list, copy-on-write hydration), and `payload` is local to
+    # this request, so there is no shared-state race. Co-located with the offloaded
+    # json.dumps below.
     if isinstance(payload.get("messages"), list):
-        payload["messages"] = blocks_to_api_messages(payload["messages"])
+        payload["messages"] = await asyncio.to_thread(
+            blocks_to_api_messages, payload["messages"]
+        )
 
     has_pdf_files = False
+
+    # Provider-bound image compression policy (admin-tunable; OpenAI-compatible
+    # path only). Per-image `full_quality` flags can opt out below.
+    cfg = request.app.state.config
+    image_compression_enabled = bool(
+        getattr(cfg, "IMAGE_PROVIDER_COMPRESSION_ENABLED", False)
+    )
+    image_compression_quality = int(
+        getattr(cfg, "IMAGE_PROVIDER_COMPRESSION_QUALITY", 85)
+    )
+    image_compression_min_bytes = int(
+        getattr(cfg, "IMAGE_PROVIDER_COMPRESSION_MIN_BYTES", 1024 * 1024)
+    )
+    image_compression_max_dimension = int(
+        getattr(cfg, "IMAGE_PROVIDER_MAX_DIMENSION", 0)
+    )
 
     # Resolve image URLs to base64
     # IMPORTANT: Local file URLs (like /api/v1/files/{id}/content) MUST be converted to base64
@@ -1067,7 +1227,15 @@ async def generate_chat_completion(
                             raise image_input_error(
                                 "Image input is missing a valid URL"
                             )
-                        
+
+                        # Per-image opt-out: when the user pinned this image to
+                        # "full quality", skip lossy compression. Pop the flag
+                        # unconditionally (whether or not compression is enabled)
+                        # so this Open WebUI-internal key never leaks to the
+                        # upstream provider, which may reject unknown fields.
+                        full_quality = bool(image_url.pop("full_quality", None))
+                        optimize_image = image_compression_enabled and not full_quality
+
                         # If already a data URL, keep provider-supported image
                         # formats as-is. Normalize unsupported data:image/*
                         # payloads (notably HEIC/HEIF from Apple devices) so
@@ -1082,37 +1250,67 @@ async def generate_chat_completion(
                                 )
 
                             data_mime = data_url_match.group(1)
+                            # Cache by content hash + params: an agentic loop
+                            # re-sends the same inline image every round, and the
+                            # b64decode + PIL recompress is blocking CPU work.
+                            cache = _image_conversion_cache(request)
+                            b64_payload = data_url_match.group(2)
+                            cache_key = (
+                                "data",
+                                hashlib.sha256(
+                                    b64_payload.encode("utf-8", "replace")
+                                ).hexdigest(),
+                                optimize_image,
+                                image_compression_quality,
+                                image_compression_min_bytes,
+                                image_compression_max_dimension,
+                            )
+                            cached = cache.get(cache_key)
+                            if cached is not None:
+                                part["image_url"]["url"] = cached
+                                continue
                             try:
-                                raw = base64.b64decode(
-                                    data_url_match.group(2), validate=False
-                                )
-                                raw, provider_mime = prepare_image_data_for_provider(
-                                    raw,
-                                    data_mime,
-                                    None,
-                                )
-                                part["image_url"]["url"] = (
-                                    f"data:{provider_mime};base64,{base64.b64encode(raw).decode('utf-8')}"
-                                )
+
+                                def _normalize_data_url() -> str:
+                                    raw = base64.b64decode(b64_payload, validate=False)
+                                    return _prepare_image_data_url_blocking(
+                                        raw,
+                                        data_mime,
+                                        None,
+                                        optimize=optimize_image,
+                                        quality=image_compression_quality,
+                                        min_bytes=image_compression_min_bytes,
+                                        max_dimension=image_compression_max_dimension,
+                                    )
+
+                                new_url = await asyncio.to_thread(_normalize_data_url)
+                                cache[cache_key] = new_url
+                                part["image_url"]["url"] = new_url
                             except Exception as e:
                                 log.error(f"Error normalizing image data URL: {e}")
                                 raise image_input_error(
                                     "Could not normalize image data for provider"
                                 )
                             continue
-                            
+
                         # Check if it's a local file URL (e.g. /api/v1/files/{id} or /api/v1/files/{id}/content)
                         # We look for the file ID pattern - match both with and without /content
-                        match = re.search(r"/api/v1/files/([^/]+)(?:/content)?(?:\?|$)", url)
+                        match = re.search(
+                            r"/api/v1/files/([^/]+)(?:/content)?(?:\?|$)", url
+                        )
                         if not match:
                             match = re.search(r"/api/v1/files/([a-f0-9-]+)", url)
                         if match:
                             file_id = match.group(1)
-                            log.debug(f"Resolving local file URL to base64: file_id={file_id}")
+                            log.debug(
+                                f"Resolving local file URL to base64: file_id={file_id}"
+                            )
                             file = Files.get_file_by_id(file_id)
                             if not file:
                                 log.warning(f"File not found in database: {file_id}")
-                                raise image_input_error("Uploaded image file was not found")
+                                raise image_input_error(
+                                    "Uploaded image file was not found"
+                                )
                             if not user_can_read_file(file, user):
                                 log.warning(
                                     f"User {user.id} does not have permission to read file {file_id}"
@@ -1124,19 +1322,21 @@ async def generate_chat_completion(
                             try:
                                 file_path = Storage.get_file(file.path)
                                 log.debug(f"Reading file from storage: {file_path}")
-                                with open(file_path, "rb") as f:
-                                    image_data = f.read()
-                                    if not image_data:
-                                        log.warning(f"File is empty: {file_path}")
-                                        raise image_input_error("Uploaded image file is empty")
-                                    image_data, mime_type = prepare_image_data_for_provider(
-                                        image_data,
-                                        (file.meta or {}).get("content_type"),
-                                        getattr(file, "filename", None),
+                                # Cached per request + blocking read/recompress
+                                # offloaded to a thread, so an agentic loop's
+                                # repeated rounds don't re-encode the same image
+                                # on the event loop every round.
+                                part["image_url"]["url"] = (
+                                    await _resolve_local_file_image_data_url(
+                                        request,
+                                        file,
+                                        file_path,
+                                        optimize=optimize_image,
+                                        quality=image_compression_quality,
+                                        min_bytes=image_compression_min_bytes,
+                                        max_dimension=image_compression_max_dimension,
                                     )
-                                    base64_image = base64.b64encode(image_data).decode("utf-8")
-                                    part["image_url"]["url"] = f"data:{mime_type};base64,{base64_image}"
-                                    log.debug(f"Successfully converted image to base64: mime_type={mime_type}, size={len(image_data)} bytes")
+                                )
                             except FileNotFoundError as e:
                                 log.error(
                                     f"File not found on disk: {file_path}. Error: {e}"
@@ -1148,7 +1348,9 @@ async def generate_chat_completion(
                                 if isinstance(e, HTTPException):
                                     raise
                                 log.error(f"Error resolving image URL {url}: {e}")
-                                raise image_input_error("Could not prepare uploaded image for provider")
+                                raise image_input_error(
+                                    "Could not prepare uploaded image for provider"
+                                )
                         # If it's a non-local URL (http/https), keep it as-is - provider may be able to fetch it
                         elif not url.startswith(("http://", "https://")):
                             # Unknown URL format that's not a public URL.
@@ -1175,8 +1377,8 @@ async def generate_chat_completion(
                         file_data = file_obj.get("file_data")
                         filename = file_obj.get("filename") or ""
                         processing_mode = (
-                            (file_obj.get("processing_mode") or "text").lower()
-                        )
+                            file_obj.get("processing_mode") or "text"
+                        ).lower()
 
                         if not isinstance(file_data, str):
                             continue
@@ -1202,14 +1404,11 @@ async def generate_chat_completion(
                         if not file or not user_can_read_file(file, user):
                             continue
 
-                        content_type = (
-                            (file.meta or {}).get("content_type")
-                            or "application/octet-stream"
-                        )
+                        content_type = (file.meta or {}).get(
+                            "content_type"
+                        ) or "application/octet-stream"
                         if isinstance(content_type, str):
-                            content_type = (
-                                content_type.split(";", 1)[0].strip().lower()
-                            )
+                            content_type = content_type.split(";", 1)[0].strip().lower()
                         else:
                             content_type = "application/octet-stream"
 
@@ -1259,10 +1458,16 @@ async def generate_chat_completion(
                                 file_path = Storage.get_file(file.path)
                                 with open(file_path, "rb") as f:
                                     raw = f.read()
-                                raw, provider_content_type = prepare_image_data_for_provider(
-                                    raw,
-                                    content_type,
-                                    display_filename,
+                                raw, provider_content_type = (
+                                    prepare_image_data_for_provider(
+                                        raw,
+                                        content_type,
+                                        display_filename,
+                                        optimize=image_compression_enabled,
+                                        quality=image_compression_quality,
+                                        min_bytes=image_compression_min_bytes,
+                                        max_dimension=image_compression_max_dimension,
+                                    )
                                 )
                                 base64_file = base64.b64encode(raw).decode("utf-8")
                                 part.clear()
@@ -1488,12 +1693,16 @@ async def generate_chat_completion(
             convert_logit_bias_input_to_json(payload["logit_bias"])
         )
 
+    provider_stream_override = _apply_provider_stream_override(payload, metadata)
+
     # Ensure usage is returned when streaming
     if payload.get("stream", False):
         if "stream_options" not in payload:
             payload["stream_options"] = {"include_usage": True}
         elif isinstance(payload["stream_options"], dict):
             payload["stream_options"]["include_usage"] = True
+
+    provider_payload_stream = bool(payload.get("stream", False))
 
     # Cache Control: optionally set "cache_control": {"type": "ephemeral"}
     # on the very last message.
@@ -1505,7 +1714,8 @@ async def generate_chat_completion(
         )
     if model_cache_control_enabled is None and isinstance(model, dict):
         model_cache_control_enabled = (
-            (model.get("info", {}) or {}).get("meta", {})
+            (model.get("info", {}) or {})
+            .get("meta", {})
             .get("cache_control_ephemeral", None)
         )
     if model_cache_control_enabled is not None:
@@ -1562,7 +1772,12 @@ async def generate_chat_completion(
         print(f"[API REQUEST] Headers: {debug_headers}")
         print(f"[API REQUEST] Payload: {payload}")
 
-    payload = json.dumps(payload)
+    # Serialize off the event loop. For the agentic tool-call loop this runs
+    # once per round on an ever-growing conversation (O(history) per round);
+    # doing it inline blocks the single loop and starves the socket delta
+    # flush between rounds. The dict is fully built and not mutated after this
+    # point on this path, so it is safe to hand to a worker thread.
+    payload = await asyncio.to_thread(json.dumps, payload)
 
     r = None
     session = None
@@ -1606,7 +1821,7 @@ async def generate_chat_completion(
                     try:
                         # Attempt to extract usage and content from the chunk
                         decoded = chunk.decode("utf-8", errors="ignore")
-                        
+
                         # Debug logging for streaming responses
                         if request.app.state.config.ENABLE_API_DEBUG_LOGGING:
                             for line in decoded.split("\n"):
@@ -1622,15 +1837,21 @@ async def generate_chat_completion(
                                         for choice in choices:
                                             delta = choice.get("delta", {})
                                             content = delta.get("content", "")
-                                            reasoning = delta.get("reasoning_content", "")
+                                            reasoning = delta.get(
+                                                "reasoning_content", ""
+                                            )
                                             if content:
                                                 # Print the actual streamed text without newline prefix
                                                 print(content, end="", flush=True)
                                             if reasoning:
-                                                print(f"[REASONING] {reasoning}", end="", flush=True)
+                                                print(
+                                                    f"[REASONING] {reasoning}",
+                                                    end="",
+                                                    flush=True,
+                                                )
                                     except json.JSONDecodeError:
                                         pass
-                        
+
                         if '"usage"' in decoded:
                             for line in decoded.split("\n"):
                                 if line.startswith("data: "):
@@ -1638,10 +1859,12 @@ async def generate_chat_completion(
                                         # Skip "data: [DONE]"
                                         if line.strip() == "data: [DONE]":
                                             continue
-                                        
+
                                         data = json.loads(line[6:])
                                         if "usage" in data:
-                                            await process_token_usage(model_id, data["usage"])
+                                            await process_token_usage(
+                                                model_id, data["usage"]
+                                            )
                                     except Exception:
                                         pass
                     except Exception:
@@ -1651,9 +1874,7 @@ async def generate_chat_completion(
                 stream_wrapper(r.content),
                 status_code=r.status,
                 headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=None
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=None),
             )
         else:
             try:
@@ -1681,7 +1902,18 @@ async def generate_chat_completion(
                 else:
                     return PlainTextResponse(status_code=r.status, content=response)
 
-            if isinstance(response, dict) and "usage" in response:
+            if (
+                isinstance(response, dict)
+                and "usage" in response
+                and not (
+                    isinstance(metadata, dict)
+                    and metadata.get("subagent_inner")
+                    and (
+                        provider_stream_override is False
+                        or provider_payload_stream
+                    )
+                )
+            ):
                 await process_token_usage(model_id, response["usage"])
 
             return response
@@ -1737,7 +1969,9 @@ async def embeddings(request: Request, form_data: dict, user):
     try:
         session = aiohttp.ClientSession(
             trust_env=True,
-            read_bufsize=4 * 1024 * 1024,  # 4MB to handle large SSE lines from reasoning models
+            read_bufsize=4
+            * 1024
+            * 1024,  # 4MB to handle large SSE lines from reasoning models
         )
         r = await session.request(
             method="POST",
@@ -1864,7 +2098,18 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
 
         session = aiohttp.ClientSession(
             trust_env=True,
-            read_bufsize=4 * 1024 * 1024,  # 4MB to handle large SSE lines from reasoning models
+            # No `total` cap: long reasoning answers / deep-research subagents
+            # legitimately stream for many minutes, and aiohttp's built-in 5-min
+            # `total` default would cancel them mid-generation. Guard only against
+            # a genuinely dead/stalled connection via `sock_read` (max gap between
+            # received bytes) — an actively-generating model never trips it.
+            timeout=aiohttp.ClientTimeout(
+                total=None,
+                sock_read=AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ,
+            ),
+            read_bufsize=4
+            * 1024
+            * 1024,  # 4MB to handle large SSE lines from reasoning models
         )
         r = await session.request(
             method=request.method,
@@ -1952,7 +2197,11 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                         status_code=r.status, content=response_data
                     )
 
-            if model_id and isinstance(response_data, dict) and "usage" in response_data:
+            if (
+                model_id
+                and isinstance(response_data, dict)
+                and "usage" in response_data
+            ):
                 await process_token_usage(model_id, response_data["usage"])
 
             return response_data

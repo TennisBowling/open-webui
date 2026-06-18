@@ -8,6 +8,7 @@
 
 	export let folders = {};
 	export let shiftKey = false;
+	export let activeChatId: string | null = null;
 
 	export let onDelete = (folderId) => {};
 
@@ -36,8 +37,12 @@
 		{folders}
 		{folderId}
 		{shiftKey}
+		{activeChatId}
 		{onDelete}
 		{onItemMove}
+		on:activate={(e) => {
+			dispatch('activate', e.detail);
+		}}
 		on:import={(e) => {
 			dispatch('import', e.detail);
 		}}

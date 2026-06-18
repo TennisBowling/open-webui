@@ -5,7 +5,7 @@
 	const dispatch = createEventDispatcher();
 
 	import { artifactCode, settings, showArtifacts, showControls } from '$lib/stores';
-	import { copyToClipboard, createMessagesList } from '$lib/utils';
+	import { blocksToDisplayMarkdown, copyToClipboard, createMessagesList } from '$lib/utils';
 
 	import XMark from '../icons/XMark.svelte';
 	import ArrowsPointingOut from '../icons/ArrowsPointingOut.svelte';
@@ -36,7 +36,12 @@
 	const getContents = () => {
 		contents = [];
 		messages.forEach((message) => {
-			const content = typeof message?.content === 'string' ? message.content : '';
+			const content =
+				typeof message?.content === 'string' && message.content
+					? message.content
+					: Array.isArray(message?.content_blocks)
+						? blocksToDisplayMarkdown(message.content_blocks)
+						: '';
 
 			if (message?.role !== 'user' && content) {
 				const codeBlockContents = content.match(/```[\s\S]*?```/g);

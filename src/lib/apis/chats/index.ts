@@ -1252,6 +1252,8 @@ export type PatchChatOp =
 	| { op: 'set_models'; models: string[] }
 	| { op: 'set_files'; files: unknown[] }
 	| { op: 'set_queue'; queue: unknown[] }
+	| { op: 'append_queue_item'; item: Record<string, unknown> }
+	| { op: 'remove_queue_item'; item_id: string }
 	| { op: 'set_tags'; tags: unknown[] }
 	| { op: 'set_history_current_id'; current_id: string }
 	| {

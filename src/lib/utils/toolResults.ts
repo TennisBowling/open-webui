@@ -9,7 +9,7 @@ export type DecodedToolArguments =
 	| null;
 
 export interface ToolCallSummary {
-	kind: 'web_search' | 'web_fetch' | 'generic';
+	kind: 'web_search' | 'web_fetch' | 'browser' | 'generic';
 	title: string;
 	subtitle?: string;
 	badge?: string;
@@ -51,6 +51,19 @@ export interface ParsedWebFetchResult {
 	raw: string;
 }
 
+export interface ParsedBrowserResult {
+	// Page URL the action happened on. Prefer the result text's `URL:` line,
+	// falling back to the `url` argument (navigate).
+	url: string;
+	domain: string;
+	// Page title from the result text's `Title:` line, when present.
+	title: string;
+	// The remaining body — the accessibility snapshot tree
+	// (`[ref=eN] role "name"` lines) or any other returned text.
+	snapshot: string;
+	raw: string;
+}
+
 export type ToolResultLookup = Map<string, unknown> | Record<string, unknown> | null | undefined;
 
 export interface ToolResultEntry {
@@ -59,6 +72,9 @@ export interface ToolResultEntry {
 	files?: unknown[];
 	embeds?: unknown[];
 	subagent_id?: string;
+	error?: boolean;
+	error_reason?: string;
+	notice?: string;
 	[key: string]: unknown;
 }
 
@@ -148,6 +164,31 @@ export const formatToolValue = (raw: unknown): string => {
 
 export const isWebToolName = (name: unknown): name is 'web_search' | 'web_fetch' => {
 	return name === 'web_search' || name === 'web_fetch';
+};
+
+// Container browser tools keep their natural `browser_*` names (they are NOT
+// MCP-aliased), so the UI can recognize them directly. They render with the
+// same pretty header + rich expand treatment as the web tools.
+const BROWSER_TOOL_NAMES = new Set([
+	'browser_navigate',
+	'browser_snapshot',
+	'browser_screenshot',
+	'browser_click',
+	'browser_type',
+	'browser_press_key',
+	'browser_select',
+	'browser_back',
+	'browser_wait'
+]);
+
+export const isBrowserToolName = (name: unknown): name is string => {
+	return typeof name === 'string' && BROWSER_TOOL_NAMES.has(name);
+};
+
+// Tools that opt into the rich (pretty header + custom expand body) rendering
+// in Collapsible instead of the bare generic args/result markdown dump.
+export const isRichToolName = (name: unknown): boolean => {
+	return isWebToolName(name) || isBrowserToolName(name);
 };
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -453,6 +494,60 @@ export const parseWebFetchResult = (rawResult: unknown): ParsedWebFetchResult =>
 	};
 };
 
+// The container browser tools return a text block shaped by the CAM daemon's
+// `_format_snapshot`:
+//     Title: <title>
+//     URL: <url>
+//
+//     <accessibility snapshot tree>
+// `Title:`/`URL:` may be absent (e.g. screenshot-only actions, error recovery
+// text). Everything after the leading metadata lines is treated as the body.
+export const parseBrowserResult = (
+	rawResult: unknown,
+	rawArgs?: unknown
+): ParsedBrowserResult => {
+	const raw = decodeToolResultText(rawResult);
+	const args = getToolArgumentsObject(rawArgs);
+	const urlFromArgs = typeof args.url === 'string' ? args.url.trim() : '';
+
+	let title = '';
+	let url = '';
+	const lines = raw.split('\n');
+	let bodyStart = 0;
+
+	// Consume the leading `Title:` / `URL:` metadata lines (in either order),
+	// stopping at the first blank line or non-metadata content.
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		const titleMatch = line.match(/^Title:\s*(.*)$/);
+		const urlMatch = line.match(/^URL:\s*(.*)$/);
+		if (titleMatch) {
+			title = titleMatch[1].trim();
+			bodyStart = i + 1;
+			continue;
+		}
+		if (urlMatch) {
+			url = urlMatch[1].trim();
+			bodyStart = i + 1;
+			continue;
+		}
+		break;
+	}
+
+	let snapshot = lines.slice(bodyStart).join('\n').replace(/^\n+/, '').trimEnd();
+	// When there were no metadata lines at all, the whole text is the body.
+	if (!title && !url) snapshot = raw.trim();
+
+	const finalUrl = url || urlFromArgs;
+	return {
+		url: finalUrl,
+		domain: getDomain(finalUrl),
+		title,
+		snapshot,
+		raw
+	};
+};
+
 export const getToolCallSummary = (
 	name: ToolName,
 	rawArgs: unknown,
@@ -518,8 +613,95 @@ export const getToolCallSummary = (
 		};
 	}
 
+	if (isBrowserToolName(name)) {
+		return getBrowserToolCallSummary(name, rawArgs, rawResult, done);
+	}
+
 	return {
 		kind: 'generic',
 		title: `View Result from ${name}`
 	};
+};
+
+// Pull the host the action settled on out of the result text's `URL:` line
+// without fully parsing the (potentially large) snapshot tree. Cheap: scans
+// only the first handful of lines.
+const browserHostFromResult = (rawResult: unknown): string => {
+	const raw = typeof rawResult === 'string' ? rawResult : decodeToolResultText(rawResult);
+	if (!raw) return '';
+	const match = raw.match(/^\s*URL:\s*(\S+)/m);
+	return match ? getDomain(match[1]) : '';
+};
+
+const truncatePreview = (value: string, max = 40): string => {
+	const trimmed = value.trim();
+	if (!trimmed) return '';
+	return truncateEnd(compactWhitespace(trimmed), max);
+};
+
+const getBrowserToolCallSummary = (
+	name: string,
+	rawArgs: unknown,
+	rawResult: unknown,
+	done: boolean
+): ToolCallSummary => {
+	const args = getToolArgumentsObject(rawArgs);
+	// Only decode the result host when the action is finished AND the host can't
+	// already be derived from the args (navigate carries its own url) — keeps the
+	// collapsed-row path from decoding big snapshots on every render.
+	const onSuffix = (host: string) => (host ? ` on ${host}` : '');
+
+	const summary = (title: string): ToolCallSummary => ({ kind: 'browser', title, badge: 'browser' });
+
+	switch (name) {
+		case 'browser_navigate': {
+			const url = typeof args.url === 'string' ? args.url.trim() : '';
+			const host = getDomain(url) || (done ? browserHostFromResult(rawResult) : '') || url;
+			return {
+				kind: 'browser',
+				title: done ? `Browsed ${host || 'page'}` : `Browsing ${host || 'page'}…`,
+				subtitle: url || undefined,
+				badge: 'browser'
+			};
+		}
+		case 'browser_snapshot': {
+			const host = done ? browserHostFromResult(rawResult) : '';
+			return summary(done ? `Read page${onSuffix(host)}` : 'Reading page…');
+		}
+		case 'browser_screenshot': {
+			const host = done ? browserHostFromResult(rawResult) : '';
+			return summary(done ? `Captured screenshot${onSuffix(host)}` : 'Capturing screenshot…');
+		}
+		case 'browser_click': {
+			const ref = typeof args.ref === 'string' ? args.ref : '';
+			const target = ref ? ` ${ref}` : '';
+			return summary(done ? `Clicked${target}` : `Clicking${target}…`);
+		}
+		case 'browser_type': {
+			const ref = typeof args.ref === 'string' ? args.ref : '';
+			const text = typeof args.text === 'string' ? truncatePreview(args.text) : '';
+			const into = ref ? ` into ${ref}` : '';
+			const preview = text ? ` “${text}”` : '';
+			return summary(done ? `Typed${preview}${into}` : `Typing${into}…`);
+		}
+		case 'browser_select': {
+			const ref = typeof args.ref === 'string' ? args.ref : '';
+			const target = ref ? ` ${ref}` : '';
+			return summary(done ? `Selected option${target}` : `Selecting option${target}…`);
+		}
+		case 'browser_press_key': {
+			const key = typeof args.key === 'string' ? args.key.trim() : '';
+			const target = key ? ` ${key}` : ' key';
+			return summary(done ? `Pressed${target}` : `Pressing${target}…`);
+		}
+		case 'browser_back': {
+			return summary(done ? 'Went back' : 'Going back…');
+		}
+		case 'browser_wait': {
+			return summary(done ? 'Waited for page' : 'Waiting for page…');
+		}
+		default: {
+			return summary(done ? 'Browser action' : 'Browser action…');
+		}
+	}
 };

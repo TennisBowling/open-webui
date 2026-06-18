@@ -6,7 +6,8 @@ Uses Exa API for search and Jina Reader for content fetching.
 
 import asyncio
 import logging
-from typing import Optional, List
+import time
+from typing import Optional, List, Tuple
 from pydantic import BaseModel
 from fastapi import Request
 
@@ -18,6 +19,28 @@ from open_webui.retrieval.web.jina import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _classify_web_error_reason(message: str) -> str:
+    """Turn a raw provider exception string into a short, human subline shown on
+    the collapsed tool-call row (e.g. 'HTTP 402 (no credits)')."""
+    text = (message or "").lower()
+    if "402" in text:
+        return "HTTP 402 (no credits)"
+    if "401" in text or "unauthorized" in text:
+        return "HTTP 401 (unauthorized)"
+    if "403" in text or "forbidden" in text:
+        return "HTTP 403 (forbidden)"
+    if "429" in text or "rate limit" in text or "too many requests" in text:
+        return "HTTP 429 (rate limited)"
+    if "timed out" in text or "timeout" in text:
+        return "timed out"
+    # Surface a generic 5xx if present; otherwise a trimmed message.
+    for code in ("500", "502", "503", "504"):
+        if code in text:
+            return f"HTTP {code} (server error)"
+    trimmed = (message or "").strip().replace("\n", " ")
+    return (trimmed[:120] + "…") if len(trimmed) > 121 else (trimmed or "request failed")
 
 
 class WebSearchTools:
@@ -38,6 +61,7 @@ class WebSearchTools:
     def __init__(self):
         self.valves = self.Valves()
         self._jina_usage_lock = asyncio.Lock()
+        self._exa_status_lock = asyncio.Lock()
 
     async def web_search(
         self,
@@ -66,58 +90,140 @@ class WebSearchTools:
             log.error("WEB SEARCH: Request context not available")
             return "Error: Request context not available"
 
-        try:
-            config = __request__.app.state.config
-            
-            if not config.EXA_API_KEY:
-                return "Error: Exa API key not configured. Please set it in Admin Settings > Web Search."
+        config = __request__.app.state.config
 
-            # Get search settings from config
-            num_results = getattr(config, 'EXA_SEARCH_NUM_RESULTS', 10)
-            search_type = getattr(config, 'EXA_SEARCH_TYPE', 'auto')
-            include_domains = getattr(config, 'EXA_INCLUDE_DOMAINS', [])
-            exclude_domains = getattr(config, 'EXA_EXCLUDE_DOMAINS', [])
+        # Ordered list of (slot, key) to try. Slot is the 1-based key index used
+        # in the admin status panel. Empty keys are dropped.
+        keys: List[Tuple[str, str]] = []
+        primary = (getattr(config, "EXA_API_KEY", "") or "").strip()
+        secondary = (getattr(config, "EXA_API_KEY_2", "") or "").strip()
+        if primary:
+            keys.append(("1", primary))
+        if secondary:
+            keys.append(("2", secondary))
 
-            # Perform the search with async HTTP I/O. Reuse the app-level
-            # aiohttp session so a burst of subagent web searches does not pay
-            # a fresh TCP/TLS setup cost per tool call.
-            http_session = getattr(__request__.app.state, "http_session", None)
-            results = await search_exa(
-                api_key=config.EXA_API_KEY,
-                query=query,
-                num_results=num_results,
-                search_type=search_type,
-                include_domains=include_domains if include_domains else None,
-                exclude_domains=exclude_domains if exclude_domains else None,
-                session=http_session,
-            )
+        if not keys:
+            return {
+                "content": (
+                    "Error: Exa API key not configured. Please set it in "
+                    "Admin Settings > Web Search."
+                ),
+                "_owui_meta": {
+                    "error": True,
+                    "reason": "API key not configured",
+                },
+            }
 
-            if not results:
-                return f"No results found for query: '{query}'"
+        # Search settings (shared across keys).
+        num_results = getattr(config, "EXA_SEARCH_NUM_RESULTS", 10)
+        search_type = getattr(config, "EXA_SEARCH_TYPE", "auto")
+        include_domains = getattr(config, "EXA_INCLUDE_DOMAINS", [])
+        exclude_domains = getattr(config, "EXA_EXCLUDE_DOMAINS", [])
+        http_session = getattr(__request__.app.state, "http_session", None)
 
-            # Format results for the model
-            formatted_results = [
-                f"## Search Results for: {query}\n",
-                f"Found {len(results)} results.\n\n",
-            ]
+        last_error_reason = ""
+        for attempt_idx, (slot, api_key) in enumerate(keys):
+            try:
+                # Reuse the app-level aiohttp session so a burst of subagent web
+                # searches does not pay a fresh TCP/TLS setup cost per tool call.
+                results = await search_exa(
+                    api_key=api_key,
+                    query=query,
+                    num_results=num_results,
+                    search_type=search_type,
+                    include_domains=include_domains if include_domains else None,
+                    exclude_domains=exclude_domains if exclude_domains else None,
+                    session=http_session,
+                )
+            except Exception as e:
+                # This key failed (credit/auth/timeout/etc.). Record its health,
+                # then fall through to the next key if one exists.
+                reason = _classify_web_error_reason(str(e))
+                last_error_reason = reason
+                log.error(
+                    f"Web search error on Exa key {slot}: {e}", exc_info=True
+                )
+                await self._record_exa_key_status(config, slot, reason)
+                continue
 
-            for idx, result in enumerate(results, 1):
-                formatted_results.append(f"### Result {idx}\n")
-                if result.title:
-                    formatted_results.append(f"**Title:** {result.title}\n")
-                formatted_results.append(f"**URL:** {result.link}\n")
-                if result.snippet:
-                    formatted_results.append(f"**Snippet:** {result.snippet}\n")
-                formatted_results.append("\n")
+            # Success (an EMPTY result set is still success — never advance to the
+            # backup key just because a query had no hits).
+            await self._record_exa_key_status(config, slot, None)
 
-            formatted_results.append("\n---\n")
-            formatted_results.append("*Use web_fetch with specific URLs to get full page content.*\n")
+            content = self._format_search_results(query, results)
+            if attempt_idx == 0:
+                return content
 
-            return "".join(formatted_results)
+            # A backup key was used because the primary failed. Surface a clean,
+            # non-error advisory in the chat row.
+            return {
+                "content": content,
+                "_owui_meta": {
+                    "notice": f"Primary key failed — used backup key {slot}",
+                },
+            }
 
-        except Exception as e:
-            log.error(f"Web search error: {e}", exc_info=True)
-            return f"Error performing web search: {str(e)}"
+        # Every configured key failed.
+        return {
+            "content": f"Error performing web search: {last_error_reason}",
+            "_owui_meta": {
+                "error": True,
+                "reason": last_error_reason or "all Exa keys failed",
+            },
+        }
+
+    def _format_search_results(self, query: str, results) -> str:
+        """Format Exa search results into the markdown the model reads."""
+        if not results:
+            return f"No results found for query: '{query}'"
+
+        formatted_results = [
+            f"## Search Results for: {query}\n",
+            f"Found {len(results)} results.\n\n",
+        ]
+
+        for idx, result in enumerate(results, 1):
+            formatted_results.append(f"### Result {idx}\n")
+            if result.title:
+                formatted_results.append(f"**Title:** {result.title}\n")
+            formatted_results.append(f"**URL:** {result.link}\n")
+            if result.snippet:
+                formatted_results.append(f"**Snippet:** {result.snippet}\n")
+            formatted_results.append("\n")
+
+        formatted_results.append("\n---\n")
+        formatted_results.append(
+            "*Use web_fetch with specific URLs to get full page content.*\n"
+        )
+
+        return "".join(formatted_results)
+
+    async def _record_exa_key_status(
+        self, config, slot: str, reason: Optional[str]
+    ) -> None:
+        """Persist per-key Exa health for the admin panel. `reason=None` clears
+        the slot (key healthy). Writes only when the status actually changes, so
+        a steady stream of healthy searches doesn't hammer the DB-backed config."""
+        async with self._exa_status_lock:
+            try:
+                current = getattr(config, "EXA_KEY_STATUS", {}) or {}
+                if not isinstance(current, dict):
+                    current = {}
+            except Exception:
+                current = {}
+
+            if reason is None:
+                if slot not in current:
+                    return  # already healthy → no write
+                new_status = {k: v for k, v in current.items() if k != slot}
+            else:
+                existing = current.get(slot)
+                if isinstance(existing, dict) and existing.get("error") == reason:
+                    return  # same error already recorded → no write
+                new_status = dict(current)
+                new_status[slot] = {"error": reason, "at": int(time.time())}
+
+            config.EXA_KEY_STATUS = new_status
 
     async def web_fetch(
         self,
@@ -163,14 +269,21 @@ class WebSearchTools:
                 and api_base_url.rstrip("/").lower()
                 == hosted_jina_api_base_url.rstrip("/").lower()
             ):
-                return (
-                    "Error: Jina API key not configured. Please set it in Admin Settings > "
-                    "Web Search, or configure a self-hosted Jina Reader API base URL."
-                )
+                return {
+                    "content": (
+                        "Error: Jina API key not configured. Please set it in "
+                        "Admin Settings > Web Search, or configure a self-hosted "
+                        "Jina Reader API base URL."
+                    ),
+                    "_owui_meta": {
+                        "error": True,
+                        "reason": "API key not configured",
+                    },
+                }
 
             # Parse URLs from the input string
             url_list = self._parse_urls(urls)
-            
+
             if not url_list:
                 return "Error: No valid URLs provided. Please provide URLs separated by commas or newlines."
 
@@ -190,7 +303,7 @@ class WebSearchTools:
             # invocation, while the shared connector avoids repeated TLS/DNS
             # setup across many simultaneous subagents.
             http_session = getattr(__request__.app.state, "http_session", None)
-            results = await fetch_jina_contents(
+            results, fetch_errors = await fetch_jina_contents(
                 api_key=api_key,
                 urls=url_list,
                 api_base_url=api_base_url,
@@ -206,7 +319,16 @@ class WebSearchTools:
                 await self._increment_jina_token_usage(config, total_usage_tokens)
 
             if not results:
-                return f"Could not fetch content from the provided URLs."
+                # Distinguish a genuine empty fetch from an auth/credit failure:
+                # if every URL raised, surface it as an error so the chat row and
+                # model both see the real cause instead of a bland "no content".
+                if fetch_errors:
+                    reason = _classify_web_error_reason(fetch_errors[0])
+                    return {
+                        "content": f"Error fetching content: {reason}",
+                        "_owui_meta": {"error": True, "reason": reason},
+                    }
+                return "Could not fetch content from the provided URLs."
 
             # Format results for the model
             formatted_results = [
@@ -234,7 +356,11 @@ class WebSearchTools:
 
         except Exception as e:
             log.error(f"Web fetch error: {e}", exc_info=True)
-            return f"Error fetching content: {str(e)}"
+            reason = _classify_web_error_reason(str(e))
+            return {
+                "content": f"Error fetching content: {str(e)}",
+                "_owui_meta": {"error": True, "reason": reason},
+            }
 
     def _parse_urls(self, urls_input: str) -> List[str]:
         """Parse URLs from a string that may contain commas, newlines, or spaces."""

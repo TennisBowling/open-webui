@@ -456,6 +456,37 @@ export const getStreamSnapshot = async (
 	return res;
 };
 
+// Live browser frame for reattach. Returns null on 204 (nothing available) or
+// any error — callers seed the live panel only when a frame is present.
+export const getBrowserFrame = async (
+	token: string,
+	message_id: string,
+	chat_id?: string | null
+) => {
+	const params = new URLSearchParams();
+	if (chat_id) params.set('chat_id', chat_id);
+	const query = params.toString();
+
+	return await fetch(
+		`${WEBUI_BASE_URL}/api/v1/streams/browser/${message_id}/frame${query ? `?${query}` : ''}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
+		}
+	)
+		.then(async (res) => {
+			if (res.status === 204 || !res.ok) return null;
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			return null;
+		});
+};
+
 export const getToolServerData = async (token: string, url: string) => {
 	let error = null;
 

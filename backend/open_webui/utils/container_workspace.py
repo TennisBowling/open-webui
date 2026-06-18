@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -190,6 +193,15 @@ def _hash_file(path: Path) -> tuple[int, str]:
             digest.update(chunk)
             size += len(chunk)
     return size, digest.hexdigest()
+
+
+def _stat_file(path: Path) -> tuple[int, int]:
+    """Return (size, mtime_ns) cheaply for the incremental-scan fast path.
+    A file whose size AND mtime match the recorded state is treated as
+    unchanged, so we can skip re-hashing it (the expensive per-turn work over a
+    workspace that accumulates many outputs)."""
+    st = path.stat()
+    return int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
 
 
 def _user_can_read_file(file: Any, user: Any) -> bool:
@@ -400,7 +412,7 @@ async def prepare_container_workspace_for_turn(
         Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id,
             user_message_id,
-            {"container_workspace_inputs": [*existing_input_records, *input_records]},
+            {"container_workspace_inputs": [*existing_input_records, *input_records]}, return_model=False
         )
 
     input_context = _build_input_location_context(input_records)
@@ -828,14 +840,49 @@ async def import_changed_container_outputs(
 
     for state_key, workspace_path, path in candidates:
         try:
-            size, sha256 = _hash_file(path)
             state = dict(outputs_state.get(state_key) or {})
+
+            # Incremental fast path: if size + mtime match the recorded state,
+            # the file is unchanged — reuse the stored hash and skip re-reading
+            # it. This avoids re-hashing the whole (possibly large, possibly
+            # many-file) outputs tree every single turn. Falls back to a full
+            # hash whenever the recorded stat is absent or doesn't match.
+            try:
+                cur_size, cur_mtime = await asyncio.to_thread(_stat_file, path)
+            except Exception:
+                cur_size, cur_mtime = None, None
+
+            prior_hash = state.get("last_hash")
+            if (
+                prior_hash
+                and cur_size is not None
+                and state.get("stat_size") == cur_size
+                and state.get("stat_mtime_ns") == cur_mtime
+            ):
+                # Unchanged since last turn — nothing to import.
+                continue
+
+            size, sha256 = await asyncio.to_thread(_hash_file, path)
             if state.get("last_hash") == sha256:
+                # Content identical (mtime touched but bytes same): refresh the
+                # cheap stat cache so future turns hit the fast path, then skip.
+                if cur_size is not None:
+                    outputs_state[state_key] = {
+                        **state,
+                        "stat_size": cur_size,
+                        "stat_mtime_ns": cur_mtime,
+                    }
+                    changed = True
                 continue
 
             version = int(state.get("version") or 0) + 1
             display_name = _unique_display_name(workspace_path, used_display_names)
-            descriptor = _store_output_file(
+            # Offload the whole store step to a thread: it does blocking Storage
+            # I/O, a DB insert, AND (for office docs) a LibreOffice subprocess
+            # that can run up to 120s. On the event loop that stalls EVERY other
+            # chat on the worker until it finishes.
+            descriptor = await asyncio.to_thread(
+                _store_output_file,
                 request,
                 user,
                 path,
@@ -870,6 +917,8 @@ async def import_changed_container_outputs(
                 **state,
                 "workspace_path": workspace_path,
                 "last_hash": sha256,
+                "stat_size": cur_size,
+                "stat_mtime_ns": cur_mtime,
                 "version": version,
                 "versions": versions,
             }
@@ -889,7 +938,250 @@ async def import_changed_container_outputs(
         message = Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
         files = _merge_files(message.get("files"), imported)
         Chats.upsert_message_to_chat_by_id_and_message_id(
-            chat_id, message_id, {"files": files}
+            chat_id, message_id, {"files": files}, return_model=False
         )
 
     return imported
+
+
+# ---------------------------------------------------------------------------
+# Live browser progress (the in-container browser daemon writes per-session
+# live-<session>.jpg + state-<session>.json — plus legacy live.jpg/state.json for
+# the default "main" session — under .cam/browser/ while an action runs; we read
+# them host-side and push them to the UI). With PARALLEL browsing there can be N
+# concurrent tabs (one per agent/session), so the poller enumerates every active
+# session and emits one browser:frame per session, tagged with its `session` id.
+# See routers/streams for the reattach GET endpoint.
+# ---------------------------------------------------------------------------
+
+_BROWSER_LIVE_REL = ".cam/browser"
+_BROWSER_LIVE_JPG = "live.jpg"
+_BROWSER_LIVE_STATE = "state.json"
+# Per-session file patterns: state-<session>.json / live-<session>.jpg.
+_BROWSER_SESSION_STATE_RE = re.compile(r"^state-(?P<session>.+)\.json$")
+_DEFAULT_BROWSER_SESSION = "main"
+
+
+def _browser_live_dir(data_root: str, chat_id: str) -> Path:
+    return _workspace_root(data_root, chat_id) / _BROWSER_LIVE_REL
+
+
+def _read_live_pair(jpg: Path, state_path: Path) -> Optional[dict]:
+    """Read one (jpg, state.json) pair into the live dict shape, or None."""
+    state: Optional[dict] = None
+    try:
+        if state_path.is_file():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = None
+
+    frame: Optional[str] = None
+    stat: Optional[tuple[int, int]] = None
+    try:
+        if jpg.is_file():
+            stat = _stat_file(jpg)
+            data = jpg.read_bytes()
+            if data:
+                frame = "data:image/jpeg;base64," + base64.b64encode(data).decode(
+                    "ascii"
+                )
+    except OSError:
+        frame = None
+        stat = None
+
+    if frame is None and state is None:
+        return None
+    return {"frame": frame, "state": state or {}, "stat": stat}
+
+
+def read_browser_live(
+    data_root: str, chat_id: str, session: Optional[str] = None
+) -> Optional[dict]:
+    """Read the daemon's current live frame + state host-side for ONE session.
+
+    ``session`` selects which tab's files to read; ``None`` (or "main") reads the
+    legacy un-suffixed live.jpg/state.json the default session also writes — so the
+    existing single-view reattach path is unchanged. A specific session reads
+    live-<session>.jpg/state-<session>.json.
+
+    Returns ``{"frame": <data-url|None>, "state": <dict>, "stat": (size,mtime_ns)|None}``
+    or ``None`` if nothing is available. Never deletes the files (the daemon
+    overwrites them continuously). Safe to call from a thread.
+    """
+    safe_chat = _safe_chat_id(chat_id)
+    if not data_root or not safe_chat:
+        return None
+    live_dir = _browser_live_dir(data_root, safe_chat)
+    if not session or session == _DEFAULT_BROWSER_SESSION:
+        jpg = live_dir / _BROWSER_LIVE_JPG
+        state_path = live_dir / _BROWSER_LIVE_STATE
+    else:
+        token = _safe_session_token(session)
+        jpg = live_dir / f"live-{token}.jpg"
+        state_path = live_dir / f"state-{token}.json"
+    return _read_live_pair(jpg, state_path)
+
+
+def _safe_session_token(session: str) -> str:
+    """Clamp a session id to the daemon's filesystem-safe filename charset.
+
+    Mirrors the daemon's sessionFileToken so the host reads the same file the
+    daemon writes. Defends against a surprising id escaping the live dir.
+    """
+    token = re.sub(r"[^A-Za-z0-9._-]", "_", str(session))[:128]
+    return token or _DEFAULT_BROWSER_SESSION
+
+
+def read_browser_live_sessions(data_root: str, chat_id: str) -> dict[str, dict]:
+    """Read EVERY active session's live frame + state for a chat.
+
+    Enumerates the per-session state-<session>.json files in the chat's
+    .cam/browser dir (the canonical "which tabs exist" signal) and pairs each with
+    its live-<session>.jpg. Returns ``{session_id: live_dict}`` (the live_dict
+    shape from read_browser_live). The legacy default ("main") session is read from
+    the un-suffixed files so a daemon that only ever wrote those (no session ids
+    sent) still surfaces exactly one tab. Empty dict when nothing is available.
+    Safe to call from a thread.
+    """
+    safe_chat = _safe_chat_id(chat_id)
+    if not data_root or not safe_chat:
+        return {}
+    live_dir = _browser_live_dir(data_root, safe_chat)
+    out: dict[str, dict] = {}
+
+    # Default/main session from the legacy un-suffixed files (the default session
+    # writes both these AND state-main.json; prefer the legacy pair so a daemon
+    # that predates per-session files still works).
+    main_live = _read_live_pair(
+        live_dir / _BROWSER_LIVE_JPG, live_dir / _BROWSER_LIVE_STATE
+    )
+    if main_live is not None:
+        out[_DEFAULT_BROWSER_SESSION] = main_live
+
+    # Per-session files for every other tab.
+    try:
+        names = list(live_dir.iterdir())
+    except OSError:
+        names = []
+    for entry in names:
+        match = _BROWSER_SESSION_STATE_RE.match(entry.name)
+        if not match:
+            continue
+        session = match.group("session")
+        if session == _DEFAULT_BROWSER_SESSION and _DEFAULT_BROWSER_SESSION in out:
+            continue  # already covered by the legacy pair
+        live = _read_live_pair(
+            live_dir / f"live-{session}.jpg", live_dir / f"state-{session}.json"
+        )
+        if live is not None:
+            out[session] = live
+    return out
+
+
+async def browser_progress_poller(
+    *,
+    data_root: str,
+    chat_id: str,
+    message_id: Optional[str],
+    session_id: Optional[str],
+    event_emitter,
+    interval: float = 0.5,
+    session: Optional[str] = None,
+) -> None:
+    """While a browser tool call runs, push live frames to the UI side-panel.
+
+    Started concurrently with the (blocking) MCP browser tool call and cancelled
+    when it returns. Emits ``browser:frame`` — a fire-and-forget custom event
+    carrying the JPEG data URL — for EACH active browser session (tab). With
+    parallel browsing several agents browse at once; this poller enumerates all of
+    them and tags every frame with its ``session`` id so the UI can group them into
+    tabs. Only re-emitted when a session's frame bytes actually change (per-session
+    mtime/size guard), so a static page doesn't spam identical frames. On cancel it
+    emits a TERMINAL frame (``done:true``) for every known session so the panel
+    freezes each tab on its final view.
+
+    Note: this poller intentionally does NOT emit persisted ``status``
+    breadcrumbs. Each browser action already renders as its own inline
+    collapsible tool-call card (running vs done), and the live side-panel shows
+    the real-time screenshot, so a separate status line would be redundant.
+
+    Designed to be resilient: any read/emit error is swallowed so the poller can
+    never break the tool call it is shadowing.
+
+    The default poll cadence (0.5s) is intentionally faster than the daemon's
+    live-capture cadence: a single navigation is often ~1.4s, so a 1s poll would
+    routinely miss the only in-flight frame and never open the live panel.
+    """
+    if not event_emitter or not data_root or not _safe_chat_id(chat_id):
+        return
+    poll_session = session or _DEFAULT_BROWSER_SESSION
+    last_stat: Optional[tuple[int, int]] = None
+
+    async def _emit_frame(state: dict, frame: Optional[str], *, done: bool) -> None:
+        payload = {
+            # The session id this frame belongs to. The UI keys its browser panel
+            # tabs by this. The daemon stamps `session` into state, so prefer that
+            # (authoritative for which tab wrote it); else the poll session.
+            "session": state.get("session") or poll_session,
+            "url": state.get("url", ""),
+            "title": state.get("title", ""),
+            "phase": "done" if done else state.get("phase", ""),
+            "action": state.get("action", ""),
+            "elapsedMs": state.get("elapsedMs", 0),
+            "startedAt": state.get("startedAt", 0),
+            "done": done,
+        }
+        if frame:
+            payload["frame"] = frame
+        try:
+            await event_emitter({"type": "browser:frame", "data": payload})
+        except Exception:
+            pass
+
+    try:
+        while True:
+            try:
+                live = await asyncio.to_thread(
+                    read_browser_live, data_root, chat_id, poll_session
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                live = None
+
+            if live:
+                state = live.get("state") or {}
+                stat = live.get("stat")
+                frame = live.get("frame")
+                # A daemon that just (re)started stamps the leftover state from a
+                # previous turn done+stale so it can't masquerade as live. Treat
+                # it as terminal: never emit it as an in-progress frame.
+                is_stale = bool(state.get("stale"))
+                done_flag = bool(state.get("done")) or is_stale
+
+                # Frame: emit only when the JPEG changed.
+                if frame and stat is not None and stat != last_stat:
+                    last_stat = stat
+                    await _emit_frame(state, frame, done=done_flag)
+
+            await asyncio.sleep(max(0.2, interval))
+    except asyncio.CancelledError:
+        # The tool call returned. Do ONE final read and emit a terminal frame
+        # (done:true) for this session. Shielded so cancellation still completes
+        # promptly. The terminal frame freezes the live panel on the final view.
+        try:
+            live = await asyncio.shield(
+                asyncio.to_thread(
+                    read_browser_live, data_root, chat_id, poll_session
+                )
+            )
+        except Exception:
+            live = None
+        if live and event_emitter:
+            state = live.get("state") or {}
+            frame = live.get("frame")
+            await _emit_frame(state, frame, done=True)
+        return
+    except Exception:
+        log.exception("browser_progress_poller crashed")
+        return

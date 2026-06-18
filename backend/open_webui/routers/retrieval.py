@@ -471,6 +471,8 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         "web": {
             "ENABLE_WEB_SEARCH": request.app.state.config.ENABLE_WEB_SEARCH,
             "EXA_API_KEY": request.app.state.config.EXA_API_KEY,
+            "EXA_API_KEY_2": request.app.state.config.EXA_API_KEY_2,
+            "EXA_KEY_STATUS": request.app.state.config.EXA_KEY_STATUS,
             "EXA_SEARCH_NUM_RESULTS": request.app.state.config.EXA_SEARCH_NUM_RESULTS,
             "EXA_SEARCH_TYPE": request.app.state.config.EXA_SEARCH_TYPE,
             "EXA_INCLUDE_DOMAINS": request.app.state.config.EXA_INCLUDE_DOMAINS,
@@ -493,6 +495,8 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
 class WebConfig(BaseModel):
     ENABLE_WEB_SEARCH: Optional[bool] = None
     EXA_API_KEY: Optional[str] = None
+    EXA_API_KEY_2: Optional[str] = None
+    EXA_KEY_STATUS: Optional[dict] = None
     EXA_SEARCH_NUM_RESULTS: Optional[int] = None
     EXA_SEARCH_TYPE: Optional[str] = None
     EXA_INCLUDE_DOMAINS: Optional[List[str]] = None
@@ -944,6 +948,8 @@ async def update_rag_config(
         # Web search settings (Exa search + Jina Reader fetch)
         web_config = form_data.web
         old_jina_api_key = request.app.state.config.JINA_API_KEY
+        old_exa_api_key = request.app.state.config.EXA_API_KEY
+        old_exa_api_key_2 = request.app.state.config.EXA_API_KEY_2
 
         request.app.state.config.ENABLE_WEB_SEARCH = (
             web_config.ENABLE_WEB_SEARCH
@@ -955,6 +961,27 @@ async def update_rag_config(
             if web_config.EXA_API_KEY is not None
             else request.app.state.config.EXA_API_KEY
         )
+        request.app.state.config.EXA_API_KEY_2 = (
+            web_config.EXA_API_KEY_2
+            if web_config.EXA_API_KEY_2 is not None
+            else request.app.state.config.EXA_API_KEY_2
+        )
+
+        # Exa per-key health. Start from the incoming status (lets the admin
+        # "Clear" action reset a slot), else keep the current status. Then drop
+        # the status for any key whose value just changed — a new/rotated key
+        # has not failed yet, so a stale "errors received" badge would mislead.
+        exa_key_status = (
+            dict(web_config.EXA_KEY_STATUS)
+            if isinstance(web_config.EXA_KEY_STATUS, dict)
+            else dict(request.app.state.config.EXA_KEY_STATUS or {})
+        )
+        if request.app.state.config.EXA_API_KEY != old_exa_api_key:
+            exa_key_status.pop("1", None)
+        if request.app.state.config.EXA_API_KEY_2 != old_exa_api_key_2:
+            exa_key_status.pop("2", None)
+        request.app.state.config.EXA_KEY_STATUS = exa_key_status
+
         request.app.state.config.EXA_SEARCH_NUM_RESULTS = (
             web_config.EXA_SEARCH_NUM_RESULTS
             if web_config.EXA_SEARCH_NUM_RESULTS is not None
@@ -1117,6 +1144,8 @@ async def update_rag_config(
         "web": {
             "ENABLE_WEB_SEARCH": request.app.state.config.ENABLE_WEB_SEARCH,
             "EXA_API_KEY": request.app.state.config.EXA_API_KEY,
+            "EXA_API_KEY_2": request.app.state.config.EXA_API_KEY_2,
+            "EXA_KEY_STATUS": request.app.state.config.EXA_KEY_STATUS,
             "EXA_SEARCH_NUM_RESULTS": request.app.state.config.EXA_SEARCH_NUM_RESULTS,
             "EXA_SEARCH_TYPE": request.app.state.config.EXA_SEARCH_TYPE,
             "EXA_INCLUDE_DOMAINS": request.app.state.config.EXA_INCLUDE_DOMAINS,

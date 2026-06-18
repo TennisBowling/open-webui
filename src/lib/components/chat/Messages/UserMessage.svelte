@@ -15,6 +15,7 @@
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import Markdown from './Markdown.svelte';
 	import Image from '$lib/components/common/Image.svelte';
+	import ImageQualityBadge from '$lib/components/chat/MessageInput/ImageQualityBadge.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 
@@ -66,7 +67,9 @@
 						{
 							type: 'image',
 							url: `${WEBUI_API_BASE_URL}/files/${uploadedFile.id}/content`,
-							id: uploadedFile.id
+							id: uploadedFile.id,
+							file: uploadedFile,
+							fullQuality: false
 						}
 					];
 				}
@@ -317,6 +320,20 @@
 												/>
 											</svg>
 										</button>
+									</div>
+									<div class="absolute bottom-0.5 left-0.5">
+										<ImageQualityBadge
+											compact={true}
+											fullQuality={file.fullQuality === true}
+											size={file?.file?.meta?.size ?? null}
+											on:toggle={(e) => {
+												const target = editedFiles[fileIdx];
+												if (target) {
+													target.fullQuality = e.detail.fullQuality;
+													editedFiles = editedFiles;
+												}
+											}}
+										/>
 									</div>
 								</div>
 							{:else}

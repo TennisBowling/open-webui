@@ -59,7 +59,13 @@ from uuid import uuid4
 
 from fastapi import Request
 
-from open_webui.env import SRC_LOG_LEVELS, STREAM_PROTOCOL_VERSION
+from open_webui.env import (
+    SRC_LOG_LEVELS,
+    STREAM_PROTOCOL_VERSION,
+    SUBAGENT_RUN_TIMEOUT_SECONDS,
+    SUBAGENT_MAX_CONCURRENCY,
+    SUBAGENT_PROVIDER_STREAM,
+)
 from open_webui.models.chats import Chats, ChatImportForm
 from open_webui.models.models import Models
 from open_webui.models.users import Users
@@ -83,6 +89,22 @@ from open_webui.utils.misc import get_message_list
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
+
+
+# Bound the number of subagents running concurrently per worker. `subagent_launch`
+# is a parallelizable tool, so a single parent turn can otherwise gather an
+# unbounded number of full nested pipelines. Lazily created so the semaphore
+# binds to the running event loop. None when the bound is disabled.
+_subagent_concurrency_sem: Optional[asyncio.Semaphore] = None
+
+
+def _get_subagent_concurrency_sem() -> Optional[asyncio.Semaphore]:
+    global _subagent_concurrency_sem
+    if SUBAGENT_MAX_CONCURRENCY <= 0:
+        return None
+    if _subagent_concurrency_sem is None:
+        _subagent_concurrency_sem = asyncio.Semaphore(SUBAGENT_MAX_CONCURRENCY)
+    return _subagent_concurrency_sem
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +263,7 @@ def _subagent_container_shared_context(
     parent_metadata: dict,
     inner_tool_ids: list[str],
     import_outputs: bool = False,
+    subagent_id: Optional[str] = None,
 ) -> dict:
     container_tool_id = _container_tool_id(request)
     if not any(
@@ -255,20 +278,35 @@ def _subagent_container_shared_context(
     server_id = _normalize_container_server_id(
         getattr(request.app.state.config, "CONTAINER_MCP_SERVER_ID", "")
     )
-    return {
+    # Per-AGENT browser session: a subagent shares the PARENT chat's container (its
+    # MCP X-Chat-Id = parent chat_id), so without a per-agent token the daemon
+    # would route every subagent's browser action to the SAME page as the parent
+    # and they'd clobber each other. We override the {{BROWSER_SESSION}} header
+    # source (browser_session in the per-server header context) with the
+    # subagent_id, so this subagent drives its OWN page/tab in the shared browser
+    # context (still logged in as the same user — cookies are context-level). The
+    # parent, by contrast, has no override and uses "main" (see
+    # resolve_tool_server_headers). browser_session is also surfaced top-level so
+    # the inner pipeline (the live-frame poller) can tag frames by session.
+    browser_session = str(subagent_id or "") or None
+    header_ctx: dict = {
+        "chat_id": parent_chat_id,
+        "message_id": parent_metadata.get("message_id"),
+        "session_id": parent_metadata.get("session_id"),
+    }
+    if browser_session:
+        header_ctx["browser_session"] = browser_session
+    shared: dict = {
         "container_workspace_chat_id": parent_chat_id,
         "container_workspace_message_id": parent_metadata.get("message_id"),
         "container_workspace_output_message_id": parent_metadata.get("message_id"),
         "container_workspace_reuse_existing_inputs": True,
         "container_workspace_import_outputs": import_outputs,
-        "tool_server_header_context": {
-            server_id: {
-                "chat_id": parent_chat_id,
-                "message_id": parent_metadata.get("message_id"),
-                "session_id": parent_metadata.get("session_id"),
-            }
-        },
+        "tool_server_header_context": {server_id: header_ctx},
     }
+    if browser_session:
+        shared["browser_session"] = browser_session
+    return shared
 
 
 def _external_tools_prompt(request: Request, inner_tool_ids: list[str]) -> str:
@@ -455,6 +493,14 @@ def _slim_tool_result_for_parent(result: Any) -> dict:
     slim: dict = {"tool_call_id": result.get("tool_call_id", "")}
     if result.get("subagent_id"):
         slim["subagent_id"] = result.get("subagent_id")
+    # Preserve the small error/notice metadata (not the heavy body) so a
+    # subagent's failed inner tool call still surfaces in the parent card.
+    if result.get("error"):
+        slim["error"] = True
+    if result.get("error_reason"):
+        slim["error_reason"] = result.get("error_reason")
+    if result.get("notice"):
+        slim["notice"] = result.get("notice")
     if result.get("content"):
         slim["result_truncated"] = True
     if result.get("files"):
@@ -695,7 +741,7 @@ def _sync_parent_subagent_placeholder(
 
         if update_data:
             Chats.upsert_message_to_chat_by_id_and_message_id(
-                parent_chat_id, parent_message_id, update_data
+                parent_chat_id, parent_message_id, update_data, return_model=False
             )
     except Exception as e:  # noqa: BLE001
         log.debug(f"failed to sync parent subagent placeholder: {e}")
@@ -740,7 +786,7 @@ def _upsert_subagent_run(
             f"sa={subagent_id} status={patch.get('status')} runs_count={len(new_runs)}"
         )
         Chats.upsert_message_to_chat_by_id_and_message_id(
-            parent_chat_id, parent_message_id, {"subagent_runs": new_runs}
+            parent_chat_id, parent_message_id, {"subagent_runs": new_runs}, return_model=False
         )
         if sync_placeholder:
             _sync_parent_subagent_placeholder(
@@ -749,12 +795,7 @@ def _upsert_subagent_run(
                 merged_run,
                 allow_append=allow_placeholder_append,
             )
-        print(
-            f"!! _upsert_subagent_run COMMITTED sa={subagent_id} runs={len(new_runs)}",
-            flush=True,
-        )
     except Exception as e:  # noqa: BLE001
-        print(f"!! _upsert_subagent_run FAILED: {e}", flush=True)
         log.warning(
             f"failed to upsert subagent_run {subagent_id} on "
             f"{parent_chat_id}/{parent_message_id}: {e}"
@@ -839,12 +880,20 @@ def _build_forwarding_emitter(
     # subagent chat's final assistant row is persisted by the normal middleware
     # save path; persisting every status/source/citation event here creates DB
     # and socket fanout pressure with 50 concurrent workers.
+    #
+    # ``browser:frame`` is the live browser side-panel feed. When a subagent
+    # drives the shared browser it must surface on the PARENT tab, not the
+    # hidden subagent chat (which no tab is viewing). We skip the base emitter
+    # for it and re-route it top-level to ``parent_event_emitter`` below, so it
+    # lands with the parent's chat_id + message_id and reaches the parent UI's
+    # ``browser:frame`` handler.
     SKIP_BASE_EMIT_TYPES = {
         "chat:completion",
         "chat:message:delta",
         "status",
         "source",
         "citation",
+        "browser:frame",
     }
     FORWARD_FLUSH_INTERVAL_SECONDS = 0.5
 
@@ -975,6 +1024,15 @@ def _build_forwarding_emitter(
                     }
                     if r.get("subagent_id"):
                         payload["subagent_id"] = r["subagent_id"]
+                    # Error/notice are tiny UI metadata (not heavy bodies), so
+                    # forward them so a subagent's failed inner tool call still
+                    # shows the error row inside the subagent card.
+                    if r.get("error"):
+                        payload["error"] = True
+                    if r.get("error_reason"):
+                        payload["error_reason"] = r["error_reason"]
+                    if r.get("notice"):
+                        payload["notice"] = r["notice"]
                     if r.get("content"):
                         payload["result_truncated"] = True
                     if r.get("files"):
@@ -1095,6 +1153,22 @@ def _build_forwarding_emitter(
                 await base_emitter(event)
             except Exception as e:  # noqa: BLE001
                 log.debug(f"subagent base emitter raised: {e}")
+
+        # Live browser side-panel feed: when the subagent drives the shared
+        # browser, surface its frames on the PARENT tab. parent_event_emitter is
+        # the parent's __event_emitter__ (get_event_emitter(parent_metadata)),
+        # which stamps the envelope chat_id/message_id = parent's — so the
+        # top-level browser:frame lands on the parent chat and reaches the
+        # parent UI's browser:frame handler (its BrowserPanel picks the live
+        # state regardless of which assistant message id owns it). Forwarded
+        # raw, NOT wrapped in chat:subagent:update, because the handler listens
+        # for a top-level browser:frame. Fire-and-forget; never block the run.
+        if etype == "browser:frame":
+            try:
+                await parent_event_emitter(event)
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"forwarding subagent browser:frame to parent UI failed: {e}")
+            return
 
         if force_fanout and etype == "files":
             try:
@@ -1228,10 +1302,19 @@ def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
             text = blocks_to_plain_text(last_text_blocks).strip()
             if text:
                 return text
-        # No trailing text after the last tool_calls — the subagent never
-        # produced a final synthesis.  Return empty string so the caller
-        # treats this as an error (prevents leaking reasoning/tool markers
-        # back to the parent model as if they were the answer).
+        # No trailing text after the last tool_calls. The subagent ended its turn
+        # on a tool_calls/reasoning block rather than a final synthesis (e.g. the
+        # model "thought" and then stopped). Before giving up, fall back to the
+        # LAST non-empty text block anywhere in the transcript — partial findings
+        # the subagent did write out are far more useful to the parent than an
+        # empty/error result, and the empty-round retry in the agentic loop is the
+        # primary defense against a genuinely text-less run.
+        for block in reversed(blocks):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = blocks_to_plain_text([block]).strip()
+                if text:
+                    return text
+        # Truly nothing usable — return empty so the caller surfaces it.
         return ""
     content = msg.get("content")
     if isinstance(content, str):
@@ -1341,7 +1424,13 @@ async def _run_inner_chat(
     # available to this subagent turn.
     inner_tool_ids = _resolve_subagent_tool_ids(request, chat_params, parent_metadata)
     container_shared_context = _subagent_container_shared_context(
-        request, parent_metadata, inner_tool_ids, import_outputs=force_fanout
+        request,
+        parent_metadata,
+        inner_tool_ids,
+        import_outputs=force_fanout,
+        # The subagent's hidden chat row id IS its stable per-agent id; use it as
+        # the browser session token so this subagent drives its own browser tab.
+        subagent_id=subagent_chat_id,
     )
     system_prompt = _compose_subagent_system_prompt(
         request,
@@ -1437,6 +1526,9 @@ async def _run_inner_chat(
         "timezone": parent_metadata.get("timezone"),
         "model": subagent_model,
         "direct": False,
+        # Keep Open WebUI's local subagent event/tool pipeline active while
+        # allowing the upstream provider request to be non-streaming.
+        "provider_stream": SUBAGENT_PROVIDER_STREAM,
         # Token analytics attribution: subagent LLM usage should roll up into
         # the visible parent chat, not into the hidden subagent chat row.
         "parent_chat_id": parent_metadata.get("chat_id"),
@@ -1521,6 +1613,41 @@ async def _run_inner_chat(
 # ---------------------------------------------------------------------------
 
 
+class SubagentTimeoutError(Exception):
+    """Raised when a subagent exceeds SUBAGENT_RUN_TIMEOUT_SECONDS."""
+
+
+async def _run_inner_chat_guarded(**kwargs) -> Optional[str]:
+    """Run a subagent's inner chat under a concurrency bound and an OPTIONAL
+    wall-clock timeout. The timeout is disabled by default
+    (``SUBAGENT_RUN_TIMEOUT_SECONDS`` = 0) so subagents can research without any
+    time ceiling; set a positive value only as an ops backstop against a
+    subagent whose own tool genuinely hangs, in which case the timeout becomes a
+    normal error the retry loop / parent model can handle. The semaphore caps
+    how many subagents run at once per worker (subagent_launch is
+    parallelizable)."""
+    sem = _get_subagent_concurrency_sem()
+
+    async def _run() -> Optional[str]:
+        if SUBAGENT_RUN_TIMEOUT_SECONDS and SUBAGENT_RUN_TIMEOUT_SECONDS > 0:
+            try:
+                return await asyncio.wait_for(
+                    _run_inner_chat(**kwargs),
+                    timeout=SUBAGENT_RUN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                raise SubagentTimeoutError(
+                    f"Subagent exceeded the {SUBAGENT_RUN_TIMEOUT_SECONDS}s time "
+                    "limit and was stopped."
+                )
+        return await _run_inner_chat(**kwargs)
+
+    if sem is None:
+        return await _run()
+    async with sem:
+        return await _run()
+
+
 async def run_subagent_launch(
     *,
     request: Optional[Request],
@@ -1540,9 +1667,7 @@ async def run_subagent_launch(
     user-visible error string on retry exhaustion. Propagates
     ``asyncio.CancelledError`` so parent cancellation tears down cleanly.
     """
-    print(f"!! run_subagent_launch ENTERED name={name!r}", flush=True)
     if request is None or user_dict is None or parent_metadata is None or parent_event_emitter is None:
-        print(f"!! run_subagent_launch MISSING CONTEXT", flush=True)
         log.warning(
             "run_subagent_launch: missing required context — "
             f"request={request is not None} user={user_dict is not None} "
@@ -1707,7 +1832,7 @@ async def run_subagent_launch(
             },
         )
         try:
-            final_text = await _run_inner_chat(
+            final_text = await _run_inner_chat_guarded(
                 request=request,
                 user=user,
                 subagent_model=subagent_model,
@@ -1748,24 +1873,62 @@ async def run_subagent_launch(
                 )
             return f"{prefix}{final_text}"
         except asyncio.CancelledError:
+            # A CancelledError here is GENUINE (user pressed Stop) only when the
+            # parent task itself is being cancelled. Subagents run inline in the
+            # parent task via asyncio.gather, so a real user-stop sets
+            # `current_task().cancelling()`. If it is NOT cancelling, this is a
+            # SPURIOUS per-subagent cancellation — an upstream stream closing /
+            # erroring for THIS subagent's inner generate_chat_completion — which
+            # previously marked a subagent that did substantial work as "cancelled"
+            # (no retry). Treat that as a normal retryable error instead so the
+            # subagent gets a clean second attempt and the user doesn't see a
+            # bogus "stopped" on a subagent they never stopped.
+            current_task = asyncio.current_task()
+            genuine_user_stop = (
+                current_task is not None and current_task.cancelling()
+            )
+            if genuine_user_stop:
+                _upsert_subagent_run(
+                    parent_chat_id,
+                    parent_message_id,
+                    subagent_id,
+                    {
+                        **base_run_patch,
+                        "status": "cancelled",
+                        "ended_at": int(time.time()),
+                    },
+                )
+                await _emit_subagent_cancel(
+                    parent_event_emitter,
+                    subagent_meta,
+                    user_id=user.id,
+                    parent_chat_id=parent_chat_id,
+                    parent_message_id=parent_message_id,
+                )
+                raise
+            # Spurious per-subagent cancel → retry like any error.
+            last_error = "subagent inner stream was cancelled (not a user stop)"
+            log.warning(
+                f"subagent {final_name} attempt {attempt}/2 hit a spurious "
+                "CancelledError (parent not stopping) — retrying as an error"
+            )
+            if attempt == 1:
+                _reset_inner_history(subagent_id)
+                continue
             _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 subagent_id,
                 {
                     **base_run_patch,
-                    "status": "cancelled",
+                    "status": "error",
                     "ended_at": int(time.time()),
+                    "error": {"message": last_error},
                 },
             )
-            await _emit_subagent_cancel(
-                parent_event_emitter,
-                subagent_meta,
-                user_id=user.id,
-                parent_chat_id=parent_chat_id,
-                parent_message_id=parent_message_id,
+            return (
+                f"Subagent {num} ({final_name}) ERROR after retry: {last_error}"
             )
-            raise
         except Exception as e:  # noqa: BLE001
             last_error = str(e)
             log.exception(
@@ -1991,37 +2154,71 @@ async def run_subagent_continue(
                 f"{final_text}"
             )
         except asyncio.CancelledError:
+            # Genuine user-stop only when the parent task is actually cancelling
+            # (see run_subagent_launch for the full rationale). A spurious
+            # per-subagent cancel (e.g. the inner stream's aiohttp total timeout)
+            # is retried as an error so a continue that did real work isn't marked
+            # "stopped" when the user never stopped it.
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                _upsert_subagent_run(
+                    parent_chat_id,
+                    parent_message_id,
+                    continue_entry_key,
+                    {
+                        **continue_base_run_patch,
+                        "status": "cancelled",
+                        "ended_at": int(time.time()),
+                    },
+                )
+                await _emit_subagent_cancel(
+                    parent_event_emitter,
+                    subagent_meta,
+                    user_id=user.id,
+                    parent_chat_id=parent_chat_id,
+                    parent_message_id=parent_message_id,
+                )
+                raise
+            last_error = "subagent inner stream was cancelled (not a user stop)"
+            log.warning(
+                f"subagent {target_name} continue attempt {attempt}/2 hit a "
+                "spurious CancelledError (parent not stopping) — retrying"
+            )
+            if attempt == 1:
+                _revert_subagent_history(target_id, user_msg_id, assistant_msg_id)
+                continue
             _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 continue_entry_key,
                 {
                     **continue_base_run_patch,
-                    "status": "cancelled",
+                    "status": "error",
                     "ended_at": int(time.time()),
+                    "error": {"message": last_error},
                 },
             )
-            await _emit_subagent_cancel(
-                parent_event_emitter,
-                subagent_meta,
-                user_id=user.id,
-                parent_chat_id=parent_chat_id,
-                parent_message_id=parent_message_id,
+            return (
+                f"Subagent {target_num} ({target_name}) continue ERROR after "
+                f"retry: {last_error}"
             )
-            raise
         except Exception as e:  # noqa: BLE001
             last_error = str(e)
             log.exception(
                 f"subagent {target_name} continue attempt {attempt}/2 failed: {e}"
             )
             if attempt == 1:
-                # For continues, DO NOT wipe history — that'd destroy the
-                # prior research. Just retry against the existing state. The
-                # retry's user message is already appended (it's the same
-                # message_id from attempt 1) so we have to undo + redo.
-                # Simpler: just retry as-is; the second attempt will append
-                # YET another user message + blank assistant, doubling the
-                # turns. That's ugly but doesn't lose data. Accept for v1.
+                # For continues, DO NOT wipe the whole history — that'd destroy
+                # the prior research the user explicitly wants to keep. Instead
+                # revert just THIS failed attempt's user→blank-assistant pair so
+                # the second attempt re-runs against the exact state the turn
+                # started from. Reverting (rather than leaving the pair in place)
+                # keeps the hidden transcript clean: no doubled/blank turns get
+                # buried mid-history, so a later "Redo last subagent turn" still
+                # reverts a single coherent pair.
+                _revert_subagent_history(
+                    target_id, user_msg_id, assistant_msg_id
+                )
                 continue
             _upsert_subagent_run(
                 parent_chat_id,
@@ -2251,6 +2448,112 @@ def _tool_call_id(call: dict) -> str:
 
 def _subagent_tool_name(call: dict) -> str:
     return str((call.get("function") or {}).get("name") or "")
+
+
+def reconcile_block_results_from_runs(content_blocks: list, subagent_runs: dict) -> bool:
+    """Backfill missing/empty subagent tool results in ``content_blocks`` from the
+    durable ``subagent_runs`` mirror so the canonical (model-bound) results array
+    matches the source of truth.
+
+    ``block["results"]`` is written by several racing writers (the live loop save,
+    the per-completion placeholder sync, the frontend arrival-order handler). When
+    a parent turn fans out many parallel subagents and is interrupted before the
+    canonical save lands, the persisted results can be a partial subset even though
+    every subagent finished and stamped its ``final_text`` into ``subagent_runs``.
+    This makes the backend authoritative: for every subagent tool call whose result
+    is missing or empty, patch in the finished run's ``final_text``.
+
+    Mutates ``content_blocks`` in place. Returns True if anything changed.
+
+    Keyed conservatively: a run is only used when it FINISHED (status done) with a
+    non-empty ``final_text``. Match a call to a run by tool_call_id first (the only
+    key that disambiguates launch vs a later continue on the same subagent), then by
+    subagent_id for launch entries."""
+    if not isinstance(content_blocks, list) or not isinstance(subagent_runs, dict):
+        return False
+
+    by_tool_call: dict = {}
+    by_subagent: dict = {}
+    for run in subagent_runs.values():
+        if not isinstance(run, dict) or run.get("status") != "done":
+            continue
+        text = run.get("final_text")
+        if not (isinstance(text, str) and text.strip()):
+            continue
+        text = text.strip()
+        tcid = str(run.get("tool_call_id") or "")
+        if tcid:
+            by_tool_call[tcid] = (text, run)
+        sid = str(run.get("subagent_id") or run.get("chat_id") or "")
+        if sid and not run.get("continuation"):
+            by_subagent[sid] = (text, run)
+    if not by_tool_call and not by_subagent:
+        return False
+
+    changed = False
+    for block in content_blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_calls":
+            continue
+        calls = block.get("content") if isinstance(block.get("content"), list) else []
+        results = block.get("results") if isinstance(block.get("results"), list) else []
+        result_by_id = {
+            str(r.get("tool_call_id") or ""): r
+            for r in results
+            if isinstance(r, dict)
+        }
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            if _subagent_tool_name(call) not in _SUBAGENT_TOOL_NAMES:
+                continue
+            call_id = _tool_call_id(call)
+            if not call_id:
+                continue
+            existing = result_by_id.get(call_id)
+            existing_content = (
+                existing.get("content") if isinstance(existing, dict) else None
+            )
+            if isinstance(existing_content, str) and existing_content.strip():
+                continue  # already has a real answer
+            if isinstance(existing, dict) and (
+                existing.get("result_ref") or existing.get("result_lazy")
+            ):
+                # A large answer that was slimmed to a lazy ref — its real body
+                # lives in the tool-result-body store, NOT here. The empty inline
+                # content is expected; don't clobber it.
+                continue
+
+            recovered = by_tool_call.get(call_id)
+            if recovered is None:
+                # Fall back to subagent_id from the existing (empty) result row.
+                sid = str(existing.get("subagent_id") or "") if isinstance(existing, dict) else ""
+                if sid:
+                    recovered = by_subagent.get(sid)
+            if recovered is None:
+                continue
+
+            text, run = recovered
+            if isinstance(existing, dict):
+                existing["content"] = text
+                if not existing.get("subagent_id") and run.get("subagent_id"):
+                    existing["subagent_id"] = run.get("subagent_id")
+            else:
+                results.append(
+                    {
+                        "tool_call_id": call_id,
+                        "content": text,
+                        **(
+                            {"subagent_id": run.get("subagent_id")}
+                            if run.get("subagent_id")
+                            else {}
+                        ),
+                    }
+                )
+                result_by_id[call_id] = results[-1]
+            changed = True
+        if changed:
+            block["results"] = results
+    return changed
 
 
 def _run_placeholder_ids(entry_key: str, run: dict) -> set[str]:
@@ -2851,12 +3154,19 @@ async def rerun_subagent_turn(
             last_error = str(e)
             log.exception(f"subagent rerun attempt {attempt}/2 failed: {e}")
             if attempt == 1:
-                # For from_launch we wipe again to mimic the launch retry
-                # path. For this_turn we leave the (re-)appended user
-                # message in place; the second attempt just adds another
-                # pair (matches the continue auto-retry behavior).
+                # from_launch: wipe the whole hidden history again to mimic the
+                # launch retry path (the user asked to discard the subagent's
+                # work, so a clean slate is correct).
+                # this_turn: revert just this failed attempt's user→blank pair so
+                # the retry re-runs against the same prior state WITHOUT doubling
+                # turns — prior research is preserved and the transcript stays
+                # clean for any subsequent redo.
                 if scope == "from_launch":
                     _reset_inner_history(subagent_id)
+                else:
+                    _revert_subagent_history(
+                        subagent_id, user_msg_id, assistant_msg_id
+                    )
                 continue
             _upsert_subagent_run(
                 parent_chat_id,

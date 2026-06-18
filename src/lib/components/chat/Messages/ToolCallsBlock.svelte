@@ -60,7 +60,8 @@
 			hasOwn(result, 'content') ||
 			(Array.isArray(result.files) && result.files.length > 0) ||
 			(Array.isArray(result.embeds) && result.embeds.length > 0) ||
-			!!result.subagent_id
+			!!result.subagent_id ||
+			result.error === true
 		);
 	};
 
@@ -72,7 +73,14 @@
 	const attributesForCall = (call: any) => {
 		const result = getResultForCall(call);
 		const name = call?.function?.name ?? '';
-		const isSubagent = subagentToolNames.has(name);
+		// A subagent call that returned a result but never produced a subagent_id
+		// is a MALFORMED call — the tool errored before creating a subagent (e.g.
+		// missing name/prompt args). Render it as a normal tool result, not a
+		// subagent card, so it doesn't get stuck on "Researching…/Subagent is
+		// starting up…" for a call that already failed.
+		const isMalformedSubagent =
+			subagentToolNames.has(name) && result !== undefined && !result?.subagent_id;
+		const isSubagent = subagentToolNames.has(name) && !isMalformedSubagent;
 		const resultPayloadReady = isSubagent ? result !== undefined : hasResultPayload(result);
 
 		return {
@@ -91,7 +99,10 @@
 			sha256: result?.sha256 ?? '',
 			summary: result?.summary ? JSON.stringify(result.summary) : '',
 			files: result?.files ? JSON.stringify(result.files) : '',
-			embeds: result?.embeds ? JSON.stringify(result.embeds) : ''
+			embeds: result?.embeds ? JSON.stringify(result.embeds) : '',
+			error: result?.error ? 'true' : 'false',
+			error_reason: result?.error_reason ?? '',
+			notice: result?.notice ?? ''
 		};
 	};
 </script>

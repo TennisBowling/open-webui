@@ -133,11 +133,39 @@ export interface SubagentRun {
 
 export const subagentLiveStates: Writable<Record<string, SubagentRun>> = writable({});
 
+export type BrowserLiveState = {
+	frame?: string; // data:image/jpeg;base64,...
+	url?: string;
+	title?: string;
+	phase?: string; // navigating | loaded | acting | done
+	action?: string;
+	statusLine?: string;
+	startedAt?: number;
+	elapsedMs?: number;
+	done?: boolean;
+	session?: string; // per-agent browser session id ("main" for the parent, subagent_id for a subagent)
+	label?: string; // human tab label (e.g. "Main" or the subagent's name)
+};
+// Keyed by per-agent browser SESSION id (one entry per browsing agent/tab) when
+// the frame carries a `session`; falls back to the assistant message_id for legacy
+// frames without one. With parallel browsing the parent and each subagent each get
+// their own entry, so the panel can show one tab per concurrent browser. Kept OUT
+// of history.messages so high-frequency frame churn never re-renders the message list.
+export const browserLiveStates: Writable<Record<string, BrowserLiveState>> = writable({});
+// Set true when the user closes the live browser panel during a turn, so a later
+// frame doesn't force it back open. Reset on chat switch / new submission.
+export const browserPanelDismissed: Writable<boolean> = writable(false);
+
 export const channels: Writable<any[]> = writable([]);
 export const chats: Writable<any[] | null> = writable(null);
 export const pinnedChats: Writable<any[]> = writable([]);
 export const tags: Writable<any[]> = writable([]);
 export const folders: Writable<any[]> = writable([]);
+export const folderChatListInvalidation: Writable<{
+	folderIds: string[];
+	seq: number;
+	reason: string;
+}> = writable({ folderIds: [], seq: 0, reason: '' });
 
 export const selectedFolder = writable(null);
 
@@ -170,6 +198,7 @@ export const showOverview = writable(false);
 export const showArtifacts = writable(false);
 export const showFilePreview = writable(false);
 export const showCallOverlay = writable(false);
+export const showBrowserPanel = writable(false);
 
 export const embed = writable(null);
 export const artifactCode = writable(null);
@@ -242,6 +271,8 @@ type Settings = {
 	voiceInterruption?: boolean;
 	collapseCodeBlocks?: boolean;
 	expandDetails?: boolean;
+	bundleAgenticSteps?: boolean;
+	agenticStepsAutoExpand?: boolean;
 	notificationSound?: boolean;
 	notificationSoundAlways?: boolean;
 	stylizedPdfExport?: boolean;
@@ -365,6 +396,18 @@ type Config = {
 	ui?: {
 		pending_user_overlay_title?: string;
 		pending_user_overlay_description?: string;
+	};
+	file?: {
+		max_size?: number | null;
+		max_count?: number | null;
+		image_compression?: {
+			width?: number | null;
+			height?: number | null;
+		};
+		image_provider_compression?: {
+			enabled?: boolean;
+			max_dimension?: number | null;
+		};
 	};
 };
 

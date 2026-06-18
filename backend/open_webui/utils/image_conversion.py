@@ -153,11 +153,14 @@ def _register_heif_opener() -> None:
         log.debug(f"pillow-heif is unavailable; HEIC/HEIF decode may fail: {e}")
 
 
-def transcode_image_to_jpeg(image_data: bytes) -> Optional[bytes]:
+def transcode_image_to_jpeg(image_data: bytes, quality: int = 92) -> Optional[bytes]:
     """Best-effort JPEG transcode for provider-safe image payloads.
 
-    HEIC/HEIF requires pillow-heif/libheif support. Other formats depend on the
-    Pillow build. Returns None when the runtime cannot decode the input.
+    Decodes any Pillow-readable image and re-encodes it as JPEG at the given
+    quality. Used both to convert unsupported formats (HEIC/HEIF, which need
+    pillow-heif/libheif) and to shrink oversized JPEGs. Never raises: returns
+    None when the runtime cannot decode the input, so callers can fall back to
+    the original bytes.
     """
     try:
         from PIL import Image, ImageOps
@@ -177,11 +180,108 @@ def transcode_image_to_jpeg(image_data: bytes) -> Optional[bytes]:
                 img = img.convert("RGB")
 
             out = io.BytesIO()
-            img.save(out, format="JPEG", quality=92, optimize=True)
+            img.save(out, format="JPEG", quality=quality, optimize=True)
             return out.getvalue()
     except Exception as e:
         log.debug(f"Could not transcode image to JPEG: {e}")
         return None
+
+
+def _downscale_image_bytes(
+    image_data: bytes,
+    max_dimension: int,
+    *,
+    quality: int = 92,
+    prefer_jpeg: bool = False,
+) -> Optional[tuple[bytes, str]]:
+    """Cap an image's longest edge at ``max_dimension``, format-preserving.
+
+    Returns ``(bytes, mime)`` when a re-encode was produced, or ``None`` when no
+    change is needed/possible — in which case the caller keeps the original
+    bytes. ``None`` is returned for:
+    - ``max_dimension <= 0`` (capping disabled — the documented escape hatch).
+    - An image already within the cap that is NOT an animated frame set (so
+      small images stay byte-identical to what the user uploaded).
+    - Any decode/encode failure (never raises; we never drop an image).
+
+    Output format mirrors the input (PNG->PNG, WEBP->WEBP, GIF->static GIF,
+    JPEG/unknown->JPEG) so screenshots/transparency survive, unless
+    ``prefer_jpeg`` forces a JPEG (used for the oversized-payload fallback and
+    for already-transcoded HEIC). Animated GIF/WEBP are always flattened to
+    their first frame when this runs, because multi-frame payloads are a common
+    provider-rejection cause.
+    """
+    if max_dimension <= 0:
+        return None
+    try:
+        from PIL import Image, ImageOps
+
+        _register_heif_opener()
+
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+
+        with Image.open(io.BytesIO(image_data)) as img:
+            fmt = (img.format or "").upper()
+            is_animated = getattr(img, "is_animated", False) and (
+                getattr(img, "n_frames", 1) > 1
+            )
+
+            img = ImageOps.exif_transpose(img)
+
+            # Palette/animated frames resample poorly in "P" mode — promote so
+            # LANCZOS has real channels to work with.
+            if img.mode in ("P", "PA"):
+                img = img.convert("RGBA")
+
+            width, height = img.size
+            long_edge = max(width, height)
+            needs_resize = long_edge > max_dimension
+
+            if not needs_resize and not is_animated:
+                return None
+
+            if needs_resize:
+                scale = max_dimension / float(long_edge)
+                new_size = (
+                    max(1, round(width * scale)),
+                    max(1, round(height * scale)),
+                )
+                img = img.resize(new_size, resample)
+
+            if prefer_jpeg or fmt not in ("PNG", "WEBP", "GIF", "JPEG"):
+                out_fmt = "JPEG"
+            else:
+                out_fmt = fmt
+
+            out = io.BytesIO()
+            if out_fmt == "JPEG":
+                if img.mode in ("RGBA", "LA") or (
+                    img.mode == "P" and "transparency" in img.info
+                ):
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    rgba = img.convert("RGBA")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    img = background
+                else:
+                    img = img.convert("RGB")
+                img.save(out, format="JPEG", quality=quality, optimize=True)
+                return out.getvalue(), "image/jpeg"
+            if out_fmt == "PNG":
+                img.save(out, format="PNG", optimize=True)
+                return out.getvalue(), "image/png"
+            if out_fmt == "WEBP":
+                img.save(out, format="WEBP", quality=quality)
+                return out.getvalue(), "image/webp"
+            if out_fmt == "GIF":
+                # Flatten any animation to a single static frame.
+                img.convert("RGBA").convert(
+                    "P", palette=Image.ADAPTIVE
+                ).save(out, format="GIF")
+                return out.getvalue(), "image/gif"
+    except Exception as e:
+        log.debug(f"Could not downscale image: {e}")
+        return None
+    return None
 
 
 def convert_heif_to_jpeg(image_data: bytes) -> bytes:
@@ -220,13 +320,76 @@ def prepare_image_data_for_provider(
     image_data: bytes,
     mime_type: Optional[str],
     filename: Optional[str],
+    *,
+    optimize: bool = False,
+    quality: int = 85,
+    min_bytes: int = 1024 * 1024,
+    max_dimension: int = 0,
 ) -> tuple[bytes, str]:
-    resolved = resolve_image_mime_type(mime_type, filename, image_data)
-    if resolved in SUPPORTED_IMAGE_MIME_TYPES:
-        return image_data, resolved
+    """Resolve an image to a provider-safe (bytes, mime) pair.
 
-    converted = transcode_image_to_jpeg(image_data)
+    Unsupported formats (notably HEIC/HEIF) are always transcoded to JPEG so
+    upstream providers don't fail request parsing.
+
+    When ``optimize`` is True, the payload is additionally made delivery-safe.
+    This is lossy/best-effort, NEVER raises, and NEVER drops an image (any
+    failure falls back to the prior bytes):
+    - ``max_dimension`` (when > 0) caps the longest edge for EVERY format,
+      preserving aspect ratio and never upscaling. A pixel-capped image is
+      always adopted even if its byte size didn't shrink, because providers
+      reject/penalize on dimensions, not just bytes. Animated GIF/WEBP are
+      flattened to their first frame.
+    - Oversized JPEGs (> ``min_bytes``) are re-encoded at ``quality``, kept only
+      if strictly smaller.
+    - PNG/WEBP still over ``min_bytes`` after capping fall back to a JPEG
+      re-encode, kept only if strictly smaller (screenshots commonly stay large
+      as PNG; JPEG keeps them under provider limits).
+
+    With ``optimize`` False the behavior is identical to a plain format
+    normalization, so callers that only need provider-safety (e.g. full-quality
+    pinned images) are unaffected and their bytes stay identical.
+    """
+    resolved = resolve_image_mime_type(mime_type, filename, image_data)
+
+    if resolved in SUPPORTED_IMAGE_MIME_TYPES:
+        data, mime = image_data, resolved
+
+        if optimize and max_dimension > 0:
+            capped = _downscale_image_bytes(data, max_dimension, quality=quality)
+            if capped:
+                data, mime = capped
+
+        if optimize and mime == "image/jpeg" and len(data) > min_bytes:
+            reencoded = transcode_image_to_jpeg(data, quality=quality)
+            if reencoded and len(reencoded) < len(data):
+                data, mime = reencoded, "image/jpeg"
+        elif (
+            optimize
+            and max_dimension > 0
+            and mime in ("image/png", "image/webp")
+            and len(data) > min_bytes
+        ):
+            # Only when dimension-capping is actively enabled: a PNG/WEBP that is
+            # still over the byte ceiling AFTER being capped (detailed
+            # screenshots) can blow a provider's per-image limit. JPEG-flatten as
+            # a last resort. When capping is OFF we never touch non-JPEG formats
+            # (preserve transparency/animation — the documented passthrough).
+            reencoded = transcode_image_to_jpeg(data, quality=quality)
+            if reencoded and len(reencoded) < len(data):
+                data, mime = reencoded, "image/jpeg"
+
+        return data, mime
+
+    converted = transcode_image_to_jpeg(
+        image_data, quality=quality if optimize else 92
+    )
     if converted:
+        if optimize and max_dimension > 0:
+            capped = _downscale_image_bytes(
+                converted, max_dimension, quality=quality, prefer_jpeg=True
+            )
+            if capped:
+                converted = capped[0]
         return converted, "image/jpeg"
 
     raise ValueError(

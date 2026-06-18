@@ -19,6 +19,7 @@
 		type PatchChatOp
 	} from '$lib/apis/chats';
 	import { copyToClipboard, extractCurlyBraceWords } from '$lib/utils';
+	import { computeChainStructureKey } from '$lib/utils/chainStructureKey';
 
 	import Message from './Messages/Message.svelte';
 	import Loader from '../common/Loader.svelte';
@@ -41,7 +42,17 @@
 	export let selectedModels;
 	export let atSelectedModel;
 
+	// Bumped by the parent (Chat.svelte) when the message graph changes shape
+	// (send/delete/branch/load/reattach) but NOT on per-frame streaming content
+	// flushes. Combined with a local structural fingerprint below, this gates the
+	// expensive chain walk so streaming deltas don't re-render the whole list.
+	export let structureRevision = 0;
+
 	let messages = [];
+	// Local structural revision: bumped by THIS component's own graph-shape
+	// mutations (pagination/stub hydration/branch navigation). Kept separate from
+	// the parent's so neither has to know about the other's mutation sites.
+	let localStructureRevision = 0;
 
 	export let setInputText: Function = () => {};
 
@@ -59,12 +70,16 @@
 	export let addMessages: Function = () => {};
 
 	export let readOnly = false;
-	export let editCodeBlock = true;
+	export let editCodeBlock = false;
 
 	export let topPadding = false;
 	export let bottomPadding = false;
 	export let autoScroll;
 	export let allowPagination = true;
+	// False during the parent's initial settle phase, when the content is hidden
+	// and the parent's settle loop owns scroll position. Prevents this component's
+	// own scroll driver from fighting the settle loop on chat open.
+	export let scrollReady = true;
 
 	export let onSelect = (e) => {};
 
@@ -168,6 +183,7 @@
 		}).catch(() => null);
 		if (mergePaginatedMessages(page) > 0) {
 			history = history;
+			localStructureRevision += 1;
 			await tick();
 		}
 	};
@@ -182,7 +198,10 @@
 			limit: MESSAGE_PAGE_SIZE
 		});
 		const hydrated = mergePaginatedMessages(page);
-		if (hydrated > 0) history = history;
+		if (hydrated > 0) {
+			history = history;
+			localStructureRevision += 1;
+		}
 		return hydrated;
 	};
 
@@ -266,6 +285,7 @@
 				hydratedCount = mergePaginatedMessages(page);
 				if (hydratedCount > 0) {
 					history = history;
+					localStructureRevision += 1;
 					if (anchorStates.has(anchorId)) {
 						anchorStates.delete(anchorId);
 						anchorStates = new Map(anchorStates);
@@ -296,7 +316,23 @@
 		}
 	};
 
-	$: {
+	// Structural key: changes ONLY when the rendered chain could change shape —
+	// the parent's structureRevision (send/delete/load/reattach), this
+	// component's localStructureRevision (pagination/stub/branch), the current
+	// branch pointer, the pagination cap, or the number of messages in the map.
+	// It deliberately does NOT depend on message CONTENT, so a streaming token
+	// flush (which mutates the leaf's content in place) does not change this key
+	// and therefore does not re-run the O(chain-length) walk below.
+	$: messageMapSize = history?.messages ? Object.keys(history.messages).length : 0;
+	$: chainStructureKey = computeChainStructureKey({
+		structureRevision,
+		localStructureRevision,
+		currentId: history?.currentId,
+		messagesCount,
+		messageMapSize
+	});
+
+	const rebuildRenderedChain = () => {
 		// Compute both the rendered list and its frontier in a single pass.
 		// The frontier carries the reason the walk stopped — `complete`
 		// (root), `capped` (hit messagesCount), `stub` (next ancestor is an
@@ -377,9 +413,13 @@
 			messages = _messages;
 			frontier = newFrontier;
 		}
-	}
+	};
 
-	$: if (autoScroll && bottomPadding) {
+	// Re-run the walk only when the structural key or the loader anchor states
+	// change — NOT on every history reassignment / content flush.
+	$: chainStructureKey, anchorStates, rebuildRenderedChain();
+
+	$: if (scrollReady && autoScroll && bottomPadding) {
 		(async () => {
 			await tick();
 			scrollToBottom();
@@ -396,6 +436,9 @@
 			return;
 		}
 		history = history;
+		// Not on the streaming hot path (branch nav / code-block edits); bump so
+		// the rebased chain walk re-renders if this carried a structural change.
+		localStructureRevision += 1;
 		await tick();
 
 		const opList = ops === undefined ? [] : Array.isArray(ops) ? ops : [ops];

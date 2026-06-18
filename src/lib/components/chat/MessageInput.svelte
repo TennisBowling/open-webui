@@ -56,6 +56,7 @@
 	import VoiceRecording from './MessageInput/VoiceRecording.svelte';
 	import FilesOverlay from './MessageInput/FilesOverlay.svelte';
 	import QueuedMessages from './MessageInput/QueuedMessages.svelte';
+	import ImageQualityBadge from './MessageInput/ImageQualityBadge.svelte';
 	import ToolServersModal from './ToolServersModal.svelte';
 
 	import RichTextInput from '../common/RichTextInput.svelte';
@@ -141,6 +142,7 @@
 		if (!(selectedToolIds ?? []).includes(containerToolId)) {
 			selectedToolIds = [...(selectedToolIds ?? []), containerToolId];
 		}
+		onSelectionTouched();
 		files = files.map((file) => ({ ...file, container_mode: true }));
 		toast.success($i18n.t('Container enabled for this message'));
 	};
@@ -158,6 +160,10 @@
 	export let studyModeEnabled = false;
 	export let dataVizEnabled = false;
 	export let subagentsEnabled = false;
+	// Fired whenever the USER explicitly toggles a tool/feature here, so the chat
+	// can mark its selection as user-curated (and stop a model switch from
+	// resetting it). No-op default keeps this optional for other callers.
+	export let onSelectionTouched: () => void = () => {};
 	// Empty string = inherit the admin-set SUBAGENT_DEFAULT_REASONING_EFFORT.
 	// Otherwise: minimal / low / medium / high / xhigh (free string; provider
 	// decides what's actually valid).
@@ -458,7 +464,8 @@
 					...files,
 					{
 						type: 'image',
-						url: imageUrl
+						url: imageUrl,
+						fullQuality: false
 					}
 				];
 			}
@@ -865,7 +872,7 @@
 			// Convert the canvas to a Base64 image URL
 			const imageUrl = canvas.toDataURL('image/png');
 			// Add the captured image to the files array to render it
-			files = [...files, { type: 'image', url: imageUrl }];
+			files = [...files, { type: 'image', url: imageUrl, fullQuality: false }];
 			// Clean memory: Clear video srcObject
 			video.srcObject = null;
 		} catch (error) {
@@ -1309,6 +1316,9 @@
 					itemId: tempImageId,
 					file: uploadedFile,
 					id: uploadedFile.id,
+					// Preserve any quality choice already made on the placeholder so
+					// a full rebuild here can never silently drop a user's pin.
+					fullQuality: files[fileIndex]?.fullQuality === true,
 					...(containerWorkspaceActive ? { container_mode: true } : {})
 				};
 				files = files;
@@ -1734,8 +1744,17 @@
 						<form
 							class="w-full flex flex-col gap-1.5"
 							on:submit|preventDefault={() => {
-								// check if selectedModels support image input
-								dispatch('submit', prompt);
+								// The send button doubles as a "Queue message" button while the
+								// model is working (see #queue-message-button). Clicking it then
+								// queues-after-final; otherwise it submits normally. (Steering is
+								// keyboard-only — bare Enter while working — to keep this button's
+								// meaning unambiguous.)
+								const working =
+									generating ||
+									(taskIds && taskIds.length > 0) ||
+									(history?.currentId &&
+										history.messages[history.currentId]?.done != true);
+								dispatch(working ? 'queueAfterFinal' : 'submit', prompt);
 							}}
 						>
 							<div
@@ -1871,6 +1890,24 @@
 															</Tooltip>
 														{/if}
 													</div>
+													<!-- Image quality / compression badge (bottom left) -->
+													{#if file.status !== 'uploading'}
+														<div class="absolute bottom-1.5 left-1.5">
+															<ImageQualityBadge
+																fullQuality={file.fullQuality === true}
+																size={file?.file?.meta?.size ?? null}
+																on:toggle={(e) => {
+																	const target = file.itemId
+																		? files.find((f) => f.itemId === file.itemId)
+																		: files[fileIdx];
+																	if (target) {
+																		target.fullQuality = e.detail.fullQuality;
+																		files = files;
+																	}
+																}}
+															/>
+														</div>
+													{/if}
 													<!-- Action buttons (top right) -->
 													<div class="absolute top-1.5 right-1.5 flex gap-1">
 														<button
@@ -2075,7 +2112,25 @@
 																	if (enterPressed) {
 																		e.preventDefault();
 																		if (prompt !== '' || files.length > 0) {
-																			dispatch('submit', prompt);
+																			// While the model is WORKING, Enter/Alt+Enter don't start a
+																			// new send — they route into the queue:
+																			//   • bare Enter → STEER: inject at the next tool-call
+																			//     boundary (mid-task course-correct)
+																			//   • Alt+Enter  → QUEUE: deliver after the whole response
+																			//     finishes (today's queue behavior)
+																			// When idle, Enter submits as normal. (Shift+Enter still
+																			// inserts a newline — it never reaches here because
+																			// enterPressed requires !shiftKey.)
+																			const working =
+																				generating ||
+																				(taskIds && taskIds.length > 0) ||
+																				(history?.currentId &&
+																					history.messages[history.currentId]?.done != true);
+																			if (working) {
+																				dispatch(e.altKey ? 'queueAfterFinal' : 'steer', prompt);
+																			} else {
+																				dispatch('submit', prompt);
+																			}
 																		}
 																	}
 																}
@@ -2213,7 +2268,10 @@
 										{#if showWebSearchButton}
 											<Tooltip content={$i18n.t('Web Search')} placement="top">
 												<button
-													on:click|preventDefault={() => (webSearchEnabled = !webSearchEnabled)}
+													on:click|preventDefault={() => {
+														webSearchEnabled = !webSearchEnabled;
+														onSelectionTouched();
+													}}
 													type="button"
 													class="group p-2 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden {webSearchEnabled ||
 													($settings?.webSearch ?? false) === 'always'
@@ -2239,6 +2297,7 @@
 														} else {
 															selectedToolIds = [...(selectedToolIds ?? []), containerToolId];
 														}
+														onSelectionTouched();
 													}}
 													type="button"
 													class="group p-2 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden {containerWorkspaceActive
@@ -2336,6 +2395,7 @@
 													<button
 														on:click|preventDefault={() => {
 															selectedToolIds = selectedToolIds.filter((id) => id !== toolId);
+															onSelectionTouched();
 														}}
 														type="button"
 														class="group px-2 py-1.5 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden text-gray-900 dark:text-gray-100 bg-manilla/60 hover:bg-manilla/80 dark:bg-manilla-dark dark:hover:bg-manilla-dark/80 border-hairline border-book-cloth/30 dark:border-book-cloth/40"
@@ -2361,6 +2421,7 @@
 												{showStudyModeButton}
 												{showDataVizButton}
 												{showImageGenerationButton}
+												{onSelectionTouched}
 												bind:selectedToolIds
 												bind:selectedFilterIds
 												bind:webSearchEnabled
@@ -2566,8 +2627,10 @@
 											{#if imageGenerationEnabled}
 												<Tooltip content={$i18n.t('Image')} placement="top">
 													<button
-														on:click|preventDefault={() =>
-															(imageGenerationEnabled = !imageGenerationEnabled)}
+														on:click|preventDefault={() => {
+															imageGenerationEnabled = !imageGenerationEnabled;
+															onSelectionTouched();
+														}}
 														type="button"
 														class="group p-[7px] flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden {imageGenerationEnabled
 															? ' text-gray-900 dark:text-gray-100 bg-manilla/60 hover:bg-manilla/80 dark:bg-manilla-dark dark:hover:bg-manilla-dark/80 border-hairline border-book-cloth/30 dark:border-book-cloth/40'

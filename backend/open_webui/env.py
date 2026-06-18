@@ -610,6 +610,94 @@ STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "17280
 
 
 ####################################
+# AGENTIC TOOL-CALL LOOP BOUNDS
+####################################
+
+# Hard ceiling on the number of tool-call rounds in a single agentic response.
+# The loop is otherwise `while len(tool_calls) > 0` with no backstop, so a model
+# that calls tools forever runs unbounded DB writes / token spend / wall time.
+# When hit, the loop stops requesting more tools and lets the model produce a
+# final answer (a synthetic notice is fed in). 0/negative disables the cap.
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+# Hard cap on agentic tool-call rounds for a single chat turn. DISABLED by
+# default (0): neither the parent chat nor subagents are capped, so the model
+# can keep calling tools as long as it needs. Set a positive value only if you
+# want an ops backstop; on reaching it the next model call is forced tool-free
+# so it must produce a final answer. Subagents are exempt regardless (see
+# utils/middleware.py) so re-enabling a parent cap never limits subagent depth.
+AGENTIC_MAX_TOOL_ROUNDS = _int_env("AGENTIC_MAX_TOOL_ROUNDS", 0)
+
+# Re-issue a model round that completed successfully but produced NOTHING usable
+# (no tool calls AND no/empty assistant text) up to this many times before giving
+# up. Models occasionally end a turn on a bare reasoning block or an empty
+# completion; without this the agentic loop just stops with no answer. Applies to
+# regular chats AND subagents (the subagent inner pipeline re-enters the same
+# loop). Does NOT retry provider errors or user cancels — only the "successful but
+# empty" case. Each retry is a full LLM round, so keep this small. 0 disables.
+AGENTIC_EMPTY_ROUND_MAX_RETRIES = _int_env("AGENTIC_EMPTY_ROUND_MAX_RETRIES", 3)
+
+# Per-subagent wall-clock timeout (seconds). DISABLED by default (0): subagents
+# must be free to research as deeply as they need, for as long as they need —
+# no time ceiling on how far they can dig. Set a positive value only if you want
+# an ops backstop against a subagent whose own tool genuinely hangs; on timeout
+# the subagent is cancelled and a non-empty error result is fed back to the
+# parent model (preserving the "one non-empty tool message per tool_call"
+# invariant). 0/negative disables the timeout.
+SUBAGENT_RUN_TIMEOUT_SECONDS = _int_env("SUBAGENT_RUN_TIMEOUT_SECONDS", 0)
+
+# Max number of subagents allowed to run concurrently per worker. `subagent_launch`
+# is parallelizable, so a single parent turn can otherwise gather an unbounded
+# number of full nested pipelines (each = a hidden chat + MCP connects + web
+# traffic). DISABLED by default (0): subagents fan out without a concurrency
+# ceiling. Set a positive value only if you want an ops backstop. 0/negative
+# disables the bound (the run path then skips the semaphore entirely).
+SUBAGENT_MAX_CONCURRENCY = _int_env("SUBAGENT_MAX_CONCURRENCY", 0)
+
+# Provider-facing subagent streaming. Disabled by default: subagents still run
+# through Open WebUI's local stream/agentic pipeline for UI updates and tool
+# loops, but their upstream LLM requests are sent as non-streaming JSON bodies.
+# Set true to restore the older provider streaming behavior.
+SUBAGENT_PROVIDER_STREAM = (
+    os.environ.get("SUBAGENT_PROVIDER_STREAM", "False").lower() == "true"
+)
+
+
+####################################
+# PROFILING (opt-in, off by default — zero overhead when disabled)
+####################################
+
+# Background event-loop lag monitor. When enabled, a task wakes every
+# PROFILE_LOOP_LAG_INTERVAL seconds and measures how late it actually fired
+# (actual minus expected). On a saturated single loop that drift is the stall
+# every other coroutine — including socket delta delivery — is waiting on. The
+# monitor logs max + p95 stall (ms) over a rolling window. Use it to quantify
+# "the loop is maxed" and to prove whether uvloop/orjson/offload helped.
+PROFILE_LOOP_LAG = os.environ.get("PROFILE_LOOP_LAG", "False").lower() == "true"
+PROFILE_LOOP_LAG_INTERVAL = float(
+    os.environ.get("PROFILE_LOOP_LAG_INTERVAL", "0.05")
+)
+PROFILE_LOOP_LAG_WINDOW_SECONDS = float(
+    os.environ.get("PROFILE_LOOP_LAG_WINDOW_SECONDS", "10")
+)
+
+# Per-response cProfile around process_chat_response. When enabled, each
+# streaming response is profiled and its stats dumped to PROFILE_CHAT_DIR as a
+# .pstats file keyed by chat/message id. Off by default (the wrapper is skipped
+# entirely, so there is no overhead unless you opt in). Inspect with
+# `python -m pstats <file>` or snakeviz.
+PROFILE_CHAT = os.environ.get("PROFILE_CHAT", "False").lower() == "true"
+PROFILE_CHAT_DIR = os.environ.get(
+    "PROFILE_CHAT_DIR", str(DATA_DIR / "profiles")
+)
+
+
+####################################
 # WEBSOCKET SUPPORT
 ####################################
 
@@ -663,6 +751,30 @@ else:
 AIOHTTP_CLIENT_SESSION_SSL = (
     os.environ.get("AIOHTTP_CLIENT_SESSION_SSL", "True").lower() == "true"
 )
+
+
+# Streaming chat-completion timeout. The streaming request to the upstream model
+# provider must NOT use aiohttp's built-in 5-minute `total` default — a long
+# reasoning answer or a deep research subagent legitimately streams for many
+# minutes, and a `total` cap cancels it mid-generation (surfaces as a spurious
+# CancelledError that strands subagents). We therefore set `total=None` and guard
+# only against a genuinely DEAD connection with `sock_read` — the max gap allowed
+# BETWEEN received bytes. An actively-generating model emits tokens well within
+# this window, so it never trips during real work; a stalled/half-open socket
+# trips it and fails cleanly instead of hanging forever. Set to 0/empty to
+# disable the sock_read guard too (fully unbounded).
+AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = os.environ.get(
+    "AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ", "600"
+)
+if AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ in ("", "0"):
+    AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = None
+else:
+    try:
+        AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = int(
+            AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ
+        )
+    except Exception:
+        AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = 600
 
 AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST = os.environ.get(
     "AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST",

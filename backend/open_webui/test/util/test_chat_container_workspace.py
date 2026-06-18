@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -19,11 +20,17 @@ def _assemble(monkeypatch, files, container_workspace_active=True):
             }
         },
     )
-    return chat_utils.assemble_conversation_from_leaf(
-        "chat-1",
-        "user-1",
-        model={"info": {"meta": {"capabilities": {"vision": True}}}},
-        container_workspace_active=container_workspace_active,
+    # assemble_conversation_from_leaf is async; drive it synchronously so these
+    # tests run without an async-pytest plugin (none is installed here, which
+    # would otherwise silently SKIP them). No request/user is passed, so the
+    # new vision/PDF preprocessing is a no-op and these assertions are unchanged.
+    return asyncio.run(
+        chat_utils.assemble_conversation_from_leaf(
+            "chat-1",
+            "user-1",
+            model={"info": {"meta": {"capabilities": {"vision": True}}}},
+            container_workspace_active=container_workspace_active,
+        )
     )
 
 

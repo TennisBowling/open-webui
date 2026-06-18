@@ -399,13 +399,214 @@ def _walk_messages_from_leaf(messages_map: dict, leaf_id: str) -> list:
     return chain
 
 
-def assemble_conversation_from_leaf(
+_DEFAULT_VISION_PREPROCESSOR_PROMPT = (
+    "Perform OCR on this image and describe its contents in the context of the "
+    "user query: {query}"
+)
+
+
+def _message_image_files(message: dict) -> list:
+    return [f for f in (message.get("files") or []) if f.get("type") == "image"]
+
+
+def _message_pdf_files(message: dict) -> list:
+    out = []
+    for f in message.get("files") or []:
+        if f.get("type") != "file":
+            continue
+        name = (f.get("name") or "").lower()
+        inner = ((f.get("file") or {}).get("filename") or "").lower()
+        if name.endswith(".pdf") or inner.endswith(".pdf"):
+            out.append(f)
+    return out
+
+
+async def preprocess_nonvision_files(
+    request,
+    user,
+    chat_id: str,
+    user_message: dict,
+    model: Optional[dict],
+) -> None:
+    """Server-side port of the client's vision/PDF preprocessing.
+
+    When a user message carries images or PDFs but the target ``model`` lacks
+    native vision AND has a configured ``vision_preprocessor_model_id``, run the
+    preprocessor model to OCR/describe the attachments, then REWRITE the user
+    message content to ``[Vision Analysis:\\n…]`` / ``[PDF Analysis (N pages):
+    \\n…]`` and persist it. This makes queued multimodal messages work when the
+    backend drains with zero tabs open (the browser that used to do this isn't
+    around).
+
+    Idempotent: guarded by the persisted ``vision_processed`` / ``pdf_processed``
+    flags (the same flags the client sets), so a re-drain / crash never
+    double-prepends the analysis. Mutates ``user_message`` IN PLACE so the
+    caller's assembled chain sees the rewritten content.
+
+    Best-effort for images (degrade to text-only on failure). For PDFs a failure
+    persists an error on the message and raises, so the drain PAUSES rather than
+    silently sending a non-vision model a PDF it can't read.
+    """
+    if not isinstance(user_message, dict) or user_message.get("role") != "user":
+        return
+    if not isinstance(model, dict):
+        return
+
+    meta = ((model.get("info") or {}).get("meta")) or {}
+    caps = meta.get("capabilities") or {}
+    has_native_vision = caps.get("vision", True)
+    preprocessor_id = meta.get("vision_preprocessor_model_id")
+    if has_native_vision or not preprocessor_id:
+        return
+
+    vision_prompt_tmpl = (
+        meta.get("vision_preprocessor_prompt") or _DEFAULT_VISION_PREPROCESSOR_PROMPT
+    )
+    base_content = user_message.get("content") or ""
+    message_id = user_message.get("id")
+
+    async def _run_ocr(messages: list) -> str:
+        ocr_form = {
+            "model": preprocessor_id,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 4096,
+        }
+        res = await generate_chat_completion(request, ocr_form, user, bypass_filter=True)
+        # generate_chat_completion returns a dict for non-streaming responses.
+        if isinstance(res, dict):
+            choices = res.get("choices") or []
+            if choices:
+                return (choices[0].get("message") or {}).get("content") or ""
+        return ""
+
+    def _persist(content: str, **flags) -> None:
+        update = {"content": content, **flags}
+        if chat_id and not str(chat_id).startswith("local:") and message_id:
+            try:
+                Chats.upsert_message_to_chat_by_id_and_message_id(
+                    chat_id, message_id, update, return_model=False
+                )
+            except Exception:
+                log.exception(
+                    "preprocess_nonvision_files: persist failed for %s/%s",
+                    chat_id,
+                    message_id,
+                )
+
+    # --- Images ---------------------------------------------------------------
+    images = _message_image_files(user_message)
+    if images and not user_message.get("vision_processed"):
+        try:
+            ocr_messages = [
+                {
+                    "role": "system",
+                    "content": vision_prompt_tmpl.replace("{query}", base_content),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": base_content},
+                        *[
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": _file_content_url(f)},
+                            }
+                            for f in images
+                            if _file_content_url(f)
+                        ],
+                    ],
+                },
+            ]
+            vision_response = await _run_ocr(ocr_messages)
+            new_content = f"[Vision Analysis:\n{vision_response}\n]\n\n{base_content}"
+            user_message["content"] = new_content
+            user_message["vision_processed"] = True
+            base_content = new_content
+            _persist(new_content, vision_processed=True)
+        except Exception:
+            log.exception(
+                "preprocess_nonvision_files: image OCR failed for %s; sending text-only",
+                chat_id,
+            )
+            # Degrade gracefully — mark processed=False, leave content as-is.
+            user_message["vision_processed"] = False
+            _persist(base_content, vision_processed=False)
+
+    # --- PDFs -----------------------------------------------------------------
+    pdfs = _message_pdf_files(user_message)
+    if pdfs and not user_message.get("pdf_processed"):
+        try:
+            ocr_messages = [
+                {
+                    "role": "system",
+                    "content": vision_prompt_tmpl.replace("{query}", base_content),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"I have uploaded {len(pdfs)} PDF document(s). "
+                                f"Please analyze them:\n\n{base_content}"
+                            ),
+                        },
+                        *[
+                            {
+                                "type": "file",
+                                "file": {
+                                    "filename": f.get("name")
+                                    or (f.get("file") or {}).get("filename")
+                                    or "document.pdf",
+                                    "file_data": _file_content_url(f),
+                                },
+                            }
+                            for f in pdfs
+                        ],
+                    ],
+                },
+            ]
+            vision_response = await _run_ocr(ocr_messages)
+            pages = len(pdfs)
+            new_content = (
+                f"[PDF Analysis ({pages} pages):\n{vision_response}\n]\n\n{base_content}"
+            )
+            user_message["content"] = new_content
+            user_message["pdf_processed"] = True
+            _persist(new_content, pdf_processed=True)
+        except Exception as e:
+            log.exception(
+                "preprocess_nonvision_files: PDF OCR failed for %s", chat_id
+            )
+            # PDF failure is fatal for the turn (the model can't read the PDF):
+            # persist an error and raise so the drain PAUSES.
+            err = {
+                "content": (
+                    f"PDF preprocessing failed: {e}\n\nThe selected model does not "
+                    "support vision natively, and PDF preprocessing could not be "
+                    "completed."
+                )
+            }
+            if chat_id and not str(chat_id).startswith("local:") and message_id:
+                try:
+                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, message_id, {"error": err}, return_model=False
+                    )
+                except Exception:
+                    pass
+            raise
+
+
+async def assemble_conversation_from_leaf(
     chat_id: str,
     leaf_message_id: Optional[str],
     new_user_message: Optional[dict] = None,
     model: Optional[dict] = None,
     system_prompt: Optional[str] = None,
     container_workspace_active: bool = False,
+    request=None,
+    user=None,
 ) -> list[dict]:
     """Backend equivalent of the frontend's ``createMessagesList`` +
     ``expandMessagesForToolResumption`` + ``buildTextFileBlocks`` +
@@ -416,6 +617,12 @@ def assemble_conversation_from_leaf(
     ``Chats.upsert_message_to_chat_by_id_and_message_id`` AND appended to the
     walk so the first send of a new turn works without a separate save round-trip
     from the frontend.
+
+    When ``request`` + ``user`` are provided and the model lacks native vision
+    but has a configured preprocessor, images/PDFs on the last user message are
+    OCR'd and folded into its text (see ``preprocess_nonvision_files``). This is
+    what makes queued multimodal messages work under the zero-tab server drain;
+    it also runs for normal tab-driven sends so behavior is identical.
     """
     messages_map = Chats.get_messages_map_by_chat_id(chat_id) or {}
 
@@ -429,6 +636,8 @@ def assemble_conversation_from_leaf(
         new_id = new_user_message["id"]
         if new_id not in messages_map:
             parent_id = new_user_message.get("parentId") or leaf_message_id
+            if leaf_message_id == new_id and parent_id and not chain:
+                chain = _walk_messages_from_leaf(messages_map, parent_id)
             persisted = {
                 "id": new_id,
                 "parentId": parent_id,
@@ -470,7 +679,7 @@ def assemble_conversation_from_leaf(
                             Chats.upsert_message_to_chat_by_id_and_message_id(
                                 chat_id,
                                 parent_id,
-                                {"childrenIds": existing_children},
+                                {"childrenIds": existing_children}, return_model=False
                             )
                         except Exception as e:
                             log.debug(
@@ -486,7 +695,7 @@ def assemble_conversation_from_leaf(
             # follow-up update_chat_by_id is needed.
             try:
                 Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, new_id, persisted
+                    chat_id, new_id, persisted, return_model=False
                 )
             except Exception as e:
                 log.debug(
@@ -494,6 +703,25 @@ def assemble_conversation_from_leaf(
                 )
 
             chain.append(persisted)
+
+    # Vision/PDF preprocessing for non-vision models (server-side port of the
+    # client path). Operates on the LAST user message in the chain — the one
+    # being sent this turn — before we build the API messages, so the OCR
+    # rewrite is what the model actually receives. Idempotent via persisted
+    # vision_processed/pdf_processed flags.
+    if request is not None and user is not None:
+        last_user_message = next(
+            (
+                m
+                for m in reversed(chain)
+                if isinstance(m, dict) and m.get("role") == "user"
+            ),
+            None,
+        )
+        if last_user_message is not None:
+            await preprocess_nonvision_files(
+                request, user, chat_id, last_user_message, model
+            )
 
     expanded = expand_messages_for_tool_resumption(chain)
 
@@ -525,6 +753,11 @@ def assemble_conversation_from_leaf(
                 forwarded["reasoning_details_per_round"] = message["reasoning_details_per_round"]
             if message.get("reasoning_details"):
                 forwarded["reasoning_details"] = message["reasoning_details"]
+            if message.get("subagent_runs"):
+                # Carry the durable subagent answer mirror so blocks_to_api_messages
+                # can recover a subagent tool result whose persisted content is empty
+                # (results array vs subagent_runs can diverge on an interrupted turn).
+                forwarded["subagent_runs"] = message["subagent_runs"]
             prepared.append(forwarded)
             continue
 
@@ -772,6 +1005,18 @@ async def generate_chat_completion(
 
     model = models[model_id]
 
+    completion_metadata = form_data.get("metadata") if isinstance(form_data, dict) else None
+    provider_stream_override = (
+        completion_metadata.get("provider_stream")
+        if isinstance(completion_metadata, dict) and "provider_stream" in completion_metadata
+        else None
+    )
+    upstream_stream = (
+        bool(provider_stream_override)
+        if provider_stream_override is not None
+        else bool(form_data.get("stream"))
+    )
+
     # Check if model is in MODELS (backend-managed) - if so, DON'T use direct flow
     is_in_backend_models = model_id in request.app.state.MODELS
     is_direct_flag_set = getattr(request.state, "direct", False)
@@ -815,7 +1060,7 @@ async def generate_chat_completion(
 
             form_data["model"] = selected_model_id
 
-            if form_data.get("stream") == True:
+            if form_data.get("stream") == True and upstream_stream:
 
                 async def stream_wrapper(stream):
                     yield f"data: {json.dumps({'selected_model_id': selected_model_id})}\n\n"
@@ -854,7 +1099,7 @@ async def generate_chat_completion(
                 user=user,
                 bypass_filter=bypass_filter,
             )
-            if form_data.get("stream"):
+            if form_data.get("stream") and upstream_stream:
                 response.headers["content-type"] = "text/event-stream"
                 return StreamingResponse(
                     convert_streaming_response_ollama_to_openai(response),
@@ -1058,7 +1303,7 @@ async def run_outlet_filters_on_completed_stream(
             {
                 "content": merged_serialized,
                 "content_blocks": merged_blocks,
-            },
+            }, return_model=False
         )
     except Exception as e:
         log.exception(f"Outlet filter persist failed: {e}")

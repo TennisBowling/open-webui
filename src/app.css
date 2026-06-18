@@ -353,6 +353,10 @@ input[type='number'] {
 	@apply bg-gray-850 border-gray-700 text-gray-100;
 }
 
+.tippy-box[data-theme~='claude'] .tippy-content {
+	@apply max-h-[60vh] overflow-y-auto;
+}
+
 .password {
 	-webkit-text-security: disc;
 }

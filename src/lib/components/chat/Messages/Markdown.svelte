@@ -18,7 +18,6 @@
 	export let save = false;
 	export let preview = false;
 	export let parseImmediately = false;
-	export let allowStreamingPlainText = false;
 
 	export let chatId = '';
 	export let messageId = '';
@@ -45,13 +44,6 @@
 	// Throttle interval in ms - parse less frequently during streaming
 	const STREAMING_THROTTLE = 100; // 10 updates per second max during streaming
 	const DONE_DELAY = 50; // Small delay when done to ensure final parse
-	const STREAMING_PLAINTEXT_CHARS = 4000;
-
-	$: streamingPlainText =
-		allowStreamingPlainText &&
-		!done &&
-		typeof content === 'string' &&
-		content.length > STREAMING_PLAINTEXT_CHARS;
 
 	const options = {
 		throwOnError: false,
@@ -123,14 +115,7 @@
 
 	// Use a reactive statement that just schedules parsing instead of doing it immediately
 	$: {
-		if (streamingPlainText) {
-			if (parseTimeout) {
-				clearTimeout(parseTimeout);
-				parseTimeout = null;
-			}
-			pendingContent = null;
-			tokens = [];
-		} else if (content) {
+		if (content) {
 			pendingContent = content;
 			scheduleParse();
 		}
@@ -143,27 +128,23 @@
 	});
 </script>
 
-{#if streamingPlainText}
-	<div dir="auto" class="whitespace-pre-wrap break-words">{content}</div>
-{:else}
-	{#key id}
-		<MarkdownTokens
-			{tokens}
-			{id}
-			{done}
-			{save}
-			{preview}
-			{editCodeBlock}
-			{topPadding}
-			{chatId}
-			{messageId}
-			{dataVizOverrides}
-			{sandboxFiles}
-			{onTaskClick}
-			{onSourceClick}
-			{onSave}
-			{onUpdate}
-			{onPreview}
-		/>
-	{/key}
-{/if}
+{#key id}
+	<MarkdownTokens
+		{tokens}
+		{id}
+		{done}
+		{save}
+		{preview}
+		{editCodeBlock}
+		{topPadding}
+		{chatId}
+		{messageId}
+		{dataVizOverrides}
+		{sandboxFiles}
+		{onTaskClick}
+		{onSourceClick}
+		{onSave}
+		{onUpdate}
+		{onPreview}
+	/>
+{/key}

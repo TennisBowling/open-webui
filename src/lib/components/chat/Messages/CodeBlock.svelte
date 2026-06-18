@@ -7,8 +7,18 @@
 
 	import 'highlight.js/styles/github-dark.min.css';
 
-	import CodeEditor from '$lib/components/common/CodeEditor.svelte';
 	import SvgPanZoom from '$lib/components/common/SVGPanZoom.svelte';
+
+	// CodeEditor pulls in the entire CodeMirror stack. Load it lazily so a
+	// transcript of read-only code blocks never mounts an editor (or imports
+	// CodeMirror) until the user explicitly clicks Edit.
+	let codeEditorPromise = null;
+	const loadCodeEditor = () => {
+		if (!codeEditorPromise) {
+			codeEditorPromise = import('$lib/components/common/CodeEditor.svelte');
+		}
+		return codeEditorPromise;
+	};
 
 	import ChevronUpDown from '$lib/components/icons/ChevronUpDown.svelte';
 
@@ -36,6 +46,7 @@
 	let codeBlockElement = null;
 	let visible = false;
 	let observer = null;
+	let editing = false;
 
 	let _code = '';
 	$: if (code) {
@@ -108,14 +119,47 @@
 		}
 	};
 
+	// Cheap change-detection: `code` and `lang` are derived from the token and
+	// are what actually drive rendering. Comparing them (plus raw length to catch
+	// trailing-fence changes) avoids the previous double `JSON.stringify(token)`
+	// of a growing token on every reactive pass -- O(token) per pass during
+	// streaming -> O(token^2) over the block's life.
+	let _tokenSig = '';
 	$: if (token) {
-		if (JSON.stringify(token) !== JSON.stringify(_token)) {
+		const sig = `${lang} ${(code ?? '').length} ${(token?.raw ?? '').length}`;
+		if (sig !== _tokenSig) {
+			_tokenSig = sig;
 			_token = token;
 		}
 	}
 
 	$: if (_token) {
 		render();
+	}
+
+	// Memoized syntax highlighting. Recomputes ONLY when the visible code or its
+	// language changes -- not on every reactive pass. Prefer `hljs.highlight` with
+	// the known language (much cheaper than `highlightAuto`'s language detection,
+	// which previously ran in the template on every re-render of a growing code
+	// block -> O(code^2) over the stream). Falls back to auto-detect only when the
+	// language is unknown.
+	let highlightedHtml = '';
+	let _lastHighlightKey = '';
+	$: {
+		if (visible && code) {
+			const key = `${lang} ${code}`;
+			if (key !== _lastHighlightKey) {
+				_lastHighlightKey = key;
+				try {
+					const known = lang && hljs.getLanguage(lang);
+					highlightedHtml = known
+						? hljs.highlight(code, { language: lang, ignoreIllegal: true }).value
+						: hljs.highlightAuto(code).value || code;
+				} catch {
+					highlightedHtml = code;
+				}
+			}
+		}
 	}
 
 	onMount(async () => {
@@ -192,7 +236,16 @@
 						</div>
 					</button>
 
-					{#if save}
+					{#if save && !edit && !editing}
+						<button
+							class="edit-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
+							on:click={() => (editing = true)}
+						>
+							{$i18n.t('Edit')}
+						</button>
+					{/if}
+
+					{#if save && (edit || editing)}
 						<button
 							class="save-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
 							on:click={saveCode}
@@ -227,25 +280,27 @@
 				<div class=" pt-8 bg-manilla/60 dark:bg-manilla-dark"></div>
 
 				{#if !collapsed}
-					{#if edit}
-						<CodeEditor
-							value={code}
-							{id}
-							{lang}
-							onSave={() => {
-								saveCode();
-							}}
-							onChange={(value) => {
-								_code = value;
-							}}
-						/>
+					{#if edit || editing}
+						{#await loadCodeEditor() then m}
+							<svelte:component
+								this={m.default}
+								value={code}
+								{id}
+								{lang}
+								onSave={() => {
+									saveCode();
+								}}
+								onChange={(value) => {
+									_code = value;
+								}}
+							/>
+						{/await}
 					{:else}
 						<pre
 							class=" hljs p-4 px-5 overflow-x-auto"
 							style="border-top-left-radius: 0px; border-top-right-radius: 0px;"><code
 								class="language-{lang} rounded-t-none whitespace-pre text-sm"
-								>{#if visible}{@html hljs.highlightAuto(code, hljs.getLanguage(lang)?.aliases)
-										.value || code}{:else}{code}{/if}</code
+								>{#if visible}{@html highlightedHtml || code}{:else}{code}{/if}</code
 							></pre>
 					{/if}
 				{:else}

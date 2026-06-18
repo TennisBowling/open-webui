@@ -2487,6 +2487,31 @@ FILE_IMAGE_COMPRESSION_HEIGHT = PersistentConfig(
 )
 
 
+IMAGE_PROVIDER_COMPRESSION_ENABLED = PersistentConfig(
+    "IMAGE_PROVIDER_COMPRESSION_ENABLED",
+    "file.image_provider_compression.enabled",
+    os.environ.get("IMAGE_PROVIDER_COMPRESSION_ENABLED", "True").lower() == "true",
+)
+
+IMAGE_PROVIDER_COMPRESSION_QUALITY = PersistentConfig(
+    "IMAGE_PROVIDER_COMPRESSION_QUALITY",
+    "file.image_provider_compression.quality",
+    int(os.environ.get("IMAGE_PROVIDER_COMPRESSION_QUALITY", "85")),
+)
+
+IMAGE_PROVIDER_COMPRESSION_MIN_BYTES = PersistentConfig(
+    "IMAGE_PROVIDER_COMPRESSION_MIN_BYTES",
+    "file.image_provider_compression.min_bytes",
+    int(os.environ.get("IMAGE_PROVIDER_COMPRESSION_MIN_BYTES", str(1024 * 1024))),
+)
+
+IMAGE_PROVIDER_MAX_DIMENSION = PersistentConfig(
+    "IMAGE_PROVIDER_MAX_DIMENSION",
+    "file.image_provider_compression.max_dimension",
+    int(os.environ.get("IMAGE_PROVIDER_MAX_DIMENSION", "2048")),
+)
+
+
 RAG_ALLOWED_FILE_EXTENSIONS = PersistentConfig(
     "RAG_ALLOWED_FILE_EXTENSIONS",
     "rag.file.allowed_extensions",
@@ -2711,6 +2736,25 @@ EXA_API_KEY = PersistentConfig(
     "EXA_API_KEY",
     "rag.web.search.exa_api_key",
     os.getenv("EXA_API_KEY", ""),
+)
+
+# Optional second Exa key. web_search falls back to this automatically when the
+# primary key returns a credit/auth error, so search keeps working while the
+# primary is topped up / rotated.
+EXA_API_KEY_2 = PersistentConfig(
+    "EXA_API_KEY_2",
+    "rag.web.search.exa_api_key_2",
+    os.getenv("EXA_API_KEY_2", ""),
+)
+
+# Per-key health for the Exa keys, surfaced in the admin Web Search panel.
+# Shape: {"1": {"error": str, "at": int}, "2": {...}}. An absent slot = healthy.
+# web_search writes a slot on failure and clears it on success (write-on-change
+# only); the admin "Clear" action resets a slot.
+EXA_KEY_STATUS = PersistentConfig(
+    "EXA_KEY_STATUS",
+    "rag.web.search.exa_key_status",
+    {},
 )
 
 # Exa Search Settings

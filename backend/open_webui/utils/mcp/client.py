@@ -1,5 +1,4 @@
-import hashlib
-import re
+import asyncio
 from typing import Optional
 from contextlib import AsyncExitStack
 
@@ -11,30 +10,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from open_webui.utils.tool_calling import mcp_tool_alias
 
 
 MCP_INIT_TIMEOUT = 10
-MCP_CALL_TIMEOUT = 60
-
-_MCP_TOOL_NAME_MAX = 64
-_MCP_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
-
-
-def mcp_tool_alias(server_id: str, tool_name: str) -> str:
-    """Build a model-facing tool name that satisfies OpenAI/OpenRouter's
-    ``^[a-zA-Z0-9_-]{1,64}$`` constraint.
-
-    Naive ``f"{server_id}_{tool_name}"`` overflows the 64-char cap as soon as
-    server_id is a uuid, and any provider rejects the entire chat-completion
-    request -- not just the offending tool. We collapse the server id into an
-    8-char hash so multiple servers stay distinct, sanitize the original tool
-    name into the allowed alphabet, and clip to the limit.
-    """
-    safe_name = _MCP_TOOL_NAME_INVALID.sub("_", tool_name or "")
-    digest = hashlib.sha1((server_id or "").encode("utf-8")).hexdigest()[:8]
-    prefix = f"mcp_{digest}_"
-    return (prefix + safe_name)[:_MCP_TOOL_NAME_MAX] or prefix[:_MCP_TOOL_NAME_MAX]
-
+MCP_CALL_TIMEOUT = 900  # 15 minutes; long bash/browser tool calls must not be cut off
 
 def build_mcp_connect_kwargs(
     connection: dict,
@@ -258,7 +238,29 @@ class MCPClient:
         stack = self.exit_stack
         self.exit_stack = None
         self.session = None
-        await stack.aclose()
+
+        # MCP streamable-http transports use AnyIO cancel scopes inside async
+        # generators. Those scopes must be exited by the SAME asyncio task that
+        # entered them. During Ctrl+C/server shutdown this task may already have
+        # pending cancellation, and letting that cancellation interrupt aclose()
+        # leaves the async generator to be finalized later by loop.shutdown_asyncgens
+        # in a different task, which raises:
+        # "Attempted to exit cancel scope in a different task than it was entered in".
+        # Temporarily clear this task's pending cancellation so the transport can
+        # close in-place, then restore the cancellation count for the caller.
+        task = asyncio.current_task()
+        uncancelled = 0
+        if task is not None and hasattr(task, "uncancel"):
+            while task.cancelling():
+                task.uncancel()
+                uncancelled += 1
+
+        try:
+            await stack.aclose()
+        finally:
+            if task is not None:
+                for _ in range(uncancelled):
+                    task.cancel()
 
     async def __aenter__(self):
         # Lazily allocated so __aexit__'s disconnect() finds a stack to close.

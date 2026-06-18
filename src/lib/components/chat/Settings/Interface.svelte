@@ -67,6 +67,8 @@
 	let collapseCodeBlocks = false;
 	let expandDetails = false;
 	let autoExpandReasoningDuringStreaming = false;
+	let bundleAgenticSteps = true;
+	let agenticStepsAutoExpand = true;
 	let showChatTitleInTab = true;
 
 	let showFloatingActionButtons = true;
@@ -217,6 +219,8 @@
 		collapseCodeBlocks = $settings?.collapseCodeBlocks ?? false;
 		expandDetails = $settings?.expandDetails ?? false;
 		autoExpandReasoningDuringStreaming = $settings?.autoExpandReasoningDuringStreaming ?? false;
+		bundleAgenticSteps = $settings?.bundleAgenticSteps ?? true;
+		agenticStepsAutoExpand = $settings?.agenticStepsAutoExpand ?? true;
 
 		landingPageMode = $settings?.landingPageMode ?? '';
 		chatBubble = $settings?.chatBubble ?? true;
@@ -864,6 +868,46 @@
 					</div>
 				</div>
 			</div>
+
+			<div>
+				<div class=" py-0.5 flex w-full justify-between">
+					<div id="bundle-agentic-steps-label" class=" self-center text-xs">
+						{$i18n.t('Bundle Agentic Steps')}
+					</div>
+
+					<div class="flex items-center gap-2 p-1">
+						<Switch
+							ariaLabelledbyId="bundle-agentic-steps-label"
+							tooltip={true}
+							bind:state={bundleAgenticSteps}
+							on:change={() => {
+								saveSettings({ bundleAgenticSteps });
+							}}
+						/>
+					</div>
+				</div>
+			</div>
+
+			{#if bundleAgenticSteps}
+				<div>
+					<div class=" py-0.5 flex w-full justify-between">
+						<div id="agentic-steps-auto-expand-label" class=" self-center text-xs">
+							{$i18n.t('Auto-Expand Agentic Steps While Working')}
+						</div>
+
+						<div class="flex items-center gap-2 p-1">
+							<Switch
+								ariaLabelledbyId="agentic-steps-auto-expand-label"
+								tooltip={true}
+								bind:state={agenticStepsAutoExpand}
+								on:change={() => {
+									saveSettings({ agenticStepsAutoExpand });
+								}}
+							/>
+						</div>
+					</div>
+				</div>
+			{/if}
 
 			<div>
 				<div class=" py-0.5 flex w-full justify-between">

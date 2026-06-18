@@ -3,7 +3,7 @@
 # least connections, or least response time for better resource utilization and performance optimization.
 
 import asyncio
-import json
+from open_webui.utils import fast_json as json
 import logging
 import os
 import random
@@ -69,6 +69,21 @@ from open_webui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
+
+
+def _provider_stream_override(metadata: dict | None) -> Optional[bool]:
+    if isinstance(metadata, dict) and "provider_stream" in metadata:
+        return bool(metadata.get("provider_stream"))
+    return None
+
+
+def _apply_provider_stream_override(payload: dict, metadata: dict | None) -> Optional[bool]:
+    provider_stream = _provider_stream_override(metadata)
+    if provider_stream is None:
+        return None
+    payload["stream"] = provider_stream
+    return provider_stream
+
 
 
 ##########################################
@@ -1372,10 +1387,17 @@ async def generate_chat_completion(
     if prefix_id:
         payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
 
+    provider_stream_override = _apply_provider_stream_override(payload, metadata)
+    request_stream = (
+        provider_stream_override
+        if provider_stream_override is not None
+        else form_data.stream
+    )
+
     return await send_post_request(
         url=f"{url}/api/chat",
         payload=json.dumps(payload),
-        stream=form_data.stream,
+        stream=request_stream,
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         content_type="application/x-ndjson",
         user=user,
@@ -1561,10 +1583,17 @@ async def generate_openai_chat_completion(
     if prefix_id:
         payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
 
+    provider_stream_override = _apply_provider_stream_override(payload, metadata)
+    request_stream = (
+        provider_stream_override
+        if provider_stream_override is not None
+        else payload.get("stream", False)
+    )
+
     return await send_post_request(
         url=f"{url}/v1/chat/completions",
         payload=json.dumps(payload),
-        stream=payload.get("stream", False),
+        stream=request_stream,
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         user=user,
         metadata=metadata,

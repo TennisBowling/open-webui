@@ -684,3 +684,406 @@ def test_tool_result_ref_without_body_fails_loudly():
                 }
             ]
         )
+
+
+# -- A2: copy-on-write hydration does not mutate caller input -----------------
+
+
+def test_hydrate_does_not_mutate_caller_blocks_or_bodies():
+    """`_hydrate_tool_result_refs` (and therefore `blocks_to_api_messages`)
+    merges out-of-line tool bodies into the result dicts for conversion, but
+    must NEVER mutate the caller's `content_blocks` or the `bodies` store. The
+    old code deep-copied everything up front to guarantee this; the new
+    copy-on-write path only clones the blocks/results it actually touches, so
+    this property needs an explicit guard."""
+    from open_webui.utils.messages import _hydrate_tool_result_refs
+
+    result = {
+        "tool_call_id": "call_1",
+        "result_ref": "call_1",
+        "result_lazy": True,
+        "content": "",
+    }
+    tool_block = {
+        "type": "tool_calls",
+        "content": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "web_fetch", "arguments": "{}"},
+            }
+        ],
+        "results": [result],
+    }
+    text_block = {"type": "text", "content": "Done."}
+    blocks = [tool_block, text_block]
+    bodies = {"call_1": {"tool_call_id": "call_1", "content": "full fetched body"}}
+
+    hydrated = _hydrate_tool_result_refs(blocks, bodies)
+
+    # The merged output carries the body content.
+    hydrated_tool = next(b for b in hydrated if b.get("type") == "tool_calls")
+    assert hydrated_tool["results"][0]["content"] == "full fetched body"
+
+    # Caller's original structures are untouched.
+    assert result["content"] == ""  # the original result dict not mutated
+    assert tool_block["results"][0] is result  # original list entry unchanged
+    assert bodies["call_1"]["content"] == "full fetched body"  # store unchanged
+    assert "result_ref" not in bodies["call_1"]
+
+    # Untouched blocks pass through by reference (no needless cloning).
+    assert hydrated[1] is text_block
+
+
+def test_hydrate_passes_blocks_through_by_reference_when_nothing_to_merge():
+    """When no result needs a body merged in, every block is returned by
+    reference — the COW path must not clone gratuitously."""
+    from open_webui.utils.messages import _hydrate_tool_result_refs
+
+    tool_block = {
+        "type": "tool_calls",
+        "content": [
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "x", "arguments": "{}"},
+            }
+        ],
+        "results": [{"tool_call_id": "c1", "content": "already inline"}],
+    }
+    text_block = {"type": "text", "content": "Hi."}
+    blocks = [tool_block, text_block]
+
+    hydrated = _hydrate_tool_result_refs(blocks, {})
+
+    assert hydrated[0] is tool_block
+    assert hydrated[1] is text_block
+
+
+
+# -- user_steer (mid-task steering) expansion ---------------------------------
+
+
+def _steer_block(content):
+    return {"type": "user_steer", "content": content}
+
+
+def test_user_steer_emits_real_user_turn_between_assistant_emissions():
+    """A `user_steer` block (the user interjected mid-task) must expand into a
+    real {"role":"user"} message, positioned in conversation order:
+    assistant(tool) → tool result → assistant text → USER(steer) → assistant."""
+    out = _expand_assistant(
+        [
+            _tool_calls_block(call_id="c1", result="r1"),
+            _text_block("Partial progress."),
+            _steer_block("actually, focus on the tests"),
+            _text_block("Okay, refocusing."),
+        ]
+    )
+    roles = [(m["role"], m.get("content")) for m in out]
+    # assistant(tool_calls) , tool , assistant("Partial progress.") , user(steer) , assistant("Okay...")
+    assert ("user", "actually, focus on the tests") in roles
+    # Order: the steer must come AFTER the partial assistant text and BEFORE the
+    # final assistant text.
+    steer_idx = next(
+        i for i, m in enumerate(out)
+        if m["role"] == "user" and m.get("content") == "actually, focus on the tests"
+    )
+    partial_idx = next(
+        i for i, m in enumerate(out)
+        if m["role"] == "assistant" and m.get("content") == "Partial progress."
+    )
+    final_idx = next(
+        i for i, m in enumerate(out)
+        if m["role"] == "assistant" and m.get("content") == "Okay, refocusing."
+    )
+    assert partial_idx < steer_idx < final_idx
+
+
+def test_user_steer_does_not_consume_reasoning_slot():
+    """A steer is not a tool round: it must not advance emission_index, so the
+    per-round reasoning still aligns to the tool_calls emissions, not the steer."""
+    out = _expand_assistant(
+        [
+            _steer_block("steer before any round"),
+            _tool_calls_block(call_id="c1", result="r1"),
+            _text_block("done"),
+        ],
+        reasoning_details_per_round=[[_enc("rs_round0")]],
+    )
+    _assert_no_dups(out)
+    # The single per-round reasoning entry must land on the tool_calls emission
+    # (emission_index 0), NOT be skipped by the steer.
+    assistant_with_reasoning = [m for m in out if _ids(m)]
+    assert len(assistant_with_reasoning) == 1
+    assert _ids(assistant_with_reasoning[0]) == ["rs_round0"]
+    # And the steer is still a real user turn.
+    assert any(
+        m["role"] == "user" and m.get("content") == "steer before any round"
+        for m in out
+    )
+
+
+def test_multiple_user_steers_each_become_user_turns_in_order():
+    out = _expand_assistant(
+        [
+            _tool_calls_block(call_id="c1", result="r1"),
+            _steer_block("first steer"),
+            _steer_block("second steer"),
+            _text_block("final"),
+        ]
+    )
+    user_contents = [m.get("content") for m in out if m["role"] == "user"]
+    assert user_contents == ["first steer", "second steer"]
+
+
+def test_empty_user_steer_is_dropped():
+    out = _expand_assistant(
+        [
+            _text_block("hi"),
+            _steer_block("   "),
+            _text_block("bye"),
+        ]
+    )
+    assert all(m["role"] != "user" for m in out)
+
+
+def test_blocks_to_api_messages_with_user_steer_full_path():
+    """End-to-end through the public gate: a saved assistant message carrying a
+    user_steer block expands with the user turn inline."""
+    out = blocks_to_api_messages(
+        [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _tool_calls_block(call_id="c1", result="r1"),
+                    _text_block("working"),
+                    _steer_block("steer me"),
+                    _text_block("steered"),
+                ],
+            },
+        ]
+    )
+    assert {"role": "user", "content": "steer me"} in out
+    # content_blocks is an internal carrier — never leaks upstream.
+    assert all("content_blocks" not in m for m in out)
+
+
+# -- Subagent result recovery from the subagent_runs mirror ------------------
+
+
+def _subagent_tool_block(call_id, name="subagent_launch", results=None):
+    return {
+        "type": "tool_calls",
+        "content": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            }
+        ],
+        **({"results": results} if results is not None else {}),
+    }
+
+
+def test_subagent_result_recovers_from_runs_mirror_by_subagent_id():
+    # A launch result whose persisted content is empty but carries the subagent_id;
+    # the durable subagent_runs has the real answer.
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block(
+                        "c1",
+                        results=[{"tool_call_id": "c1", "content": "", "subagent_id": "sa1"}],
+                    ),
+                ],
+                "subagent_runs": {
+                    "sa1": {
+                        "subagent_id": "sa1",
+                        "status": "done",
+                        "final_text": "the real subagent answer",
+                    }
+                },
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "c1"
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "the real subagent answer"}
+    ]
+
+
+def test_subagent_result_recovers_by_tool_call_id_when_result_missing():
+    # The result row is ENTIRELY missing (no subagent_id available on a result),
+    # so only the tool_call_id key can recover it.
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block("c2", results=[]),
+                ],
+                "subagent_runs": {
+                    "sa2": {
+                        "subagent_id": "sa2",
+                        "tool_call_id": "c2",
+                        "status": "done",
+                        "final_text": "recovered via tool_call_id",
+                    }
+                },
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "recovered via tool_call_id"}
+    ]
+
+
+def test_subagent_continue_recovers_fresh_turn_not_stale_launch():
+    # Same subagent_id, two entries: the launch (keyed by sa) and the continue
+    # (keyed by sa#cont). The continue's tool_call_id must pull the FRESH answer.
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block(
+                        "cont_call",
+                        name="subagent_continue",
+                        results=[{"tool_call_id": "cont_call", "content": "", "subagent_id": "sa3"}],
+                    ),
+                ],
+                "subagent_runs": {
+                    "sa3": {
+                        "subagent_id": "sa3",
+                        "tool_call_id": "launch_call",
+                        "status": "done",
+                        "final_text": "STALE launch answer",
+                    },
+                    "sa3#cont_call": {
+                        "subagent_id": "sa3",
+                        "tool_call_id": "cont_call",
+                        "continuation": True,
+                        "status": "done",
+                        "final_text": "FRESH continue answer",
+                    },
+                },
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "FRESH continue answer"}
+    ]
+
+
+def test_subagent_error_status_still_falls_through_to_placeholder():
+    # A run that finished with status != done (or empty final_text) must NOT be
+    # used — the empty result falls through to the [No output...] placeholder.
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block(
+                        "c4",
+                        results=[{"tool_call_id": "c4", "content": "", "subagent_id": "sa4"}],
+                    ),
+                ],
+                "subagent_runs": {
+                    "sa4": {
+                        "subagent_id": "sa4",
+                        "status": "error",
+                        "final_text": "",
+                    }
+                },
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "[No output was produced for this tool call.]"}
+    ]
+
+
+def test_subagent_runs_absent_keeps_existing_placeholder_behavior():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block(
+                        "c5",
+                        results=[{"tool_call_id": "c5", "content": "", "subagent_id": "sa5"}],
+                    ),
+                ],
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [
+        {"type": "text", "text": "[No output was produced for this tool call.]"}
+    ]
+
+
+def test_subagent_nonempty_result_is_not_overridden_by_mirror():
+    # If the persisted result already has content, the mirror must not clobber it.
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    _subagent_tool_block(
+                        "c6",
+                        results=[{"tool_call_id": "c6", "content": "already here", "subagent_id": "sa6"}],
+                    ),
+                ],
+                "subagent_runs": {
+                    "sa6": {
+                        "subagent_id": "sa6",
+                        "status": "done",
+                        "final_text": "different mirror text",
+                    }
+                },
+            },
+        ]
+    )
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [{"type": "text", "text": "already here"}]
+
+
+def test_subagent_reconciliation_does_not_perturb_reasoning_dedup():
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "c7",
+                                "type": "function",
+                                "function": {"name": "subagent_launch", "arguments": "{}"},
+                            }
+                        ],
+                        "reasoning_details": [_enc("rs_S")],
+                        "results": [{"tool_call_id": "c7", "content": "", "subagent_id": "sa7"}],
+                    },
+                ],
+                "reasoning_details_per_round": [[_enc("rs_S")]],
+                "subagent_runs": {
+                    "sa7": {"subagent_id": "sa7", "status": "done", "final_text": "ans"},
+                },
+            },
+        ]
+    )
+    _assert_no_dups(out)
+    assert _ids(out[0]) == ["rs_S"]
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["content"] == [{"type": "text", "text": "ans"}]

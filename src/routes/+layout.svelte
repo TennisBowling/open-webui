@@ -48,7 +48,11 @@
 	import i18n, { initI18n, getLanguages, changeLanguage } from '$lib/i18n';
 	import { bestMatchingLanguage } from '$lib/utils';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
-	import { applySidebarEvent, SIDEBAR_EVENT_TYPES } from '$lib/utils/sidebarSync';
+	import {
+		applySidebarEvent,
+		refreshSidebarSnapshot,
+		SIDEBAR_EVENT_TYPES
+	} from '$lib/utils/sidebarSync';
 	import { streamPerfCount, streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
@@ -66,9 +70,9 @@
 
 	setContext('i18n', i18n);
 
-	const bc = new BroadcastChannel('active-tab-channel');
-
-	const SUPPORTS_BROADCAST_CHANNEL = typeof BroadcastChannel !== 'undefined';
+	const SUPPORTS_BROADCAST_CHANNEL =
+		typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined';
+	let activeTabBc = SUPPORTS_BROADCAST_CHANNEL ? new BroadcastChannel('active-tab-channel') : null;
 	let eventsBc = null;
 	// LRU-ish dedup window for events replayed via the owui-events
 	// BroadcastChannel. Bounds memory while remaining large enough to
@@ -77,6 +81,9 @@
 	const seenBroadcastOrder = [];
 	let primarySessionId = null;
 	let suppressBroadcast = false;
+	let sidebarReconcileTimer = null;
+	let sidebarReconcilePromise = null;
+	let hiddenAt = 0;
 
 	let loaded = false;
 	let tokenTimer = null;
@@ -84,6 +91,64 @@
 	let showRefresh = false;
 
 	const BREAKPOINT = 768;
+	const SIDEBAR_RECONCILE_AFTER_HIDDEN_MS = 30_000;
+
+	const rememberEvent = (event) => {
+		const dataPart = event?.data ?? {};
+		const type = dataPart?.type ?? '';
+		const messageId = event?.message_id ?? '';
+		const eventChatId = event?.chat_id ?? '';
+		const data = dataPart?.data ?? {};
+		let version = data?.version ?? dataPart?.version ?? event?.version ?? '';
+		let id = dataPart?.event_id ?? '';
+
+		if (!id && type === 'chat:delta:batch') {
+			const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
+			const hasSubagentUpdate = batch.some((b) => b?.data?.type === 'chat:subagent:update');
+			if (hasSubagentUpdate) return false;
+			const first = batch[0]?.data?.data?.version ?? batch[0]?.data?.version ?? '';
+			const last =
+				batch[batch.length - 1]?.data?.data?.version ??
+				batch[batch.length - 1]?.data?.version ??
+				'';
+			version = `b:${batch.length}:${first}:${last}`;
+		}
+
+		if (!id && type === 'chat:subagent:update') return false;
+		if (!id && (messageId || eventChatId)) {
+			id = [messageId, eventChatId, type, version].join('|');
+		}
+		if (!id && SIDEBAR_EVENT_TYPES.has(type) && data?.id) {
+			id = [type, data.id, data.updated_at ?? '', dataPart?.emitted_at ?? ''].join('|');
+		}
+		if (!id) return false;
+
+		if (seenBroadcastEvents.has(id)) return true;
+		seenBroadcastEvents.add(id);
+		seenBroadcastOrder.push(id);
+		if (seenBroadcastOrder.length > 300) {
+			const evicted = seenBroadcastOrder.shift();
+			if (evicted !== undefined) seenBroadcastEvents.delete(evicted);
+		}
+		return false;
+	};
+
+	const scheduleSidebarReconcile = (reason = 'unknown', delay = 250) => {
+		if (typeof localStorage === 'undefined' || !localStorage?.token) return;
+		if (sidebarReconcileTimer) clearTimeout(sidebarReconcileTimer);
+		sidebarReconcileTimer = setTimeout(async () => {
+			if (sidebarReconcilePromise || typeof localStorage === 'undefined' || !localStorage?.token)
+				return;
+			sidebarReconcilePromise = refreshSidebarSnapshot(localStorage.token, reason).catch((err) => {
+				console.error('sidebar reconcile failed', reason, err);
+			});
+			try {
+				await sidebarReconcilePromise;
+			} finally {
+				sidebarReconcilePromise = null;
+			}
+		}, delay);
+	};
 
 	const parseChatIdFromPath = (pathname = '') => {
 		const match = pathname.match(/^\/c\/([^/?#]+)/);
@@ -150,6 +215,7 @@
 					} else {
 						primarySessionId = null;
 					}
+					scheduleSidebarReconcile('socket:connect');
 				});
 			} else {
 				console.warn('No token found in localStorage, user-join event not emitted');
@@ -230,6 +296,7 @@
 		const perf = streamPerfStart();
 		const eventType = event?.data?.type ?? null;
 		const streamScoped = STREAM_SCOPED_EVENT_TYPES.has(eventType);
+		const sidebarEvent = eventType && SIDEBAR_EVENT_TYPES.has(eventType);
 
 		// Chat.svelte is the only component that owns live stream rendering. The
 		// global layout listener used to recursively unpack stream batches too,
@@ -237,6 +304,11 @@
 		if (streamScoped) {
 			streamPerfCount(`layout.stream_ignored.${eventType ?? 'unknown'}`);
 			streamPerfEnd('layout.stream_ignored', perf);
+			return;
+		}
+
+		if (eventType && rememberEvent(event)) {
+			streamPerfEnd('layout.event_duplicate', perf);
 			return;
 		}
 
@@ -251,7 +323,8 @@
 			primarySessionId &&
 			$socket?.id &&
 			$socket.id === primarySessionId &&
-			!streamScoped
+			!streamScoped &&
+			!sidebarEvent
 		) {
 			try {
 				eventsBc.postMessage(event);
@@ -393,6 +466,15 @@
 		}
 	};
 
+	onDestroy(() => {
+		activeTabBc?.close();
+		eventsBc?.close();
+		if (tokenTimer) clearInterval(tokenTimer);
+		if (sidebarReconcileTimer) clearTimeout(sidebarReconcileTimer);
+		$socket?.off('events', chatEventHandler);
+		$socket?.off('events:channel', channelEventHandler);
+	});
+
 	onMount(async () => {
 		let touchstartY = 0;
 
@@ -448,11 +530,13 @@
 		}
 
 		// Listen for messages on the BroadcastChannel
-		bc.onmessage = (event) => {
-			if (event.data === 'active') {
-				isLastActiveTab.set(false); // Another tab became active
-			}
-		};
+		if (activeTabBc) {
+			activeTabBc.onmessage = (event) => {
+				if (event.data === 'active') {
+					isLastActiveTab.set(false); // Another tab became active
+				}
+			};
+		}
 
 		if (SUPPORTS_BROADCAST_CHANNEL) {
 			eventsBc = new BroadcastChannel('owui-events');
@@ -465,80 +549,6 @@
 				// ignore that replay or cross-channel ordering can create artificial
 				// version gaps and force snapshot catch-up.
 				if (payload?.session_id && $socket?.id && payload.session_id === $socket.id) return;
-				// Defensive dedup: if the backend briefly has two primary
-				// sessions during the election race (e.g. old primary
-				// disconnecting at the same instant a new tab connects),
-				// the same event can arrive on this channel twice. Drop
-				// repeats so non-primary tabs don't double-apply stream
-				// updates. Identifier covers message id, event type, and
-				// the per-message version when present.
-				try {
-					const dataPart = payload?.data ?? {};
-					const messageId = payload?.message_id ?? '';
-					const chatId = payload?.chat_id ?? '';
-					const type = dataPart?.type ?? '';
-					let version = dataPart?.data?.version ?? dataPart?.version ?? payload?.version ?? '';
-					// For batched envelopes the outer type doesn't carry a
-					// version; derive a scoped key from the inner batch's
-					// first+last versions (plus length) so distinct batches
-					// don't collide on the same message id. chat:subagent:update
-					// inner events don't have a top-level version field — the
-					// inner_event nested inside MAY have one for chat:delta /
-					// chat:done, but for status/error events there is none and
-					// distinct batches could collide. Skip dedup entirely when
-					// the batch contains a chat:subagent:update entry: the
-					// server-side 0.5s throttle already coalesces these and
-					// queueSubagentUpdate is idempotent for repeated state.
-					if (type === 'chat:delta:batch') {
-						const batch = Array.isArray(dataPart?.batch) ? dataPart.batch : [];
-						const hasSubagentUpdate = batch.some((b) => b?.data?.type === 'chat:subagent:update');
-						if (hasSubagentUpdate) {
-							// Bypass dedup — replay every batch as-is.
-							suppressBroadcast = true;
-							try {
-								await chatEventHandler(payload, () => {});
-							} catch (err) {
-								console.error('owui-events replay failed', err);
-							} finally {
-								suppressBroadcast = false;
-							}
-							return;
-						}
-						const first = batch[0]?.data?.data?.version ?? batch[0]?.data?.version ?? '';
-						const last =
-							batch[batch.length - 1]?.data?.data?.version ??
-							batch[batch.length - 1]?.data?.version ??
-							'';
-						version = `b:${batch.length}:${first}:${last}`;
-					}
-					// Only dedup when we have at least a message/chat id to
-					// scope by — otherwise distinct events with no
-					// identifying fields would all collapse onto one entry.
-					// Skip chat:subagent:update entirely — these envelopes
-					// don't carry a per-emit version (the throttle key is
-					// subagent_id, set server-side) and queueSubagentUpdate
-					// is idempotent for repeated state, so a rare duplicate
-					// during the primary-election race is harmless.
-					if (type === 'chat:subagent:update') {
-						// fall through to replay without recording dedup id
-					} else if (messageId || chatId) {
-						const id = [messageId, chatId, type, version].join('|');
-						if (seenBroadcastEvents.has(id)) {
-							return;
-						}
-						seenBroadcastEvents.add(id);
-						seenBroadcastOrder.push(id);
-						if (seenBroadcastOrder.length > 200) {
-							const evicted = seenBroadcastOrder.shift();
-							if (evicted !== undefined) {
-								seenBroadcastEvents.delete(evicted);
-							}
-						}
-					}
-				} catch (err) {
-					// Identifier construction must never break replay.
-					console.error('owui-events dedup id failed', err);
-				}
 				// Non-primary tabs receive deduped stream events here. Replay
 				// them through the same handler the socket would invoke, with
 				// the re-broadcast guard set so we don't echo back.
@@ -557,10 +567,16 @@
 		const handleVisibilityChange = () => {
 			if (document.visibilityState === 'visible') {
 				isLastActiveTab.set(true); // This tab is now the active tab
-				bc.postMessage('active'); // Notify other tabs that this tab is active
+				activeTabBc?.postMessage('active'); // Notify other tabs that this tab is active
+				if (hiddenAt && Date.now() - hiddenAt > SIDEBAR_RECONCILE_AFTER_HIDDEN_MS) {
+					scheduleSidebarReconcile('visibility:resume');
+				}
+				hiddenAt = 0;
 
 				// Check token expiry when the tab becomes active
 				checkTokenExpiry();
+			} else if (document.visibilityState === 'hidden') {
+				hiddenAt = Date.now();
 			}
 		};
 

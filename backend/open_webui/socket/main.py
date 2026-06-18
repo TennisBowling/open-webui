@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import random
 
 import socketio
@@ -35,6 +36,7 @@ from open_webui.env import (
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
+from open_webui.socket.serializer import orjson_serializer
 from open_webui.tasks import (
     create_task,
     stop_item_tasks,
@@ -77,6 +79,7 @@ if WEBSOCKET_MANAGER == "redis":
         always_connect=True,
         client_manager=mgr,
         max_http_buffer_size=WEBSOCKET_MAX_MESSAGE_SIZE,
+        json=orjson_serializer,
     )
 else:
     sio = socketio.AsyncServer(
@@ -86,6 +89,7 @@ else:
         allow_upgrades=ENABLE_WEBSOCKET_SUPPORT,
         always_connect=True,
         max_http_buffer_size=WEBSOCKET_MAX_MESSAGE_SIZE,
+        json=orjson_serializer,
     )
 
 
@@ -233,6 +237,35 @@ def get_user_id_from_session_pool(sid):
     return None
 
 
+def _unique_session_ids(session_ids):
+    unique = []
+    seen = set()
+    for session_id in session_ids or []:
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        unique.append(session_id)
+    return unique
+
+
+def _register_user_session(user, sid):
+    SESSION_POOL[sid] = user.model_dump(exclude=["date_of_birth", "bio", "gender"])
+
+    current_sessions = USER_POOL.get(user.id, []) or []
+    if isinstance(current_sessions, str):
+        current_sessions = [current_sessions]
+
+    USER_POOL[user.id] = _unique_session_ids(
+        [
+            session_id
+            for session_id in [*current_sessions, sid]
+            if session_id == sid or session_id in SESSION_POOL
+        ]
+    )
+
+    return _elect_primary_session(user.id, sid)
+
+
 def _elect_primary_session(user_id, sid):
     """Set sid as the user's primary session if no live primary is currently
     recorded. Returns the resulting primary sid for this user.
@@ -308,14 +341,25 @@ def get_token_groups():
     return token_groups.get_token_groups()
 
 
-def set_token_group(group_name: str, models: list, limit: int = None, reset_time: str = '00:00', reset_timezone: str = 'UTC', window_duration: int = None):
+def set_token_group(
+    group_name: str,
+    models: list,
+    limit: int = None,
+    reset_time: str = "00:00",
+    reset_timezone: str = "UTC",
+    window_duration: int = None,
+):
     """Set a token group"""
     # Try to update first, if not found create new
     if not token_groups.update_token_group(group_name, models, limit, window_duration):
-        return token_groups.create_token_group(group_name, models, limit or 0, reset_time, reset_timezone, window_duration)
+        return token_groups.create_token_group(
+            group_name, models, limit or 0, reset_time, reset_timezone, window_duration
+        )
 
 
-def update_token_group(group_name: str, models: list = None, limit: int = None, window_duration: int = None):
+def update_token_group(
+    group_name: str, models: list = None, limit: int = None, window_duration: int = None
+):
     """Update an existing token group"""
     return token_groups.update_token_group(group_name, models, limit, window_duration)
 
@@ -329,7 +373,10 @@ def get_token_usage():
     """Get current token usage for all groups from database"""
     # Import here to avoid circular imports
     from open_webui.models.token_usage import token_groups as db_token_groups
-    groups = db_token_groups.get_token_groups()  # This returns groups WITH usage from DB
+
+    groups = (
+        db_token_groups.get_token_groups()
+    )  # This returns groups WITH usage from DB
     return {name: group_data["usage"] for name, group_data in groups.items()}
 
 
@@ -344,10 +391,14 @@ async def usage(sid, data):
         user_id = user.get("id") if user else None
         chat_id = data.get("chat_id")
 
-        log.info(f"📊 [socket:usage] Received from frontend: model={model_id}, chat_id={chat_id}, user_id={user_id}")
+        log.info(
+            f"📊 [socket:usage] Received from frontend: model={model_id}, chat_id={chat_id}, user_id={user_id}"
+        )
 
         # Process token usage tracking with chat_id and user_id for analytics
-        await process_token_usage(model_id, usage_data, chat_id=chat_id, user_id=user_id)
+        await process_token_usage(
+            model_id, usage_data, chat_id=chat_id, user_id=user_id
+        )
 
 
 @sio.on("model-switch")
@@ -358,20 +409,22 @@ async def model_switch(sid, data):
     """
     if sid not in SESSION_POOL:
         return {"status": False, "message": "Session not found"}
-    
+
     chat_id = data.get("chat_id")
     new_model_id = data.get("model_id")
     task_id = data.get("task_id")
-    
+
     if not new_model_id:
         return {"status": False, "message": "No model_id provided"}
-    
-    log.info(f"Model switch request: chat_id={chat_id}, task_id={task_id}, new_model={new_model_id}")
-    
+
+    log.info(
+        f"Model switch request: chat_id={chat_id}, task_id={task_id}, new_model={new_model_id}"
+    )
+
     # If a specific task_id is provided, switch for that task
     if task_id:
         result = await set_pending_model_switch(task_id, new_model_id)
-        
+
         # Emit event to notify frontend that model switch is pending
         await sio.emit(
             "events",
@@ -383,14 +436,14 @@ async def model_switch(sid, data):
                     "data": {
                         "task_id": task_id,
                         "model_id": new_model_id,
-                    }
-                }
+                    },
+                },
             },
             to=sid,
         )
-        
+
         return result
-    
+
     # If no task_id provided, try to find active tasks for the chat
     if chat_id:
         task_ids = await list_task_ids_by_item_id(REDIS, chat_id)
@@ -399,7 +452,7 @@ async def model_switch(sid, data):
             for tid in task_ids:
                 result = await set_pending_model_switch(tid, new_model_id)
                 results.append(result)
-            
+
             # Emit event for each task
             await sio.emit(
                 "events",
@@ -411,13 +464,16 @@ async def model_switch(sid, data):
                         "data": {
                             "task_ids": task_ids,
                             "model_id": new_model_id,
-                        }
-                    }
+                        },
+                    },
                 },
                 to=sid,
             )
-            
-            return {"status": True, "message": f"Model switch queued for {len(task_ids)} active task(s)"}
+
+            return {
+                "status": True,
+                "message": f"Model switch queued for {len(task_ids)} active task(s)",
+            }
         else:
             return {"status": False, "message": "No active tasks found for this chat"}
 
@@ -512,13 +568,13 @@ async def process_token_usage(
 ):
     """
     Process token usage data and update all tracking tables.
-    
+
     Updates:
     1. Token group usage (existing rate limiting feature)
     2. Conversation token usage (new - for per-chat tracking)
     3. Daily token usage (new - for heatmaps)
     4. Model token usage (new - for model breakdowns)
-    
+
     Args:
         model_id: The model being used
         usage_data: Dict containing prompt_tokens, completion_tokens, etc.
@@ -529,9 +585,11 @@ async def process_token_usage(
         parent_message_id: Parent assistant message for subagent runs
         source_type: chat, subagent, task, proxy, etc.
     """
-    log.info(f"📊 [process_token_usage] Called with model={model_id}, chat_id={chat_id}, user_id={user_id}")
+    log.info(
+        f"📊 [process_token_usage] Called with model={model_id}, chat_id={chat_id}, user_id={user_id}"
+    )
     log.info(f"📊 [process_token_usage] usage_data={usage_data}")
-    
+
     if not usage_data:
         log.info(f"📊 [process_token_usage] No usage_data, returning early")
         return
@@ -552,8 +610,10 @@ async def process_token_usage(
     token_in = int(prompt_tokens or 0)
     token_out = int(completion_tokens or 0)
     token_total = int(usage_data.get("total_tokens", token_in + token_out) or 0)
-    
-    log.info(f"📊 [process_token_usage] Calculated: in={token_in}, out={token_out}, total={token_total}")
+
+    log.info(
+        f"📊 [process_token_usage] Calculated: in={token_in}, out={token_out}, total={token_total}"
+    )
 
     # 1. Update existing group-based token tracking (for rate limiting)
     token_groups.update_token_usage(model_id, token_in, token_out, token_total)
@@ -561,10 +621,12 @@ async def process_token_usage(
     # 2-4. Update analytics tables for "Wrapped" feature
     try:
         from open_webui.models.analytics import Analytics
-        
+
         event_source_chat_id = source_chat_id or chat_id
         event_source_type = source_type or (
-            "subagent" if event_source_chat_id and chat_id and event_source_chat_id != chat_id else "chat"
+            "subagent"
+            if event_source_chat_id and chat_id and event_source_chat_id != chat_id
+            else "chat"
         )
 
         # 2. Store immutable per-request event first. This is the source of
@@ -587,7 +649,9 @@ async def process_token_usage(
 
         # 3. Update conversation token usage (per-visible-chat tracking)
         if chat_id and user_id:
-            log.info(f"📊 [process_token_usage] Updating conversation token usage for chat={chat_id}, user={user_id}")
+            log.info(
+                f"📊 [process_token_usage] Updating conversation token usage for chat={chat_id}, user={user_id}"
+            )
             result = Analytics.update_conversation_token_usage(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -595,38 +659,48 @@ async def process_token_usage(
                 token_in=token_in,
                 token_out=token_out,
                 token_total=token_total,
-                cache_read_tokens=cache_read_tokens
+                cache_read_tokens=cache_read_tokens,
             )
             log.info(f"📊 [process_token_usage] Conversation update result: {result}")
         else:
-            log.info(f"📊 [process_token_usage] Skipping conversation update - chat_id={chat_id}, user_id={user_id}")
-        
+            log.info(
+                f"📊 [process_token_usage] Skipping conversation update - chat_id={chat_id}, user_id={user_id}"
+            )
+
         # 4. Update daily token usage (for heatmaps)
         if user_id:
-            log.info(f"📊 [process_token_usage] Updating daily token usage for user={user_id}")
+            log.info(
+                f"📊 [process_token_usage] Updating daily token usage for user={user_id}"
+            )
             Analytics.update_daily_token_usage(
                 user_id=user_id,
                 token_in=token_in,
                 token_out=token_out,
                 token_total=token_total,
                 chat_id=chat_id,
-                cache_read_tokens=cache_read_tokens
+                cache_read_tokens=cache_read_tokens,
             )
-        
+
         # 5. Update model token usage (for model breakdowns)
-        log.info(f"📊 [process_token_usage] Updating model token usage for model={model_id}")
+        log.info(
+            f"📊 [process_token_usage] Updating model token usage for model={model_id}"
+        )
         Analytics.update_model_token_usage(
             user_id=user_id,
             model_id=model_id,
             token_in=token_in,
             token_out=token_out,
             token_total=token_total,
-            cache_read_tokens=cache_read_tokens
+            cache_read_tokens=cache_read_tokens,
         )
-        
-        log.info(f"📊 [process_token_usage] SUCCESS: model={model_id}, chat={chat_id}, user={user_id}, tokens={token_total}")
+
+        log.info(
+            f"📊 [process_token_usage] SUCCESS: model={model_id}, chat={chat_id}, user={user_id}, tokens={token_total}"
+        )
     except Exception as e:
-        log.error(f"📊 [process_token_usage] ERROR updating analytics: {e}", exc_info=True)
+        log.error(
+            f"📊 [process_token_usage] ERROR updating analytics: {e}", exc_info=True
+        )
 
     # Push refreshed token-usage groups to every active session of this user
     # so the frontend doesn't have to poll. Wire Contract #6.
@@ -635,7 +709,10 @@ async def process_token_usage(
             groups = token_groups.get_token_groups()
             await push_token_usage_update(user_id, groups)
         except Exception as e:
-            log.error(f"📊 [process_token_usage] ERROR pushing token-usage:update: {e}", exc_info=True)
+            log.error(
+                f"📊 [process_token_usage] ERROR pushing token-usage:update: {e}",
+                exc_info=True,
+            )
 
 
 async def push_token_usage_update(user_id: str, groups: dict):
@@ -667,15 +744,7 @@ async def connect(sid, environ, auth):
             user = Users.get_user_by_id(data["id"])
 
         if user:
-            SESSION_POOL[sid] = user.model_dump(
-                exclude=["date_of_birth", "bio", "gender"]
-            )
-            if user.id in USER_POOL:
-                USER_POOL[user.id] = USER_POOL[user.id] + [sid]
-            else:
-                USER_POOL[user.id] = [sid]
-
-            _elect_primary_session(user.id, sid)
+            _register_user_session(user, sid)
 
 
 @sio.on("user-join")
@@ -693,13 +762,7 @@ async def user_join(sid, data):
     if not user:
         return
 
-    SESSION_POOL[sid] = user.model_dump(exclude=["date_of_birth", "bio", "gender"])
-    if user.id in USER_POOL:
-        USER_POOL[user.id] = USER_POOL[user.id] + [sid]
-    else:
-        USER_POOL[user.id] = [sid]
-
-    primary_sid = _elect_primary_session(user.id, sid)
+    primary_sid = _register_user_session(user, sid)
 
     # Join all the channels
     channels = Channels.get_channels_by_user_id(user.id)
@@ -719,8 +782,7 @@ async def stream_subscribe(sid, data):
     if not chat_id:
         return {"status": False, "error": "Missing chat_id"}
 
-    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.get("id"))
-    if chat is None:
+    if not Chats.user_owns_chat(chat_id, user.get("id")):
         return {"status": False, "error": "Chat not found"}
 
     await sio.enter_room(sid, stream_room(chat_id))
@@ -1150,7 +1212,7 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "content": content,
-                        },
+                        }, return_model=False
                     )
 
             if "type" in event_data and event_data["type"] == "replace":
@@ -1161,7 +1223,7 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                     {
                         "content": content,
-                    },
+                    }, return_model=False
                 )
 
             if "type" in event_data and event_data["type"] == "embeds":
@@ -1180,7 +1242,7 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                     {
                         "embeds": embeds,
-                    },
+                    }, return_model=False
                 )
 
             if "type" in event_data and event_data["type"] == "data_viz:override":
@@ -1204,7 +1266,7 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "dataVizOverrides": overrides,
-                        },
+                        }, return_model=False
                     )
 
             if "type" in event_data and event_data["type"] == "files":
@@ -1223,7 +1285,7 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                     {
                         "files": files,
-                    },
+                    }, return_model=False
                 )
 
             if event_data.get("type") in ["source", "citation"]:
@@ -1244,7 +1306,7 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "sources": sources,
-                        },
+                        }, return_model=False
                     )
 
     return __event_emitter__
@@ -1256,9 +1318,22 @@ async def broadcast_sidebar_event(user_id, event_data, skip_sid=None):
     "events" channel the frontend already listens on; the envelope's chat_id
     is null because these events are not chat-scoped — they update the
     sidebar list, pinned/folder/tag state, etc."""
-    session_ids = [
-        sid for sid in USER_POOL.get(user_id, []) if sid and sid != skip_sid
-    ]
+    event_data = dict(event_data or {})
+    event_data.setdefault(
+        "event_id",
+        f"sidebar:{user_id}:{time.time_ns()}:{random.getrandbits(32):08x}",
+    )
+    event_data.setdefault("emitted_at", time.time())
+    if skip_sid:
+        event_data.setdefault("source_session_id", skip_sid)
+
+    session_ids = _unique_session_ids(
+        [
+            sid
+            for sid in USER_POOL.get(user_id, [])
+            if sid and sid != skip_sid and sid in SESSION_POOL
+        ]
+    )
 
     if not session_ids:
         return
@@ -1269,6 +1344,38 @@ async def broadcast_sidebar_event(user_id, event_data, skip_sid=None):
                 "events",
                 {
                     "chat_id": None,
+                    "message_id": None,
+                    "data": event_data,
+                },
+                to=sid,
+            )
+            for sid in session_ids
+        ]
+    )
+
+
+async def broadcast_queue_event(user_id, chat_id, event_data, skip_sid=None):
+    """Fan out a message-queue event (chat:queue:updated / chat:queue:drained)
+    to every active session of ``user_id``. Unlike sidebar events, the envelope
+    carries ``chat_id`` so the frontend can route it to the right chat's
+    reflector. Used so all tabs (and a later-opened tab) reflect the queue
+    state changing under server-driven draining."""
+    event_data = dict(event_data or {})
+    session_ids = _unique_session_ids(
+        [
+            sid
+            for sid in USER_POOL.get(user_id, [])
+            if sid and sid != skip_sid and sid in SESSION_POOL
+        ]
+    )
+    if not session_ids:
+        return
+    await asyncio.gather(
+        *[
+            sio.emit(
+                "events",
+                {
+                    "chat_id": chat_id,
                     "message_id": None,
                     "data": event_data,
                 },
@@ -1480,14 +1587,28 @@ def stream_version_get(message_id) -> int:
 
 def set_stream_state(message_id, patch: dict) -> None:
     try:
-        existing = copy.deepcopy(STREAM_STATE.get(message_id, {}) or {})
+        existing = STREAM_STATE.get(message_id, {}) or {}
         if not isinstance(existing, dict):
             existing = {}
+        # Shallow-merge into a NEW dict so we never mutate the stored snapshot
+        # in place (a RedisDict get returns a fresh object, but the in-memory
+        # store returns the live object). The previous snapshot's values are
+        # carried by reference — only keys present in `patch` are replaced, and
+        # those replacements are deep-copied below, so no stale value is shared.
+        merged = dict(existing)
         if isinstance(patch, dict):
-            existing.update(copy.deepcopy(patch))
-        existing["updated_at"] = time.time()
-        STREAM_STATE[message_id] = existing
-        _index_stream(str(message_id), existing)
+            # Deep-copy ONLY the patch. Callers (e.g. the per-token flush) pass
+            # `_strip_tool_results(content_blocks)`, whose text/reasoning blocks
+            # are shared by reference with the still-mutating live content_blocks
+            # tail. Copying the patch freezes the snapshot at this version and
+            # decouples it from subsequent in-place appends. Deep-copying the
+            # *accumulated* state too (the old behavior) re-copied the whole
+            # growing blocks list every token for nothing — O(N) per token,
+            # O(N^2) per stream — since `update` immediately overwrote it.
+            merged.update(copy.deepcopy(patch))
+        merged["updated_at"] = time.time()
+        STREAM_STATE[message_id] = merged
+        _index_stream(str(message_id), merged)
     except Exception:
         pass
 
@@ -1534,9 +1655,24 @@ def get_tool_result_body(message_id, tool_call_id):
         return None
 
 
-def get_tool_result_bodies(message_id) -> dict:
+def get_tool_result_bodies(message_id, *, deep_copy: bool = True) -> dict:
+    """Return the accumulated large tool-result bodies for a message.
+
+    ``deep_copy=True`` (default) copies so external callers can't mutate the
+    live store. The per-round agentic loop passes ``deep_copy=False``: at round K
+    the store holds K accumulated web-page/file bodies, and a deepcopy on every
+    round is O(total tool output) × rounds = O(N²) of large-data copying on the
+    event loop. The two hot-path callers (the checkpoint builder and the
+    in-flight assistant assembly) consume the result strictly read-only — the
+    checkpoint spreads it into a new dict, and ``_hydrate_tool_result_refs`` only
+    reads body values (and copies-on-write into fresh result dicts) — and the
+    outbound conversion runs to completion synchronously before the store can
+    change again, so sharing the live reference is safe."""
     try:
-        return copy.deepcopy(TOOL_RESULT_BODIES.get(str(message_id), {}) or {})
+        bodies = TOOL_RESULT_BODIES.get(str(message_id), {}) or {}
+        if not deep_copy:
+            return bodies
+        return copy.deepcopy(bodies)
     except Exception:
         return {}
 
@@ -1663,6 +1799,52 @@ _BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result", "chat:subagent:u
 DeltaBatchKey = tuple[str, str]
 _pending_delta_buffer: Dict[DeltaBatchKey, list] = {}
 _pending_delta_scheduled: Set[DeltaBatchKey] = set()
+SOCKET_BATCH_MAX_BYTES = max(65536, min(1_000_000, WEBSOCKET_MAX_MESSAGE_SIZE // 2))
+
+
+def _socket_payload_size(payload) -> int:
+    try:
+        return len(
+            json.dumps(payload, ensure_ascii=False, default=str).encode(
+                "utf-8", "replace"
+            )
+        )
+    except Exception:
+        return SOCKET_BATCH_MAX_BYTES + 1
+
+
+def _make_delta_batch_envelope(batch: list) -> dict:
+    head = batch[0] if isinstance(batch[0], dict) else {}
+    return {
+        "chat_id": head.get("chat_id"),
+        "message_id": head.get("message_id"),
+        "session_id": head.get("session_id"),
+        "data": {
+            "type": "chat:delta:batch",
+            "batch": batch,
+        },
+    }
+
+
+def _split_delta_batch(buf: list) -> list[dict]:
+    envelopes: list[dict] = []
+    current: list = []
+
+    for item in buf:
+        candidate = [*current, item]
+        candidate_envelope = _make_delta_batch_envelope(candidate)
+        if (
+            current
+            and _socket_payload_size(candidate_envelope) > SOCKET_BATCH_MAX_BYTES
+        ):
+            envelopes.append(_make_delta_batch_envelope(current))
+            current = [item]
+        else:
+            current = candidate
+
+    if current:
+        envelopes.append(_make_delta_batch_envelope(current))
+    return envelopes
 
 
 def _is_batchable_payload(payload) -> bool:
@@ -1749,20 +1931,11 @@ async def _flush_delta_buffer(key: DeltaBatchKey) -> None:
         # Single envelope — no point wrapping in a batch.
         await _emit_to_primary_raw(user_id, buf[0])
         return
-    # Use the chat_id/message_id of the first envelope so client-side dedup
-    # has scope. Inner envelopes carry their own ids and will be replayed
-    # individually on the frontend.
-    head = buf[0] if isinstance(buf[0], dict) else {}
-    envelope = {
-        "chat_id": head.get("chat_id"),
-        "message_id": head.get("message_id"),
-        "session_id": head.get("session_id"),
-        "data": {
-            "type": "chat:delta:batch",
-            "batch": buf,
-        },
-    }
-    await _emit_to_primary_raw(user_id, envelope)
+    # Inner envelopes carry their own ids and are replayed individually on the
+    # frontend. Split by serialized size so enormous responses never exceed the
+    # Engine.IO/Socket.IO packet limit as a single `chat:delta:batch` frame.
+    for envelope in _split_delta_batch(buf):
+        await _emit_to_primary_raw(user_id, envelope)
 
 
 def get_event_call(request_info):
@@ -1786,3 +1959,21 @@ def get_event_call(request_info):
 
 
 get_event_caller = get_event_call
+
+
+def get_headless_event_call(request_info):
+    """Event caller for request-free (headless) generations — e.g. the
+    autonomous queue drain, which runs with no originating socket session.
+
+    The normal ``get_event_call`` does ``sio.call("events", ..., to=session_id)``
+    and AWAITS a client ack. With ``session_id=None`` that would broadcast to
+    everyone and block forever waiting for a reply nobody owns. A headless run
+    can't prompt a human, so we decline interactive callbacks immediately. The
+    only caller is the ``direct_tool`` (client-executed tool) path, which treats
+    a falsy ``status`` as "not handled" and falls through gracefully. Server-side
+    tools don't use the caller at all and run normally."""
+
+    async def __headless_event_caller__(event_data):
+        return {"status": False, "headless": True}
+
+    return __headless_event_caller__

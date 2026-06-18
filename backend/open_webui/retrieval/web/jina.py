@@ -175,7 +175,7 @@ async def fetch_jina_contents(
     max_concurrency: int = 5,
     session: Optional[aiohttp.ClientSession] = None,
     api_base_url: str = DEFAULT_JINA_READER_API_BASE_URL,
-) -> List[JinaContentResult]:
+) -> tuple[List[JinaContentResult], List[str]]:
     """
     Fetch full content from URLs using Jina Reader's POST JSON API.
 
@@ -191,11 +191,13 @@ async def fetch_jina_contents(
         api_base_url: Jina Reader API endpoint. Defaults to hosted Jina Reader.
 
     Returns:
-        JinaContentResult objects in the same order as the requested URLs, with
-        failed URLs omitted after logging a warning.
+        A `(results, errors)` tuple. `results` holds JinaContentResult objects in
+        the same order as the requested URLs, with failed URLs omitted. `errors`
+        holds one short message per failed URL so the caller can distinguish a
+        genuine empty fetch from an auth/credit failure.
     """
     if not urls:
-        return []
+        return [], []
 
     api_base_url = normalize_jina_reader_api_base_url(api_base_url)
     viewport_width = max(320, int(viewport_width or 1280))
@@ -206,6 +208,7 @@ async def fetch_jina_contents(
     log.info("Jina Reader fetch for %s URL(s)", len(urls))
 
     semaphore = asyncio.Semaphore(max_concurrency)
+    errors: List[str] = []
 
     async def run_with_session(active_session: aiohttp.ClientSession):
         async def guarded_fetch(fetch_url: str):
@@ -222,6 +225,7 @@ async def fetch_jina_contents(
                     )
                 except Exception as e:
                     log.warning("Jina Reader fetch failed for %s: %s", fetch_url, e)
+                    errors.append(str(e))
                     return None
 
         return await asyncio.gather(*(guarded_fetch(url) for url in urls))
@@ -236,4 +240,4 @@ async def fetch_jina_contents(
 
     successful_results = [result for result in results if result is not None]
     log.info("Jina Reader returned content for %s URL(s)", len(successful_results))
-    return successful_results
+    return successful_results, errors

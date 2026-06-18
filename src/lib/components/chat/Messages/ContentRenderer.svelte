@@ -15,7 +15,10 @@
 	} from '$lib/stores';
 	import FloatingButtons from '../ContentRenderer/FloatingButtons.svelte';
 	import ToolCallsBlock from './ToolCallsBlock.svelte';
+	import WorkingBlock from './WorkingBlock.svelte';
+	import Skeleton from './Skeleton.svelte';
 	import { blocksToDisplayMarkdown, createMessagesList } from '$lib/utils';
+	import { computeAgenticRenderItems } from '$lib/utils/agenticGroups';
 	import { streamPerfEnd, streamPerfStart } from '$lib/utils/streamPerf';
 
 	export let id;
@@ -51,6 +54,19 @@
 
 	export let editCodeBlock = true;
 	export let topPadding = false;
+	// When true, done messages parse their markdown synchronously instead of on a
+	// short debounce. Used on initial chat load so historical content reaches its
+	// final height before the settle loop reveals the messages.
+	export let parseImmediately = false;
+
+	// Clean terminal signals for the "Working for X" agentic-step bundling.
+	// `done` (above) is polluted by the chatFadeStreamingText setting upstream,
+	// so it can't be used to tell whether the message is still generating.
+	// `messageDone` is the unfiltered message.done; `messageStopped` /
+	// `messageErrored` choose the frozen header wording on a terminal burst.
+	export let messageDone = false;
+	export let messageStopped = false;
+	export let messageErrored = false;
 
 	export let onSave = (e) => {};
 	export let onSourceClick = (e) => {};
@@ -70,7 +86,7 @@
 	let blockToolPayloads = [];
 	/** @type {string[]} */
 	let blockProjectionSignatures = [];
-	/** @type {WeakMap<object, { content: any; results: any; signature: string }>} */
+	/** @type {WeakMap<object, { tag: string; signature: string }>} */
 	let toolBlockSignatureCache = new WeakMap();
 
 	const textSig = (value) => {
@@ -102,9 +118,34 @@
 			.join(';')}`;
 	};
 
+	// Cheap fingerprint that DOES change on the in-place mutations the streaming
+	// path performs: tool_call_add pushes onto block.content, tool_call_args_append
+	// grows the last call's arguments string, and tool results grow block.results —
+	// all WITHOUT changing the array object identity. Keying the cache on array
+	// identity alone (the previous approach) returned a stale signature while
+	// arguments streamed in, stalling the live tool-call display. This tag is O(1):
+	// it samples only the counts and the last element's growing fields.
+	const toolBlockMutationTag = (block) => {
+		const calls = Array.isArray(block?.content) ? block.content : [];
+		const results = Array.isArray(block?.results) ? block.results : [];
+		const lastCall = calls.length ? calls[calls.length - 1] : null;
+		const lastResult = results.length ? results[results.length - 1] : null;
+		const lastArgs = lastCall?.function?.arguments;
+		const lastArgsLen = typeof lastArgs === 'string' ? lastArgs.length : 0;
+		const lastResultContent = lastResult?.content;
+		const lastResultLen = typeof lastResultContent === 'string' ? lastResultContent.length : 0;
+		// Include the last result's error flag: a result can flip non-error →
+		// error (or gain a notice) without changing its content length, and the
+		// collapsed row must re-project to show it.
+		const lastResultError = lastResult?.error ? '1' : '0';
+		const lastResultNotice = lastResult?.notice ? '1' : '0';
+		return `${calls.length}|${lastArgsLen}|${results.length}|${lastResultLen}|${lastResultError}|${lastResultNotice}`;
+	};
+
 	const toolBlockSignature = (block) => {
+		const tag = toolBlockMutationTag(block);
 		const cached = toolBlockSignatureCache.get(block);
-		if (cached && cached.content === block?.content && cached.results === block?.results) {
+		if (cached && cached.tag === tag) {
 			return cached.signature;
 		}
 
@@ -116,9 +157,12 @@
 			calls
 				.map((call) => {
 					const fn = call?.function ?? {};
-					return [call?.id ?? '', call?.tool_call_id ?? '', fn.name ?? '', textSig(fn.arguments)].join(
-						','
-					);
+					return [
+						call?.id ?? '',
+						call?.tool_call_id ?? '',
+						fn.name ?? '',
+						textSig(fn.arguments)
+					].join(',');
 				})
 				.join(';'),
 			results
@@ -133,7 +177,10 @@
 						jsonSig(result?.summary),
 						listSig(result?.files),
 						listSig(result?.embeds),
-						result?.subagent_id ?? ''
+						result?.subagent_id ?? '',
+						result?.error ? '1' : '0',
+						textSig(result?.error_reason),
+						textSig(result?.notice)
 					].join(',')
 				)
 				.join(';')
@@ -141,8 +188,7 @@
 
 		if (block && typeof block === 'object') {
 			toolBlockSignatureCache.set(block, {
-				content: block.content,
-				results: block.results,
+				tag,
 				signature
 			});
 		}
@@ -172,7 +218,10 @@
 					summary: result?.summary ?? null,
 					files: Array.isArray(result?.files) ? result.files : [],
 					embeds: Array.isArray(result?.embeds) ? result.embeds : [],
-					subagent_id: result?.subagent_id ?? ''
+					subagent_id: result?.subagent_id ?? '',
+					error: result?.error === true,
+					error_reason: result?.error_reason ?? '',
+					notice: result?.notice ?? ''
 				}))
 			: [];
 
@@ -257,6 +306,34 @@
 	// id}` to tear down and rebuild the rendered DOM).
 	$: structuredBlocks = Array.isArray(content_blocks) ? content_blocks : [];
 	$: structuredMode = structuredBlocks.length > 0;
+
+	// "Working for X" agentic-step bundling. When enabled, contiguous bursts of
+	// reasoning+tool_calls collapse into one WorkingBlock; otherwise the legacy
+	// flat per-block layout. Pure O(N) pass over the block array — the projection
+	// cache above is untouched, so streaming stays O(changed-blocks).
+	$: bundleAgentic = $settings?.bundleAgenticSteps ?? true;
+	$: agenticAutoExpand = $settings?.agenticStepsAutoExpand ?? true;
+	$: renderItems = computeAgenticRenderItems(structuredBlocks, bundleAgentic);
+	const renderItemKey = (/** @type {any} */ item) =>
+		item.kind === 'group' ? `g${item.indices[0]}` : `b${item.index}`;
+
+	// Tail liveness cursor. The per-burst working spinner, a streaming text block,
+	// and the "Thinking…"/"Executing…" reasoning+tool indicators are the normal
+	// signs the model is alive. But two tail states render *nothing*: the empty
+	// placeholder `text("")` the backend parks as the next stream target after a
+	// tool round, and a `user_steer` block injected mid-task (which also pushes
+	// the working burst out of the last slot, so its spinner switches off). In
+	// those states the message looks frozen even though generation continues, so
+	// park the same typewriter cursor at the tail — where the model writes next —
+	// but only while actually generating.
+	$: tailItem = renderItems.length ? renderItems[renderItems.length - 1] : null;
+	$: tailBlock = tailItem && tailItem.kind === 'block' ? structuredBlocks[tailItem.index] : null;
+	$: tailIsSilent =
+		tailBlock != null &&
+		((tailBlock.type === 'text' && `${tailBlock.content ?? ''}`.trim().length === 0) ||
+			tailBlock.type === 'user_steer');
+	$: showTailCursor =
+		structuredMode && !messageDone && !messageStopped && !messageErrored && tailIsSilent;
 	/** @type {string[]} */
 	let sourceIds = [];
 
@@ -386,24 +463,117 @@
 			document.removeEventListener('keydown', keydownHandler);
 		}
 	});
+
+	// Shared by the inline-block render path and the bundled WorkingBlock so
+	// artifact auto-detection / preview behaves identically inside or outside a
+	// "Working for X" group.
+	const handleMarkdownArtifact = (/** @type {any} */ token) => {
+		const { lang, text: code } = token;
+		if (
+			($settings?.detectArtifacts ?? true) &&
+			(['html', 'svg'].includes(lang) || (lang === 'xml' && code.includes('svg'))) &&
+			!$mobile &&
+			chatId
+		) {
+			showArtifacts.set(true);
+			showFilePreview.set(false);
+			showControls.set(true);
+		}
+	};
+
+	const handleMarkdownPreview = async (/** @type {any} */ value) => {
+		await artifactCode.set(value);
+		await showControls.set(true);
+		await showArtifacts.set(true);
+		await showOverview.set(false);
+		await showEmbeds.set(false);
+		await showFilePreview.set(false);
+	};
 </script>
 
 <div bind:this={contentContainerElement}>
 	{#if structuredMode}
-		{#each structuredBlocks as block, i (i)}
-			{#if block?.type === 'tool_calls'}
-				<ToolCallsBlock id={`${id}-b${i}`} blockJson={blockToolPayloads[i] ?? ''} {chatId} {messageId} />
-			{:else}
-				<Markdown
-					id={`${id}-b${i}`}
-					content={blockProjections[i] ?? ''}
-					allowStreamingPlainText={block?.type === 'text'}
+		{#each renderItems as item (renderItemKey(item))}
+			{#if item.kind === 'group'}
+				{@const lastItem = renderItems[renderItems.length - 1]}
+				<WorkingBlock
+					idPrefix={id}
+					{messageId}
+					{chatId}
 					{model}
 					{save}
 					{preview}
 					{done}
 					{editCodeBlock}
-					topPadding={i === 0 ? topPadding : false}
+					{dataVizOverrides}
+					{sandboxFiles}
+					{sourceIds}
+					{onSourceClick}
+					{onTaskClick}
+					{onSave}
+					onArtifactDetected={handleMarkdownArtifact}
+					onPreview={handleMarkdownPreview}
+					working={!messageDone && item === lastItem}
+					autoExpand={agenticAutoExpand}
+					messageStopped={messageStopped && item === lastItem}
+					errored={messageErrored && item === lastItem}
+					members={item.indices.map((bi) => ({
+						index: bi,
+						block: structuredBlocks[bi],
+						projection: blockProjections[bi] ?? '',
+						toolPayload: blockToolPayloads[bi] ?? ''
+					}))}
+				/>
+			{:else if structuredBlocks[item.index]?.type === 'tool_calls'}
+				<ToolCallsBlock
+					id={`${id}-b${item.index}`}
+					blockJson={blockToolPayloads[item.index] ?? ''}
+					{chatId}
+					{messageId}
+				/>
+			{:else if structuredBlocks[item.index]?.type === 'user_steer'}
+				<!-- Mid-task user interjection (steering): the user sent this while the
+				     model was working and the backend injected it at a tool-call
+				     boundary. Render as an inline user bubble so the transcript shows
+				     exactly what the model saw, in order. -->
+				<div class="flex justify-end my-2.5" dir="ltr">
+					<div
+						class="flex flex-col items-end max-w-[80%]"
+						aria-label="Steered message"
+					>
+						<div
+							class="flex items-center gap-1 mb-1 text-[11px] text-gray-400 dark:text-gray-500 pr-0.5"
+						>
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 16 16"
+								fill="currentColor"
+								class="size-3"
+							>
+								<path
+									d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z"
+								/>
+							</svg>
+							<span>{$i18n.t('Steered')}</span>
+						</div>
+						<div
+							class="rounded-2xl px-3.5 py-2 bg-gray-50 dark:bg-gray-850 text-gray-800 dark:text-gray-100 text-sm whitespace-pre-wrap break-words"
+						>
+							{structuredBlocks[item.index]?.content ?? ''}
+						</div>
+					</div>
+				</div>
+			{:else}
+				<Markdown
+					id={`${id}-b${item.index}`}
+					content={blockProjections[item.index] ?? ''}
+					{model}
+					{save}
+					{preview}
+					{done}
+					{parseImmediately}
+					{editCodeBlock}
+					topPadding={item.index === 0 ? topPadding : false}
 					{chatId}
 					{messageId}
 					{dataVizOverrides}
@@ -412,41 +582,23 @@
 					{onSourceClick}
 					{onTaskClick}
 					{onSave}
-					onUpdate={(token) => {
-						const { lang, text: code } = token;
-
-						if (
-							($settings?.detectArtifacts ?? true) &&
-							(['html', 'svg'].includes(lang) || (lang === 'xml' && code.includes('svg'))) &&
-							!$mobile &&
-							chatId
-						) {
-							showArtifacts.set(true);
-							showFilePreview.set(false);
-							showControls.set(true);
-						}
-					}}
-					onPreview={async (value) => {
-						console.log('Preview', value);
-						await artifactCode.set(value);
-						await showControls.set(true);
-						await showArtifacts.set(true);
-						await showOverview.set(false);
-						await showEmbeds.set(false);
-						await showFilePreview.set(false);
-					}}
+					onUpdate={handleMarkdownArtifact}
+					onPreview={handleMarkdownPreview}
 				/>
 			{/if}
 		{/each}
+		{#if showTailCursor}
+			<Skeleton size="md" />
+		{/if}
 	{:else}
 		<Markdown
 			{id}
 			content={content ?? ''}
-			allowStreamingPlainText={true}
 			{model}
 			{save}
 			{preview}
 			{done}
+			{parseImmediately}
 			{editCodeBlock}
 			{topPadding}
 			{chatId}

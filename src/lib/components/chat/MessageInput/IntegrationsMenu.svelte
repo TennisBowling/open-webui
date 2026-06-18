@@ -55,6 +55,9 @@
 	export let onShowValves: Function;
 	export let onClose: Function;
 	export let closeOnOutsideClick = true;
+	// Fired on every explicit user toggle so the chat marks its tool/feature
+	// selection as user-curated (a model switch then keeps it). No-op default.
+	export let onSelectionTouched: () => void = () => {};
 
 	let show = false;
 	let tab = '';
@@ -79,6 +82,7 @@
 		} else {
 			selectedToolIds = [...selectedToolIds, containerToolId];
 		}
+		onSelectionTouched();
 	};
 
 	$: if (show) {
@@ -205,6 +209,7 @@
 											} else {
 												selectedToolIds = selectedToolIds.filter((id) => id !== containerToolId);
 											}
+											onSelectionTouched();
 										}}
 									/>
 								</div>
@@ -251,6 +256,7 @@
 										} else {
 											selectedFilterIds = [...selectedFilterIds, filter.id];
 										}
+										onSelectionTouched();
 									}}
 								>
 									<div class="flex-1 truncate">
@@ -317,6 +323,7 @@
 								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
 								on:click={() => {
 									studyModeEnabled = !studyModeEnabled;
+									onSelectionTouched();
 								}}
 							>
 								<div class="flex-1 truncate">
@@ -359,6 +366,7 @@
 								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
 								on:click={() => {
 									dataVizEnabled = !dataVizEnabled;
+									onSelectionTouched();
 								}}
 							>
 								<div class="flex-1 truncate">
@@ -404,6 +412,7 @@
 								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
 								on:click={() => {
 									webSearchEnabled = !webSearchEnabled;
+									onSelectionTouched();
 								}}
 							>
 								<div class="flex-1 truncate">
@@ -435,6 +444,7 @@
 								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
 								on:click={() => {
 									imageGenerationEnabled = !imageGenerationEnabled;
+									onSelectionTouched();
 								}}
 							>
 								<div class="flex-1 truncate">
@@ -520,6 +530,7 @@
 									} else {
 										selectedToolIds = selectedToolIds.filter((id) => id !== toolId);
 									}
+									onSelectionTouched();
 								}
 							}}
 						>
@@ -580,6 +591,7 @@
 											} else {
 												selectedToolIds = selectedToolIds.filter((id) => id !== toolId);
 											}
+											onSelectionTouched();
 										}}
 									/>
 								</div>

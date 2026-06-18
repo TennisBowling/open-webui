@@ -11,7 +11,7 @@
 	import { goto } from '$app/navigation';
 	import { toast } from 'svelte-sonner';
 
-	import { chatId, mobile, selectedFolder, showSidebar } from '$lib/stores';
+	import { folderChatListInvalidation, mobile, selectedFolder, showSidebar } from '$lib/stores';
 
 	import {
 		deleteFolderById,
@@ -49,6 +49,7 @@
 	export let folders;
 	export let folderId;
 	export let shiftKey = false;
+	export let activeChatId = null;
 
 	export let className = '';
 
@@ -66,6 +67,8 @@
 	let dragged = false;
 
 	let clickTimer = null;
+	let folderInvalidationUnsubscribe = null;
+	let lastFolderInvalidationSeq = 0;
 
 	let name = '';
 
@@ -252,6 +255,13 @@
 				setFolderItems();
 			}
 		};
+		folderInvalidationUnsubscribe = folderChatListInvalidation.subscribe((value) => {
+			if (!value?.seq || value.seq === lastFolderInvalidationSeq) return;
+			if (!value.folderIds?.includes(folderId)) return;
+
+			lastFolderInvalidationSeq = value.seq;
+			setFolderItems();
+		});
 		if (folderElement) {
 			folderElement.addEventListener('dragover', onDragOver);
 			folderElement.addEventListener('drop', onDrop);
@@ -273,8 +283,11 @@
 	});
 
 	onDestroy(() => {
+		folderInvalidationUnsubscribe?.();
+		delete folderRegistry[folderId];
+
 		if (folderElement) {
-			folderElement.addEventListener('dragover', onDragOver);
+			folderElement.removeEventListener('dragover', onDragOver);
 			folderElement.removeEventListener('drop', onDrop);
 			folderElement.removeEventListener('dragleave', onDragLeave);
 
@@ -474,7 +487,7 @@
 				id="folder-{folderId}-button"
 				class="relative w-full py-1 px-1.5 rounded-xl flex items-center gap-1.5 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition {$selectedFolder?.id ===
 				folderId
-					? 'bg-manilla/40 dark:bg-manilla-dark selected before:content-[\'\'] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r'
+					? "bg-manilla/40 dark:bg-manilla-dark selected before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r"
 					: ''}"
 				on:dblclick={(e) => {
 					if (clickTimer) {
@@ -619,9 +632,13 @@
 								{folders}
 								folderId={childFolder.id}
 								{shiftKey}
+								{activeChatId}
 								parentDragged={dragged}
 								{onItemMove}
 								{onDelete}
+								on:activate={(e) => {
+									dispatch('activate', e.detail);
+								}}
 								on:import={(e) => {
 									dispatch('import', e.detail);
 								}}
@@ -640,6 +657,10 @@
 							id={chat.id}
 							title={chat.title}
 							{shiftKey}
+							active={chat.id === activeChatId}
+							on:activate={(e) => {
+								dispatch('activate', e.detail);
+							}}
 							on:change={(e) => {
 								dispatch('change', e.detail);
 							}}

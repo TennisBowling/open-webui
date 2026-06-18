@@ -105,6 +105,31 @@
 							</span>
 						</div>
 					{:else}
+						<div class="mb-1 flex items-center gap-1.5">
+							{#if item.mode === 'steer'}
+								<span
+									class="inline-flex items-center gap-1 rounded-full bg-book-cloth/15 px-1.5 py-0.5 text-[10px] font-medium text-book-cloth dark:bg-manilla-dark dark:text-gray-100"
+									title={$i18n.t('Sent at the next tool call to steer the response')}
+								>
+									<svg
+										xmlns="http://www.w3.org/2000/svg"
+										viewBox="0 0 16 16"
+										fill="currentColor"
+										class="size-2.5"
+									>
+										<path d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z" />
+									</svg>
+									{$i18n.t('Steer')}
+								</span>
+							{:else}
+								<span
+									class="inline-flex items-center rounded-full bg-gray-200/70 px-1.5 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+									title={$i18n.t('Sent after the response finishes')}
+								>
+									{$i18n.t('After response')}
+								</span>
+							{/if}
+						</div>
 						<button
 							type="button"
 							class="block w-full text-left text-gray-800 dark:text-gray-100 line-clamp-2 leading-snug hover:underline decoration-dotted underline-offset-2"

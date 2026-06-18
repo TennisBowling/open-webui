@@ -825,6 +825,10 @@
 										preview={!readOnly}
 										{editCodeBlock}
 										{topPadding}
+										parseImmediately={message?.done ?? false}
+										messageDone={message?.done ?? false}
+										messageStopped={message?.userStopped === true}
+										messageErrored={!!message?.error}
 										done={($settings?.chatFadeStreamingText ?? true)
 											? (message?.done ?? false)
 											: true}
@@ -1271,7 +1275,7 @@
 											: ''}
 										placement="bottom"
 										clickToStick={true}
-										tippyOptions={{ delay: [0, 100] }}
+										tippyOptions={{ delay: [0, 100], appendTo: () => document.body }}
 									>
 										<button
 											aria-hidden="true"

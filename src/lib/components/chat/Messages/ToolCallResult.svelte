@@ -5,10 +5,11 @@
 	import { toast } from 'svelte-sonner';
 
 	import { copyToClipboard } from '$lib/utils';
-	import { decodeToolResultText, formatToolValue } from '$lib/utils/toolResults';
+	import { decodeToolResultText, formatToolValue, isBrowserToolName } from '$lib/utils/toolResults';
 	import { getChatMessageToolResult } from '$lib/apis/chats';
 	import WebFetchResult from './ToolResults/WebFetchResult.svelte';
 	import WebSearchResult from './ToolResults/WebSearchResult.svelte';
+	import BrowserToolResult from './ToolResults/BrowserToolResult.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
@@ -21,6 +22,9 @@
 	export let messageId = '';
 	export let toolCallId = '';
 	export let done = true;
+	export let files: unknown[] = [];
+	export let error = false;
+	export let errorReason = '';
 
 	const normalizeLiveResultRaw = (raw: unknown) => {
 		if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -76,6 +80,13 @@
 	// chrome. Decode request/raw text only when that tab is visible; the rich
 	// Result tab parses its own data lazily inside the specialized component.
 	$: requestText = activeTab === 'request' ? formatToolValue(argsRaw) : '';
+	$: genericResultText =
+		activeTab === 'result' &&
+		name !== 'web_search' &&
+		name !== 'web_fetch' &&
+		!isBrowserToolName(name)
+			? decodeToolResultText(normalizedResultRaw)
+			: '';
 	$: resultText = activeTab === 'raw' ? decodeToolResultText(normalizedResultRaw) : '';
 
 	const labelForTab = (tab: Tab) => {
@@ -130,6 +141,16 @@
 
 	<div class="p-3">
 		{#if activeTab === 'result'}
+			{#if error}
+				<div
+					class="mb-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
+				>
+					<div class="font-medium">{$i18n.t('This tool call returned an error.')}</div>
+					{#if errorReason}
+						<div class="mt-1 text-xs opacity-90">{errorReason}</div>
+					{/if}
+				</div>
+			{/if}
 			{#if !done}
 				<div
 					class="rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
@@ -152,6 +173,14 @@
 				<WebSearchResult id={`${id}-web-search`} resultRaw={normalizedResultRaw} {argsRaw} />
 			{:else if name === 'web_fetch'}
 				<WebFetchResult id={`${id}-web-fetch`} resultRaw={normalizedResultRaw} />
+			{:else if isBrowserToolName(name)}
+				<BrowserToolResult id={`${id}-browser`} resultRaw={normalizedResultRaw} {argsRaw} {files} />
+			{:else}
+				<div
+					class="max-h-[48vh] overflow-y-auto rounded-xl bg-white p-3 text-xs text-gray-900 dark:bg-gray-900 dark:text-gray-100"
+				>
+					<pre class="whitespace-pre-wrap break-words font-mono">{genericResultText || ''}</pre>
+				</div>
 			{/if}
 		{:else if activeTab === 'request'}
 			<div class="max-h-[48vh] overflow-y-auto rounded-xl bg-gray-950 p-3 text-xs text-gray-100">

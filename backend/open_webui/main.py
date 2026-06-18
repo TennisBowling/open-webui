@@ -67,10 +67,12 @@ from open_webui.socket.main import (
     get_models_in_use,
     get_active_user_ids,
     get_token_groups,
+    set_stream_state,
     set_token_group,
     update_token_group,
     delete_token_group,
     get_token_usage,
+    clear_stream_state,
 )
 from open_webui.routers import (
     analytics,
@@ -218,6 +220,10 @@ from open_webui.config import (
     RAG_FILE_MAX_SIZE,
     FILE_IMAGE_COMPRESSION_WIDTH,
     FILE_IMAGE_COMPRESSION_HEIGHT,
+    IMAGE_PROVIDER_COMPRESSION_ENABLED,
+    IMAGE_PROVIDER_COMPRESSION_QUALITY,
+    IMAGE_PROVIDER_COMPRESSION_MIN_BYTES,
+    IMAGE_PROVIDER_MAX_DIMENSION,
     RAG_OPENAI_API_BASE_URL,
     RAG_OPENAI_API_KEY,
     RAG_AZURE_OPENAI_BASE_URL,
@@ -270,6 +276,8 @@ from open_webui.config import (
     # Retrieval (Web Search: Exa search + Jina Reader fetch)
     ENABLE_WEB_SEARCH,
     EXA_API_KEY,
+    EXA_API_KEY_2,
+    EXA_KEY_STATUS,
     EXA_SEARCH_NUM_RESULTS,
     EXA_SEARCH_TYPE,
     EXA_INCLUDE_DOMAINS,
@@ -440,6 +448,9 @@ from open_webui.env import (
     SRC_LOG_LEVELS,
     VERSION,
     INSTANCE_ID,
+    PROFILE_LOOP_LAG,
+    PROFILE_LOOP_LAG_INTERVAL,
+    PROFILE_LOOP_LAG_WINDOW_SECONDS,
     WEBUI_BUILD_HASH,
     WEBUI_SECRET_KEY,
     WEBUI_SESSION_COOKIE_SAME_SITE,
@@ -508,6 +519,7 @@ from open_webui.tasks import (
 )  # Import from tasks.py
 
 from open_webui.utils.redis import get_sentinels_from_env
+from open_webui.utils.headless_request import HeadlessRequest
 
 
 from open_webui.constants import ERROR_MESSAGES
@@ -624,9 +636,35 @@ async def lifespan(app: FastAPI):
             redis_task_command_listener(app)
         )
 
+        # Periodic sweeper: recover chats whose message-queue drain marker was
+        # set but whose generation died before clearing it (worker crash between
+        # marking and spawning). Redis-only — single-worker recovers via
+        # next-completion / tab-load instead. Bounded by the draining_chats set.
+        async def _queue_drain_sweeper():
+            from open_webui.utils.chat_queue import sweep_orphaned_drains
+
+            while True:
+                try:
+                    await asyncio.sleep(15)
+                    await sweep_orphaned_drains(app)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("queue drain sweeper iteration failed")
+
+        app.state.queue_drain_sweeper = asyncio.create_task(_queue_drain_sweeper())
+
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = THREAD_POOL_SIZE
+
+    if PROFILE_LOOP_LAG:
+        from open_webui.utils.loop_lag import start_loop_lag_monitor
+
+        app.state.loop_lag_monitor = start_loop_lag_monitor(
+            interval=PROFILE_LOOP_LAG_INTERVAL,
+            window_seconds=PROFILE_LOOP_LAG_WINDOW_SECONDS,
+        )
 
     asyncio.create_task(periodic_usage_pool_cleanup())
 
@@ -682,6 +720,12 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+
+    if hasattr(app.state, "queue_drain_sweeper"):
+        app.state.queue_drain_sweeper.cancel()
+
+    if getattr(app.state, "loop_lag_monitor", None) is not None:
+        app.state.loop_lag_monitor.cancel()
 
     # Fold the WAL back into the main DB file before disposing the pool so that
     # the next start (or a server-side backup) sees a single consolidated file.
@@ -915,6 +959,12 @@ app.state.config.FILE_MAX_SIZE = RAG_FILE_MAX_SIZE
 app.state.config.FILE_MAX_COUNT = RAG_FILE_MAX_COUNT
 app.state.config.FILE_IMAGE_COMPRESSION_WIDTH = FILE_IMAGE_COMPRESSION_WIDTH
 app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT = FILE_IMAGE_COMPRESSION_HEIGHT
+app.state.config.IMAGE_PROVIDER_COMPRESSION_ENABLED = IMAGE_PROVIDER_COMPRESSION_ENABLED
+app.state.config.IMAGE_PROVIDER_COMPRESSION_QUALITY = IMAGE_PROVIDER_COMPRESSION_QUALITY
+app.state.config.IMAGE_PROVIDER_COMPRESSION_MIN_BYTES = (
+    IMAGE_PROVIDER_COMPRESSION_MIN_BYTES
+)
+app.state.config.IMAGE_PROVIDER_MAX_DIMENSION = IMAGE_PROVIDER_MAX_DIMENSION
 
 
 app.state.config.RAG_FULL_CONTEXT = RAG_FULL_CONTEXT
@@ -1014,6 +1064,8 @@ app.state.config.YOUTUBE_LOADER_PROXY_URL = YOUTUBE_LOADER_PROXY_URL
 # Web Search (Exa search + Jina Reader fetch)
 app.state.config.ENABLE_WEB_SEARCH = ENABLE_WEB_SEARCH
 app.state.config.EXA_API_KEY = EXA_API_KEY
+app.state.config.EXA_API_KEY_2 = EXA_API_KEY_2
+app.state.config.EXA_KEY_STATUS = EXA_KEY_STATUS
 app.state.config.EXA_SEARCH_NUM_RESULTS = EXA_SEARCH_NUM_RESULTS
 app.state.config.EXA_SEARCH_TYPE = EXA_SEARCH_TYPE
 app.state.config.EXA_INCLUDE_DOMAINS = EXA_INCLUDE_DOMAINS
@@ -1589,13 +1641,15 @@ async def chat_completion(
                 and f"server:mcp:{container_server_id}" in tool_ids
             )
 
-            assembled = assemble_conversation_from_leaf(
+            assembled = await assemble_conversation_from_leaf(
                 form_data["chat_id"],
                 leaf_id,
                 new_user_message=new_user_message,
                 model=assemble_model,
                 system_prompt=(form_data.get("params") or {}).get("system"),
                 container_workspace_active=container_workspace_active,
+                request=request,
+                user=user,
             )
             form_data["messages"] = assembled
         except HTTPException:
@@ -1657,6 +1711,10 @@ async def chat_completion(
             "chat_id": form_data.pop("chat_id", None),
             "message_id": form_data.pop("id", None),
             "session_id": form_data.pop("session_id", None),
+            "headless": form_data.pop("headless", False),
+            "queue_drained_broadcast": form_data.pop(
+                "queue_drained_broadcast", None
+            ),
             "filter_ids": form_data.pop("filter_ids", []),
             "tool_ids": form_data.get("tool_ids", None),
             "tool_servers": form_data.pop("tool_servers", None),
@@ -1724,6 +1782,63 @@ async def chat_completion(
                 except:
                     pass
 
+            # Headless queue drain: at this point the new user message is
+            # persisted (assemble_conversation_from_leaf stamped history.currentId)
+            # and the assistant row has its model. Materialize a minimal assistant
+            # placeholder + register stream state, THEN tell every tab to attach —
+            # so a tab's loadChat() finds the user message, the assistant row
+            # (model + generating), and an active stream to subscribe/snapshot.
+            # Broadcasting earlier (at drain time) raced ahead of this persistence
+            # and left tabs showing only an empty date divider.
+            if metadata.get("headless") and metadata.get("chat_id") and metadata.get(
+                "message_id"
+            ) and not str(metadata["chat_id"]).startswith("local:"):
+                broadcast_spec = metadata.get("queue_drained_broadcast") or {}
+                try:
+                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        {
+                            "role": "assistant",
+                            "model": model_id,
+                            "parentId": broadcast_spec.get("user_message_id"),
+                            "done": False,
+                        },
+                        return_model=False,
+                    )
+                except Exception:
+                    log.exception("headless assistant placeholder upsert failed")
+                try:
+                    set_stream_state(
+                        metadata["message_id"],
+                        {
+                            "chat_id": metadata["chat_id"],
+                            "status": "in_progress",
+                            "content_blocks": [],
+                        },
+                    )
+                except Exception:
+                    log.exception("headless set_stream_state failed")
+                try:
+                    from open_webui.utils.chat_queue import broadcast_queue_state
+
+                    await broadcast_queue_state(
+                        metadata.get("user_id"),
+                        metadata["chat_id"],
+                        event_type="chat:queue:drained",
+                        **{
+                            k: broadcast_spec[k]
+                            for k in (
+                                "item_id",
+                                "user_message_id",
+                                "response_message_id",
+                            )
+                            if broadcast_spec.get(k) is not None
+                        },
+                    )
+                except Exception:
+                    log.exception("headless chat:queue:drained broadcast failed")
+
             stage = "response"
             return await process_chat_response(
                 request, response, form_data, user, metadata, model, events, tasks
@@ -1735,6 +1850,15 @@ async def chat_completion(
                 stage,
                 mcp_server_ids,
             )
+            if metadata.get("message_id"):
+                set_stream_state(
+                    metadata["message_id"],
+                    {
+                        "chat_id": metadata.get("chat_id"),
+                        "status": "cancelled",
+                    },
+                )
+                clear_stream_state(metadata["message_id"])
             try:
                 event_emitter = get_event_emitter(metadata)
                 await event_emitter(
@@ -1742,10 +1866,39 @@ async def chat_completion(
                 )
             except Exception as e:
                 pass
+            # Cancelled before/around streaming: PAUSE the queue (clear this
+            # generation's marker, best-effort).
+            if metadata.get("chat_id") and metadata.get("message_id"):
+                try:
+                    from open_webui.utils.chat_queue import clear_draining
+
+                    await clear_draining(
+                        getattr(request.app.state, "redis", None),
+                        metadata["chat_id"],
+                        finished_response_id=metadata.get("message_id"),
+                        user_id=metadata.get("user_id"),
+                    )
+                except Exception:
+                    pass
+            # Re-raise after cleanup so the cancellation propagates and the task
+            # actually unwinds/exits. Swallowing it leaves the task alive inside
+            # anyio's cancel scope, which then reschedules _deliver_cancellation
+            # every loop tick forever, pinning a core at idle until restart (see
+            # the matching fix + py-spy evidence in process_chat_response).
+            raise
         except Exception as e:
             log.debug(f"Error processing chat payload: {e}")
             if metadata.get("chat_id") and metadata.get("message_id"):
                 # Update the chat message with the error
+                set_stream_state(
+                    metadata["message_id"],
+                    {
+                        "chat_id": metadata.get("chat_id"),
+                        "status": "error",
+                        "error": {"content": str(e)},
+                    },
+                )
+                clear_stream_state(metadata["message_id"])
                 try:
                     if not metadata["chat_id"].startswith("local:"):
                         Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -1768,6 +1921,23 @@ async def chat_completion(
                     )
 
                 except:
+                    pass
+
+            # Generation failed before/around streaming: PAUSE the queue by
+            # clearing this generation's draining marker (best-effort). The
+            # middleware error path already clears for mid-stream errors; this
+            # catches payload/setup-stage failures that never reached it.
+            if metadata.get("chat_id") and metadata.get("message_id"):
+                try:
+                    from open_webui.utils.chat_queue import clear_draining
+
+                    await clear_draining(
+                        getattr(request.app.state, "redis", None),
+                        metadata["chat_id"],
+                        finished_response_id=metadata.get("message_id"),
+                        user_id=metadata.get("user_id"),
+                    )
+                except Exception:
                     pass
         finally:
             mcp_clients = metadata.get("mcp_clients") or {}
@@ -1801,6 +1971,72 @@ async def chat_completion(
 # Alias for chat_completion (Legacy)
 generate_chat_completions = chat_completion
 generate_chat_completion = chat_completion
+
+
+async def start_generation(
+    chat_id: str,
+    send_spec: dict,
+    user,
+    *,
+    oauth_session_id: Optional[str] = None,
+):
+    """Request-free entrypoint to start a chat generation.
+
+    Mirrors what the ``/api/chat/completions`` route does, but without an
+    inbound HTTP ``Request`` — used by the autonomous message-queue drain to
+    start the next queued turn with zero browser tabs open. Builds a
+    ``HeadlessRequest`` carrier and a v2 ``form_data`` from ``send_spec`` (the
+    self-contained queue item), then calls the same ``chat_completion`` so the
+    full pipeline (assembly, preprocessing, tools, persistence, socket
+    delivery) is byte-identical to a tab-driven send.
+
+    ``send_spec`` keys (all optional except ``model`` + ``leaf_message_id`` +
+    ``new_user_message``): ``model``, ``leaf_message_id``, ``new_user_message``,
+    ``params``, ``tool_ids``, ``tool_servers``, ``filter_ids``, ``features``,
+    ``variables``, ``files``, ``reasoning``, ``service_tier``, ``timezone``,
+    ``background_tasks``, ``stream`` (defaults True), ``model_item``.
+
+    ``session_id`` is intentionally NOT set: with no originating socket, the
+    event emitter fans out to all of the user's open tabs (and persists to the
+    DB regardless), so any open tab receives the stream and closed-tab runs are
+    recoverable via the snapshot/active-stream machinery. Returns whatever
+    ``chat_completion`` returns (the generation runs inline within this call).
+    """
+    request = HeadlessRequest(app, cookies={"oauth_session_id": oauth_session_id} if oauth_session_id else None)
+
+    form_data = {
+        "stream": send_spec.get("stream", True),
+        "model": send_spec.get("model"),
+        "chat_id": chat_id,
+        "id": send_spec.get("response_message_id") or send_spec.get("id"),
+        "leaf_message_id": send_spec.get("leaf_message_id"),
+        # Marks this as a request-free run so process_chat_response builds a
+        # fan-out emitter despite the absent session_id (see its gate).
+        "headless": True,
+    }
+    # Optional fields — include only when present so we match the route's body
+    # shape (which omits undefined keys) and don't override pipeline defaults.
+    for key in (
+        "new_user_message",
+        "params",
+        "tool_ids",
+        "tool_servers",
+        "filter_ids",
+        "features",
+        "variables",
+        "files",
+        "reasoning",
+        "service_tier",
+        "background_tasks",
+        "model_item",
+        "stream_options",
+        "timezone",
+        "queue_drained_broadcast",
+    ):
+        if send_spec.get(key) is not None:
+            form_data[key] = send_spec[key]
+
+    return await chat_completion(request, form_data, user)
 
 
 @app.post("/api/chat/completed")
@@ -1996,6 +2232,10 @@ async def get_app_config(request: Request):
                     "image_compression": {
                         "width": app.state.config.FILE_IMAGE_COMPRESSION_WIDTH,
                         "height": app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT,
+                    },
+                    "image_provider_compression": {
+                        "enabled": app.state.config.IMAGE_PROVIDER_COMPRESSION_ENABLED,
+                        "max_dimension": app.state.config.IMAGE_PROVIDER_MAX_DIMENSION,
                     },
                 },
                 "permissions": {**app.state.config.USER_PERMISSIONS},
