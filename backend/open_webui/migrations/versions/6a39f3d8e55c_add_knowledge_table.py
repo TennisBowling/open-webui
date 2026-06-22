@@ -7,6 +7,7 @@ Create Date: 2024-10-01 14:02:35.241684
 """
 
 from alembic import op
+from alembic import context
 import sqlalchemy as sa
 from sqlalchemy.sql import table, column, select
 import json
@@ -32,6 +33,9 @@ def upgrade():
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("updated_at", sa.BigInteger(), nullable=True),
     )
+
+    if context.is_offline_mode():
+        return
 
     print("Migrating data from document table to knowledge table")
     # Representation of the existing 'document' table

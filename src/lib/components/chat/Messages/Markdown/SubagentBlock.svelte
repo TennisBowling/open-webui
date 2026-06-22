@@ -85,12 +85,18 @@
 	// own state.
 	$: staleLaunchSibling = (
 		stale && run?.subagent_id
-			? (Object.values($subagentLiveStates).find(
-					(r: any) =>
-						r &&
-						!r.continuation &&
-						(r.subagent_id === run.subagent_id || r.chat_id === run.subagent_id)
-				) as any)
+			? ((Object.values($subagentLiveStates) as any[])
+					.filter(
+						(r: any) =>
+							r &&
+							!r.continuation &&
+							(r.subagent_id === run.subagent_id || r.chat_id === run.subagent_id)
+					)
+					// Multiple relaunches of the same subagent can leave several
+					// non-continuation entries; mirror the MOST RECENT one (highest
+					// started_at) so the stale card reflects its true replacement
+					// rather than whichever happened to be enumerated first.
+					.sort((a: any, b: any) => (b?.started_at ?? 0) - (a?.started_at ?? 0))[0] as any)
 			: null
 	);
 	// The run we actually present for a stale card: the launch sibling when we
@@ -187,15 +193,19 @@
 
 	// Header line. While running we keep the "Researching…" badge and show the
 	// ticking timer beside it (template). When terminal, the duration phrase
-	// replaces the badge text; the colored icon still conveys state. Falls back
-	// to a bare label when no timing is available (e.g. placeholder-only run).
+	// replaces the badge text; the colored icon still conveys state. When timing
+	// is unavailable (legacy runs persisted before timing was stamped) we still
+	// say "Researched" — NEVER a bare "Done", which reads as a different state
+	// from the "Researched for 7m" cards and is exactly the inconsistency the
+	// user reported. New runs always carry both timestamps (the backend stamps
+	// them atomically), so they always get the duration.
 	$: headerStatusText =
 		status === 'running'
 			? $i18n.t('Researching…')
 			: status === 'done'
 				? timerText
 					? $i18n.t('Researched for {{duration}}', { duration: timerText })
-					: $i18n.t('Done')
+					: $i18n.t('Researched')
 				: status === 'cancelled'
 					? timerText
 						? $i18n.t('Stopped after {{duration}}', { duration: timerText })
@@ -270,12 +280,18 @@
 		: -1;
 	// The authoritative final answer. Prefer the actual trailing text block; if the
 	// transcript somehow lacks it (a live-delivery gap), fall back to run.final_text
-	// (what the parent model received) and then the reload fallback. This guarantees
-	// the answer is shown even when content_blocks is incomplete.
+	// (what the parent model received). Only fall back to `fallbackContent` when
+	// there is NO transcript at all — `fallbackContent` is the WHOLE subagent chat
+	// serialized to `<details type="tool_calls">…` markdown (blocksToDisplayMarkdown),
+	// which <Markdown> re-expands into the rich web_search/fetch cards. Using it as
+	// the "final answer" alongside a present transcript renders every tool call
+	// twice: once barebones in the transcript, once richly here. Guard on
+	// !hasTranscript so the rich serialization is only ever the no-transcript
+	// fallback path (which also has its own dedicated branch in the template).
 	$: finalAnswerText = doneRendering
 		? (finalTextIdx >= 0
 				? `${contentBlocks[finalTextIdx].content ?? ''}`
-				: displayFinalText || fallbackContent || '')
+				: displayFinalText || (hasTranscript ? '' : fallbackContent) || '')
 		: '';
 	// Transcript = the work (reasoning + tool calls + any interstitial text),
 	// excluding the trailing final-answer block which is rendered separately.
@@ -292,30 +308,21 @@
 	let open = false;
 
 	// Expansion should feel instant even for finished subagents with a long
-	// transcript. Mount a cheap shell first, then progressively hydrate the
-	// heavy body/Markdown work after the click frame has painted.
-	const INITIAL_DONE_BLOCK_LIMIT = 12;
-	const BLOCK_HYDRATION_BATCH = 12;
-	const RICH_MARKDOWN_BATCH = 1;
-	const EAGER_BODY_BLOCK_LIMIT = 12;
-	const EAGER_BODY_MAX_CHARS = 160_000;
+	// transcript. We mount a cheap shell first, then reveal the body on the next
+	// paint for large transcripts so the slide transition isn't janky.
+	//
+	// The transcript blocks themselves are cheap to render (plain pre-wrapped
+	// text + barebones tool-call lines); the ONLY heavy render is the final
+	// answer, which is its own dedicated Markdown section below. So we render the
+	// WHOLE transcript at once — no progressive block window, no idle-callback
+	// growth that could stall under main-thread load and leave a permanent
+	// "Loading earlier steps…" line (the exact jank the user reported).
+	const EAGER_BODY_BLOCK_LIMIT = 40;
+	const EAGER_BODY_MAX_CHARS = 200_000;
 
 	let bodyReady = false;
-	let bodyBlockLimit = INITIAL_DONE_BLOCK_LIMIT;
-	let richBlockLimit = 0;
 	let bodyFrame: number | null = null;
 	let bodyTimeout: ReturnType<typeof setTimeout> | null = null;
-	let blockHydrationScheduled = false;
-	let richHydrationScheduled = false;
-	let idleHandle: number | null = null;
-
-	const cancelIdle = () => {
-		const idleWindow = typeof window !== 'undefined' ? (window as any) : null;
-		if (idleHandle !== null && idleWindow?.cancelIdleCallback) {
-			idleWindow.cancelIdleCallback(idleHandle);
-		}
-		idleHandle = null;
-	};
 
 	const runAfterPaint = (fn: () => void) => {
 		if (typeof window === 'undefined') {
@@ -333,39 +340,12 @@
 		});
 	};
 
-	const runWhenIdle = (fn: () => void, timeout = 500) => {
-		if (typeof window === 'undefined') {
-			fn();
-			return;
-		}
-		const idleWindow = window as any;
-		if (typeof idleWindow.requestIdleCallback === 'function') {
-			idleHandle = idleWindow.requestIdleCallback(
-				() => {
-					idleHandle = null;
-					fn();
-				},
-				{ timeout }
-			);
-		} else {
-			bodyTimeout = setTimeout(() => {
-				bodyTimeout = null;
-				fn();
-			}, 32);
-		}
-	};
-
 	const resetHydration = () => {
 		if (typeof window !== 'undefined' && bodyFrame !== null) window.cancelAnimationFrame(bodyFrame);
 		if (bodyTimeout !== null) clearTimeout(bodyTimeout);
-		cancelIdle();
 		bodyFrame = null;
 		bodyTimeout = null;
-		blockHydrationScheduled = false;
-		richHydrationScheduled = false;
 		bodyReady = false;
-		bodyBlockLimit = INITIAL_DONE_BLOCK_LIMIT;
-		richBlockLimit = 0;
 	};
 
 	const estimateBlockSize = (block: any) => {
@@ -383,19 +363,16 @@
 	const estimateInitialBodySize = () => {
 		const blocks = Array.isArray(run?.content_blocks) ? run.content_blocks : [];
 		if (blocks.length > 0) {
-			return blocks
-				.slice(0, INITIAL_DONE_BLOCK_LIMIT)
-				.reduce((sum: number, block: any) => sum + estimateBlockSize(block), 0);
+			return blocks.reduce((sum: number, block: any) => sum + estimateBlockSize(block), 0);
 		}
 		return `${run?.final_text ?? fallbackContent ?? ''}`.length;
 	};
 
 	const shouldShowBodyImmediately = () => {
-		// Running subagents render text blocks as plain pre-wrapped text, so there is
-		// no expensive final markdown parse to protect. Showing the body immediately
-		// lets the slide transition measure the real in-progress content.
+		// Running subagents render text blocks as plain pre-wrapped text, so there
+		// is no expensive parse to protect. Showing the body immediately lets the
+		// slide transition measure the real in-progress content.
 		if (status === 'running') return true;
-
 		const blocks = Array.isArray(run?.content_blocks) ? run.content_blocks : [];
 		if (blocks.length > EAGER_BODY_BLOCK_LIMIT) return false;
 		return estimateInitialBodySize() <= EAGER_BODY_MAX_CHARS;
@@ -422,43 +399,10 @@
 	// used to render thinking / tool calls / answer exactly like a live run.
 	let fallbackBlocks: any[] | null = null;
 
-	$: visibleContentBlocks = doneRendering
-		? transcriptBlocks.slice(0, Math.min(bodyBlockLimit, transcriptBlocks.length))
-		: transcriptBlocks;
-	$: hasMoreContentBlocks = doneRendering && bodyBlockLimit < transcriptBlocks.length;
-	$: richTarget = hasTranscript
-		? Math.min(bodyBlockLimit, transcriptBlocks.length)
-		: finalAnswerText || displayFinalText || fallbackContent
-			? 1
-			: 0;
-
-	const scheduleMoreContentBlocks = () => {
-		if (blockHydrationScheduled) return;
-		blockHydrationScheduled = true;
-		runWhenIdle(() => {
-			blockHydrationScheduled = false;
-			if (!open || !bodyReady || !doneRendering) return;
-			bodyBlockLimit = Math.min(transcriptBlocks.length, bodyBlockLimit + BLOCK_HYDRATION_BATCH);
-		}, 350);
-	};
-
-	const scheduleMoreRichMarkdown = () => {
-		if (richHydrationScheduled) return;
-		richHydrationScheduled = true;
-		runWhenIdle(() => {
-			richHydrationScheduled = false;
-			if (!open || !bodyReady || !doneRendering) return;
-			richBlockLimit = Math.min(richTarget, richBlockLimit + RICH_MARKDOWN_BATCH);
-		}, 700);
-	};
-
-	$: if (open && bodyReady && hasMoreContentBlocks) {
-		scheduleMoreContentBlocks();
-	}
-
-	$: if (open && bodyReady && doneRendering && richBlockLimit < richTarget) {
-		scheduleMoreRichMarkdown();
-	}
+	// Render the whole transcript at once — it is cheap (see above), so there is
+	// Render the whole transcript at once — it is cheap (see above), so there is
+	// no window to grow and nothing to "load later".
+	$: visibleContentBlocks = transcriptBlocks;
 
 	async function fetchFallbackContent() {
 		if (fallbackFetching || fallbackContent) return;
@@ -576,6 +520,11 @@
 			);
 		} else {
 			resetHydration();
+			// Tell the chat the user finished reading — it re-enables stream
+			// following if they're back near the bottom.
+			rootEl?.dispatchEvent(
+				new CustomEvent('subagent:collapse', { bubbles: true })
+			);
 		}
 
 		// After the DOM settles (body mount + slide start), restore the card to
@@ -667,6 +616,28 @@
 			toast.error($i18n.t('Subagent is already running.'));
 			return;
 		}
+		// "Restart from beginning" wipes the WHOLE hidden subagent chat, which
+		// discards every follow-up (continuation) turn for this subagent. Warn
+		// before destroying that work so it never happens silently.
+		if (scope === 'from_launch' && run?.subagent_id) {
+			const continuations = Object.values($subagentLiveStates).filter(
+				(r: any) =>
+					r &&
+					r.continuation === true &&
+					(r.subagent_id === run.subagent_id || r.chat_id === run.subagent_id)
+			).length;
+			if (continuations > 0) {
+				const ok =
+					typeof window === 'undefined' ||
+					window.confirm(
+						$i18n.t(
+							'Restarting from the beginning discards this subagent’s {{n}} follow-up turn(s). Continue?',
+							{ n: continuations }
+						)
+					);
+				if (!ok) return;
+			}
+		}
 		// We need a few things to call /rerun: which parent chat (the chat
 		// we're inside), which parent message (stored on the run), which
 		// entry to refresh (the stateKey), and a session_id so events route
@@ -708,11 +679,21 @@
 					started_at: Math.floor(Date.now() / 1000),
 					ended_at: undefined
 				};
-				return {
-					...s,
-					[stateKey]: next,
-					[entryKey]: next
-				};
+				const out = { ...s };
+				// Write under EVERY key this run is addressable by (the store
+				// seeds each run under up to 4 keys). Updating only two left the
+				// others pointing at the stale done/stale object, so a card that
+				// resolved via a different key kept showing the old state.
+				const keys = [
+					stateKey,
+					entryKey,
+					cur.tool_call_id,
+					cur.subagent_id,
+					cur.chat_id,
+					cur.entry_key
+				].filter(Boolean);
+				for (const k of keys) out[k] = next;
+				return out;
 			});
 			// Open the subagent body after redo so the live rerun is visible
 			// even after the redo dropdown closes.
@@ -933,22 +914,15 @@
 					<div class="subagent-inner space-y-2">
 						{#each visibleContentBlocks as block, i (i)}
 							{#if block?.type === 'text'}
-								{#if doneRendering && i < richBlockLimit}
-									<div class="markdown-prose">
-										<Markdown
-											id={`subagent-${stateKey}-text-${i}`}
-											content={block.content ?? ''}
-											done={true}
-											editCodeBlock={false}
-										/>
-									</div>
-								{:else}
-									<div
-										class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
-									>
-										{doneRendering ? previewText(block.content) : (block.content ?? '')}
-									</div>
-								{/if}
+								<!-- Interstitial "thinking out loud" text between tool calls.
+								     Rendered as plain pre-wrapped text (cheap, instant) — the
+								     final answer is the only rich-Markdown render, in its own
+								     section below. -->
+								<div
+									class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
+								>
+									{doneRendering ? previewText(block.content) : (block.content ?? '')}
+								</div>
 							{:else if block?.type === 'reasoning'}
 								<details class="rounded-lg bg-gray-50 dark:bg-gray-850 px-3 py-1.5">
 									<summary
@@ -998,11 +972,6 @@
 								</div>
 							{/if}
 						{/each}
-						{#if hasMoreContentBlocks}
-							<div class="text-xs text-gray-400 dark:text-gray-500 italic">
-								{$i18n.t('Loading earlier steps…')}
-							</div>
-						{/if}
 					</div>
 				{/if}
 
@@ -1020,22 +989,14 @@
 						/>
 					</div>
 				{:else if !hasTranscript && fallbackContent}
-					{#if richBlockLimit >= 1}
-						<div class="markdown-prose">
-							<Markdown
-								id={`subagent-${stateKey}-fallback`}
-								content={fallbackContent}
-								done={true}
-								editCodeBlock={false}
-							/>
-						</div>
-					{:else}
-						<div
-							class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
-						>
-							{previewText(fallbackContent)}
-						</div>
-					{/if}
+					<div class="markdown-prose">
+						<Markdown
+							id={`subagent-${stateKey}-fallback`}
+							content={fallbackContent}
+							done={true}
+							editCodeBlock={false}
+						/>
+					</div>
 				{:else if !hasTranscript && fallbackFetching}
 					<div class="text-sm text-gray-500 dark:text-gray-400 italic">
 						{$i18n.t('Loading subagent results…')}

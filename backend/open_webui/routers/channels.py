@@ -54,14 +54,14 @@ router = APIRouter()
 
 @router.get("/", response_model=list[ChannelModel])
 async def get_channels(user=Depends(get_verified_user)):
-    return Channels.get_channels_by_user_id(user.id)
+    return await Channels.get_channels_by_user_id(user.id)
 
 
 @router.get("/list", response_model=list[ChannelModel])
 async def get_all_channels(user=Depends(get_verified_user)):
     if user.role == "admin":
-        return Channels.get_channels()
-    return Channels.get_channels_by_user_id(user.id)
+        return await Channels.get_channels()
+    return await Channels.get_channels_by_user_id(user.id)
 
 
 ############################
@@ -72,7 +72,7 @@ async def get_all_channels(user=Depends(get_verified_user)):
 @router.post("/create", response_model=Optional[ChannelModel])
 async def create_new_channel(form_data: ChannelForm, user=Depends(get_admin_user)):
     try:
-        channel = Channels.insert_new_channel(None, form_data, user.id)
+        channel = await Channels.insert_new_channel(None, form_data, user.id)
         return ChannelModel(**channel.model_dump())
     except Exception as e:
         log.exception(e)
@@ -88,7 +88,7 @@ async def create_new_channel(form_data: ChannelForm, user=Depends(get_admin_user
 
 @router.get("/{id}", response_model=Optional[ChannelResponse])
 async def get_channel_by_id(id: str, user=Depends(get_verified_user)):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -122,14 +122,14 @@ async def get_channel_by_id(id: str, user=Depends(get_verified_user)):
 async def update_channel_by_id(
     id: str, form_data: ChannelForm, user=Depends(get_admin_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
         )
 
     try:
-        channel = Channels.update_channel_by_id(id, form_data)
+        channel = await Channels.update_channel_by_id(id, form_data)
         return ChannelModel(**channel.model_dump())
     except Exception as e:
         log.exception(e)
@@ -145,14 +145,14 @@ async def update_channel_by_id(
 
 @router.delete("/{id}/delete", response_model=bool)
 async def delete_channel_by_id(id: str, user=Depends(get_admin_user)):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
         )
 
     try:
-        Channels.delete_channel_by_id(id)
+        await Channels.delete_channel_by_id(id)
         return True
     except Exception as e:
         log.exception(e)
@@ -174,7 +174,7 @@ class MessageUserResponse(MessageResponse):
 async def get_channel_messages(
     id: str, skip: int = 0, limit: int = 50, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -187,16 +187,16 @@ async def get_channel_messages(
             status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()
         )
 
-    message_list = Messages.get_messages_by_channel_id(id, skip, limit)
+    message_list = await Messages.get_messages_by_channel_id(id, skip, limit)
     users = {}
 
     messages = []
     for message in message_list:
         if message.user_id not in users:
-            user = Users.get_user_by_id(message.user_id)
+            user = await Users.get_user_by_id(message.user_id)
             users[message.user_id] = user
 
-        thread_replies = Messages.get_thread_replies_by_message_id(message.id)
+        thread_replies = await Messages.get_thread_replies_by_message_id(message.id)
         latest_thread_reply_at = (
             thread_replies[0].created_at if thread_replies else None
         )
@@ -207,7 +207,7 @@ async def get_channel_messages(
                     **message.model_dump(),
                     "reply_count": len(thread_replies),
                     "latest_reply_at": latest_thread_reply_at,
-                    "reactions": Messages.get_reactions_by_message_id(message.id),
+                    "reactions": await Messages.get_reactions_by_message_id(message.id),
                     "user": UserNameResponse(**users[message.user_id].model_dump()),
                 }
             )
@@ -249,7 +249,7 @@ async def send_notification(name, webui_url, channel, message, active_user_ids):
 async def model_response_handler(request, channel, message, user):
     MODELS = {
         model["id"]: model
-        for model in get_filtered_models(await get_all_models(request, user=user), user)
+        for model in await get_filtered_models(await get_all_models(request, user=user), user)
     }
 
     mentions = extract_mentions(message.content)
@@ -281,7 +281,7 @@ async def model_response_handler(request, channel, message, user):
         if model:
             try:
                 # reverse to get in chronological order
-                thread_messages = Messages.get_messages_by_parent_id(
+                thread_messages = await Messages.get_messages_by_parent_id(
                     channel.id,
                     message.parent_id if message.parent_id else message.id,
                 )[::-1]
@@ -312,7 +312,7 @@ async def model_response_handler(request, channel, message, user):
                 for thread_message in thread_messages:
                     message_user = None
                     if thread_message.user_id not in message_users:
-                        message_user = Users.get_user_by_id(thread_message.user_id)
+                        message_user = await Users.get_user_by_id(thread_message.user_id)
                         message_users[thread_message.user_id] = message_user
                     else:
                         message_user = message_users[thread_message.user_id]
@@ -423,7 +423,7 @@ async def model_response_handler(request, channel, message, user):
 async def new_message_handler(
     request: Request, id: str, form_data: MessageForm, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -437,9 +437,9 @@ async def new_message_handler(
         )
 
     try:
-        message = Messages.insert_new_message(form_data, channel.id, user.id)
+        message = await Messages.insert_new_message(form_data, channel.id, user.id)
         if message:
-            message = Messages.get_message_by_id(message.id)
+            message = await Messages.get_message_by_id(message.id)
             event_data = {
                 "channel_id": channel.id,
                 "message_id": message.id,
@@ -459,7 +459,7 @@ async def new_message_handler(
 
             if message.parent_id:
                 # If this message is a reply, emit to the parent message as well
-                parent_message = Messages.get_message_by_id(message.parent_id)
+                parent_message = await Messages.get_message_by_id(message.parent_id)
 
                 if parent_message:
                     await sio.emit(
@@ -531,7 +531,7 @@ async def post_new_message(
 async def get_channel_message(
     id: str, message_id: str, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -544,7 +544,7 @@ async def get_channel_message(
             status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()
         )
 
-    message = Messages.get_message_by_id(message_id)
+    message = await Messages.get_message_by_id(message_id)
     if not message:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -555,12 +555,13 @@ async def get_channel_message(
             status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT()
         )
 
+    message_user = await Users.get_user_by_id(message.user_id)
     return MessageUserResponse(
         **{
             **message.model_dump(),
             "user": UserNameResponse(
-                **Users.get_user_by_id(message.user_id).model_dump()
-            ),
+                **message_user.model_dump()
+            ) if message_user else None,
         }
     )
 
@@ -580,7 +581,7 @@ async def get_channel_thread_messages(
     limit: int = 50,
     user=Depends(get_verified_user),
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -593,13 +594,13 @@ async def get_channel_thread_messages(
             status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()
         )
 
-    message_list = Messages.get_messages_by_parent_id(id, message_id, skip, limit)
+    message_list = await Messages.get_messages_by_parent_id(id, message_id, skip, limit)
     users = {}
 
     messages = []
     for message in message_list:
         if message.user_id not in users:
-            user = Users.get_user_by_id(message.user_id)
+            user = await Users.get_user_by_id(message.user_id)
             users[message.user_id] = user
 
         messages.append(
@@ -608,7 +609,7 @@ async def get_channel_thread_messages(
                     **message.model_dump(),
                     "reply_count": 0,
                     "latest_reply_at": None,
-                    "reactions": Messages.get_reactions_by_message_id(message.id),
+                    "reactions": await Messages.get_reactions_by_message_id(message.id),
                     "user": UserNameResponse(**users[message.user_id].model_dump()),
                 }
             )
@@ -628,13 +629,13 @@ async def get_channel_thread_messages(
 async def update_message_by_id(
     id: str, message_id: str, form_data: MessageForm, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
         )
 
-    message = Messages.get_message_by_id(message_id)
+    message = await Messages.get_message_by_id(message_id)
     if not message:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -655,8 +656,8 @@ async def update_message_by_id(
         )
 
     try:
-        message = Messages.update_message_by_id(message_id, form_data)
-        message = Messages.get_message_by_id(message_id)
+        message = await Messages.update_message_by_id(message_id, form_data)
+        message = await Messages.get_message_by_id(message_id)
 
         if message:
             await sio.emit(
@@ -695,7 +696,7 @@ class ReactionForm(BaseModel):
 async def add_reaction_to_message(
     id: str, message_id: str, form_data: ReactionForm, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -708,7 +709,7 @@ async def add_reaction_to_message(
             status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()
         )
 
-    message = Messages.get_message_by_id(message_id)
+    message = await Messages.get_message_by_id(message_id)
     if not message:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -720,8 +721,8 @@ async def add_reaction_to_message(
         )
 
     try:
-        Messages.add_reaction_to_message(message_id, user.id, form_data.name)
-        message = Messages.get_message_by_id(message_id)
+        await Messages.add_reaction_to_message(message_id, user.id, form_data.name)
+        message = await Messages.get_message_by_id(message_id)
 
         await sio.emit(
             "events:channel",
@@ -758,7 +759,7 @@ async def add_reaction_to_message(
 async def remove_reaction_by_id_and_user_id_and_name(
     id: str, message_id: str, form_data: ReactionForm, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -771,7 +772,7 @@ async def remove_reaction_by_id_and_user_id_and_name(
             status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()
         )
 
-    message = Messages.get_message_by_id(message_id)
+    message = await Messages.get_message_by_id(message_id)
     if not message:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -783,11 +784,11 @@ async def remove_reaction_by_id_and_user_id_and_name(
         )
 
     try:
-        Messages.remove_reaction_by_id_and_user_id_and_name(
+        await Messages.remove_reaction_by_id_and_user_id_and_name(
             message_id, user.id, form_data.name
         )
 
-        message = Messages.get_message_by_id(message_id)
+        message = await Messages.get_message_by_id(message_id)
 
         await sio.emit(
             "events:channel",
@@ -824,13 +825,13 @@ async def remove_reaction_by_id_and_user_id_and_name(
 async def delete_message_by_id(
     id: str, message_id: str, user=Depends(get_verified_user)
 ):
-    channel = Channels.get_channel_by_id(id)
+    channel = await Channels.get_channel_by_id(id)
     if not channel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
         )
 
-    message = Messages.get_message_by_id(message_id)
+    message = await Messages.get_message_by_id(message_id)
     if not message:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -853,7 +854,7 @@ async def delete_message_by_id(
         )
 
     try:
-        Messages.delete_message_by_id(message_id)
+        await Messages.delete_message_by_id(message_id)
         await sio.emit(
             "events:channel",
             {
@@ -874,7 +875,7 @@ async def delete_message_by_id(
 
         if message.parent_id:
             # If this message is a reply, emit to the parent message as well
-            parent_message = Messages.get_message_by_id(message.parent_id)
+            parent_message = await Messages.get_message_by_id(message.parent_id)
 
             if parent_message:
                 await sio.emit(

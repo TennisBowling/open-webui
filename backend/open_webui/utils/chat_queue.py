@@ -65,7 +65,7 @@ def _drain_lock_key(chat_id: str) -> str:
     return f"{REDIS_KEY_PREFIX}:chat:drain_lock:{chat_id}"
 
 
-def _draining_set_key() -> str:
+async def _draining_set_key() -> str:
     return f"{REDIS_KEY_PREFIX}:chat:draining_chats"
 
 
@@ -139,12 +139,12 @@ def _item_spec(item: dict) -> dict:
     return spec if isinstance(spec, dict) else item
 
 
-def _current_leaf_id(chat_id: str) -> Optional[str]:
+async def _current_leaf_id(chat_id: str) -> Optional[str]:
     """Return the chat's current head message id (history.currentId), read from
     the raw blob (the message table is peeled out but currentId stays). This is
     the parent the next queued user message hangs off of."""
     try:
-        chat = Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id(chat_id)
         if not chat or not isinstance(chat.chat, dict):
             return None
         history = chat.chat.get("history") or {}
@@ -153,7 +153,7 @@ def _current_leaf_id(chat_id: str) -> Optional[str]:
         return None
 
 
-def _build_send_spec_from_item(
+async def _build_send_spec_from_item(
     item: dict,
     response_message_id: str,
     leaf_message_id: Optional[str],
@@ -221,7 +221,7 @@ async def broadcast_queue_state(user_id: str, chat_id: str, event_type: str = "c
     if not user_id or not chat_id or str(chat_id).startswith("local:"):
         return
     try:
-        state = Chats.get_queue_state_by_id(chat_id) or {}
+        state = await Chats.get_queue_state_by_id(chat_id) or {}
         from open_webui.socket.main import broadcast_queue_event
 
         await broadcast_queue_event(
@@ -262,10 +262,10 @@ async def clear_draining(
     steer reaches when the model finishes with no more tools). ``user_id`` (when
     known) lets us broadcast the resulting chip-strip change to the user's tabs.
     """
-    Chats.clear_draining_by_id(chat_id, finished_response_id)
+    await Chats.clear_draining_by_id(chat_id, finished_response_id)
     # Only drop from the cross-worker draining set when the chat is no longer
     # marked (a newer generation may have re-marked it).
-    state = Chats.get_queue_state_by_id(chat_id)
+    state = await Chats.get_queue_state_by_id(chat_id)
     marker_now_clear = not state or state.get("draining") is None
     if marker_now_clear:
         await _unregister_draining(redis, chat_id)
@@ -278,11 +278,11 @@ async def clear_draining(
     # an in-flight response. Best-effort; never break the caller.
     if marker_now_clear and not str(chat_id).startswith("local:"):
         try:
-            converted = Chats.convert_steer_items_to_after_final_by_id(chat_id)
+            converted = await Chats.convert_steer_items_to_after_final_by_id(chat_id)
             if converted:
                 resolved_user_id = user_id
                 if resolved_user_id is None:
-                    chat = Chats.get_chat_by_id(chat_id)
+                    chat = await Chats.get_chat_by_id(chat_id)
                     resolved_user_id = getattr(chat, "user_id", None)
                 if resolved_user_id:
                     await broadcast_queue_state(resolved_user_id, chat_id)
@@ -311,7 +311,7 @@ async def _finalize_failed_headless_drain(
     tabs to reload. All best-effort; never raises."""
     detail = getattr(error, "detail", None) or str(error) or "Generation failed"
     try:
-        Chats.upsert_message_to_chat_by_id_and_message_id(
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id,
             response_message_id,
             {
@@ -387,7 +387,7 @@ async def maybe_drain_queue(
                 "started_at": int(time.time()),
             }
 
-        result = Chats.pop_queue_head_and_mark_draining_by_id(
+        result = await Chats.pop_queue_head_and_mark_draining_by_id(
             chat_id, _marker, expected_finished_response_id=finished_response_id
         )
         if not result or result.get("item") is None:
@@ -408,7 +408,7 @@ async def maybe_drain_queue(
         # generation stamped to its own assistant message. This mirrors the old
         # client dequeueAndSend, which parented the queued user message off
         # history.currentId at send time.
-        leaf_message_id = _current_leaf_id(chat_id)
+        leaf_message_id = await _current_leaf_id(chat_id)
 
         # Build the new user message fresh: snapshot content/files/models from the
         # queue item, assign a fresh id + the resolved parent. Read through
@@ -425,7 +425,7 @@ async def maybe_drain_queue(
             or ([spec_src.get("model")] if spec_src.get("model") else []),
         }
 
-        send_spec = _build_send_spec_from_item(
+        send_spec = await _build_send_spec_from_item(
             item, new_response_id, leaf_message_id, new_user_message
         )
         # Carry the attach ids so the generation can fire `chat:queue:drained`
@@ -536,7 +536,7 @@ async def sweep_orphaned_drains(app) -> int:
     handled = 0
     for chat_id in chat_ids:
         try:
-            state = Chats.get_queue_state_by_id(chat_id)
+            state = await Chats.get_queue_state_by_id(chat_id)
             if not state or state.get("draining") is None:
                 # Marker already cleared; drop from the set.
                 await _unregister_draining(redis, chat_id)
@@ -575,9 +575,9 @@ async def sweep_orphaned_drains(app) -> int:
             if queue:
                 # Need the owning user to start a generation. Resolve from the
                 # chat row.
-                chat = Chats.get_chat_by_id(chat_id)
+                chat = await Chats.get_chat_by_id(chat_id)
                 user = (
-                    Users.get_user_by_id(chat.user_id)
+                    await Users.get_user_by_id(chat.user_id)
                     if chat and getattr(chat, "user_id", None)
                     else None
                 )

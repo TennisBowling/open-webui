@@ -18,6 +18,7 @@ import string
 from open_webui.utils.middleware import (
     _StreamTextAccumulator,
     _emit_delta_for_blocks,
+    _merge_tool_result_body_maps,
 )
 
 
@@ -233,6 +234,21 @@ def test_suffix_matches_full_tail():
         full = "".join(parts)
         for k in (0, 1, 3, len(full) // 2, len(full), len(full) + 5):
             assert acc.suffix(k) == (full[-k:] if k > 0 else "")
+
+
+def test_tool_result_body_maps_merge_all_authoritative_sources():
+    merged = _merge_tool_result_body_maps(
+        {"call_1": {"content": "persisted"}, "bad": "not a body"},
+        {"call_2": {"content": "live"}},
+        {"call_1": {"content": "split wins"}, 3: {"content": "numeric key"}},
+        None,
+    )
+
+    assert merged == {
+        "call_1": {"content": "split wins"},
+        "call_2": {"content": "live"},
+        "3": {"content": "numeric key"},
+    }
 
 
 def test_translator_honors_emitted_len_no_round_boundary_dup():

@@ -1,13 +1,15 @@
 import logging
 import os
 import time
+import asyncio
 
 import docker
 import pytest
+import asyncpg
 from docker import DockerClient
 from pytest_docker.plugin import get_docker_ip
 from fastapi.testclient import TestClient
-from sqlalchemy import text, create_engine
+from sqlalchemy import text
 
 
 log = logging.getLogger(__name__)
@@ -64,7 +66,16 @@ class AbstractPostgresTest(AbstractIntegrationTest):
         pw = env_vars_postgres["POSTGRES_PASSWORD"]
         port = 8081
         db = env_vars_postgres["POSTGRES_DB"]
-        return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
+        return f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
+
+    @classmethod
+    async def _probe_postgres(cls, database_url: str) -> None:
+        raw_url = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+        conn = await asyncpg.connect(raw_url)
+        try:
+            await conn.execute("SELECT 1")
+        finally:
+            await conn.close()
 
     @classmethod
     def setup_class(cls):
@@ -92,11 +103,9 @@ class AbstractPostgresTest(AbstractIntegrationTest):
             db = None
             while retries > 0:
                 try:
-                    from open_webui.config import OPEN_WEBUI_DIR
-
-                    db = create_engine(database_url, pool_pre_ping=True)
-                    db = db.connect()
+                    asyncio.run(cls._probe_postgres(database_url))
                     log.info("postgres is ready!")
+                    db = True
                     break
                 except Exception as e:
                     log.warning(e)
@@ -106,7 +115,6 @@ class AbstractPostgresTest(AbstractIntegrationTest):
             if db:
                 # import must be after setting env!
                 cls.fast_api_client = get_fast_api_client()
-                db.close()
             else:
                 raise Exception("Could not connect to Postgres")
         except Exception as ex:
@@ -115,16 +123,18 @@ class AbstractPostgresTest(AbstractIntegrationTest):
             pytest.fail(f"Could not setup test environment: {ex}")
 
     def _check_db_connection(self):
-        from open_webui.internal.db import Session
+        from open_webui.internal.db import engine
+
+        async def _check():
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
 
         retries = 10
         while retries > 0:
             try:
-                Session.execute(text("SELECT 1"))
-                Session.commit()
+                asyncio.run(_check())
                 break
             except Exception as e:
-                Session.rollback()
                 log.warning(e)
                 time.sleep(3)
                 retries -= 1
@@ -139,23 +149,21 @@ class AbstractPostgresTest(AbstractIntegrationTest):
         cls.docker_client.containers.get(cls.DOCKER_CONTAINER_NAME).remove(force=True)
 
     def teardown_method(self):
-        from open_webui.internal.db import Session
+        from open_webui.internal.db import engine
 
-        # rollback everything not yet committed
-        Session.commit()
+        async def _truncate():
+            async with engine.begin() as conn:
+                for table in [
+                    "auth",
+                    "chat",
+                    "chatidtag",
+                    "document",
+                    "memory",
+                    "model",
+                    "prompt",
+                    "tag",
+                    '"user"',
+                ]:
+                    await conn.execute(text(f"TRUNCATE TABLE {table} CASCADE"))
 
-        # truncate all tables
-        tables = [
-            "auth",
-            "chat",
-            "chatidtag",
-            "document",
-            "memory",
-            "model",
-            "prompt",
-            "tag",
-            '"user"',
-        ]
-        for table in tables:
-            Session.execute(text(f"TRUNCATE TABLE {table}"))
-        Session.commit()
+        asyncio.run(_truncate())

@@ -1,9 +1,9 @@
-"""High-fidelity test: drive the REAL v2 emitter (`_wrap_event_emitter_v2`) and
+"""High-fidelity test: drive the REAL v2.1 emitter (`_wrap_event_emitter_v21`) and
 the real `_emit_delta_for_blocks` translator with chat:completion events, capture
 the actual `chat:delta` socket payloads, reconstruct the client, and assert the
 client's text/reasoning content matches the server's content_blocks exactly.
 
-This exercises the production translator path (shared by every v2 stream) rather
+This exercises the production translator path (shared by every v2.1 stream) rather
 than a simplified harness — it is the regression guard for the
 `_emit_delta_for_blocks` mirror-population fix (the `or []` throwaway-list bug).
 
@@ -12,22 +12,16 @@ socket/main store binds the engine at import); no Redis → in-memory stream sta
 """
 
 import asyncio
-import os
 import random
-import shutil
 import string
-import tempfile
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "v2_emitter_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
+from test.util.db import configure_test_database
+
+configure_test_database()
+import os
 os.environ.pop("WEBSOCKET_REDIS_URL", None)
 
-from open_webui.utils.middleware import _wrap_event_emitter_v2  # noqa: E402
+from open_webui.utils.middleware import _wrap_event_emitter_v21  # noqa: E402
 from open_webui.socket import main as socket_main  # noqa: E402
 
 
@@ -125,7 +119,7 @@ def _drive(seed):
             "chat_id": f"c-{seed}",
             "session_id": f"s-{seed}",
         }
-        emitter = _wrap_event_emitter_v2(inner_emitter, metadata)
+        emitter = _wrap_event_emitter_v21(inner_emitter, metadata)
 
         # Build a server-side content_blocks sequence and emit chat:completion
         # flushes (the v1-shaped event the wrapper translates). This mirrors how
@@ -184,7 +178,7 @@ def _drive(seed):
         mw.emit_to_primary = mw_orig
 
 
-def test_real_v2_emitter_reconstructs_text_exactly():
+def test_real_v21_emitter_reconstructs_text_exactly():
     mismatches = []
     for seed in range(400):
         srv, cli, _ = _drive(seed)
@@ -193,7 +187,7 @@ def test_real_v2_emitter_reconstructs_text_exactly():
     assert not mismatches, f"{len(mismatches)} mismatches; first: {mismatches[0]}"
 
 
-def test_real_v2_emitter_version_monotonic():
+def test_real_v21_emitter_version_monotonic():
     # Every emitted delta must carry a strictly increasing version (the frontend
     # drops version <= mirror.version and snapshot-gaps on version > v+1).
     for seed in range(200):
@@ -204,7 +198,7 @@ def test_real_v2_emitter_version_monotonic():
 
 
 def _drive_steer(seed):
-    """Drive the REAL v2 translator through a steering sequence — assistant text,
+    """Drive the REAL v2.1 translator through a steering sequence — assistant text,
     a tool_calls round, then a `user_steer` block injected at the boundary, then
     the assistant continues — and return (server_steer_text, client_steer_text)
     so the test can assert the steer content reached the client mirror live."""
@@ -232,7 +226,7 @@ def _drive_steer(seed):
             "chat_id": f"c-{seed}",
             "session_id": f"s-{seed}",
         }
-        emitter = _wrap_event_emitter_v2(inner_emitter, metadata)
+        emitter = _wrap_event_emitter_v21(inner_emitter, metadata)
         content_blocks = []
 
         def _drive_coro(coro):
@@ -284,9 +278,9 @@ def _drive_steer(seed):
         mw.emit_to_primary = mw_orig
 
 
-def test_v2_emitter_delivers_user_steer_block_content_live():
+def test_v21_emitter_delivers_user_steer_block_content_live():
     """REGRESSION: a `user_steer` block (mid-task steering) must reach the client
-    mirror via the live v2 delta path — not only on reload. The translator emits
+    mirror via the live v2.1 delta path — not only on reload. The translator emits
     it as a block_open carrying the steer text as a static `content` attr (text/
     reasoning stream via text_append; user_steer has no follow-up op)."""
     for seed in range(25):
@@ -296,7 +290,7 @@ def test_v2_emitter_delivers_user_steer_block_content_live():
 
 
 if __name__ == "__main__":
-    test_real_v2_emitter_reconstructs_text_exactly()
-    test_real_v2_emitter_version_monotonic()
-    test_v2_emitter_delivers_user_steer_block_content_live()
-    print("real v2 emitter tests passed")
+    test_real_v21_emitter_reconstructs_text_exactly()
+    test_real_v21_emitter_version_monotonic()
+    test_v21_emitter_delivers_user_steer_block_content_live()
+    print("real v2.1 emitter tests passed")

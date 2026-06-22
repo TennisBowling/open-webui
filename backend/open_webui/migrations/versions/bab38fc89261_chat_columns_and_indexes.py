@@ -21,7 +21,7 @@ Postgres branch is a no-op; columns and indexes there will ship separately.
 """
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import op, context
 
 revision = "bab38fc89261"
 down_revision = "fa1c3b27e891"
@@ -35,8 +35,11 @@ def upgrade():
 
     # Add columns idempotently (some installs may already have them from
     # a prior partial migration / a manual patch).
-    inspector = sa.inspect(bind)
-    chat_columns = {c["name"] for c in inspector.get_columns("chat")}
+    if context.is_offline_mode():
+        chat_columns = set()
+    else:
+        inspector = sa.inspect(bind)
+        chat_columns = {c["name"] for c in inspector.get_columns("chat")}
     if "subagent_of" not in chat_columns:
         op.add_column("chat", sa.Column("subagent_of", sa.String(), nullable=True))
     if "model_id_primary" not in chat_columns:
@@ -100,8 +103,11 @@ def downgrade():
             )
         )
 
-    inspector = sa.inspect(bind)
-    chat_columns = {c["name"] for c in inspector.get_columns("chat")}
+    if context.is_offline_mode():
+        chat_columns = {"subagent_of", "model_id_primary"}
+    else:
+        inspector = sa.inspect(bind)
+        chat_columns = {c["name"] for c in inspector.get_columns("chat")}
     if "model_id_primary" in chat_columns:
         try:
             op.drop_column("chat", "model_id_primary")

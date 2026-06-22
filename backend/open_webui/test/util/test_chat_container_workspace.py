@@ -7,10 +7,10 @@ chat_utils = pytest.importorskip("open_webui.utils.chat")
 
 
 def _assemble(monkeypatch, files, container_workspace_active=True):
-    monkeypatch.setattr(
-        chat_utils.Chats,
-        "get_messages_map_by_chat_id",
-        lambda _chat_id: {
+    # `get_messages_map_by_chat_id` is awaited in production (async runtime
+    # migration), so the stub must be a coroutine.
+    async def _fake_messages_map(_chat_id):
+        return {
             "user-1": {
                 "id": "user-1",
                 "parentId": None,
@@ -18,7 +18,12 @@ def _assemble(monkeypatch, files, container_workspace_active=True):
                 "content": "inspect these files",
                 "files": files,
             }
-        },
+        }
+
+    monkeypatch.setattr(
+        chat_utils.Chats,
+        "get_messages_map_by_chat_id",
+        _fake_messages_map,
     )
     # assemble_conversation_from_leaf is async; drive it synchronously so these
     # tests run without an async-pytest plugin (none is installed here, which

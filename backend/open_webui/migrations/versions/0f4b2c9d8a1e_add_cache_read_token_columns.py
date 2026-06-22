@@ -10,7 +10,7 @@ Historical aggregation/backfill is intentionally kept out of the migration; run
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 
 
@@ -22,10 +22,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def _existing_tables() -> set[str]:
+    if context.is_offline_mode():
+        return set()
     return set(sa.inspect(op.get_bind()).get_table_names())
 
 
 def _existing_columns(table_name: str) -> set[str]:
+    if context.is_offline_mode():
+        return set()
     inspector = sa.inspect(op.get_bind())
     if table_name not in inspector.get_table_names():
         return set()
@@ -33,6 +37,8 @@ def _existing_columns(table_name: str) -> set[str]:
 
 
 def _existing_indexes(table_name: str) -> set[str]:
+    if context.is_offline_mode():
+        return set()
     inspector = sa.inspect(op.get_bind())
     if table_name not in inspector.get_table_names():
         return set()

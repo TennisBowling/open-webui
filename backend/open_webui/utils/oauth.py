@@ -407,7 +407,7 @@ class OAuthClientManager:
         """
         try:
             # Get the OAuth session
-            session = OAuthSessions.get_session_by_provider_and_user_id(
+            session = await OAuthSessions.get_session_by_provider_and_user_id(
                 client_id, user_id
             )
             if not session:
@@ -429,7 +429,7 @@ class OAuthClientManager:
                     log.warning(
                         f"Token refresh failed for user {user_id}, client_id {session.provider}, deleting session {session.id}"
                     )
-                    OAuthSessions.delete_session_by_id(session.id)
+                    await OAuthSessions.delete_session_by_id(session.id)
                     return None
             return session.token
 
@@ -453,7 +453,7 @@ class OAuthClientManager:
 
             if refreshed_token:
                 # Update the session with new token data
-                session = OAuthSessions.update_session_by_id(
+                session = await OAuthSessions.update_session_by_id(
                     session.id, refreshed_token
                 )
                 log.info(f"Successfully refreshed token for session {session.id}")
@@ -601,12 +601,12 @@ class OAuthClientManager:
                         )
 
                     # Clean up any existing sessions for this user/client_id first
-                    sessions = OAuthSessions.get_sessions_by_user_id(user_id)
+                    sessions = await OAuthSessions.get_sessions_by_user_id(user_id)
                     for session in sessions:
                         if session.provider == client_id:
-                            OAuthSessions.delete_session_by_id(session.id)
+                            await OAuthSessions.delete_session_by_id(session.id)
 
-                    session = OAuthSessions.create_session(
+                    session = await OAuthSessions.create_session(
                         user_id=user_id,
                         provider=client_id,
                         token=token,
@@ -683,7 +683,7 @@ class OAuthManager:
         """
         try:
             # Get the OAuth session
-            session = OAuthSessions.get_session_by_id_and_user_id(session_id, user_id)
+            session = await OAuthSessions.get_session_by_id_and_user_id(session_id, user_id)
             if not session:
                 log.warning(
                     f"No OAuth session found for user {user_id}, session {session_id}"
@@ -703,7 +703,7 @@ class OAuthManager:
                     log.warning(
                         f"Token refresh failed for user {user_id}, provider {session.provider}, deleting session {session.id}"
                     )
-                    OAuthSessions.delete_session_by_id(session.id)
+                    await OAuthSessions.delete_session_by_id(session.id)
 
                     return None
             return session.token
@@ -728,7 +728,7 @@ class OAuthManager:
 
             if refreshed_token:
                 # Update the session with new token data
-                session = OAuthSessions.update_session_by_id(
+                session = await OAuthSessions.update_session_by_id(
                     session.id, refreshed_token
                 )
                 log.info(f"Successfully refreshed token for session {session.id}")
@@ -832,8 +832,8 @@ class OAuthManager:
             log.error(f"Exception during token refresh for provider {provider}: {e}")
             return None
 
-    def get_user_role(self, user, user_data):
-        user_count = Users.get_num_users()
+    async def get_user_role(self, user, user_data):
+        user_count = await Users.get_num_users()
         if user and user_count == 1:
             # If the user is the only user, assign the role "admin" - actually repairs role for single user on login
             log.debug("Assigning the only user the admin role")
@@ -896,7 +896,7 @@ class OAuthManager:
 
         return role
 
-    def update_user_groups(self, user, user_data, default_permissions):
+    async def update_user_groups(self, user, user_data, default_permissions):
         log.debug("Running OAUTH Group management")
         oauth_claim = auth_manager_config.OAUTH_GROUPS_CLAIM
 
@@ -921,8 +921,8 @@ class OAuthManager:
             else:
                 user_oauth_groups = []
 
-        user_current_groups: list[GroupModel] = Groups.get_groups_by_member_id(user.id)
-        all_available_groups: list[GroupModel] = Groups.get_groups()
+        user_current_groups: list[GroupModel] = await Groups.get_groups_by_member_id(user.id)
+        all_available_groups: list[GroupModel] = await Groups.get_groups()
 
         # Create groups if they don't exist and creation is enabled
         if auth_manager_config.ENABLE_OAUTH_GROUP_CREATION:
@@ -930,7 +930,7 @@ class OAuthManager:
             all_group_names = {g.name for g in all_available_groups}
             groups_created = False
             # Determine creator ID: Prefer admin, fallback to current user if no admin exists
-            admin_user = Users.get_super_admin_user()
+            admin_user = await Users.get_super_admin_user()
             creator_id = admin_user.id if admin_user else user.id
             log.debug(f"Using creator ID {creator_id} for potential group creation.")
 
@@ -947,7 +947,7 @@ class OAuthManager:
                             user_ids=[],  # Start with no users, user will be added later by subsequent logic
                         )
                         # Use determined creator ID (admin or fallback to current user)
-                        created_group = Groups.insert_new_group(
+                        created_group = await Groups.insert_new_group(
                             creator_id, new_group_form
                         )
                         if created_group:
@@ -966,7 +966,7 @@ class OAuthManager:
 
             # Refresh the list of all available groups if any were created
             if groups_created:
-                all_available_groups = Groups.get_groups()
+                all_available_groups = await Groups.get_groups()
                 log.debug("Refreshed list of all available groups after creation.")
 
         log.debug(f"Oauth Groups claim: {oauth_claim}")
@@ -1002,7 +1002,7 @@ class OAuthManager:
                     permissions=group_permissions,
                     user_ids=user_ids,
                 )
-                Groups.update_group_by_id(
+                await Groups.update_group_by_id(
                     id=group_model.id, form_data=update_form, overwrite=False
                 )
 
@@ -1019,7 +1019,7 @@ class OAuthManager:
                     f"Adding user to group {group_model.name} as it was found in their oauth groups"
                 )
 
-                user_ids = group_model.user_ids
+                user_ids = list(group_model.user_ids or [])
                 user_ids.append(user.id)
 
                 # In case a group is created, but perms are never assigned to the group by hitting "save"
@@ -1033,7 +1033,7 @@ class OAuthManager:
                     permissions=group_permissions,
                     user_ids=user_ids,
                 )
-                Groups.update_group_by_id(
+                await Groups.update_group_by_id(
                     id=group_model.id, form_data=update_form, overwrite=False
                 )
 
@@ -1200,20 +1200,20 @@ class OAuthManager:
                 raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
             # Check if the user exists
-            user = Users.get_user_by_oauth_sub(provider_sub)
+            user = await Users.get_user_by_oauth_sub(provider_sub)
             if not user:
                 # If the user does not exist, check if merging is enabled
                 if auth_manager_config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL:
                     # Check if the user exists by email
-                    user = Users.get_user_by_email(email)
+                    user = await Users.get_user_by_email(email)
                     if user:
                         # Update the user with the new oauth sub
-                        Users.update_user_oauth_sub_by_id(user.id, provider_sub)
+                        await Users.update_user_oauth_sub_by_id(user.id, provider_sub)
 
             if user:
-                determined_role = self.get_user_role(user, user_data)
+                determined_role = await self.get_user_role(user, user_data)
                 if user.role != determined_role:
-                    Users.update_user_role_by_id(user.id, determined_role)
+                    await Users.update_user_role_by_id(user.id, determined_role)
                 # Update profile picture if enabled and different from current
                 if auth_manager_config.OAUTH_UPDATE_PICTURE_ON_LOGIN:
                     picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
@@ -1226,7 +1226,7 @@ class OAuthManager:
                             new_picture_url, token.get("access_token")
                         )
                         if processed_picture_url != user.profile_image_url:
-                            Users.update_user_profile_image_url_by_id(
+                            await Users.update_user_profile_image_url_by_id(
                                 user.id, processed_picture_url
                             )
                             log.debug(f"Updated profile picture for user {user.email}")
@@ -1234,7 +1234,7 @@ class OAuthManager:
                 # If the user does not exist, check if signups are enabled
                 if auth_manager_config.ENABLE_OAUTH_SIGNUP:
                     # Check if an existing user with the same email already exists
-                    existing_user = Users.get_user_by_email(email)
+                    existing_user = await Users.get_user_by_email(email)
                     if existing_user:
                         raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
 
@@ -1256,14 +1256,14 @@ class OAuthManager:
                         log.warning("Username claim is missing, using email as name")
                         name = email
 
-                    user = Auths.insert_new_auth(
+                    user = await Auths.insert_new_auth(
                         email=email,
                         password=get_password_hash(
                             str(uuid.uuid4())
                         ),  # Random password, not used
                         name=name,
                         profile_image_url=picture_url,
-                        role=self.get_user_role(None, user_data),
+                        role=await self.get_user_role(None, user_data),
                         oauth_sub=provider_sub,
                     )
 
@@ -1292,7 +1292,7 @@ class OAuthManager:
                 auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT
                 and user.role != "admin"
             ):
-                self.update_user_groups(
+                await self.update_user_groups(
                     user=user,
                     user_data=user_data,
                     default_permissions=request.app.state.config.USER_PERMISSIONS,
@@ -1346,12 +1346,12 @@ class OAuthManager:
                 token["expires_at"] = datetime.now().timestamp() + token["expires_in"]
 
             # Clean up any existing sessions for this user/provider first
-            sessions = OAuthSessions.get_sessions_by_user_id(user.id)
+            sessions = await OAuthSessions.get_sessions_by_user_id(user.id)
             for session in sessions:
                 if session.provider == provider:
-                    OAuthSessions.delete_session_by_id(session.id)
+                    await OAuthSessions.delete_session_by_id(session.id)
 
-            session = OAuthSessions.create_session(
+            session = await OAuthSessions.create_session(
                 user_id=user.id,
                 provider=provider,
                 token=token,

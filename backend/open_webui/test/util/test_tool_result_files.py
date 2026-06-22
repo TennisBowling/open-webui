@@ -8,20 +8,20 @@ changed to return a **dict** (`{"status": True, **model_dump()}`), so `.id` rais
 `process_tool_result` call sites, so it tore down the whole turn (and each subagent that
 hit a browser image tool errored "after retry"). See the gyms-research chat forensics.
 
-These are sync tests — ``process_tool_result``, ``upload_image``, ``upload_audio`` and
-``uploaded_file_id`` are all synchronous, so no ``pytest-asyncio`` is needed (it's absent
-in this env; see the backend-test-env-setup memory).
+These were sync tests, but the async runtime migration made ``process_tool_result``,
+``upload_image``, ``upload_audio`` and the ``get_*_url_from_base64`` helpers
+coroutines (they ``await`` the DB/file handlers). The calls are therefore driven
+with ``asyncio.run(...)`` and any monkeypatched helper that production awaits is an
+``async def`` so the await resolves. ``uploaded_file_id`` stays synchronous.
 """
 
-import os
+import asyncio
 import tempfile
 import types
 
-# Point the DB engine at a throwaway path BEFORE importing any open_webui module
-# (the engine binds at import time). We never touch real storage here.
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "tool_result_files_test.db")
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+from test.util.db import configure_test_database
+
+configure_test_database()
 
 import pytest  # noqa: E402
 
@@ -83,27 +83,31 @@ class _FakeUser:
 def test_upload_image_handles_dict_return(monkeypatch):
     captured = {}
 
-    def fake_handler(request, file, metadata, process, user, **kwargs):
+    async def fake_handler(request, file, metadata, process, user, **kwargs):
         # Mirror the real return shape: a dict, NOT a FileModel.
         captured["filename"] = file.filename
         return {"status": True, "id": "img-999", "filename": "generated"}
 
     monkeypatch.setattr(images_mod, "upload_file_handler", fake_handler)
 
-    url = images_mod.upload_image(
-        _FakeRequest(), b"\x89PNG\r\n", "image/png", {"chat_id": "c"}, _FakeUser()
+    url = asyncio.run(
+        images_mod.upload_image(
+            _FakeRequest(), b"\x89PNG\r\n", "image/png", {"chat_id": "c"}, _FakeUser()
+        )
     )
     assert url == "/api/v1/files/img-999/content"
 
 
 def test_upload_audio_handles_dict_return(monkeypatch):
-    def fake_handler(request, file, metadata, process, user, **kwargs):
+    async def fake_handler(request, file, metadata, process, user, **kwargs):
         return {"status": True, "id": "aud-111", "filename": "generated"}
 
     monkeypatch.setattr(utils_files_mod, "upload_file_handler", fake_handler)
 
-    url = utils_files_mod.upload_audio(
-        _FakeRequest(), b"RIFF....", "audio/wav", {"chat_id": "c"}, _FakeUser()
+    url = asyncio.run(
+        utils_files_mod.upload_audio(
+            _FakeRequest(), b"RIFF....", "audio/wav", {"chat_id": "c"}, _FakeUser()
+        )
     )
     assert url == "/api/v1/files/aud-111/content"
 
@@ -114,7 +118,7 @@ def test_upload_audio_handles_dict_return(monkeypatch):
 def test_get_image_url_accepts_non_png(monkeypatch):
     seen = {}
 
-    def fake_upload_image(request, image_data, content_type, metadata, user):
+    async def fake_upload_image(request, image_data, content_type, metadata, user):
         seen["content_type"] = content_type
         return "/api/v1/files/jpeg-1/content"
 
@@ -124,36 +128,46 @@ def test_get_image_url_accepts_non_png(monkeypatch):
     import base64
 
     payload = base64.b64encode(b"\xff\xd8\xff\xe0jpegbytes").decode()
-    url = utils_files_mod.get_image_url_from_base64(
-        _FakeRequest(), f"data:image/jpeg;base64,{payload}", {}, _FakeUser()
+    url = asyncio.run(
+        utils_files_mod.get_image_url_from_base64(
+            _FakeRequest(), f"data:image/jpeg;base64,{payload}", {}, _FakeUser()
+        )
     )
     assert url == "/api/v1/files/jpeg-1/content"
     assert seen["content_type"] == "image/jpeg"
 
 
 def test_get_file_url_routes_image_and_audio(monkeypatch):
-    monkeypatch.setattr(
-        utils_files_mod, "get_image_url_from_base64", lambda *a, **k: "IMG"
-    )
-    monkeypatch.setattr(
-        utils_files_mod, "get_audio_url_from_base64", lambda *a, **k: "AUD"
-    )
+    async def fake_image_url(*a, **k):
+        return "IMG"
+
+    async def fake_audio_url(*a, **k):
+        return "AUD"
+
+    monkeypatch.setattr(utils_files_mod, "get_image_url_from_base64", fake_image_url)
+    monkeypatch.setattr(utils_files_mod, "get_audio_url_from_base64", fake_audio_url)
     assert (
-        utils_files_mod.get_file_url_from_base64(
-            None, "data:image/webp;base64,AAAA", {}, None
+        asyncio.run(
+            utils_files_mod.get_file_url_from_base64(
+                None, "data:image/webp;base64,AAAA", {}, None
+            )
         )
         == "IMG"
     )
     assert (
-        utils_files_mod.get_file_url_from_base64(
-            None, "data:audio/mpeg;base64,AAAA", {}, None
+        asyncio.run(
+            utils_files_mod.get_file_url_from_base64(
+                None, "data:audio/mpeg;base64,AAAA", {}, None
+            )
         )
         == "AUD"
     )
     # Unsupported scheme -> None (no crash)
     assert (
-        utils_files_mod.get_file_url_from_base64(
-            None, "data:application/pdf;base64,AAAA", {}, None
+        asyncio.run(
+            utils_files_mod.get_file_url_from_base64(
+                None, "data:application/pdf;base64,AAAA", {}, None
+            )
         )
         is None
     )
@@ -171,23 +185,26 @@ def _mcp_image_result():
 
 
 def test_process_tool_result_image_happy_path(monkeypatch):
-    monkeypatch.setattr(
-        mw, "get_file_url_from_base64", lambda *a, **k: "/files/shot-1/content"
-    )
+    async def fake_file_url(*a, **k):
+        return "/files/shot-1/content"
+
+    monkeypatch.setattr(mw, "get_file_url_from_base64", fake_file_url)
     (
         tool_result,
         files,
         embeds,
         vision,
         meta,
-    ) = mw.process_tool_result(
-        _FakeRequest(),
-        "browser_snapshot",
-        _mcp_image_result(),
-        "mcp",
-        metadata={"chat_id": "c", "message_id": "m"},
-        user=_FakeUser(),
-        model={"info": {"meta": {"capabilities": {"vision": True}}}},
+    ) = asyncio.run(
+        mw.process_tool_result(
+            _FakeRequest(),
+            "browser_snapshot",
+            _mcp_image_result(),
+            "mcp",
+            metadata={"chat_id": "c", "message_id": "m"},
+            user=_FakeUser(),
+            model={"info": {"meta": {"capabilities": {"vision": True}}}},
+        )
     )
     assert any(
         f.get("url") == "/files/shot-1/content" for f in files
@@ -197,7 +214,7 @@ def test_process_tool_result_image_happy_path(monkeypatch):
 
 
 def test_process_tool_result_image_persist_failure_is_best_effort(monkeypatch):
-    def boom(*a, **k):
+    async def boom(*a, **k):
         raise AttributeError("'dict' object has no attribute 'id'")
 
     monkeypatch.setattr(mw, "get_file_url_from_base64", boom)
@@ -209,14 +226,16 @@ def test_process_tool_result_image_persist_failure_is_best_effort(monkeypatch):
         embeds,
         vision,
         meta,
-    ) = mw.process_tool_result(
-        _FakeRequest(),
-        "browser_snapshot",
-        _mcp_image_result(),
-        "mcp",
-        metadata={"chat_id": "c", "message_id": "m"},
-        user=_FakeUser(),
-        model={"info": {"meta": {"capabilities": {"vision": True}}}},
+    ) = asyncio.run(
+        mw.process_tool_result(
+            _FakeRequest(),
+            "browser_snapshot",
+            _mcp_image_result(),
+            "mcp",
+            metadata={"chat_id": "c", "message_id": "m"},
+            user=_FakeUser(),
+            model={"info": {"meta": {"capabilities": {"vision": True}}}},
+        )
     )
     assert files == [], "failed image upload must not leave a broken file entry"
     assert vision == [], "failed image upload must not leave a broken vision attachment"
@@ -225,15 +244,20 @@ def test_process_tool_result_image_persist_failure_is_best_effort(monkeypatch):
 
 def test_process_tool_result_image_none_url_not_appended(monkeypatch):
     # Unsupported mime -> helper returns None -> no {"url": None} entry.
-    monkeypatch.setattr(mw, "get_file_url_from_base64", lambda *a, **k: None)
-    _, files, _, vision, _ = mw.process_tool_result(
-        _FakeRequest(),
-        "browser_snapshot",
-        _mcp_image_result(),
-        "mcp",
-        metadata={"chat_id": "c", "message_id": "m"},
-        user=_FakeUser(),
-        model=None,
+    async def none_url(*a, **k):
+        return None
+
+    monkeypatch.setattr(mw, "get_file_url_from_base64", none_url)
+    _, files, _, vision, _ = asyncio.run(
+        mw.process_tool_result(
+            _FakeRequest(),
+            "browser_snapshot",
+            _mcp_image_result(),
+            "mcp",
+            metadata={"chat_id": "c", "message_id": "m"},
+            user=_FakeUser(),
+            model=None,
+        )
     )
     assert files == []
     assert vision == []

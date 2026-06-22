@@ -4,8 +4,14 @@
 	export let id = '';
 	export let block: any = {};
 	export let blockJson = '';
+	export let blockRev = '';
 	export let chatId = '';
 	export let messageId = '';
+	// True once the parent assistant message is terminally done / stopped /
+	// errored. The ask_user card uses it to detect an ORPHANED question (the
+	// generation ended — e.g. the user pressed Stop — while the card was still
+	// waiting) so it can disable the form instead of pretending it's live.
+	export let messageTerminated = false;
 
 	const subagentToolNames = new Set([
 		'subagent_launch',
@@ -37,7 +43,7 @@
 		}
 	}
 
-	$: renderBlock = blockJson ? parsedBlock : block;
+	$: renderBlock = blockJson ? parsedBlock : (blockRev, block);
 	$: calls = Array.isArray(renderBlock?.content) ? renderBlock.content : [];
 	$: results = Array.isArray(renderBlock?.results) ? renderBlock.results : [];
 	let resultByCallId: Map<string, any> = new Map();
@@ -81,10 +87,14 @@
 		const isMalformedSubagent =
 			subagentToolNames.has(name) && result !== undefined && !result?.subagent_id;
 		const isSubagent = subagentToolNames.has(name) && !isMalformedSubagent;
+		// The built-in ask_user tool renders its own interactive question card
+		// (AskUserBlock) instead of a generic tool-call row. The question lives in
+		// the call arguments; the answer (once the user submits) is the result.
+		const isAskUser = name === 'ask_user';
 		const resultPayloadReady = isSubagent ? result !== undefined : hasResultPayload(result);
 
 		return {
-			type: isSubagent ? 'subagent_launch' : 'tool_calls',
+			type: isSubagent ? 'subagent_launch' : isAskUser ? 'ask_user' : 'tool_calls',
 			done: resultPayloadReady ? 'true' : 'false',
 			id: result?.subagent_id ?? call?.id ?? call?.tool_call_id ?? '',
 			tool_call_id: call?.id ?? call?.tool_call_id ?? '',
@@ -102,7 +112,8 @@
 			embeds: result?.embeds ? JSON.stringify(result.embeds) : '',
 			error: result?.error ? 'true' : 'false',
 			error_reason: result?.error_reason ?? '',
-			notice: result?.notice ?? ''
+			notice: result?.notice ?? '',
+			message_terminated: messageTerminated ? 'true' : 'false'
 		};
 	};
 </script>

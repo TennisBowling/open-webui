@@ -98,7 +98,7 @@ async def _resolve_config(request: Request, user):
 
 
 async def _resolve_user(request: Request, user):
-    fresh = Users.get_user_by_id(user.id) or user
+    fresh = await Users.get_user_by_id(user.id) or user
     return {
         "id": fresh.id,
         "email": fresh.email,
@@ -112,7 +112,7 @@ async def _resolve_user(request: Request, user):
 
 
 async def _resolve_settings(request: Request, user):
-    fresh = Users.get_user_by_id(user.id)
+    fresh = await Users.get_user_by_id(user.id)
     if not fresh:
         return None
     return _to_jsonable(fresh.settings)
@@ -149,11 +149,11 @@ async def _resolve_folders(request: Request, user):
 
 
 async def _resolve_tags(request: Request, user):
-    return _to_jsonable(Tags.get_tags_by_user_id(user.id))
+    return _to_jsonable(await Tags.get_tags_by_user_id(user.id))
 
 
 async def _resolve_pinned(request: Request, user):
-    return _to_jsonable(Chats.get_pinned_chats_by_user_id(user.id))
+    return _to_jsonable(await Chats.get_pinned_chats_by_user_id(user.id))
 
 
 async def _resolve_chats(request: Request, user):
@@ -161,7 +161,7 @@ async def _resolve_chats(request: Request, user):
     # /api/v1/chats/?page=1 (limit=60). Pinned/folders are separate components.
     limit = 60
     return _to_jsonable(
-        Chats.get_chat_title_id_list_by_user_id(
+        await Chats.get_chat_title_id_list_by_user_id(
             user.id,
             include_folders=False,
             include_pinned=False,
@@ -172,7 +172,7 @@ async def _resolve_chats(request: Request, user):
 
 
 async def _resolve_channels(request: Request, user):
-    return _to_jsonable(Channels.get_channels_by_user_id(user.id))
+    return _to_jsonable(await Channels.get_channels_by_user_id(user.id))
 
 
 _RESOLVERS = {

@@ -135,7 +135,7 @@ async def _start_oauth(request: Request, connection: MCPConnectionWithSecrets) -
             "state": state,
             "code_verifier": code_verifier,
         }
-        MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
+        await MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
         authorization_url = build_authorization_url(
             auth_metadata,
             client_info,
@@ -188,7 +188,7 @@ async def discover_mcp_url(form_data: MCPDiscoverForm, user=Depends(get_verified
 
 @router.get("/connections", response_model=list[MCPConnectionModel])
 async def get_mcp_connections(user=Depends(get_verified_user)):
-    connections = MCPConnections.get_connections_by_user_id(user.id, include_secrets=True)
+    connections = await MCPConnections.get_connections_by_user_id(user.id, include_secrets=True)
     result = []
     for connection in connections:
         item = connection.model_dump(exclude={"key", "headers", "env", "oauth"})
@@ -201,7 +201,7 @@ async def get_mcp_connections(user=Depends(get_verified_user)):
 @router.post("/connections", response_model=MCPConnectionModel)
 async def create_mcp_connection(request: Request, form_data: MCPConnectionForm, user=Depends(get_verified_user)):
     _validate_form(form_data, user, request)
-    connection = MCPConnections.insert_new_connection(user.id, form_data)
+    connection = await MCPConnections.insert_new_connection(user.id, form_data)
     if not connection:
         raise HTTPException(status_code=400, detail="Failed to create MCP connection")
     return connection
@@ -209,13 +209,13 @@ async def create_mcp_connection(request: Request, form_data: MCPConnectionForm, 
 
 @router.patch("/connections/{connection_id}", response_model=MCPConnectionModel)
 async def update_mcp_connection(connection_id: str, request: Request, form_data: MCPConnectionUpdateForm, user=Depends(get_verified_user)):
-    existing = MCPConnections.get_connection_by_id_and_user_id(connection_id, user.id)
+    existing = await MCPConnections.get_connection_by_id_and_user_id(connection_id, user.id)
     if not existing:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
     updated = form_data.model_dump(exclude_unset=True)
     merged = MCPConnectionForm(**{**existing.model_dump(), **updated, "id": connection_id, "name": updated.get("name", existing.name)})
     _validate_form(merged, user, request)
-    connection = MCPConnections.update_connection_by_id_and_user_id(connection_id, user.id, updated)
+    connection = await MCPConnections.update_connection_by_id_and_user_id(connection_id, user.id, updated)
     if not connection:
         raise HTTPException(status_code=400, detail="Failed to update MCP connection")
     return connection
@@ -223,12 +223,12 @@ async def update_mcp_connection(connection_id: str, request: Request, form_data:
 
 @router.delete("/connections/{connection_id}")
 async def delete_mcp_connection(connection_id: str, user=Depends(get_verified_user)):
-    return {"status": MCPConnections.delete_connection_by_id_and_user_id(connection_id, user.id)}
+    return {"status": await MCPConnections.delete_connection_by_id_and_user_id(connection_id, user.id)}
 
 
 @router.post("/connections/{connection_id}/oauth/start")
 async def start_mcp_oauth(connection_id: str, request: Request, user=Depends(get_verified_user)):
-    connection = MCPConnections.get_connection_by_id_and_user_id(
+    connection = await MCPConnections.get_connection_by_id_and_user_id(
         connection_id, user.id, include_secrets=True
     )
     if not connection:
@@ -238,7 +238,7 @@ async def start_mcp_oauth(connection_id: str, request: Request, user=Depends(get
 
 @router.post("/connections/{connection_id}/oauth/disconnect")
 async def disconnect_mcp_oauth(connection_id: str, user=Depends(get_verified_user)):
-    connection = MCPConnections.update_oauth_by_id_and_user_id(connection_id, user.id, {})
+    connection = await MCPConnections.update_oauth_by_id_and_user_id(connection_id, user.id, {})
     if not connection:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
     return {"status": True}
@@ -259,7 +259,7 @@ async def _list_specs(connection: MCPConnectionWithSecrets, user=None, metadata:
 
 @router.get("/connections/{connection_id}/tools")
 async def get_mcp_connection_tools(connection_id: str, user=Depends(get_verified_user)):
-    connection = MCPConnections.get_connection_by_id_and_user_id(
+    connection = await MCPConnections.get_connection_by_id_and_user_id(
         connection_id, user.id, include_secrets=True
     )
     if not connection:
@@ -272,7 +272,7 @@ async def get_mcp_connection_tools(connection_id: str, user=Depends(get_verified
 
 @router.post("/connections/{connection_id}/verify")
 async def verify_mcp_connection(connection_id: str, request: Request, user=Depends(get_verified_user)):
-    connection = MCPConnections.get_connection_by_id_and_user_id(
+    connection = await MCPConnections.get_connection_by_id_and_user_id(
         connection_id, user.id, include_secrets=True
     )
     if not connection:
@@ -287,7 +287,7 @@ async def verify_mcp_connection(connection_id: str, request: Request, user=Depen
 
 @oauth_router.get("/{connection_id}/callback")
 async def mcp_oauth_callback(connection_id: str, request: Request):
-    connection = MCPConnections.get_connection_by_id(connection_id, include_secrets=True)
+    connection = await MCPConnections.get_connection_by_id(connection_id, include_secrets=True)
     if not connection:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
     oauth = connection.oauth or {}
@@ -310,7 +310,7 @@ async def mcp_oauth_callback(connection_id: str, request: Request):
         oauth["tokens"] = {**tokens, "expires_at": token_expires_at(tokens)}
         oauth.pop("state", None)
         oauth.pop("code_verifier", None)
-        MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
+        await MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
     except Exception as exc:
         log.exception("MCP OAuth callback failed")
         return RedirectResponse(url=f"{_base_url(request)}/?error={type(exc).__name__}")

@@ -217,7 +217,15 @@ async def get_tools(
                     tools_dict[tool_name] = tool_spec
             continue
 
-        tool = Tools.get_tool_by_id(tool_id)
+        # Handle the built-in ask_user tool (pause to ask the user a question)
+        if tool_id == "builtin:ask_user":
+            ask_user_tools = get_ask_user_tool_specs(extra_params)
+            if ask_user_tools:
+                for tool_name, tool_spec in ask_user_tools.items():
+                    tools_dict[tool_name] = tool_spec
+            continue
+
+        tool = await Tools.get_tool_by_id(tool_id)
         if tool is None:
 
             if tool_id.startswith("server:"):
@@ -355,18 +363,18 @@ async def get_tools(
         else:
             module = request.app.state.TOOLS.get(tool_id, None)
             if module is None:
-                module, _ = load_tool_module_by_id(tool_id)
+                module, _ = await load_tool_module_by_id(tool_id)
                 request.app.state.TOOLS[tool_id] = module
 
             extra_params["__id__"] = tool_id
 
             # Set valves for the tool
             if hasattr(module, "valves") and hasattr(module, "Valves"):
-                valves = Tools.get_tool_valves_by_id(tool_id) or {}
+                valves = await Tools.get_tool_valves_by_id(tool_id) or {}
                 module.valves = module.Valves(**valves)
             if hasattr(module, "UserValves"):
                 extra_params["__user__"]["valves"] = module.UserValves(  # type: ignore
-                    **Tools.get_user_valves_by_id_and_user_id(tool_id, user.id)
+                    **await Tools.get_user_valves_by_id_and_user_id(tool_id, user.id)
                 )
 
             for spec in tool.specs:
@@ -1077,6 +1085,64 @@ def get_view_image_tool_specs(extra_params: dict) -> dict:
             "spec": spec_map["view_image"],
             "callable": callable_view_image,
             "metadata": {"parallelizable": True},
+        }
+    }
+
+
+def get_ask_user_tool_specs(extra_params: dict) -> dict:
+    """
+    Generate the built-in ask_user tool spec.
+
+    Args:
+        extra_params: Extra parameters to inject (__request__, __user__, etc.)
+    """
+    from open_webui.utils.ask_user_tool import get_ask_user_tools_instance
+
+    tool_instance = get_ask_user_tools_instance()
+    specs = get_tool_specs(tool_instance)
+
+    if not specs:
+        return {}
+
+    spec_map = {}
+    for spec in specs:
+        if "function" in spec:
+            name = spec["function"].get("name")
+        else:
+            name = spec.get("name")
+        if name:
+            spec_map[name] = spec
+
+    # Strip the injected __-prefixed params from the advertised schema so the
+    # model only sees `questions`.
+    for spec in spec_map.values():
+        target = spec.get("function", spec)
+        params = target.get("parameters", {})
+        properties = params.get("properties", {}) or {}
+        target["parameters"]["properties"] = {
+            k: v for k, v in properties.items() if not k.startswith("__")
+        }
+        if "required" in params:
+            target["parameters"]["required"] = [
+                r for r in params["required"] if not r.startswith("__")
+            ]
+
+    if "ask_user" not in spec_map:
+        return {}
+
+    callable_ask_user = get_async_tool_function_and_apply_extra_params(
+        tool_instance.ask_user, extra_params
+    )
+    return {
+        "ask_user": {
+            "id": "builtin:ask_user",
+            "name": "ask_user",
+            "spec": spec_map["ask_user"],
+            "callable": callable_ask_user,
+            # A user question is a barrier: it must NOT run concurrently with
+            # sibling tool calls (it blocks for a human), and serial execution
+            # keeps multiple questions in one round in a deterministic order.
+            "metadata": {"parallelizable": False},
         }
     }
 

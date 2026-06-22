@@ -422,7 +422,10 @@
 	$: if (scrollReady && autoScroll && bottomPadding) {
 		(async () => {
 			await tick();
-			scrollToBottom();
+			// autoScroll can flip false (user pulled away) between the guard above and
+			// this microtask resolving — re-read it so a late file-chip resize can't
+			// yank the user back to the bottom.
+			if (autoScroll) scrollToBottom();
 		})();
 	}
 
@@ -496,7 +499,7 @@
 			autoScroll = element.scrollHeight - element.scrollTop <= element.clientHeight + 50;
 
 			setTimeout(() => {
-				scrollToBottom();
+				if (autoScroll) scrollToBottom();
 			}, 100);
 		}
 	};
@@ -545,7 +548,7 @@
 			autoScroll = element.scrollHeight - element.scrollTop <= element.clientHeight + 50;
 
 			setTimeout(() => {
-				scrollToBottom();
+				if (autoScroll) scrollToBottom();
 			}, 100);
 		}
 	};
@@ -598,7 +601,7 @@
 			autoScroll = element.scrollHeight - element.scrollTop <= element.clientHeight + 50;
 
 			setTimeout(() => {
-				scrollToBottom();
+				if (autoScroll) scrollToBottom();
 			}, 100);
 		}
 	};
@@ -776,7 +779,7 @@
 			const element = document.getElementById('messages-container');
 			autoScroll = element.scrollHeight - element.scrollTop <= element.clientHeight + 50;
 			setTimeout(() => {
-				scrollToBottom();
+				if (autoScroll) scrollToBottom();
 			}, 100);
 		}
 	};

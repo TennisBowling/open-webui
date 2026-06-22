@@ -3,6 +3,8 @@ import logging
 import os
 import shutil
 import base64
+import asyncio
+import threading
 import redis
 
 from datetime import datetime
@@ -12,7 +14,10 @@ from urllib.parse import urlparse
 
 import requests
 from pydantic import BaseModel
-from sqlalchemy import JSON, Column, DateTime, Integer, func
+from sqlalchemy import Column, DateTime, Integer, delete, func, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 from authlib.integrations.starlette_client import OAuth
 
 
@@ -33,7 +38,7 @@ from open_webui.env import (
     ENABLE_API_DEBUG_LOGGING,
     log,
 )
-from open_webui.internal.db import Base, get_db
+from open_webui.internal.db import Base, dispose_engine, get_db
 from open_webui.utils.redis import get_redis_connection
 
 
@@ -50,8 +55,41 @@ logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 ####################################
 
 
+def _run_blocking_in_thread(fn):
+    result = {}
+    error = {}
+
+    def runner():
+        try:
+            result["value"] = fn()
+        except BaseException as e:
+            error["value"] = e
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
+def _run_bootstrap_coro(coro, *, dispose_global_engine: bool = True):
+    async def runner():
+        try:
+            return await coro
+        finally:
+            if dispose_global_engine:
+                await dispose_engine()
+
+    return asyncio.run(runner())
+
+
 # Function to run the alembic migrations
 def run_migrations():
+    if os.environ.get("OPEN_WEBUI_SKIP_MIGRATIONS", "False").lower() == "true":
+        log.info("Skipping migrations because OPEN_WEBUI_SKIP_MIGRATIONS=true")
+        return
+
     log.info("Running migrations")
     try:
         from alembic import command
@@ -63,19 +101,28 @@ def run_migrations():
         migrations_path = OPEN_WEBUI_DIR / "migrations"
         alembic_cfg.set_main_option("script_location", str(migrations_path))
 
-        command.upgrade(alembic_cfg, "head")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            command.upgrade(alembic_cfg, "head")
+        else:
+            _run_blocking_in_thread(lambda: command.upgrade(alembic_cfg, "head"))
     except Exception as e:
         log.exception(f"Error running migrations: {e}")
 
 
 run_migrations()
 
+SKIP_CONFIG_DB_LOAD = (
+    os.environ.get("OPEN_WEBUI_SKIP_CONFIG_DB_LOAD", "False").lower() == "true"
+)
+
 
 class Config(Base):
     __tablename__ = "config"
 
     id = Column(Integer, primary_key=True)
-    data = Column(JSON, nullable=False)
+    data = Column(JSONB, nullable=False)
     version = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=True, onupdate=func.now())
@@ -86,27 +133,103 @@ def load_json_config():
         return json.load(file)
 
 
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+async def _run_isolated_config_db(operation):
+    """Run a config-table operation on a fresh engine bound to this loop.
+
+    Synchronous config writes can happen inside request/tool coroutines through
+    ``AppConfig.__setattr__``. They must not use the process-global asyncpg pool
+    from a worker thread, because pooled asyncpg connections are event-loop
+    bound. A one-shot NullPool engine is slower but correct for these sync bridge
+    paths and keeps normal async callers on the shared engine.
+    """
+    isolated_engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+    isolated_session = async_sessionmaker(
+        bind=isolated_engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    try:
+        async with isolated_session() as db:
+            return await operation(db)
+    finally:
+        await isolated_engine.dispose()
+
+
+def _run_db_bootstrap(coro_factory, *, isolated_coro_factory=None):
+    if not _has_running_loop():
+        return _run_bootstrap_coro(coro_factory())
+
+    if isolated_coro_factory is None:
+        isolated_coro_factory = coro_factory
+
+    return _run_blocking_in_thread(
+        lambda: _run_bootstrap_coro(
+            isolated_coro_factory(), dispose_global_engine=False
+        )
+    )
+
+
+async def _save_to_db_with_session(db, data):
+    result = await db.execute(select(Config).order_by(Config.id.asc()).limit(1))
+    existing_config = result.scalars().first()
+    if not existing_config:
+        db.add(Config(data=data, version=0))
+    else:
+        existing_config.data = data
+        existing_config.updated_at = datetime.now()
+        db.add(existing_config)
+    await db.commit()
+
+
+async def save_to_db_async(data):
+    async with get_db() as db:
+        await _save_to_db_with_session(db, data)
+
+
+async def _save_to_db_isolated_async(data):
+    return await _run_isolated_config_db(
+        lambda db: _save_to_db_with_session(db, data)
+    )
+
+
 def save_to_db(data):
-    with get_db() as db:
-        existing_config = db.query(Config).first()
-        if not existing_config:
-            new_config = Config(data=data, version=0)
-            db.add(new_config)
-        else:
-            existing_config.data = data
-            existing_config.updated_at = datetime.now()
-            db.add(existing_config)
-        db.commit()
+    return _run_db_bootstrap(
+        lambda: save_to_db_async(data),
+        isolated_coro_factory=lambda: _save_to_db_isolated_async(data),
+    )
+
+
+async def _reset_config_with_session(db):
+    await db.execute(delete(Config))
+    await db.commit()
+
+
+async def reset_config_async():
+    async with get_db() as db:
+        await _reset_config_with_session(db)
+
+
+async def _reset_config_isolated_async():
+    return await _run_isolated_config_db(_reset_config_with_session)
 
 
 def reset_config():
-    with get_db() as db:
-        db.query(Config).delete()
-        db.commit()
+    return _run_db_bootstrap(
+        reset_config_async,
+        isolated_coro_factory=_reset_config_isolated_async,
+    )
 
 
 # When initializing, check if config.json exists and migrate it to the database
-if os.path.exists(f"{DATA_DIR}/config.json"):
+if not SKIP_CONFIG_DB_LOAD and os.path.exists(f"{DATA_DIR}/config.json"):
     data = load_json_config()
     save_to_db(data)
     os.rename(f"{DATA_DIR}/config.json", f"{DATA_DIR}/old_config.json")
@@ -117,13 +240,29 @@ DEFAULT_CONFIG = {
 }
 
 
+async def _get_config_with_session(db):
+    result = await db.execute(select(Config).order_by(Config.id.desc()).limit(1))
+    config_entry = result.scalars().first()
+    return config_entry.data if config_entry else DEFAULT_CONFIG
+
+
+async def get_config_async():
+    async with get_db() as db:
+        return await _get_config_with_session(db)
+
+
+async def _get_config_isolated_async():
+    return await _run_isolated_config_db(_get_config_with_session)
+
+
 def get_config():
-    with get_db() as db:
-        config_entry = db.query(Config).order_by(Config.id.desc()).first()
-        return config_entry.data if config_entry else DEFAULT_CONFIG
+    return _run_db_bootstrap(
+        get_config_async,
+        isolated_coro_factory=_get_config_isolated_async,
+    )
 
 
-CONFIG_DATA = get_config()
+CONFIG_DATA = DEFAULT_CONFIG if SKIP_CONFIG_DB_LOAD else get_config()
 
 
 def get_config_value(config_path: str):
@@ -140,11 +279,11 @@ def get_config_value(config_path: str):
 PERSISTENT_CONFIG_REGISTRY = []
 
 
-def save_config(config):
+async def save_config_async(config):
     global CONFIG_DATA
     global PERSISTENT_CONFIG_REGISTRY
     try:
-        save_to_db(config)
+        await save_to_db_async(config)
         CONFIG_DATA = config
 
         # Trigger updates on all registered PersistentConfig entries
@@ -154,6 +293,28 @@ def save_config(config):
         log.exception(e)
         return False
     return True
+
+
+async def _save_config_isolated_async(config):
+    global CONFIG_DATA
+    global PERSISTENT_CONFIG_REGISTRY
+    try:
+        await _save_to_db_isolated_async(config)
+        CONFIG_DATA = config
+
+        for config_item in PERSISTENT_CONFIG_REGISTRY:
+            config_item.update()
+    except Exception as e:
+        log.exception(e)
+        return False
+    return True
+
+
+def save_config(config):
+    return _run_db_bootstrap(
+        lambda: save_config_async(config),
+        isolated_coro_factory=lambda: _save_config_isolated_async(config),
+    )
 
 
 T = TypeVar("T")
@@ -221,6 +382,18 @@ class PersistentConfig(Generic[T]):
         save_to_db(CONFIG_DATA)
         self.config_value = self.value
 
+    async def save_async(self):
+        log.info(f"Saving '{self.env_name}' to the database")
+        path_parts = self.config_path.split(".")
+        sub_config = CONFIG_DATA
+        for key in path_parts[:-1]:
+            if key not in sub_config:
+                sub_config[key] = {}
+            sub_config = sub_config[key]
+        sub_config[path_parts[-1]] = self.value
+        await save_to_db_async(CONFIG_DATA)
+        self.config_value = self.value
+
 
 class AppConfig:
     _redis: Union[redis.Redis, redis.cluster.RedisCluster] = None
@@ -259,6 +432,18 @@ class AppConfig:
             if self._redis:
                 redis_key = f"{self._redis_key_prefix}:config:{key}"
                 self._redis.set(redis_key, json.dumps(self._state[key].value))
+
+    async def set_async(self, key, value):
+        if isinstance(value, PersistentConfig):
+            self._state[key] = value
+            return
+
+        self._state[key].value = value
+        await self._state[key].save_async()
+
+        if self._redis:
+            redis_key = f"{self._redis_key_prefix}:config:{key}"
+            self._redis.set(redis_key, json.dumps(self._state[key].value))
 
     def __getattr__(self, key):
         if key not in self._state:
@@ -1060,6 +1245,23 @@ try:
 except Exception:
     pass
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
+
+
+####################################
+# MODEL PRICING / COST
+####################################
+
+ENABLE_PRICING_SYNC = PersistentConfig(
+    "ENABLE_PRICING_SYNC",
+    "pricing.sync_enabled",
+    os.environ.get("ENABLE_PRICING_SYNC", "True").lower() == "true",
+)
+
+PRICING_SYNC_INTERVAL_HOURS = PersistentConfig(
+    "PRICING_SYNC_INTERVAL_HOURS",
+    "pricing.sync_interval_hours",
+    int(os.environ.get("PRICING_SYNC_INTERVAL_HOURS", "12")),
+)
 
 
 ####################################
@@ -1933,7 +2135,7 @@ Responses from models: {{responses}}"""
 # Vector Database
 ####################################
 
-VECTOR_DB = os.environ.get("VECTOR_DB", "chroma")
+VECTOR_DB = os.environ.get("VECTOR_DB", "pgvector")
 
 # Chroma
 CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"
@@ -3060,6 +3262,33 @@ SUBAGENT_PARENT_PROMPT = PersistentConfig(
     "SUBAGENT_PARENT_PROMPT",
     "subagents.parent_prompt",
     os.getenv("SUBAGENT_PARENT_PROMPT", DEFAULT_SUBAGENT_PARENT_PROMPT),
+)
+
+# Built-in `ask_user` tool: lets the model pause mid-task to ask the user one or
+# more multiple-choice (or free-form) questions via an inline card, then resume
+# once answered. Enabled by default so it's available out of the box; the model
+# only ever calls it when it genuinely needs a decision from the user.
+ENABLE_ASK_USER = PersistentConfig(
+    "ENABLE_ASK_USER",
+    "ask_user.enable",
+    os.getenv("ENABLE_ASK_USER", "True").lower() == "true",
+)
+
+# Appended to the parent chat's system prompt when ask_user is enabled. Teaches
+# the model when and how to use the tool. Admin-editable.
+DEFAULT_ASK_USER_PARENT_PROMPT = """You can ask the user a question and pause until they answer, using the `ask_user` tool.
+
+Use it when you hit a genuine decision point where the user's input changes what you do next — an ambiguous requirement, a choice between real alternatives, a missing preference you can't infer. Do NOT use it for things you can reasonably decide yourself, and do NOT use it to narrate progress.
+
+- `questions`: 1-4 questions. Each has a `question` (the full text), an optional short `header` label (max ~12 chars, e.g. "Auth method"), `multiSelect` (true to let the user pick several options), `allowOther` (true to offer a free-text "Other" escape hatch — default true), and `options`: 2-4 `{label, description}` choices. Omit `options` (or pass an empty list) to ask a pure free-form question with just a text box.
+- Keep options distinct and mutually exclusive (unless `multiSelect`). If you recommend one, put it first and add "(Recommended)" to its label.
+
+The user's answer comes back as the tool result. Continue the task using their choices. If the result says the user skipped, proceed with your best judgment and note the assumption you made."""
+
+ASK_USER_PARENT_PROMPT = PersistentConfig(
+    "ASK_USER_PARENT_PROMPT",
+    "ask_user.parent_prompt",
+    os.getenv("ASK_USER_PARENT_PROMPT", DEFAULT_ASK_USER_PARENT_PROMPT),
 )
 
 # Reasoning effort for the subagent's inner chat. Empty string = let the

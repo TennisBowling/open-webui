@@ -6,7 +6,7 @@
 		chatTokenStats,
 		chatTokenStatsRefreshTrigger
 	} from '$lib/stores';
-	import { getChatTokenStats, formatTokenCount } from '$lib/apis/analytics';
+	import { getChatTokenStats, formatTokenCount, formatCost } from '$lib/apis/analytics';
 	import Tooltip from '../common/Tooltip.svelte';
 
 	const i18n = getContext('i18n');
@@ -137,6 +137,7 @@
 			last_output_tokens: current?.last_output_tokens ?? 0,
 			last_cache_read_tokens: current?.last_cache_read_tokens ?? 0,
 			message_count: current?.message_count ?? 0,
+			cost: current?.cost ?? 0,
 			loading: true
 		}));
 
@@ -168,6 +169,7 @@
 					last_output_tokens: stats.last_output_tokens,
 					last_cache_read_tokens: stats.last_cache_read_tokens ?? 0,
 					message_count: stats.message_count,
+					cost: stats.cost ?? 0,
 					loading: false
 				};
 
@@ -263,6 +265,14 @@
 					<span>${$i18n.t('Request Total')}:</span>
 					<span class="font-mono font-semibold">${$chatTokenStats.total_tokens.toLocaleString()}</span>
 				</div>
+				${
+					($chatTokenStats.cost ?? 0) > 0
+						? `<div class="flex justify-between gap-4">
+						<span>${$i18n.t('Cost')}:</span>
+						<span class="font-mono font-semibold text-emerald-400">${formatCost($chatTokenStats.cost)}</span>
+					</div>`
+						: ''
+				}
 				<div class="text-gray-400 text-[10px] mt-2">
 					${$chatTokenStats.message_count} ${$i18n.t('messages')}
 				</div>
@@ -342,6 +352,18 @@
 				</svg>
 				<span>{formatTokenCount($chatTokenStats.total_tokens)}</span>
 			</span>
+
+			{#if ($chatTokenStats.cost ?? 0) > 0}
+				<span class="text-gray-300 dark:text-gray-600">·</span>
+
+				<!-- Estimated cost -->
+				<span
+					class="flex items-center gap-0.5 font-semibold text-emerald-600 dark:text-emerald-400"
+					title={$i18n.t('Estimated cost')}
+				>
+					<span>{formatCost($chatTokenStats.cost)}</span>
+				</span>
+			{/if}
 		</div>
 	</Tooltip>
 {:else if $chatTokenStats?.loading}

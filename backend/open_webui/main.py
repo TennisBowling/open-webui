@@ -73,6 +73,7 @@ from open_webui.socket.main import (
     delete_token_group,
     get_token_usage,
     clear_stream_state,
+    stream_version_init,
 )
 from open_webui.routers import (
     analytics,
@@ -114,7 +115,7 @@ from open_webui.routers.retrieval import (
     get_rf,
 )
 
-from open_webui.internal.db import Session, engine
+from open_webui.internal.db import dispose_engine, engine
 
 from open_webui.models.functions import Functions
 from open_webui.models.models import Models
@@ -137,6 +138,8 @@ from open_webui.config import (
     ENABLE_DIRECT_CONNECTIONS,
     # Model list
     ENABLE_BASE_MODELS_CACHE,
+    ENABLE_PRICING_SYNC,
+    PRICING_SYNC_INTERVAL_HOURS,
     # Thread pool size for FastAPI/AnyIO
     THREAD_POOL_SIZE,
     # Tool Server Configs
@@ -320,6 +323,9 @@ from open_webui.config import (
     SUBAGENT_DEFAULT_SERVICE_TIER,
     SUBAGENT_ALLOW_EXTERNAL_TOOLS,
     SUBAGENT_EXTERNAL_TOOLS_PROMPT,
+    # Ask user
+    ENABLE_ASK_USER,
+    ASK_USER_PARENT_PROMPT,
     # Flex auto-flip
     FLEX_AUTO_FLIP_ENABLED,
     FLEX_AUTO_FLIP_OFF_PEAK_START_HOUR,
@@ -430,7 +436,7 @@ from open_webui.config import (
     AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
     AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH,
     AppConfig,
-    reset_config,
+    reset_config_async,
 )
 from open_webui.env import (
     LICENSE_KEY,
@@ -527,7 +533,6 @@ from open_webui.constants import ERROR_MESSAGES
 
 if SAFE_MODE:
     print("SAFE MODE ENABLED")
-    Functions.deactivate_all_functions()
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -607,12 +612,54 @@ https://github.com/open-webui/open-webui
 
 
 @asynccontextmanager
+def _install_benign_shutdown_error_filter() -> None:
+    """Downgrade known-benign async-generator teardown errors the event loop
+    reports while finalizing async generators at process exit.
+
+    On Ctrl+C an MCP streamable-HTTP client (an anyio task group living inside an
+    async generator) whose owning chat/subagent task was cancelled mid-stream may
+    not finish unwinding before ``loop.shutdown_asyncgens()`` finalizes it. asyncio
+    then routes ``RuntimeError: athrow(): asynchronous generator is already
+    running`` (or anyio's "Attempted to exit cancel scope in a different task")
+    through the loop exception handler, which loguru renders as a scary multi-frame
+    traceback. These are teardown races during exit — nothing is generating, no
+    data is touched. Everything else is delegated to asyncio's normal handler
+    unchanged, so real errors are still surfaced.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    prior_handler = loop.get_exception_handler()
+    benign_markers = (
+        "asynchronous generator is already running",
+        "Attempted to exit cancel scope in a different task",
+    )
+
+    def _handler(loop, context):
+        exc = context.get("exception")
+        blob = f"{context.get('message', '')} {exc!r}"
+        if any(marker in blob for marker in benign_markers):
+            log.debug("Suppressed benign async-gen teardown at shutdown: %s", blob.strip())
+            return
+        if prior_handler is not None:
+            prior_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
 async def lifespan(app: FastAPI):
     app.state.instance_id = INSTANCE_ID
     start_logger()
+    _install_benign_shutdown_error_filter()
 
     if RESET_CONFIG_ON_START:
-        reset_config()
+        await reset_config_async()
+
+    if SAFE_MODE:
+        await Functions.deactivate_all_functions()
 
     if LICENSE_KEY:
         get_license_data(app, LICENSE_KEY)
@@ -620,7 +667,7 @@ async def lifespan(app: FastAPI):
     # This should be blocking (sync) so functions are not deactivated on first /get_models calls
     # when the first user lands on the / route.
     log.info("Installing external dependencies of functions and tools...")
-    install_tool_and_function_dependencies()
+    await install_tool_and_function_dependencies()
 
     app.state.redis = get_redis_connection(
         redis_url=REDIS_URL,
@@ -667,6 +714,40 @@ async def lifespan(app: FastAPI):
         )
 
     asyncio.create_task(periodic_usage_pool_cleanup())
+
+    # Keep-fresh sweep for chat-search message embeddings (semantic search). Decoupled
+    # from the sync write path; embeds new/changed messages on an interval. No-op when
+    # ENABLE_CHAT_SEMANTIC_SEARCH is off or there's nothing stale.
+    from open_webui.utils.chat_embedder import embedding_sweeper_loop
+
+    app.state.chat_embedding_sweeper = asyncio.create_task(embedding_sweeper_loop())
+
+    # Periodic OpenRouter price-catalog sync. Populates model_pricing_catalog so
+    # admin cost views can price models. First run is ~immediate to fill an empty
+    # catalog on boot; thereafter every PRICING_SYNC_INTERVAL_HOURS. In-process
+    # asyncio loop (no external scheduler), mirroring the queue-drain sweeper.
+    async def _pricing_sync_loop():
+        from open_webui.utils.pricing import run_pricing_sync
+
+        # small initial delay so boot isn't blocked on an external HTTP call
+        first = True
+        while True:
+            try:
+                if not first:
+                    interval = app.state.config.PRICING_SYNC_INTERVAL_HOURS or 12
+                    await asyncio.sleep(max(1, int(interval)) * 3600)
+                else:
+                    await asyncio.sleep(5)
+                    first = False
+                if app.state.config.ENABLE_PRICING_SYNC:
+                    await run_pricing_sync()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("pricing sync iteration failed")
+                await asyncio.sleep(3600)
+
+    app.state.pricing_sync_loop = asyncio.create_task(_pricing_sync_loop())
 
     # Persistent HTTP session with connection pooling — avoids the cost of
     # creating a new aiohttp.ClientSession (TLS handshake, DNS, connector
@@ -724,16 +805,17 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "queue_drain_sweeper"):
         app.state.queue_drain_sweeper.cancel()
 
+    if hasattr(app.state, "pricing_sync_loop"):
+        app.state.pricing_sync_loop.cancel()
+
+    if hasattr(app.state, "chat_embedding_sweeper"):
+        app.state.chat_embedding_sweeper.cancel()
+
     if getattr(app.state, "loop_lag_monitor", None) is not None:
         app.state.loop_lag_monitor.cancel()
 
-    # Fold the WAL back into the main DB file before disposing the pool so that
-    # the next start (or a server-side backup) sees a single consolidated file.
     try:
-        if engine.dialect.name == "sqlite":
-            with engine.connect() as conn:
-                conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
-        engine.dispose()
+        await dispose_engine()
     except Exception as e:
         log.exception(f"Error during database teardown: {e}")
 
@@ -850,6 +932,8 @@ app.state.SCIM_TOKEN = SCIM_TOKEN
 ########################################
 
 app.state.config.ENABLE_BASE_MODELS_CACHE = ENABLE_BASE_MODELS_CACHE
+app.state.config.ENABLE_PRICING_SYNC = ENABLE_PRICING_SYNC
+app.state.config.PRICING_SYNC_INTERVAL_HOURS = PRICING_SYNC_INTERVAL_HOURS
 app.state.BASE_MODELS = []
 
 ########################################
@@ -1120,6 +1204,9 @@ app.state.config.SUBAGENT_DEFAULT_SERVICE_TIER = SUBAGENT_DEFAULT_SERVICE_TIER
 app.state.config.SUBAGENT_ALLOW_EXTERNAL_TOOLS = SUBAGENT_ALLOW_EXTERNAL_TOOLS
 app.state.config.SUBAGENT_EXTERNAL_TOOLS_PROMPT = SUBAGENT_EXTERNAL_TOOLS_PROMPT
 
+app.state.config.ENABLE_ASK_USER = ENABLE_ASK_USER
+app.state.config.ASK_USER_PARENT_PROMPT = ASK_USER_PARENT_PROMPT
+
 # Flex auto-flip
 app.state.config.FLEX_AUTO_FLIP_ENABLED = FLEX_AUTO_FLIP_ENABLED
 app.state.config.FLEX_AUTO_FLIP_OFF_PEAK_START_HOUR = FLEX_AUTO_FLIP_OFF_PEAK_START_HOUR
@@ -1380,8 +1467,6 @@ app.add_middleware(SecurityHeadersMiddleware)
 @app.middleware("http")
 async def commit_session_after_request(request: Request, call_next):
     response = await call_next(request)
-    # log.debug("Commit session after request")
-    Session.commit()
     return response
 
 
@@ -1543,7 +1628,7 @@ async def get_models(
             )
         )
 
-    models = get_filtered_models(models, user)
+    models = await get_filtered_models(models, user)
 
     log.debug(
         f"/api/models returned filtered models accessible to the user: {json.dumps([model.get('id') for model in models])}"
@@ -1599,7 +1684,7 @@ async def chat_completion(
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
-    # B10: detect v2 body shape (carries `leaf_message_id`, no `messages`).
+    # B10: detect v2.1 body shape (carries `leaf_message_id`, no `messages`).
     # Server walks the chat tree to assemble the canonical conversation. v1 body
     # (with `messages`) falls through to the existing pipeline unchanged.
     if (
@@ -1613,7 +1698,7 @@ async def chat_completion(
 
             # Auth: caller must own the chat we're about to walk.
             if user and user.role != "admin":
-                owned = Chats.get_chat_by_id_and_user_id(form_data["chat_id"], user.id)
+                owned = await Chats.get_chat_by_id_and_user_id(form_data["chat_id"], user.id)
                 if owned is None:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -1655,7 +1740,7 @@ async def chat_completion(
         except HTTPException:
             raise
         except Exception as e:
-            log.exception(f"v2 conversation assembly failed: {e}")
+            log.exception(f"v2.1 conversation assembly failed: {e}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to assemble conversation: {e}",
@@ -1674,14 +1759,14 @@ async def chat_completion(
         # If model is in MODELS, always use backend handling even if direct was requested
         if is_in_models:
             model = request.app.state.MODELS[model_id]
-            model_info = Models.get_model_by_id(model_id)
+            model_info = await Models.get_model_by_id(model_id)
 
             # Check if user has access to the model
             if not BYPASS_MODEL_ACCESS_CONTROL and (
                 user.role != "admin" or not BYPASS_ADMIN_ACCESS_CONTROL
             ):
                 try:
-                    check_model_access(user, model)
+                    await check_model_access(user, model)
                 except Exception as e:
                     raise e
         elif is_direct_requested:
@@ -1739,7 +1824,7 @@ async def chat_completion(
 
         if metadata.get("chat_id") and (user and user.role != "admin"):
             if not metadata["chat_id"].startswith("local:"):
-                chat = Chats.get_chat_by_id_and_user_id(metadata["chat_id"], user.id)
+                chat = await Chats.get_chat_by_id_and_user_id(metadata["chat_id"], user.id)
                 if chat is None:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -1755,6 +1840,51 @@ async def chat_completion(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
+
+    async def register_stream_start_if_needed():
+        if STREAM_PROTOCOL_VERSION != "v2.1":
+            return
+        if not (
+            metadata.get("chat_id")
+            and metadata.get("message_id")
+            and not str(metadata.get("chat_id", "")).startswith("local:")
+        ):
+            return
+        try:
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                metadata["chat_id"],
+                metadata["message_id"],
+                {
+                    "role": "assistant",
+                    "model": model_id,
+                    "done": False,
+                },
+                return_model=False,
+            )
+        except Exception:
+            log.exception("stream startup assistant placeholder upsert failed")
+        try:
+            stream_version_init(
+                metadata["message_id"],
+                chat_id=metadata.get("chat_id"),
+                user_id=metadata.get("user_id"),
+                session_id=metadata.get("session_id"),
+                content_blocks=[],
+            )
+            set_stream_state(
+                metadata["message_id"],
+                {
+                    "chat_id": metadata.get("chat_id"),
+                    "user_id": metadata.get("user_id"),
+                    "session_id": metadata.get("session_id"),
+                    "status": "in_progress",
+                    "content_blocks": [],
+                    "snapshot_version": 0,
+                    "model": model_id,
+                },
+            )
+        except Exception:
+            log.exception("stream startup state registration failed")
 
     async def process_chat(request, form_data, user, metadata, model):
         # Track which stage we reached so the cancel log can say where it
@@ -1772,7 +1902,7 @@ async def chat_completion(
             if metadata.get("chat_id") and metadata.get("message_id"):
                 try:
                     if not metadata["chat_id"].startswith("local:"):
-                        Chats.upsert_message_to_chat_by_id_and_message_id(
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
                             {
@@ -1795,7 +1925,7 @@ async def chat_completion(
             ) and not str(metadata["chat_id"]).startswith("local:"):
                 broadcast_spec = metadata.get("queue_drained_broadcast") or {}
                 try:
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
@@ -1901,7 +2031,7 @@ async def chat_completion(
                 clear_stream_state(metadata["message_id"])
                 try:
                     if not metadata["chat_id"].startswith("local:"):
-                        Chats.upsert_message_to_chat_by_id_and_message_id(
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
                             {
@@ -1957,6 +2087,7 @@ async def chat_completion(
         and metadata.get("chat_id")
         and metadata.get("message_id")
     ):
+        await register_stream_start_if_needed()
         # Asynchronous Chat Processing
         task_id, _ = await create_task(
             request.app.state.redis,
@@ -1985,7 +2116,7 @@ async def start_generation(
     Mirrors what the ``/api/chat/completions`` route does, but without an
     inbound HTTP ``Request`` — used by the autonomous message-queue drain to
     start the next queued turn with zero browser tabs open. Builds a
-    ``HeadlessRequest`` carrier and a v2 ``form_data`` from ``send_spec`` (the
+    ``HeadlessRequest`` carrier and a v2.1 ``form_data`` from ``send_spec`` (the
     self-contained queue item), then calls the same ``chat_completion`` so the
     full pipeline (assembly, preprocessing, tools, persistence, socket
     delivery) is byte-identical to a tab-driven send.
@@ -2089,7 +2220,7 @@ async def list_tasks_endpoint(request: Request, user=Depends(get_verified_user))
 async def list_tasks_by_chat_id_endpoint(
     request: Request, chat_id: str, user=Depends(get_verified_user)
 ):
-    chat = Chats.get_chat_by_id(chat_id)
+    chat = await Chats.get_chat_by_id(chat_id)
     if chat is None or chat.user_id != user.id:
         return {"task_ids": []}
 
@@ -2130,9 +2261,9 @@ async def get_app_config(request: Request):
                 detail="Invalid token",
             )
         if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+            user = await Users.get_user_by_id(data["id"])
 
-    user_count = Users.get_num_users()
+    user_count = await Users.get_num_users()
     onboarding = False
 
     if user is None:
@@ -2170,6 +2301,7 @@ async def get_app_config(request: Request):
                     "enable_study_mode": app.state.config.ENABLE_STUDY_MODE,
                     "enable_data_viz": app.state.config.ENABLE_DATA_VIZ,
                     "enable_subagents": app.state.config.ENABLE_SUBAGENTS,
+                    "enable_ask_user": app.state.config.ENABLE_ASK_USER,
                     "enable_container_workspace_sync": app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
                     "container_mcp_server_id": app.state.config.CONTAINER_MCP_SERVER_ID,
                     # Surfaced (non-secret) so the per-chat Subagent settings
@@ -2547,7 +2679,7 @@ async def get_usage_groups(user=Depends(get_verified_user)):
     - reset_type: 'daily' or 'rolling_window'
     """
     # get_token_groups now handles reset checks and returns full data
-    groups = get_token_groups()
+    groups = await get_token_groups()
 
     return {"groups": groups}
 
@@ -2559,10 +2691,10 @@ async def create_usage_group(
 ):
     """Create a new token group"""
     try:
-        set_token_group(form_data.name, form_data.models, form_data.limit, form_data.resetTime, form_data.resetTimezone)
+        await set_token_group(form_data.name, form_data.models, form_data.limit, form_data.resetTime, form_data.resetTimezone)
 
         # Get the created group data (includes usage and reset info)
-        groups = get_token_groups()
+        groups = await get_token_groups()
         group_data = groups.get(form_data.name, {})
 
         return {
@@ -2584,12 +2716,12 @@ async def update_usage_group(
 ):
     """Update an existing token group"""
     try:
-        success = update_token_group(name, form_data.models, form_data.limit)
+        success = await update_token_group(name, form_data.models, form_data.limit)
         if not success:
             raise HTTPException(status_code=404, detail="Group not found")
 
         # Get the updated group data (includes usage and reset info)
-        groups = get_token_groups()
+        groups = await get_token_groups()
         group_data = groups.get(name, {})
 
         return {
@@ -2612,7 +2744,7 @@ async def delete_usage_group(
 ):
     """Delete a token group"""
     try:
-        success = delete_token_group(name)
+        success = await delete_token_group(name)
         if not success:
             raise HTTPException(status_code=404, detail="Group not found")
         
@@ -2628,7 +2760,7 @@ async def manual_reset_usage(user=Depends(get_verified_user)):
     """Manually reset all token usage (for testing daily reset functionality)"""
     try:
         from open_webui.models.token_usage import token_groups
-        success = token_groups.force_reset_all_usage()
+        success = await token_groups.force_reset_all_usage()
         
         if success:
             return {
@@ -2649,7 +2781,8 @@ async def healthcheck():
 
 @app.get("/health/db")
 async def healthcheck_with_db():
-    Session.execute(text("SELECT 1;")).all()
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
     return {"status": True}
 
 

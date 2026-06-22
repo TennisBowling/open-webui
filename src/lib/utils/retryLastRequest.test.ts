@@ -31,7 +31,7 @@ describe('getStructuredRetryLastRequestContext', () => {
 		expect(context?.content).toBe('');
 	});
 
-	it('requires result bodies or durable refs instead of stream-v2 slim placeholders', () => {
+	it('requires result bodies or durable refs instead of stream-v2.1 slim placeholders', () => {
 		const context = getStructuredRetryLastRequestContext({
 			content_blocks: [
 				{

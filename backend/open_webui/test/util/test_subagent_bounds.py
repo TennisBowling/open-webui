@@ -14,32 +14,37 @@ constants. Instead these tests patch the already-bound constants in
 """
 
 import asyncio
-import os
-import shutil
-import tempfile
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "subagent_bounds_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+from test.util.db import configure_test_database
+
+configure_test_database()
 
 import open_webui.utils.subagent as sa  # noqa: E402
 
 
-def test_default_bounds_are_sane():
-    # The shipped defaults: a cap exists, a timeout exists, concurrency bounded.
+def test_default_bounds_are_opt_in():
+    # The parent tool-round cap, the subagent wall-clock timeout, and the
+    # subagent concurrency ceiling are ops backstops that ship DISABLED by
+    # default (0) — a subagent must be free to run as deep/long/wide as it needs,
+    # and operators opt in by setting a positive value (see env.py). They must be
+    # non-negative ints so the disabled sentinel (0) and any opt-in value are both
+    # valid. The empty-round retry, by contrast, ships ENABLED so a model that
+    # ends a turn with nothing usable is re-issued instead of stalling.
     from open_webui.env import (
         AGENTIC_MAX_TOOL_ROUNDS,
+        AGENTIC_EMPTY_ROUND_MAX_RETRIES,
         SUBAGENT_RUN_TIMEOUT_SECONDS,
         SUBAGENT_MAX_CONCURRENCY,
     )
 
-    assert AGENTIC_MAX_TOOL_ROUNDS > 0
-    assert SUBAGENT_RUN_TIMEOUT_SECONDS > 0
-    assert SUBAGENT_MAX_CONCURRENCY > 0
+    assert isinstance(AGENTIC_MAX_TOOL_ROUNDS, int) and AGENTIC_MAX_TOOL_ROUNDS >= 0
+    assert (
+        isinstance(SUBAGENT_RUN_TIMEOUT_SECONDS, int)
+        and SUBAGENT_RUN_TIMEOUT_SECONDS >= 0
+    )
+    assert isinstance(SUBAGENT_MAX_CONCURRENCY, int) and SUBAGENT_MAX_CONCURRENCY >= 0
+    # Empty-round retry ships enabled (small positive).
+    assert AGENTIC_EMPTY_ROUND_MAX_RETRIES > 0
 
 
 def test_subagent_guard_times_out_hung_inner_chat(monkeypatch):
@@ -96,4 +101,3 @@ def test_concurrency_semaphore_disabled(monkeypatch):
     monkeypatch.setattr(sa, "SUBAGENT_MAX_CONCURRENCY", 0)
     monkeypatch.setattr(sa, "_subagent_concurrency_sem", None)
     assert sa._get_subagent_concurrency_sem() is None
-

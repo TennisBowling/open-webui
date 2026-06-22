@@ -7,7 +7,7 @@ Create Date: 2026-05-31
 
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 
 
@@ -19,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     bind = op.get_bind()
-    tables = set(sa.inspect(bind).get_table_names())
+    tables = set() if context.is_offline_mode() else set(sa.inspect(bind).get_table_names())
     if "mcp_connection" in tables:
         return
 

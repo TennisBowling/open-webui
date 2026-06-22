@@ -26,7 +26,7 @@ import re
 from typing import Optional
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import op, context
 
 
 revision = "a7f2d8b4c901"
@@ -308,6 +308,8 @@ def _migrate_chat(chat_data) -> Optional[dict]:
 
 
 def upgrade() -> None:
+    if context.is_offline_mode():
+        return
     connection = op.get_bind()
     rows = connection.execute(sa.text("SELECT id, chat FROM chat")).fetchall()
     migrated = 0
@@ -342,6 +344,8 @@ def downgrade() -> None:
     design — the live loop persists content_blocks going forward; rolling back means
     accepting that the next turn after a tool call will partial-cache again until a
     fresh response replays into HTML."""
+    if context.is_offline_mode():
+        return
     connection = op.get_bind()
     rows = connection.execute(sa.text("SELECT id, chat FROM chat")).fetchall()
     for row in rows:

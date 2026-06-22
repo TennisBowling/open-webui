@@ -285,8 +285,11 @@
 	const STREAM_SCOPED_EVENT_TYPES = new Set([
 		'chat:delta',
 		'chat:delta:batch',
+		'chat:delta:batch2',
 		'tool_call:result',
 		'chat:subagent:update',
+		'browser:frame',
+		'chat:stream:sync_required',
 		'chat:done',
 		'chat:message:error',
 		'chat:tasks:cancel'

@@ -11,7 +11,7 @@ This migration adds the analytics tables for the "Wrapped" feature:
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 import open_webui.internal.db
 
@@ -24,10 +24,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def _existing_tables() -> set:
+    if context.is_offline_mode():
+        return set()
     return set(sa.inspect(op.get_bind()).get_table_names())
 
 
 def _existing_indexes(table_name: str) -> set:
+    if context.is_offline_mode():
+        return set()
     inspector = sa.inspect(op.get_bind())
     if table_name not in inspector.get_table_names():
         return set()

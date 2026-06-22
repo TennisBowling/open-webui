@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_access, has_permission
+from open_webui.utils.access_control import has_access_async, has_permission_async
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STATIC_DIR
 
 log = logging.getLogger(__name__)
@@ -47,9 +47,9 @@ def validate_model_id(model_id: str) -> bool:
 @router.get("/", response_model=list[ModelUserResponse])
 async def get_models(id: Optional[str] = None, user=Depends(get_verified_user)):
     if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        return Models.get_models()
+        return await Models.get_models()
     else:
-        return Models.get_models_by_user_id(user.id)
+        return await Models.get_models_by_user_id(user.id)
 
 
 ###########################
@@ -59,7 +59,7 @@ async def get_models(id: Optional[str] = None, user=Depends(get_verified_user)):
 
 @router.get("/base", response_model=list[ModelResponse])
 async def get_base_models(user=Depends(get_admin_user)):
-    return Models.get_base_models()
+    return await Models.get_base_models()
 
 
 ############################
@@ -73,7 +73,7 @@ async def create_new_model(
     form_data: ModelForm,
     user=Depends(get_verified_user),
 ):
-    if user.role != "admin" and not has_permission(
+    if user.role != "admin" and not await has_permission_async(
         user.id, "workspace.models", request.app.state.config.USER_PERMISSIONS
     ):
         raise HTTPException(
@@ -81,7 +81,7 @@ async def create_new_model(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    model = Models.get_model_by_id(form_data.id)
+    model = await Models.get_model_by_id(form_data.id)
     if model:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -95,7 +95,7 @@ async def create_new_model(
         )
 
     else:
-        model = Models.insert_new_model(form_data, user.id)
+        model = await Models.insert_new_model(form_data, user.id)
         if model:
             return model
         else:
@@ -112,7 +112,7 @@ async def create_new_model(
 
 @router.get("/export", response_model=list[ModelModel])
 async def export_models(user=Depends(get_admin_user)):
-    return Models.get_models()
+    return await Models.get_models()
 
 
 ############################
@@ -136,7 +136,7 @@ async def import_models(
                 model_id = model_data.get("id")
 
                 if model_id and validate_model_id(model_id):
-                    existing_model = Models.get_model_by_id(model_id)
+                    existing_model = await Models.get_model_by_id(model_id)
                     if existing_model:
                         # Update existing model
                         model_data["meta"] = model_data.get("meta", {})
@@ -145,13 +145,13 @@ async def import_models(
                         updated_model = ModelForm(
                             **{**existing_model.model_dump(), **model_data}
                         )
-                        Models.update_model_by_id(model_id, updated_model)
+                        await Models.update_model_by_id(model_id, updated_model)
                     else:
                         # Insert new model
                         model_data["meta"] = model_data.get("meta", {})
                         model_data["params"] = model_data.get("params", {})
                         new_model = ModelForm(**model_data)
-                        Models.insert_new_model(user_id=user.id, form_data=new_model)
+                        await Models.insert_new_model(user_id=user.id, form_data=new_model)
             return True
         else:
             raise HTTPException(status_code=400, detail="Invalid JSON format")
@@ -173,7 +173,7 @@ class SyncModelsForm(BaseModel):
 async def sync_models(
     request: Request, form_data: SyncModelsForm, user=Depends(get_admin_user)
 ):
-    return Models.sync_models(user.id, form_data.models)
+    return await Models.sync_models(user.id, form_data.models)
 
 
 ###########################
@@ -184,12 +184,12 @@ async def sync_models(
 # Note: We're not using the typical url path param here, but instead using a query parameter to allow '/' in the id
 @router.get("/model", response_model=Optional[ModelResponse])
 async def get_model_by_id(id: str, user=Depends(get_verified_user)):
-    model = Models.get_model_by_id(id)
+    model = await Models.get_model_by_id(id)
     if model:
         if (
             (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
             or model.user_id == user.id
-            or has_access(user.id, "read", model.access_control)
+            or await has_access_async(user.id, "read", model.access_control)
         ):
             return model
     else:
@@ -206,7 +206,7 @@ async def get_model_by_id(id: str, user=Depends(get_verified_user)):
 
 @router.get("/model/profile/image")
 async def get_model_profile_image(id: str, user=Depends(get_verified_user)):
-    model = Models.get_model_by_id(id)
+    model = await Models.get_model_by_id(id)
     if model:
         if model.meta.profile_image_url:
             if model.meta.profile_image_url.startswith("http"):
@@ -239,14 +239,14 @@ async def get_model_profile_image(id: str, user=Depends(get_verified_user)):
 
 @router.post("/model/toggle", response_model=Optional[ModelResponse])
 async def toggle_model_by_id(id: str, user=Depends(get_verified_user)):
-    model = Models.get_model_by_id(id)
+    model = await Models.get_model_by_id(id)
     if model:
         if (
             user.role == "admin"
             or model.user_id == user.id
-            or has_access(user.id, "write", model.access_control)
+            or await has_access_async(user.id, "write", model.access_control)
         ):
-            model = Models.toggle_model_by_id(id)
+            model = await Models.toggle_model_by_id(id)
 
             if model:
                 return model
@@ -278,7 +278,7 @@ async def update_model_by_id(
     form_data: ModelForm,
     user=Depends(get_verified_user),
 ):
-    model = Models.get_model_by_id(id)
+    model = await Models.get_model_by_id(id)
 
     if not model:
         raise HTTPException(
@@ -288,7 +288,7 @@ async def update_model_by_id(
 
     if (
         model.user_id != user.id
-        and not has_access(user.id, "write", model.access_control)
+        and not await has_access_async(user.id, "write", model.access_control)
         and user.role != "admin"
     ):
         raise HTTPException(
@@ -296,7 +296,7 @@ async def update_model_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    model = Models.update_model_by_id(id, form_data)
+    model = await Models.update_model_by_id(id, form_data)
     return model
 
 
@@ -307,7 +307,7 @@ async def update_model_by_id(
 
 @router.delete("/model/delete", response_model=bool)
 async def delete_model_by_id(id: str, user=Depends(get_verified_user)):
-    model = Models.get_model_by_id(id)
+    model = await Models.get_model_by_id(id)
     if not model:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -317,18 +317,18 @@ async def delete_model_by_id(id: str, user=Depends(get_verified_user)):
     if (
         user.role != "admin"
         and model.user_id != user.id
-        and not has_access(user.id, "write", model.access_control)
+        and not await has_access_async(user.id, "write", model.access_control)
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    result = Models.delete_model_by_id(id)
+    result = await Models.delete_model_by_id(id)
     return result
 
 
 @router.delete("/delete/all", response_model=bool)
 async def delete_all_models(user=Depends(get_admin_user)):
-    result = Models.delete_all_models()
+    result = await Models.delete_all_models()
     return result

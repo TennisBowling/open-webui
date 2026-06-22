@@ -149,43 +149,44 @@ def _build_loader_from_request_config(request: Request) -> Loader:
     )
 
 
-def _extract_now(request: Request, file_id: str) -> None:
+async def _extract_now(request: Request, file_id: str) -> None:
     """Run the Loader on a file and cache the result. No idempotency check —
     callers should gate on ``file.data.status`` if they want one. Always sets
     status="processing" before running and status="completed"|"failed" after.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file or not file.path:
         return
 
-    Files.update_file_data_by_id(file_id, {"status": "processing"})
+    await Files.update_file_data_by_id(file_id, {"status": "processing"})
 
     try:
         file_path = Storage.get_file(file.path)
         loader = _build_loader_from_request_config(request)
-        docs = loader.load(
+        docs = await asyncio.to_thread(
+            loader.load,
             file.filename,
             (file.meta or {}).get("content_type"),
             file_path,
         )
         text = " ".join([doc.page_content for doc in docs])
 
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             file_id,
             {"content": text, "status": "completed"},
         )
-        Files.update_file_hash_by_id(file_id, calculate_sha256_string(text))
+        await Files.update_file_hash_by_id(file_id, calculate_sha256_string(text))
     except Exception as e:
         log.exception(
             "file_extraction: failed to extract content from %s: %s", file_id, e
         )
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             file_id,
             {"status": "failed", "error": str(e)},
         )
 
 
-def extract_and_cache_file_content(request: Request, file_id: str) -> None:
+async def extract_and_cache_file_content(request: Request, file_id: str) -> None:
     """BackgroundTask entry. Idempotent — does nothing if the file is already
     extracted or currently being extracted by another worker.
 
@@ -193,7 +194,7 @@ def extract_and_cache_file_content(request: Request, file_id: str) -> None:
     to ``_extract_now`` concurrently. Both produce the same content for the
     same input, so the worst case is one wasted extraction; no data corruption.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return
     data = file.data or {}
@@ -201,7 +202,7 @@ def extract_and_cache_file_content(request: Request, file_id: str) -> None:
         return
     if data.get("status") == "processing":
         return
-    _extract_now(request, file_id)
+    await _extract_now(request, file_id)
 
 
 async def get_or_extract_file_content(
@@ -220,7 +221,7 @@ async def get_or_extract_file_content(
       old files (uploaded before background extraction was wired up) still
       work on first use.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return ""
 
@@ -240,7 +241,7 @@ async def get_or_extract_file_content(
         while time.monotonic() < deadline:
             await asyncio.sleep(delay)
             delay = min(delay * 1.5, 5.0)
-            file = Files.get_file_by_id(file_id)
+            file = await Files.get_file_by_id(file_id)
             if not file:
                 return ""
             data = file.data or {}
@@ -254,9 +255,9 @@ async def get_or_extract_file_content(
         )
         return ""
 
-    # Pending / unknown — run inline in a worker thread.
-    await asyncio.to_thread(_extract_now, request, file_id)
-    file = Files.get_file_by_id(file_id)
+    # Pending / unknown — run inline; blocking loader work is pushed to a worker.
+    await _extract_now(request, file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return ""
     return (file.data or {}).get("content", "") or ""

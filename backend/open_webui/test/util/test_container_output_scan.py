@@ -15,18 +15,13 @@ collaborators (Storage/DB/reclaim) mocked, and spy on ``_hash_file`` /
 
 import asyncio
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "container_scan_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+from test.util.db import configure_test_database
+
+configure_test_database()
 
 import open_webui.utils.container_workspace as cw  # noqa: E402
 
@@ -59,25 +54,38 @@ def _drive(monkeypatch, tmp: Path, data_root: Path, meta_store: dict):
 
     chat_obj = MagicMock()
     chat_obj.meta = meta_store["meta"]
-    monkeypatch.setattr(cw.Chats, "get_chat_by_id", lambda *_a, **_k: chat_obj)
+
+    # The async runtime migration made every `Chats.*` accessor (and
+    # `_store_output_file`) a coroutine; production awaits them, so the stubs
+    # must be `async def`. `_hash_file` stays sync — it's driven via
+    # `asyncio.to_thread`.
+    async def _fake_get_chat_by_id(*_a, **_k):
+        return chat_obj
+
+    async def _fake_update_chat_meta(_cid, m):
+        meta_store["meta"] = m
+
+    async def _fake_get_message(*_a, **_k):
+        return {}
+
+    async def _fake_upsert_message(*a, **k):
+        return None
+
+    monkeypatch.setattr(cw.Chats, "get_chat_by_id", _fake_get_chat_by_id)
+    monkeypatch.setattr(cw.Chats, "update_chat_meta_by_id", _fake_update_chat_meta)
     monkeypatch.setattr(
-        cw.Chats,
-        "update_chat_meta_by_id",
-        lambda _cid, m: meta_store.__setitem__("meta", m),
-    )
-    monkeypatch.setattr(
-        cw.Chats, "get_message_by_id_and_message_id", lambda *_a, **_k: {}
+        cw.Chats, "get_message_by_id_and_message_id", _fake_get_message
     )
     monkeypatch.setattr(
         cw.Chats,
         "upsert_message_to_chat_by_id_and_message_id",
-        lambda *a, **k: None,
+        _fake_upsert_message,
     )
 
     # Store step: return a stable descriptor without touching Storage/DB/subproc.
     store_calls = {"n": 0}
 
-    def _fake_store(req, usr, path, display_name, size, sha256, *rest):
+    async def _fake_store(req, usr, path, display_name, size, sha256, *rest):
         store_calls["n"] += 1
         return {"id": f"file-{store_calls['n']}", "name": display_name}
 

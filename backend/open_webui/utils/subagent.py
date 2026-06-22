@@ -309,7 +309,7 @@ def _subagent_container_shared_context(
     return shared
 
 
-def _external_tools_prompt(request: Request, inner_tool_ids: list[str]) -> str:
+async def _external_tools_prompt(request: Request, inner_tool_ids: list[str]) -> str:
     has_external_tools = any(
         tool_id != "builtin:web_search" for tool_id in inner_tool_ids
     )
@@ -320,7 +320,7 @@ def _external_tools_prompt(request: Request, inner_tool_ids: list[str]) -> str:
     ).strip()
 
 
-def _compose_subagent_system_prompt(
+async def _compose_subagent_system_prompt(
     request: Request, subagent_model_id: str, external_tools_prompt: str = ""
 ) -> str:
     """Return the subagent's system prompt: the model's own admin-set system
@@ -328,7 +328,7 @@ def _compose_subagent_system_prompt(
     blank line. No admin-level preamble replaces the model's persona."""
     model_prompt = ""
     try:
-        model_info = Models.get_model_by_id(subagent_model_id)
+        model_info = await Models.get_model_by_id(subagent_model_id)
         if model_info and model_info.params:
             params = (
                 model_info.params.model_dump()
@@ -530,7 +530,7 @@ def _slim_content_blocks_for_parent(content_blocks: list[dict]) -> list[dict]:
     return slim_blocks
 
 
-def _slim_inner_event_for_parent(inner_event: dict) -> dict:
+async def _slim_inner_event_for_parent(inner_event: dict) -> dict:
     """Remove inner subagent tool bodies from parent-forwarded events only."""
     if not isinstance(inner_event, dict):
         return inner_event
@@ -565,189 +565,169 @@ def _slim_inner_event_for_parent(inner_event: dict) -> dict:
     return inner_event
 
 
-def _sync_parent_subagent_placeholder(
-    parent_chat_id: str,
-    parent_message_id: str,
-    run: dict,
-    *,
-    allow_append: bool = True,
+def _apply_subagent_placeholder_patch(
+    message: dict, run: dict, update_data: dict, *, allow_append: bool = True
 ) -> None:
-    """Make reloads deterministic while the parent response is mid-tool-call.
+    """Patch the parent assistant message's placeholder for one subagent run.
 
-    The live parent pipeline emits a tool_calls content block before executing
-    the tool, but with realtime-save off that in-flight block is not guaranteed
-    to be in the DB when the user reloads. The subagent runner *does* persist
-    subagent_runs immediately, so mirror a minimal placeholder into the parent
-    assistant message whenever a run changes. Later, middleware's final
-    end-of-stream save overwrites this with the canonical full content_blocks.
+    Sync, in-memory version of the old ``_sync_parent_subagent_placeholder``.
+    It operates on the message dict the atomic mutator ALREADY read under the
+    per-message write lock, so it patches the LATEST ``content_blocks`` rather
+    than a stale snapshot — closing the race where a sibling's placeholder write
+    reverted parent text/blocks that were appended after the sibling's read.
 
-    User-initiated reruns pass ``allow_append=False``. Reruns happen after the
-    parent message already has canonical content_blocks, so appending a new
-    synthetic tool_calls block would look like the parent model continued.
+    Any change is written into ``update_data`` (top-level ``content_blocks`` /
+    ``content`` keys) for the caller's single merged write. See
+    ``_upsert_subagent_run`` for the orchestration.
+
+    User-initiated reruns pass ``allow_append=False`` — the parent message
+    already has canonical content_blocks, so appending a synthetic tool_calls
+    block would look like the parent model continued.
     """
-    if not parent_chat_id or parent_chat_id.startswith("local:"):
+    tool_call_id = str(
+        run.get("tool_call_id")
+        or run.get("entry_key")
+        or run.get("subagent_id")
+        or run.get("chat_id")
+        or ""
+    )
+    if not tool_call_id:
         return
-    try:
-        message = (
-            Chats.get_message_by_id_and_message_id(parent_chat_id, parent_message_id)
-            or {}
-        )
-        tool_call_id = str(
-            run.get("tool_call_id")
-            or run.get("entry_key")
-            or run.get("subagent_id")
-            or run.get("chat_id")
-            or ""
-        )
-        if not tool_call_id:
-            return
 
-        update_data: dict = {}
-        placeholder_block = _subagent_placeholder_block(run)
-        existing_blocks = message.get("content_blocks")
-        if isinstance(existing_blocks, list):
-            blocks = list(existing_blocks)
-            found = False
-            blocks_changed = False
-            for block in blocks:
-                if not isinstance(block, dict) or block.get("type") != "tool_calls":
-                    continue
-                calls = (
-                    block.get("content")
-                    if isinstance(block.get("content"), list)
-                    else []
+    placeholder_block = _subagent_placeholder_block(run)
+    existing_blocks = message.get("content_blocks")
+    if isinstance(existing_blocks, list):
+        blocks = list(existing_blocks)
+        found = False
+        blocks_changed = False
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_calls":
+                continue
+            calls = (
+                block.get("content")
+                if isinstance(block.get("content"), list)
+                else []
+            )
+            results = (
+                block.get("results")
+                if isinstance(block.get("results"), list)
+                else []
+            )
+            matched_tool_call_id = ""
+            for call in calls:
+                if isinstance(call, dict) and _tool_call_id(call) == tool_call_id:
+                    matched_tool_call_id = tool_call_id
+                    break
+
+            # Old entries can be missing tool_call_id. In that case the
+            # safety validator can still find the parent block by the saved
+            # result's subagent_id; mirror that fallback here so a redo can
+            # update the canonical result instead of appending a duplicate.
+            if not matched_tool_call_id:
+                wanted_subagent_id = str(
+                    run.get("subagent_id") or run.get("chat_id") or ""
                 )
-                results = (
-                    block.get("results")
-                    if isinstance(block.get("results"), list)
-                    else []
-                )
-                matched_tool_call_id = ""
+                result_call_ids = {
+                    str(r.get("tool_call_id") or "")
+                    for r in results
+                    if isinstance(r, dict)
+                    and wanted_subagent_id
+                    and r.get("subagent_id") == wanted_subagent_id
+                    and r.get("tool_call_id")
+                }
                 for call in calls:
-                    if isinstance(call, dict) and _tool_call_id(call) == tool_call_id:
-                        matched_tool_call_id = tool_call_id
+                    if not isinstance(call, dict):
+                        continue
+                    call_id = _tool_call_id(call)
+                    if (
+                        call_id
+                        and call_id in result_call_ids
+                        and _subagent_tool_name(call) in _SUBAGENT_TOOL_NAMES
+                    ):
+                        matched_tool_call_id = call_id
                         break
 
-                # Old entries can be missing tool_call_id. In that case the
-                # safety validator can still find the parent block by the saved
-                # result's subagent_id; mirror that fallback here so a redo can
-                # update the canonical result instead of appending a duplicate.
-                if not matched_tool_call_id:
-                    wanted_subagent_id = str(
-                        run.get("subagent_id") or run.get("chat_id") or ""
+            if not matched_tool_call_id:
+                continue
+            found = True
+            # Patch the result/subagent_id into an already-present tool_calls
+            # block. This closes the gap where the call was saved while
+            # running, but the completion result was persisted via
+            # subagent_runs before middleware's final content_blocks save.
+            if _subagent_run_is_terminal(run):
+                result = dict(placeholder_block.get("results", [{}])[0])
+                result["tool_call_id"] = matched_tool_call_id
+                replaced = False
+                for idx, existing_result in enumerate(results):
+                    if (
+                        isinstance(existing_result, dict)
+                        and existing_result.get("tool_call_id") == matched_tool_call_id
+                    ):
+                        merged_result = {**existing_result, **result}
+                        if merged_result != existing_result:
+                            results[idx] = merged_result
+                            blocks_changed = True
+                        replaced = True
+                        break
+                if not replaced:
+                    results.append(result)
+                    blocks_changed = True
+                if blocks_changed:
+                    block["results"] = results
+            else:
+                # Non-terminal: a rerun just flipped this run back to
+                # "running". Drop any stale result for this tool call from
+                # the canonical block so EVERY reader (reload re-seeding in
+                # Chat.svelte, a second browser tab) sees a consistent
+                # running-with-no-result state instead of the old answer.
+                kept_results = [
+                    r
+                    for r in results
+                    if not (
+                        isinstance(r, dict)
+                        and r.get("tool_call_id") == matched_tool_call_id
                     )
-                    result_call_ids = {
-                        str(r.get("tool_call_id") or "")
-                        for r in results
-                        if isinstance(r, dict)
-                        and wanted_subagent_id
-                        and r.get("subagent_id") == wanted_subagent_id
-                        and r.get("tool_call_id")
-                    }
-                    for call in calls:
-                        if not isinstance(call, dict):
-                            continue
-                        call_id = _tool_call_id(call)
-                        if (
-                            call_id
-                            and call_id in result_call_ids
-                            and _subagent_tool_name(call) in _SUBAGENT_TOOL_NAMES
-                        ):
-                            matched_tool_call_id = call_id
-                            break
-
-                if not matched_tool_call_id:
-                    continue
-                found = True
-                # Patch the result/subagent_id into an already-present tool_calls
-                # block. This closes the gap where the call was saved while
-                # running, but the completion result was persisted via
-                # subagent_runs before middleware's final content_blocks save.
-                if _subagent_run_is_terminal(run):
-                    result = dict(placeholder_block.get("results", [{}])[0])
-                    result["tool_call_id"] = matched_tool_call_id
-                    replaced = False
-                    for idx, existing_result in enumerate(results):
-                        if (
-                            isinstance(existing_result, dict)
-                            and existing_result.get("tool_call_id") == matched_tool_call_id
-                        ):
-                            merged_result = {**existing_result, **result}
-                            if merged_result != existing_result:
-                                results[idx] = merged_result
-                                blocks_changed = True
-                            replaced = True
-                            break
-                    if not replaced:
-                        results.append(result)
-                        blocks_changed = True
-                    if blocks_changed:
-                        block["results"] = results
-                else:
-                    # Non-terminal: a rerun just flipped this run back to
-                    # "running". Drop any stale result for this tool call from
-                    # the canonical block so EVERY reader (reload re-seeding in
-                    # Chat.svelte, a second browser tab) sees a consistent
-                    # running-with-no-result state instead of the old answer.
-                    # Without this, reload-mid-rerun re-derives status=done from
-                    # the lingering result and flashes the previous output until
-                    # the next live event arrives. The new result is written
-                    # back here once the rerun reaches a terminal state.
-                    kept_results = [
-                        r
-                        for r in results
-                        if not (
-                            isinstance(r, dict)
-                            and r.get("tool_call_id") == matched_tool_call_id
-                        )
-                    ]
-                    if len(kept_results) != len(results):
-                        block["results"] = kept_results
-                        blocks_changed = True
-                break
-            if not found and allow_append:
-                blocks.append(placeholder_block)
-                blocks_changed = True
-            if blocks_changed:
-                update_data["content_blocks"] = blocks
-        else:
-            # If the message has no structured blocks yet (the common reload-
-            # while-running gap), install a one-block placeholder. Also do it
-            # when the legacy content is itself just/mostly a subagent details
-            # placeholder; ResponseMessage prefers content_blocks, so this fixes
-            # stale done=false/id="" HTML after reload.
-            existing_content_for_check = (
-                message.get("content")
-                if isinstance(message.get("content"), str)
-                else ""
-            )
-            content_without_subagent_details = re.sub(
-                r'<details\b[^>]*type="subagent_launch"[^>]*>[\s\S]*?</details>',
-                "",
-                existing_content_for_check,
-                flags=re.I,
-            ).strip()
-            if not existing_content_for_check.strip() or not content_without_subagent_details:
-                update_data["content_blocks"] = [placeholder_block]
-
-        existing_content = (
-            message.get("content") if isinstance(message.get("content"), str) else ""
+                ]
+                if len(kept_results) != len(results):
+                    block["results"] = kept_results
+                    blocks_changed = True
+            break
+        if not found and allow_append:
+            blocks.append(placeholder_block)
+            blocks_changed = True
+        if blocks_changed:
+            update_data["content_blocks"] = blocks
+    else:
+        # If the message has no structured blocks yet (the common reload-
+        # while-running gap), install a one-block placeholder. Also do it
+        # when the legacy content is itself just/mostly a subagent details
+        # placeholder; ResponseMessage prefers content_blocks, so this fixes
+        # stale done=false/id="" HTML after reload.
+        existing_content_for_check = (
+            message.get("content")
+            if isinstance(message.get("content"), str)
+            else ""
         )
-        if allow_append and tool_call_id not in existing_content:
-            placeholder_html = _subagent_placeholder_html(run)
-            update_data["content"] = (
-                f"{existing_content.rstrip()}\n{placeholder_html}".strip()
-            )
+        content_without_subagent_details = re.sub(
+            r'<details\b[^>]*type="subagent_launch"[^>]*>[\s\S]*?</details>',
+            "",
+            existing_content_for_check,
+            flags=re.I,
+        ).strip()
+        if not existing_content_for_check.strip() or not content_without_subagent_details:
+            update_data["content_blocks"] = [placeholder_block]
 
-        if update_data:
-            Chats.upsert_message_to_chat_by_id_and_message_id(
-                parent_chat_id, parent_message_id, update_data, return_model=False
-            )
-    except Exception as e:  # noqa: BLE001
-        log.debug(f"failed to sync parent subagent placeholder: {e}")
+    existing_content = (
+        message.get("content") if isinstance(message.get("content"), str) else ""
+    )
+    if allow_append and tool_call_id not in existing_content:
+        placeholder_html = _subagent_placeholder_html(run)
+        update_data["content"] = (
+            f"{existing_content.rstrip()}\n{placeholder_html}".strip()
+        )
 
 
-def _upsert_subagent_run(
+async def _upsert_subagent_run(
     parent_chat_id: str,
     parent_message_id: str,
     subagent_id: str,
@@ -755,51 +735,88 @@ def _upsert_subagent_run(
     *,
     sync_placeholder: bool = True,
     allow_placeholder_append: bool = True,
-) -> None:
+    reserve: Optional[dict] = None,
+) -> Optional[dict]:
     """Merge ``patch`` into ``parent_message.subagent_runs[subagent_id]``,
-    preserving other keys and sibling subagents. Idempotent — safe to call
-    multiple times. Skips silently if either id is missing or the chat row is
-    a temp/local chat (those never persist)."""
+    preserving other keys and sibling subagents, and (when ``sync_placeholder``)
+    keep the parent message's placeholder block/content in sync — all in ONE
+    atomic, per-message-serialized read-modify-write.
+
+    Concurrency: parallel subagent fan-out branches all write to the SAME parent
+    assistant message. ``Chats.update_message_fields_atomic`` runs this merge
+    under a per-(chat, message) async lock and re-reads the live map inside that
+    lock, so a sibling can never clobber another's entry, timestamps, or the
+    parent's freshly-streamed ``content_blocks``. Returns the merged run dict
+    (so the launch path can read the atomically-assigned ``num``/``name``), or
+    ``None`` on skip/failure.
+
+    ``reserve`` (launch only): ``{"desired_name": str, "other_runs": dict}`` —
+    when this call creates a BRAND-NEW entry, assign ``num`` + a
+    collision-disambiguated ``name`` from the fresh run map under the lock so
+    concurrent launches don't all land on the same number/name. Idempotent —
+    safe to call multiple times. Skips silently for missing ids / local chats.
+    """
     if not parent_chat_id or not parent_message_id or not subagent_id:
         log.warning(
             "_upsert_subagent_run SKIP: missing id(s) — "
             f"chat={parent_chat_id!r} msg={parent_message_id!r} sa={subagent_id!r}"
         )
-        return
+        return None
     if parent_chat_id.startswith("local:"):
-        return
-    try:
-        existing_message = (
-            Chats.get_message_by_id_and_message_id(parent_chat_id, parent_message_id)
-            or {}
-        )
-        existing_runs = existing_message.get("subagent_runs") or {}
-        if not isinstance(existing_runs, dict):
-            existing_runs = {}
-        prior = existing_runs.get(subagent_id) or {}
-        if not isinstance(prior, dict):
-            prior = {}
-        merged_run = {**prior, **patch}
-        new_runs = {**existing_runs, subagent_id: merged_run}
-        log.info(
-            f"_upsert_subagent_run: chat={parent_chat_id} msg={parent_message_id} "
-            f"sa={subagent_id} status={patch.get('status')} runs_count={len(new_runs)}"
-        )
-        Chats.upsert_message_to_chat_by_id_and_message_id(
-            parent_chat_id, parent_message_id, {"subagent_runs": new_runs}, return_model=False
-        )
+        return None
+
+    holder: dict = {}
+
+    def _mutator(existing: dict) -> Optional[dict]:
+        existing_runs = existing.get("subagent_runs")
+        existing_runs = dict(existing_runs) if isinstance(existing_runs, dict) else {}
+        prior = existing_runs.get(subagent_id)
+        prior = prior if isinstance(prior, dict) else {}
+
+        effective_patch = dict(patch)
+        # Atomic slot reservation: only for a brand-new launch entry. Computed
+        # from the FRESH run map under the write lock so parallel launches each
+        # see prior siblings' reservations and never collide.
+        if reserve is not None and not prior:
+            other_runs = reserve.get("other_runs") or {}
+            combined = {**other_runs, **existing_runs}
+            final_name, was_renamed = _disambiguate_name(
+                reserve.get("desired_name") or "", combined
+            )
+            launch_count = sum(
+                1
+                for r in combined.values()
+                if isinstance(r, dict) and not r.get("continuation")
+            )
+            effective_patch["name"] = final_name
+            effective_patch["num"] = launch_count + 1
+            holder["was_renamed"] = was_renamed
+
+        merged_run = {**prior, **effective_patch}
+        existing_runs[subagent_id] = merged_run
+        holder["merged"] = merged_run
+
+        update_data: dict = {"subagent_runs": existing_runs}
         if sync_placeholder:
-            _sync_parent_subagent_placeholder(
-                parent_chat_id,
-                parent_message_id,
+            _apply_subagent_placeholder_patch(
+                existing,
                 merged_run,
+                update_data,
                 allow_append=allow_placeholder_append,
             )
+        return update_data
+
+    try:
+        await Chats.update_message_fields_atomic(
+            parent_chat_id, parent_message_id, _mutator
+        )
     except Exception as e:  # noqa: BLE001
         log.warning(
             f"failed to upsert subagent_run {subagent_id} on "
             f"{parent_chat_id}/{parent_message_id}: {e}"
         )
+        return None
+    return holder.get("merged")
 
 
 async def _emit_subagent_cancel(
@@ -812,7 +829,7 @@ async def _emit_subagent_cancel(
 ) -> None:
     """Best-effort live cancellation update for a parent-visible subagent row.
 
-    Under v2 we route through ``emit_to_primary`` so the envelope is delivered
+    Under v2.1 we route through ``emit_to_primary`` so the envelope is delivered
     to the elected primary session only (and gets per-tick batched alongside
     other ``chat:subagent:update`` events). Under v1 we fall back to the
     direct parent_event_emitter fan-out so existing behavior is preserved."""
@@ -825,7 +842,7 @@ async def _emit_subagent_cancel(
         },
     }
     if (
-        STREAM_PROTOCOL_VERSION == "v2"
+        STREAM_PROTOCOL_VERSION == "v2.1"
         and user_id
     ):
         envelope = {
@@ -846,7 +863,65 @@ async def _emit_subagent_cancel(
         log.debug(f"subagent cancel emit failed: {e}")
 
 
-def _build_forwarding_emitter(
+async def _emit_subagent_terminal(
+    parent_event_emitter: Optional[Callable[[dict], Awaitable[None]]],
+    subagent_meta: dict,
+    *,
+    status: str,
+    message: Optional[str] = None,
+    user_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
+) -> None:
+    """Push a TERMINAL state to the parent live card for a failure/stop that did
+    NOT originate from the inner pipeline's own error emission.
+
+    The forwarding emitter only relays events the inner ``process_chat_response``
+    actually emits. When a subagent dies via a path that emits no inner terminal
+    event — the empty-final-text ``RuntimeError``, a ``SubagentTimeoutError``, a
+    model-resolution crash, a blocked/failed rerun — the parent card's
+    ``live:true`` store entry would otherwise spin "Researching…" forever until
+    reload. This synthesizes the inner terminal event the client's
+    ``mergeSubagentPendingIntoRun`` already knows how to fold in
+    (``chat:message:error`` / ``chat:tasks:cancel``), so the card resolves live.
+    Routing mirrors ``_emit_subagent_cancel``.
+    """
+    if status == "cancelled":
+        inner_event: dict = {"type": "chat:tasks:cancel"}
+    elif status == "error":
+        inner_event = {
+            "type": "chat:message:error",
+            "data": {"error": message or "Subagent failed."},
+        }
+    else:
+        return
+    payload_data = {
+        "type": "chat:subagent:update",
+        "data": {
+            **subagent_meta,
+            "inner_event": inner_event,
+        },
+    }
+    if STREAM_PROTOCOL_VERSION == "v2.1" and user_id:
+        envelope = {
+            "chat_id": parent_chat_id,
+            "message_id": parent_message_id,
+            "data": payload_data,
+        }
+        try:
+            await emit_to_primary(user_id, envelope)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"subagent terminal emit_to_primary failed; falling back: {e}")
+    if parent_event_emitter is None:
+        return
+    try:
+        await parent_event_emitter(payload_data)
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"subagent terminal emit failed: {e}")
+
+
+async def _build_forwarding_emitter(
     subagent_socket_info: dict,
     parent_event_emitter: Callable[[dict], Awaitable[None]],
     subagent_meta: dict,
@@ -864,7 +939,7 @@ def _build_forwarding_emitter(
     invalidation. We coalesce non-terminal parent updates to 2Hz per subagent
     and always flush terminal/error/cancel events immediately.
 
-    ``force_fanout`` makes parent-facing updates bypass the v2 stream-scoped
+    ``force_fanout`` makes parent-facing updates bypass the v2.1 stream-scoped
     ``emit_to_primary`` path and fan out to every one of the user's sessions
     directly. Reruns set this because they run detached from any parent stream,
     where stream-room/primary-election routing is unreliable (see _emit_parent).
@@ -897,9 +972,9 @@ def _build_forwarding_emitter(
     }
     FORWARD_FLUSH_INTERVAL_SECONDS = 0.5
 
-    v2_enabled = STREAM_PROTOCOL_VERSION == "v2"
+    v21_enabled = STREAM_PROTOCOL_VERSION == "v2.1"
     inner_message_id = subagent_socket_info.get("message_id") if isinstance(subagent_socket_info, dict) else None
-    # User/parent identifiers for the primary-only emit path (v2). The
+    # User/parent identifiers for the primary-only emit path (v2.1). The
     # parent_event_emitter path remains as a fallback so any failure in the
     # primary emit (or v1 mode) still reaches sibling sessions via fan-out.
     user_id_for_primary = (
@@ -912,12 +987,12 @@ def _build_forwarding_emitter(
     session_id_for_primary = (
         subagent_socket_info.get("session_id") if isinstance(subagent_socket_info, dict) else None
     )
-    # Per-subagent mirror — independent of the parent's v2 mirror. Tracks the
+    # Per-subagent mirror — independent of the parent's v2.1 mirror. Tracks the
     # slim (results-stripped) block shape so we can diff fresh content_blocks
     # into compact chat:delta ops, and remembers which tool_call_ids have
     # already been shipped as tool_call:result inner events.
-    v2_mirror: dict = {"blocks": [], "tool_results_sent": set()}
-    if v2_enabled and inner_message_id:
+    v21_mirror: dict = {"blocks": [], "tool_results_sent": set()}
+    if v21_enabled and inner_message_id:
         stream_version_init(
             inner_message_id,
             chat_id=subagent_socket_info.get("chat_id") if isinstance(subagent_socket_info, dict) else None,
@@ -940,7 +1015,7 @@ def _build_forwarding_emitter(
         )
 
     async def _emit_parent(inner_event: dict) -> None:
-        parent_inner_event = _slim_inner_event_for_parent(inner_event)
+        parent_inner_event = await _slim_inner_event_for_parent(inner_event)
         payload_data = {
             "type": "chat:subagent:update",
             "data": {
@@ -948,7 +1023,7 @@ def _build_forwarding_emitter(
                 "inner_event": parent_inner_event,
             },
         }
-        # Under v2 ship via emit_to_primary so the envelope goes to the
+        # Under v2.1 ship via emit_to_primary so the envelope goes to the
         # elected primary session only (and joins the per-tick batch with
         # chat:delta / tool_call:result emits). Sibling tabs receive the
         # event via the primary tab's BroadcastChannel relay. Under v1 we
@@ -956,7 +1031,7 @@ def _build_forwarding_emitter(
         # its own copy directly from the server.
         #
         # EXCEPTION — reruns (force_fanout): a redo runs as a DETACHED
-        # background task with no active parent generation. The v2
+        # background task with no active parent generation. The v2.1
         # emit_to_primary path is stream-scoped: it targets stream-room
         # subscribers + the elected primary session. During a real parent
         # stream the visible tab is provably in that room, but for a detached
@@ -966,7 +1041,7 @@ def _build_forwarding_emitter(
         # up". Fan out directly to every one of the user's sessions instead;
         # the per-token-fanout cost emit_to_primary exists to avoid is
         # irrelevant for a single rerun.
-        if v2_enabled and user_id_for_primary and not force_fanout:
+        if v21_enabled and user_id_for_primary and not force_fanout:
             envelope = {
                 "chat_id": parent_chat_id_for_primary,
                 "message_id": parent_message_id_for_primary,
@@ -992,7 +1067,7 @@ def _build_forwarding_emitter(
         # parent UI's chat:subagent:update handler routes it correctly.
         await _emit_parent(inner_event)
 
-    async def _emit_v2_deltas_for_completion(completion_event: dict) -> None:
+    async def _emit_v21_deltas_for_completion(completion_event: dict) -> None:
         """Translate a coalesced `chat:completion` (with full content_blocks)
         into compact `chat:delta` inner events, plus separate `tool_call:result`
         inner events for any newly-finished tool calls. Mirrors B9's wrapper
@@ -1014,9 +1089,9 @@ def _build_forwarding_emitter(
                     if not isinstance(r, dict):
                         continue
                     tc_id = r.get("tool_call_id")
-                    if not tc_id or tc_id in v2_mirror["tool_results_sent"]:
+                    if not tc_id or tc_id in v21_mirror["tool_results_sent"]:
                         continue
-                    v2_mirror["tool_results_sent"].add(tc_id)
+                    v21_mirror["tool_results_sent"].add(tc_id)
                     payload = {
                         "message_id": inner_message_id,
                         "tool_call_id": tc_id,
@@ -1057,7 +1132,7 @@ def _build_forwarding_emitter(
                 },
             )
             awaitables = _emit_delta_for_blocks(
-                _emit_parent_raw, inner_message_id, v2_mirror, content_blocks
+                _emit_parent_raw, inner_message_id, v21_mirror, content_blocks
             )
             # Preserve order for dependent block_open/text_append ops.
             for awaitable in awaitables:
@@ -1115,8 +1190,8 @@ def _build_forwarding_emitter(
         if status_event is not None:
             await _emit_parent(status_event)
         if completion_event is not None:
-            if v2_enabled:
-                await _emit_v2_deltas_for_completion(completion_event)
+            if v21_enabled:
+                await _emit_v21_deltas_for_completion(completion_event)
             else:
                 await _emit_parent(completion_event)
 
@@ -1185,9 +1260,9 @@ def _build_forwarding_emitter(
             # keeps final state immediate while preserving the latest content
             # seen before an error/cancel.
             await _flush_pending()
-            if v2_enabled and etype == "chat:completion":
+            if v21_enabled and etype == "chat:completion":
                 # Translate terminal completion into deltas + chat:done.
-                await _emit_v2_deltas_for_completion(event)
+                await _emit_v21_deltas_for_completion(event)
             else:
                 # Error/cancel pass through as-is; the parent UI handles them
                 # via the existing terminal-event branch (mergeSubagentPendingIntoRun).
@@ -1199,7 +1274,7 @@ def _build_forwarding_emitter(
     return forwarding_emitter
 
 
-def _append_history_for_inner_run(
+async def _append_history_for_inner_run(
     subagent_chat_id: str, prompt: str, user_msg_id: str, assistant_msg_id: str, model_id: str
 ) -> None:
     """Append a new user message and a blank assistant message to the
@@ -1208,7 +1283,7 @@ def _append_history_for_inner_run(
 
     Writes directly via ``update_chat_by_id`` so the two messages land in a
     single row update — atomic w.r.t. the next save."""
-    chat = Chats.get_chat_by_id(subagent_chat_id)
+    chat = await Chats.get_chat_by_id(subagent_chat_id)
     if not chat:
         raise RuntimeError(f"subagent chat {subagent_chat_id} not found")
     chat_data = chat.chat or {}
@@ -1248,10 +1323,10 @@ def _append_history_for_inner_run(
     history["messages"] = messages
     history["currentId"] = assistant_msg_id
     chat_data["history"] = history
-    Chats.update_chat_by_id(subagent_chat_id, chat_data)
+    await Chats.update_chat_by_id(subagent_chat_id, chat_data)
 
 
-def _load_inner_api_messages(
+async def _load_inner_api_messages(
     subagent_chat_id: str, up_to_message_id: str, system_prompt: str
 ) -> list[dict]:
     """Build the API-shaped message list for the inner run.
@@ -1260,7 +1335,7 @@ def _load_inner_api_messages(
     chat history converted via ``blocks_to_api_messages``. The trailing blank
     assistant message is dropped automatically by ``blocks_to_api_messages``
     (it has no content / tool_calls / reasoning to emit)."""
-    chat = Chats.get_chat_by_id(subagent_chat_id)
+    chat = await Chats.get_chat_by_id(subagent_chat_id)
     if not chat:
         raise RuntimeError(f"subagent chat {subagent_chat_id} not found")
     messages_map = ((chat.chat or {}).get("history") or {}).get("messages") or {}
@@ -1273,14 +1348,14 @@ def _load_inner_api_messages(
     return api_messages
 
 
-def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
+async def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
     """Read the final assistant text from the subagent chat row.
 
     Prefers ``blocks_to_plain_text(content_blocks)`` (canonical, clean) over
     the legacy HTML ``content`` projection. Returns empty string if nothing
     is there — caller decides how to surface that."""
     msg = (
-        Chats.get_message_by_id_and_message_id(subagent_chat_id, assistant_msg_id)
+        await Chats.get_message_by_id_and_message_id(subagent_chat_id, assistant_msg_id)
         or {}
     )
     blocks = msg.get("content_blocks")
@@ -1314,6 +1389,25 @@ def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
                 text = blocks_to_plain_text([block]).strip()
                 if text:
                     return text
+        # No text anywhere, but the subagent DID work (tool calls / reasoning).
+        # Rather than return "" — which makes the caller wipe the whole hidden
+        # transcript and re-run from scratch (discarding that work and
+        # double-charging) — surface the trailing reasoning as the synthesis.
+        # The model's analysis is far more useful to the parent than an empty/
+        # error result, and it preserves the research instead of throwing it away.
+        last_reasoning: list[dict] = []
+        for block in reversed(blocks):
+            btype = block.get("type") if isinstance(block, dict) else None
+            if btype == "reasoning":
+                last_reasoning.insert(0, block)
+            elif btype == "tool_calls":
+                break
+            elif btype == "text":
+                continue
+        if last_reasoning:
+            text = blocks_to_plain_text(last_reasoning).strip()
+            if text:
+                return text
         # Truly nothing usable — return empty so the caller surfaces it.
         return ""
     content = msg.get("content")
@@ -1322,16 +1416,16 @@ def _extract_final_text(subagent_chat_id: str, assistant_msg_id: str) -> str:
     return ""
 
 
-def _reset_inner_history(subagent_chat_id: str) -> None:
+async def _reset_inner_history(subagent_chat_id: str) -> None:
     """Wipe the subagent chat's history back to empty. Used between the first
     failed attempt and the auto-retry so we send a clean slate the second
     time (otherwise the broken half of round-1 corrupts round-2)."""
-    chat = Chats.get_chat_by_id(subagent_chat_id)
+    chat = await Chats.get_chat_by_id(subagent_chat_id)
     if not chat:
         return
     chat_data = chat.chat or {}
     chat_data["history"] = {"messages": {}, "currentId": None}
-    Chats.update_chat_by_id(subagent_chat_id, chat_data)
+    await Chats.update_chat_by_id(subagent_chat_id, chat_data)
 
 
 # ---------------------------------------------------------------------------
@@ -1411,7 +1505,7 @@ async def _run_inner_chat(
         raise RuntimeError("subagent model has no id")
 
     # 1. Append the user prompt + blank assistant to the subagent chat history.
-    _append_history_for_inner_run(
+    await _append_history_for_inner_run(
         subagent_chat_id=subagent_chat_id,
         prompt=prompt,
         user_msg_id=user_msg_id,
@@ -1432,12 +1526,12 @@ async def _run_inner_chat(
         # the browser session token so this subagent drives its own browser tab.
         subagent_id=subagent_chat_id,
     )
-    system_prompt = _compose_subagent_system_prompt(
+    system_prompt = await _compose_subagent_system_prompt(
         request,
         subagent_model_id,
-        external_tools_prompt=_external_tools_prompt(request, inner_tool_ids),
+        external_tools_prompt=await _external_tools_prompt(request, inner_tool_ids),
     )
-    api_messages = _load_inner_api_messages(
+    api_messages = await _load_inner_api_messages(
         subagent_chat_id, assistant_msg_id, system_prompt
     )
 
@@ -1503,7 +1597,7 @@ async def _run_inner_chat(
         "message_id": assistant_msg_id,
     }
 
-    forwarding_emitter = _build_forwarding_emitter(
+    forwarding_emitter = await _build_forwarding_emitter(
         subagent_socket_info=subagent_socket_info,
         parent_event_emitter=parent_event_emitter,
         subagent_meta=subagent_meta,
@@ -1605,7 +1699,7 @@ async def _run_inner_chat(
                 )
 
     # 6. Read the final text out of the subagent chat row.
-    return _extract_final_text(subagent_chat_id, assistant_msg_id)
+    return await _extract_final_text(subagent_chat_id, assistant_msg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1675,7 +1769,7 @@ async def run_subagent_launch(
         )
         return "Subagent ERROR: tool was invoked without required runtime context"
 
-    user = Users.get_user_by_id(user_dict.get("id"))
+    user = await Users.get_user_by_id(user_dict.get("id"))
     if user is None:
         return "Subagent ERROR: user context unavailable"
 
@@ -1684,7 +1778,7 @@ async def run_subagent_launch(
     if not parent_chat_id or not parent_message_id:
         return "Subagent ERROR: parent chat context unavailable"
 
-    parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    parent_chat = await Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
     if parent_chat is None:
         return "Subagent ERROR: parent chat not accessible"
 
@@ -1693,10 +1787,26 @@ async def run_subagent_launch(
         f"chat={parent_chat_id} msg={parent_message_id}"
     )
 
-    # Disambiguate name + assign num.
+    # Provisional name/num for the subagent chat title (cosmetic). The
+    # AUTHORITATIVE num + collision-disambiguated name are assigned atomically
+    # under the parent-message write lock by the first `_upsert_subagent_run`
+    # below (via `reserve=`), so parallel launches in one fan-out never collide.
     all_runs = _gather_all_subagent_runs(parent_chat)
     final_name, was_renamed = _disambiguate_name((name or "").strip(), all_runs)
     num = len(all_runs) + 1
+    # Runs on OTHER parent messages (stable during this turn) — the reservation
+    # combines these with the live siblings on THIS message to number/name us.
+    _other_runs = {}
+    _pc_messages = (
+        ((parent_chat.chat if parent_chat else {}) or {}).get("history") or {}
+    ).get("messages") or {}
+    if isinstance(_pc_messages, dict):
+        for _mid, _msg in _pc_messages.items():
+            if _mid == parent_message_id or not isinstance(_msg, dict):
+                continue
+            _r = _msg.get("subagent_runs")
+            if isinstance(_r, dict):
+                _other_runs.update(_r)
 
     # Resolve subagent model.
     subagent_model_id = _resolve_subagent_model_id(request, parent_chat, parent_model)
@@ -1706,7 +1816,7 @@ async def run_subagent_launch(
 
     # Atomic create with subagent_of meta — never appears in main chat list.
     subagent_chat_title = f"{final_name} (subagent of {parent_chat.title})"
-    subagent_chat = Chats.import_chat(
+    subagent_chat = await Chats.import_chat(
         user.id,
         ChatImportForm(
             **{
@@ -1731,7 +1841,7 @@ async def run_subagent_launch(
     subagent_id = subagent_chat.id
     # Patch meta.subagent_id so the side fields all reference the row's id.
     try:
-        Chats.update_chat_by_id(
+        await Chats.update_chat_by_id(
             subagent_id,
             {
                 **(subagent_chat.chat or {}),
@@ -1759,17 +1869,6 @@ async def run_subagent_launch(
     if tool_call_id:
         request.state.subagent_id_by_tool_call[tool_call_id] = subagent_id
 
-    subagent_meta = {
-        "subagent_id": subagent_id,
-        "entry_key": subagent_id,
-        "num": num,
-        "name": final_name,
-        "parent_message_id": parent_message_id,
-        "tool_call_id": tool_call_id,
-        "chat_id": subagent_id,
-        "prompt": prompt,
-        "background": background,
-    }
     started_at = int(time.time())
     base_run_patch = {
         "subagent_id": subagent_id,
@@ -1780,8 +1879,16 @@ async def run_subagent_launch(
         "tool_call_id": tool_call_id,
         "prompt": prompt,
         "background": background,
+        # Carried on EVERY patch so a terminal write always re-asserts the start
+        # time — the timer ("Researched for 7m") needs both bounds, and this
+        # makes "Done" (no-duration) impossible for a run that actually ran.
+        "started_at": started_at,
     }
-    _upsert_subagent_run(
+    # First write reserves this subagent's slot: num + collision-disambiguated
+    # name are assigned ATOMICALLY from the live run map under the parent-message
+    # write lock, so parallel launches in one fan-out get distinct numbers/names
+    # instead of all computing "Subagent N" off the same stale snapshot.
+    merged_run = await _upsert_subagent_run(
         parent_chat_id,
         parent_message_id,
         subagent_id,
@@ -1790,7 +1897,30 @@ async def run_subagent_launch(
             "status": "running",
             "started_at": started_at,
         },
+        reserve={
+            "desired_name": (name or "").strip(),
+            "other_runs": _other_runs,
+        },
     )
+    if isinstance(merged_run, dict):
+        num = merged_run.get("num", num)
+        final_name = merged_run.get("name", final_name)
+        base_run_patch["num"] = num
+        base_run_patch["name"] = final_name
+    was_renamed = bool(final_name) and final_name != (name or "").strip()
+
+    subagent_meta = {
+        "subagent_id": subagent_id,
+        "entry_key": subagent_id,
+        "num": num,
+        "name": final_name,
+        "parent_message_id": parent_message_id,
+        "tool_call_id": tool_call_id,
+        "chat_id": subagent_id,
+        "prompt": prompt,
+        "background": background,
+        "started_at": started_at,
+    }
     try:
         await parent_event_emitter(
             {
@@ -1821,7 +1951,7 @@ async def run_subagent_launch(
         # inner chat crashes mid-run.
         user_msg_id = str(uuid4())
         assistant_msg_id = str(uuid4())
-        _upsert_subagent_run(
+        await _upsert_subagent_run(
             parent_chat_id,
             parent_message_id,
             subagent_id,
@@ -1851,7 +1981,7 @@ async def run_subagent_launch(
                 # it. (Empty tool result back to the parent is a bad UX —
                 # tells the parent model nothing.)
                 raise RuntimeError("subagent produced no final text")
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 subagent_id,
@@ -1888,7 +2018,7 @@ async def run_subagent_launch(
                 current_task is not None and current_task.cancelling()
             )
             if genuine_user_stop:
-                _upsert_subagent_run(
+                await _upsert_subagent_run(
                     parent_chat_id,
                     parent_message_id,
                     subagent_id,
@@ -1913,9 +2043,9 @@ async def run_subagent_launch(
                 "CancelledError (parent not stopping) — retrying as an error"
             )
             if attempt == 1:
-                _reset_inner_history(subagent_id)
+                await _reset_inner_history(subagent_id)
                 continue
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 subagent_id,
@@ -1925,6 +2055,15 @@ async def run_subagent_launch(
                     "ended_at": int(time.time()),
                     "error": {"message": last_error},
                 },
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=last_error,
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
             )
             return (
                 f"Subagent {num} ({final_name}) ERROR after retry: {last_error}"
@@ -1936,9 +2075,9 @@ async def run_subagent_launch(
             )
             if attempt == 1:
                 # Wipe the subagent history so the retry is a clean run.
-                _reset_inner_history(subagent_id)
+                await _reset_inner_history(subagent_id)
                 continue
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 subagent_id,
@@ -1948,6 +2087,15 @@ async def run_subagent_launch(
                     "ended_at": int(time.time()),
                     "error": {"message": last_error},
                 },
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=last_error or "unknown error",
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
             )
             return (
                 f"Subagent {num} ({final_name}) ERROR after retry: "
@@ -1972,7 +2120,7 @@ async def run_subagent_continue(
     if request is None or user_dict is None or parent_metadata is None or parent_event_emitter is None:
         return "Subagent ERROR: tool was invoked without required runtime context"
 
-    user = Users.get_user_by_id(user_dict.get("id"))
+    user = await Users.get_user_by_id(user_dict.get("id"))
     if user is None:
         return "Subagent ERROR: user context unavailable"
 
@@ -1981,7 +2129,7 @@ async def run_subagent_continue(
     if not parent_chat_id or not parent_message_id:
         return "Subagent ERROR: parent chat context unavailable"
 
-    parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    parent_chat = await Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
     if parent_chat is None:
         return "Subagent ERROR: parent chat not accessible"
 
@@ -2028,7 +2176,7 @@ async def run_subagent_continue(
     target_num = target_run.get("num") or 0
 
     # Load the subagent chat row.
-    subagent_chat = Chats.get_chat_by_id_and_user_id(target_id, user.id)
+    subagent_chat = await Chats.get_chat_by_id_and_user_id(target_id, user.id)
     if subagent_chat is None:
         return f"Subagent {target_num} ({target_name}) ERROR: subagent chat row missing"
 
@@ -2056,6 +2204,7 @@ async def run_subagent_continue(
     if tool_call_id:
         request.state.subagent_id_by_tool_call[tool_call_id] = target_id
 
+    started_at = int(time.time())
     subagent_meta = {
         "subagent_id": target_id,
         "num": target_num,
@@ -2064,8 +2213,8 @@ async def run_subagent_continue(
         "tool_call_id": tool_call_id,
         "chat_id": target_id,
         "continuation": True,
+        "started_at": started_at,
     }
-    started_at = int(time.time())
     # Continuations get their OWN entry under subagent_runs (keyed by
     # tool_call_id when we have one, else falling back to subagent_id with a
     # round suffix). This lets each tool call's collapsible block stay
@@ -2082,8 +2231,10 @@ async def run_subagent_continue(
         "tool_call_id": tool_call_id,
         "continuation": True,
         "prompt": prompt,
+        # See base_run_patch in run_subagent_launch — keep timing on every patch.
+        "started_at": started_at,
     }
-    _upsert_subagent_run(
+    await _upsert_subagent_run(
         parent_chat_id,
         parent_message_id,
         continue_entry_key,
@@ -2111,7 +2262,7 @@ async def run_subagent_continue(
     for attempt in (1, 2):
         user_msg_id = str(uuid4())
         assistant_msg_id = str(uuid4())
-        _upsert_subagent_run(
+        await _upsert_subagent_run(
             parent_chat_id,
             parent_message_id,
             continue_entry_key,
@@ -2138,7 +2289,7 @@ async def run_subagent_continue(
             )
             if not final_text:
                 raise RuntimeError("subagent produced no final text")
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 continue_entry_key,
@@ -2161,7 +2312,7 @@ async def run_subagent_continue(
             # "stopped" when the user never stopped it.
             current_task = asyncio.current_task()
             if current_task is not None and current_task.cancelling():
-                _upsert_subagent_run(
+                await _upsert_subagent_run(
                     parent_chat_id,
                     parent_message_id,
                     continue_entry_key,
@@ -2185,9 +2336,9 @@ async def run_subagent_continue(
                 "spurious CancelledError (parent not stopping) — retrying"
             )
             if attempt == 1:
-                _revert_subagent_history(target_id, user_msg_id, assistant_msg_id)
+                await _revert_subagent_history(target_id, user_msg_id, assistant_msg_id)
                 continue
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 continue_entry_key,
@@ -2197,6 +2348,15 @@ async def run_subagent_continue(
                     "ended_at": int(time.time()),
                     "error": {"message": last_error},
                 },
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=last_error,
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
             )
             return (
                 f"Subagent {target_num} ({target_name}) continue ERROR after "
@@ -2216,11 +2376,11 @@ async def run_subagent_continue(
                 # keeps the hidden transcript clean: no doubled/blank turns get
                 # buried mid-history, so a later "Redo last subagent turn" still
                 # reverts a single coherent pair.
-                _revert_subagent_history(
+                await _revert_subagent_history(
                     target_id, user_msg_id, assistant_msg_id
                 )
                 continue
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 parent_message_id,
                 continue_entry_key,
@@ -2230,6 +2390,15 @@ async def run_subagent_continue(
                     "ended_at": int(time.time()),
                     "error": {"message": last_error},
                 },
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=last_error or "unknown error",
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=parent_message_id,
             )
             return (
                 f"Subagent {target_num} ({target_name}) continue ERROR after retry: "
@@ -2244,7 +2413,7 @@ async def run_subagent_continue(
 # ---------------------------------------------------------------------------
 
 
-def _revert_subagent_history(
+async def _revert_subagent_history(
     subagent_chat_id: str, user_msg_id: str, assistant_msg_id: str
 ) -> None:
     """Remove a single ``user→assistant`` pair from the subagent chat's
@@ -2255,7 +2424,7 @@ def _revert_subagent_history(
     """
     if not subagent_chat_id or not user_msg_id:
         return
-    chat = Chats.get_chat_by_id(subagent_chat_id)
+    chat = await Chats.get_chat_by_id(subagent_chat_id)
     if not chat:
         return
     chat_data = chat.chat or {}
@@ -2283,30 +2452,54 @@ def _revert_subagent_history(
     history["messages"] = messages
     history["currentId"] = parent_id  # may be None if user_msg was the root
     chat_data["history"] = history
-    Chats.update_chat_by_id(subagent_chat_id, chat_data)
+    await Chats.update_chat_by_id(subagent_chat_id, chat_data)
 
 
 def _find_subagent_entry(
     parent_chat, entry_key: str
-) -> tuple[Optional[str], Optional[dict]]:
+) -> tuple[Optional[str], Optional[str], Optional[dict]]:
     """Locate ``subagent_runs[entry_key]`` somewhere in the parent chat's
-    message history. Returns ``(parent_message_id, entry_dict)`` or
-    ``(None, None)`` if not found. The caller passes a parent_message_id
-    hint but we tolerate it being wrong (e.g. the user reloaded between
-    pages and we lost track) — the entry_key is unique enough across the
-    whole chat to find it cleanly."""
+    message history. Returns ``(parent_message_id, canonical_key, entry_dict)``
+    or ``(None, None, None)`` if not found. The caller passes a
+    parent_message_id hint but we tolerate it being wrong (e.g. the user
+    reloaded between pages and we lost track) — the entry_key is unique enough
+    across the whole chat to find it cleanly.
+
+    The frontend derives the clicked ``entry_key`` as
+    ``run.entry_key || run.subagent_id || run.chat_id || run.tool_call_id``
+    (Chat.svelte / SubagentBlock.svelte), but the backend keys launches by
+    bare ``subagent_id`` and continuations by ``subagent_id#tool_call_id``.
+    So the value the frontend sends is NOT guaranteed to be the literal dict
+    key. After an exact-key miss we fall back to the same alias resolver the
+    placeholder-sync path uses (``subagent_id``/``chat_id``/``tool_call_id``
+    → canonical key, ambiguity-safe) so a valid rerun never spuriously
+    reports 'entry not found'. The returned ``canonical_key`` is ALWAYS the
+    real dict key (not the alias the caller passed) so downstream writes
+    (``write_entry_key``) land on the existing entry instead of forking a new
+    orphan key."""
     history_messages = (
         ((parent_chat.chat if parent_chat else {}) or {}).get("history") or {}
     ).get("messages") or {}
     if not isinstance(history_messages, dict):
-        return (None, None)
+        return (None, None, None)
     for msg_id, msg in history_messages.items():
         if not isinstance(msg, dict):
             continue
         runs = msg.get("subagent_runs")
         if isinstance(runs, dict) and entry_key in runs:
-            return (msg_id, runs[entry_key])
-    return (None, None)
+            return (msg_id, entry_key, runs[entry_key])
+    # Exact-key miss: try resolving the value as an alias (subagent_id /
+    # chat_id / tool_call_id) within each parent message's run map.
+    for msg_id, msg in history_messages.items():
+        if not isinstance(msg, dict):
+            continue
+        runs = msg.get("subagent_runs")
+        if not isinstance(runs, dict):
+            continue
+        canonical = _subagent_run_lookup_by_placeholder_id(msg).get(str(entry_key))
+        if canonical and canonical in runs:
+            return (msg_id, canonical, runs[canonical])
+    return (None, None, None)
 
 
 def _find_launch_entry_for_subagent(
@@ -2384,9 +2577,18 @@ def _resolve_subagent_rerun_context(
     if scope not in ("this_turn", "from_launch"):
         raise ValueError(f"invalid rerun scope: {scope}")
 
-    located_msg_id, target_entry = _find_subagent_entry(parent_chat, entry_key)
+    located_msg_id, canonical_key, target_entry = _find_subagent_entry(
+        parent_chat, entry_key
+    )
     if target_entry is None:
         raise ValueError(f"subagent run entry '{entry_key}' not found")
+    # Normalize to the real dict key. The frontend may have clicked with an
+    # alias (tool_call_id / subagent_id) that is not the literal map key; the
+    # ``this_turn`` path writes to ``write_entry_key = entry_key``, so using
+    # the alias would fork a new orphan entry instead of updating the existing
+    # one.
+    if canonical_key:
+        entry_key = canonical_key
     if located_msg_id and located_msg_id != parent_message_id:
         parent_message_id = located_msg_id
 
@@ -2878,20 +3080,33 @@ def _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx: dict) -> N
         _validate_subagent_turn_is_latest(subagent_chat, write_entry)
 
 
-def validate_subagent_rerun_allowed(
+async def validate_subagent_rerun_allowed(
     *, user, parent_chat_id: str, parent_message_id: str, entry_key: str, scope: str
 ) -> None:
     """Public preflight used by the HTTP router before it creates the rerun
     background task. ``rerun_subagent_turn`` calls the same validation again
     immediately before mutating state so races are still caught.
     """
-    parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    parent_chat = await Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
     if parent_chat is None:
         raise ValueError("parent chat not accessible")
     ctx = _resolve_subagent_rerun_context(
         parent_chat, parent_message_id, entry_key, scope
     )
-    subagent_chat = Chats.get_chat_by_id_and_user_id(ctx["subagent_id"], user.id)
+    # Reject a redo of an entry that is already mid-run (a second tab, or a redo
+    # fired before the first finished) so two reruns can't interleave on the
+    # same hidden chat and corrupt its history.
+    write_entry = ctx.get("write_entry") or ctx.get("target_entry") or {}
+    if (
+        isinstance(write_entry, dict)
+        and write_entry.get("status") == "running"
+        and not write_entry.get("ended_at")
+    ):
+        _rerun_blocked(
+            "This subagent is already running — wait for it to finish before redoing.",
+            code="subagent_already_running",
+        )
+    subagent_chat = await Chats.get_chat_by_id_and_user_id(ctx["subagent_id"], user.id)
     if subagent_chat is None:
         raise ValueError("subagent chat not accessible")
     _validate_subagent_rerun_context(parent_chat, subagent_chat, ctx)
@@ -2929,7 +3144,7 @@ async def rerun_subagent_turn(
     if scope not in ("this_turn", "from_launch"):
         raise ValueError(f"invalid rerun scope: {scope}")
 
-    parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    parent_chat = await Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
     if parent_chat is None:
         raise ValueError("parent chat not accessible")
 
@@ -2947,7 +3162,7 @@ async def rerun_subagent_turn(
     write_entry = ctx["write_entry"]
     inner_prompt = ctx["inner_prompt"]
 
-    subagent_chat = Chats.get_chat_by_id_and_user_id(subagent_id, user.id)
+    subagent_chat = await Chats.get_chat_by_id_and_user_id(subagent_id, user.id)
     if subagent_chat is None:
         raise ValueError("subagent chat not accessible")
 
@@ -2958,7 +3173,7 @@ async def rerun_subagent_turn(
         # guard above proved that the launch entry is still the latest
         # unresolved parent result AND the current leaf of the hidden subagent
         # chat (i.e. no continuation depends on it).
-        _reset_inner_history(subagent_id)
+        await _reset_inner_history(subagent_id)
 
         # Mark every OTHER entry (continues) for this subagent as stale so
         # the UI can show them differently. In the common safe path there are
@@ -2975,7 +3190,7 @@ async def rerun_subagent_turn(
                     and run.get("subagent_id") == subagent_id
                     and k != write_entry_key
                 ):
-                    _upsert_subagent_run(
+                    await _upsert_subagent_run(
                         parent_chat_id,
                         m_id,
                         k,
@@ -2989,7 +3204,7 @@ async def rerun_subagent_turn(
         prior_user_id = target_entry.get("user_msg_id")
         prior_assistant_id = target_entry.get("assistant_msg_id")
         if prior_user_id:
-            _revert_subagent_history(
+            await _revert_subagent_history(
                 subagent_id, prior_user_id, prior_assistant_id or ""
             )
 
@@ -3025,17 +3240,21 @@ async def rerun_subagent_turn(
         "timezone": None,
     }
 
+    rerun_started_at = int(time.time())
+    # Build from the write entry but DROP None values so a missing launch entry
+    # (e.g. clicked from a continuation whose launch was lost) can't overwrite
+    # good prior num/name/prompt with None on the merge.
     rerun_base_run_patch = {
         "subagent_id": subagent_id,
         "entry_key": write_entry_key,
-        "num": (write_entry or {}).get("num"),
-        "name": (write_entry or {}).get("name"),
         "chat_id": subagent_id,
-        "tool_call_id": (write_entry or {}).get("tool_call_id"),
-        "prompt": (write_entry or {}).get("prompt"),
-        "background": (write_entry or {}).get("background"),
         "continuation": bool((write_entry or {}).get("continuation")),
+        "started_at": rerun_started_at,
     }
+    for _k in ("num", "name", "tool_call_id", "prompt", "background"):
+        _v = (write_entry or {}).get(_k)
+        if _v is not None:
+            rerun_base_run_patch[_k] = _v
     subagent_meta = {
         **rerun_base_run_patch,
         "parent_message_id": write_msg_id,
@@ -3043,8 +3262,8 @@ async def rerun_subagent_turn(
     if not rerun_base_run_patch.get("continuation"):
         subagent_meta.pop("continuation", None)
 
-    def assert_parent_result_still_unconsumed() -> None:
-        refreshed_parent_chat = Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
+    async def assert_parent_result_still_unconsumed() -> None:
+        refreshed_parent_chat = await Chats.get_chat_by_id_and_user_id(parent_chat_id, user.id)
         if refreshed_parent_chat is None:
             _rerun_blocked("Cannot finish subagent redo: parent chat is no longer accessible.")
         _validate_parent_subagent_result_unconsumed(
@@ -3052,15 +3271,16 @@ async def rerun_subagent_turn(
         )
 
     # Flip the entry back to running + clear the prior final_text so the
-    # UI's auto-expand-while-running kicks in.
-    _upsert_subagent_run(
+    # UI's auto-expand-while-running kicks in. started_at is the FRESH rerun
+    # start (carried on subagent_meta too) so other tabs time the rerun, not
+    # the original launch.
+    await _upsert_subagent_run(
         parent_chat_id,
         write_msg_id,
         write_entry_key,
         {
             **rerun_base_run_patch,
             "status": "running",
-            "started_at": int(time.time()),
             "ended_at": None,
             "final_text": None,
             "error": None,
@@ -3083,7 +3303,7 @@ async def rerun_subagent_turn(
     for attempt in (1, 2):
         user_msg_id = str(uuid4())
         assistant_msg_id = str(uuid4())
-        _upsert_subagent_run(
+        await _upsert_subagent_run(
             parent_chat_id,
             write_msg_id,
             write_entry_key,
@@ -3095,7 +3315,7 @@ async def rerun_subagent_turn(
             allow_placeholder_append=False,
         )
         try:
-            final_text = await _run_inner_chat(
+            final_text = await _run_inner_chat_guarded(
                 request=request,
                 user=user,
                 subagent_model=subagent_model,
@@ -3112,8 +3332,8 @@ async def rerun_subagent_turn(
             )
             if not final_text:
                 raise RuntimeError("subagent produced no final text")
-            assert_parent_result_still_unconsumed()
-            _upsert_subagent_run(
+            await assert_parent_result_still_unconsumed()
+            await _upsert_subagent_run(
                 parent_chat_id,
                 write_msg_id,
                 write_entry_key,
@@ -3127,8 +3347,8 @@ async def rerun_subagent_turn(
             )
             return
         except asyncio.CancelledError:
-            assert_parent_result_still_unconsumed()
-            _upsert_subagent_run(
+            await assert_parent_result_still_unconsumed()
+            await _upsert_subagent_run(
                 parent_chat_id,
                 write_msg_id,
                 write_entry_key,
@@ -3147,10 +3367,34 @@ async def rerun_subagent_turn(
                 parent_message_id=write_msg_id,
             )
             raise
-        except SubagentRerunBlockedError:
+        except SubagentRerunBlockedError as blocked:
+            # Blocked AFTER the optimistic flip to running (a concurrent parent
+            # edit landed between preflight and here). Resolve the card to error
+            # so it doesn't spin forever; the router also toasts the reason.
+            await _upsert_subagent_run(
+                parent_chat_id,
+                write_msg_id,
+                write_entry_key,
+                {
+                    **rerun_base_run_patch,
+                    "status": "error",
+                    "ended_at": int(time.time()),
+                    "error": {"message": str(blocked)},
+                },
+                allow_placeholder_append=False,
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=str(blocked),
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=write_msg_id,
+            )
             raise
         except Exception as e:  # noqa: BLE001
-            assert_parent_result_still_unconsumed()
+            await assert_parent_result_still_unconsumed()
             last_error = str(e)
             log.exception(f"subagent rerun attempt {attempt}/2 failed: {e}")
             if attempt == 1:
@@ -3162,13 +3406,13 @@ async def rerun_subagent_turn(
                 # turns — prior research is preserved and the transcript stays
                 # clean for any subsequent redo.
                 if scope == "from_launch":
-                    _reset_inner_history(subagent_id)
+                    await _reset_inner_history(subagent_id)
                 else:
-                    _revert_subagent_history(
+                    await _revert_subagent_history(
                         subagent_id, user_msg_id, assistant_msg_id
                     )
                 continue
-            _upsert_subagent_run(
+            await _upsert_subagent_run(
                 parent_chat_id,
                 write_msg_id,
                 write_entry_key,
@@ -3179,5 +3423,14 @@ async def rerun_subagent_turn(
                     "error": {"message": last_error},
                 },
                 allow_placeholder_append=False,
+            )
+            await _emit_subagent_terminal(
+                parent_event_emitter,
+                subagent_meta,
+                status="error",
+                message=last_error or "unknown error",
+                user_id=user.id,
+                parent_chat_id=parent_chat_id,
+                parent_message_id=write_msg_id,
             )
             return

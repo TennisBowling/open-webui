@@ -138,14 +138,14 @@ async def rerun_subagent(
     # silently swallow auth/lookup errors inside the background task.
     from open_webui.models.chats import Chats
 
-    parent_chat = Chats.get_chat_by_id_and_user_id(
+    parent_chat = await Chats.get_chat_by_id_and_user_id(
         form_data.parent_chat_id, user.id
     )
     if parent_chat is None:
         raise HTTPException(status_code=404, detail="Parent chat not found")
 
     try:
-        validate_subagent_rerun_allowed(
+        await validate_subagent_rerun_allowed(
             user=user,
             parent_chat_id=form_data.parent_chat_id,
             parent_message_id=form_data.parent_message_id,
@@ -191,9 +191,13 @@ async def rerun_subagent(
         except Exception as e:
             log.exception(f"subagent rerun task failed: {e}")
 
+    # Register under a DISTINCT task id (not the parent chat id) so the chat's
+    # global Stop button / a parent-generation cancel can't tear down an
+    # independent redo the user kicked off. Keyed by the entry so a future
+    # targeted "stop this redo" can find it.
     task_id, _ = await create_task(
         request.app.state.redis,
         _run(),
-        id=form_data.parent_chat_id,
+        id=f"subagent-rerun:{form_data.parent_chat_id}:{form_data.entry_key}",
     )
     return {"status": True, "task_id": task_id}

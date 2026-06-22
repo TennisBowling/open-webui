@@ -38,12 +38,7 @@ current_tool_call_id_var: ContextVar[Optional[str]] = ContextVar(
 
 
 def _merge_streamed_string(existing: str | None, chunk: str | None) -> str:
-    """Merge provider tool-call string deltas defensively.
-
-    OpenAI-style streams usually send true deltas, but some compatible
-    providers resend cumulative/full fields (notably function.name). Blind
-    append turns `web_search` + `web_search` into `web_searchweb_search`.
-    """
+    """Merge streamed reasoning metadata that may resend cumulative text."""
     if not chunk:
         return existing or ""
     existing = existing or ""
@@ -60,6 +55,26 @@ def _merge_streamed_string(existing: str | None, chunk: str | None) -> str:
     for overlap in range(max_overlap, 0, -1):
         if existing.endswith(chunk[:overlap]):
             return existing + chunk[overlap:]
+    return existing + chunk
+
+
+def _merge_streamed_tool_call_field(existing: str | None, chunk: str | None) -> str:
+    """Merge streamed tool-call name/argument fragments without overlap loss.
+
+    ``function.arguments`` is an executable JSON string. True streaming deltas
+    must append byte-for-byte; suffix-overlap dedupe corrupts repeated text like
+    ``https://``, ``rooms``, ``<<``, and long runs. The only compatibility case
+    handled here is a provider resending a cumulative full prefix.
+    """
+    if not chunk:
+        return existing or ""
+    existing = existing or ""
+    if not existing:
+        return chunk
+    if chunk == existing:
+        return existing
+    if chunk.startswith(existing):
+        return chunk
     return existing + chunk
 
 
@@ -214,11 +229,11 @@ DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
 # ---------------------------------------------------------------------------
-# Stream v2 delta translator
+# Stream v2.1 delta translator
 # ---------------------------------------------------------------------------
 #
 # The v1 emitter ships the entire `content_blocks` array on every flush (O(N²)
-# bytes per turn). v2 ships only what changed since the last emit. To avoid
+# bytes per turn). v2.1 ships only what changed since the last emit. To avoid
 # rewriting the 1300-line stream loop, we install a translator that diffs the
 # incoming content_blocks against a per-message mirror and emits the matching
 # `chat:delta` ops. Anything not a content_blocks-bearing `chat:completion`
@@ -440,7 +455,7 @@ def _emit_delta_for_blocks(
     return awaitables
 
 
-def _wrap_event_emitter_v2(inner_emitter, metadata):
+async def _wrap_event_emitter_v21(inner_emitter, metadata):
     """Returns an async event_emitter that translates `chat:completion` flushes
     into compact `chat:delta` ops, leaves non-streaming events untouched, and
     funnels stream events to the user's primary session only (B8 election)."""
@@ -457,7 +472,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
         # Send a fully-formed `events` envelope to the primary session only.
         # Fallback: if no primary registered, fan to all (handled inside
         # emit_to_primary). DB persistence is already handled by the inner
-        # emitter for v1-shaped payloads; v2 deltas are not persisted on a
+        # emitter for v1-shaped payloads; v2.1 deltas are not persisted on a
         # per-emit basis (the per-chunk upsert at the call site covers the
         # canonical content).
         if not user_id:
@@ -471,7 +486,7 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
         }
         await emit_to_primary(user_id, envelope)
 
-    async def __v2_emitter__(event_data):
+    async def __v21_emitter__(event_data):
         etype = (event_data or {}).get("type")
 
         # Pass-through events: anything not `chat:completion` flows through
@@ -592,13 +607,13 @@ def _wrap_event_emitter_v2(inner_emitter, metadata):
 
     # Expose the mirror so the outer pipeline can emit tool_call:result events
     # and the final chat:done envelope coherently.
-    __v2_emitter__._v2_mirror = mirror  # type: ignore[attr-defined]
-    __v2_emitter__._inner = inner_emitter  # type: ignore[attr-defined]
-    __v2_emitter__._emit_raw_primary = _emit_raw_primary  # type: ignore[attr-defined]
-    return __v2_emitter__
+    __v21_emitter__._v21_mirror = mirror  # type: ignore[attr-defined]
+    __v21_emitter__._inner = inner_emitter  # type: ignore[attr-defined]
+    __v21_emitter__._emit_raw_primary = _emit_raw_primary  # type: ignore[attr-defined]
+    return __v21_emitter__
 
 
-def process_tool_result(
+async def process_tool_result(
     request,
     tool_function_name,
     tool_result,
@@ -1339,7 +1354,7 @@ async def chat_image_generation_handler(
     return form_data
 
 
-def apply_params_to_form_data(form_data, model):
+async def apply_params_to_form_data(form_data, model):
     params = form_data.pop("params", {})
     custom_params = params.pop("custom_params", {})
 
@@ -1410,7 +1425,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
 
-    form_data = apply_params_to_form_data(form_data, model)
+    form_data = await apply_params_to_form_data(form_data, model)
 
     # Ensure stream_options.include_usage is enabled for token usage tracking
     if form_data.get("stream", False):
@@ -1475,7 +1490,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Check if the request has chat_id and is inside of a folder
     chat_id = metadata.get("chat_id", None)
     if chat_id and user:
-        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
         if chat and chat.folder_id:
             folder = Folders.get_folder_by_id_and_user_id(chat.folder_id, user.id)
 
@@ -1499,8 +1514,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     try:
         filter_functions = [
-            Functions.get_function_by_id(filter_id)
-            for filter_id in get_sorted_filter_ids(
+            await Functions.get_function_by_id(filter_id)
+            for filter_id in await get_sorted_filter_ids(
                 request, model, metadata.get("filter_ids", [])
             )
         ]
@@ -1856,7 +1871,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     return form_data, metadata, events
 
 
-def _get_token_usage_chat_id(metadata: dict | None):
+async def _get_token_usage_chat_id(metadata: dict | None):
     """Chat id to use for conversation-level token analytics.
 
     Hidden subagent chats should not get separate conversation_token_usage rows;
@@ -1878,7 +1893,7 @@ async def process_chat_response(
         messages = []
 
         if "chat_id" in metadata and not metadata["chat_id"].startswith("local:"):
-            messages_map = Chats.get_messages_map_by_chat_id(metadata["chat_id"])
+            messages_map = await Chats.get_messages_map_by_chat_id(metadata["chat_id"])
             message = messages_map.get(metadata["message_id"]) if messages_map else None
 
             message_list = get_message_list(messages_map, metadata["message_id"])
@@ -1968,7 +1983,7 @@ async def process_chat_response(
                             )
 
                             if not metadata.get("chat_id", "").startswith("local:"):
-                                Chats.upsert_message_to_chat_by_id_and_message_id(
+                                await Chats.upsert_message_to_chat_by_id_and_message_id(
                                     metadata["chat_id"],
                                     metadata["message_id"],
                                     {
@@ -2032,7 +2047,7 @@ async def process_chat_response(
                                 if not title:
                                     title = messages[0].get("content", user_message)
 
-                                Chats.update_chat_title_by_id(
+                                await Chats.update_chat_title_by_id(
                                     metadata["chat_id"], title
                                 )
 
@@ -2045,7 +2060,7 @@ async def process_chat_response(
                         elif len(messages) == 2:
                             title = messages[0].get("content", user_message)
 
-                            Chats.update_chat_title_by_id(metadata["chat_id"], title)
+                            await Chats.update_chat_title_by_id(metadata["chat_id"], title)
 
                             await event_emitter(
                                 {
@@ -2083,7 +2098,7 @@ async def process_chat_response(
 
                             try:
                                 tags = json.loads(tags_string).get("tags", [])
-                                Chats.update_chat_tags_by_id(
+                                await Chats.update_chat_tags_by_id(
                                     metadata["chat_id"], tags, user
                                 )
 
@@ -2117,10 +2132,10 @@ async def process_chat_response(
         )
         event_caller = metadata.get("event_caller_override") or get_event_call(metadata)
 
-        if STREAM_PROTOCOL_VERSION == "v2" and not metadata.get(
+        if STREAM_PROTOCOL_VERSION == "v2.1" and not metadata.get(
             "event_emitter_override"
         ):
-            event_emitter = _wrap_event_emitter_v2(event_emitter, metadata)
+            event_emitter = await _wrap_event_emitter_v21(event_emitter, metadata)
 
     model_id = form_data.get("model", "")
 
@@ -2201,7 +2216,7 @@ async def process_chat_response(
                     else:
                         error = str(error)
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
@@ -2217,7 +2232,7 @@ async def process_chat_response(
                         )
 
                 if "selected_model_id" in response_data:
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
@@ -2241,7 +2256,7 @@ async def process_chat_response(
                             }
                         )
 
-                        title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                        title = await Chats.get_chat_title_by_id(metadata["chat_id"])
 
                         # Include usage in the final completion event
                         completion_data = {
@@ -2281,7 +2296,7 @@ async def process_chat_response(
                                 reasoning_details
                             ]
 
-                        Chats.upsert_message_to_chat_by_id_and_message_id(
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
                             update_data,
@@ -2375,8 +2390,8 @@ async def process_chat_response(
         "__model__": model,
     }
     filter_functions = [
-        Functions.get_function_by_id(filter_id)
-        for filter_id in get_sorted_filter_ids(
+        await Functions.get_function_by_id(filter_id)
+        for filter_id in await get_sorted_filter_ids(
             request, model, metadata.get("filter_ids", [])
         )
     ]
@@ -2433,10 +2448,10 @@ async def process_chat_response(
                 # falls through and computes normally so the per-chunk DB write
                 # at L2836 stores a coherent content column.
                 #
-                # 3) Under STREAM_PROTOCOL_VERSION="v2" (B9): the wire
-                #    translator (`_wrap_event_emitter_v2`) drops the `content`
+                # 3) Under STREAM_PROTOCOL_VERSION="v2.1" (B9): the wire
+                #    translator (`_wrap_event_emitter_v21`) drops the `content`
                 #    string entirely and ships `chat:delta` ops derived from
-                #    `content_blocks`. Per-chunk DB writes under v2 also skip
+                #    `content_blocks`. Per-chunk DB writes under v2.1 also skip
                 #    the `content` column (see hot-path upsert below). The
                 #    `content` column converges at end-of-stream via the
                 #    `force=True` call in the success/cancel finalisers, so
@@ -2445,7 +2460,7 @@ async def process_chat_response(
                 if not force:
                     if metadata.get("subagent_inner"):
                         return ""
-                    if STREAM_PROTOCOL_VERSION == "v2":
+                    if STREAM_PROTOCOL_VERSION == "v2.1":
                         return ""
                     if not ENABLE_REALTIME_CHAT_SAVE:
                         return ""
@@ -2796,7 +2811,7 @@ async def process_chat_response(
 
                 return content, content_blocks, end_flag
 
-            message = Chats.get_message_by_id_and_message_id(
+            message = await Chats.get_message_by_id_and_message_id(
                 metadata["chat_id"], metadata["message_id"]
             )
 
@@ -2826,7 +2841,7 @@ async def process_chat_response(
 
             # Retry-last-request can pre-seed the assistant row with completed
             # tool-call rounds. Continue streaming from those structured blocks
-            # instead of flattening them to a single text block, otherwise v2
+            # instead of flattening them to a single text block, otherwise v2.1
             # would resend the whole agentic turn instead of just the final
             # post-tool request.
             if isinstance(existing_content_blocks, list) and existing_content_blocks:
@@ -2868,18 +2883,18 @@ async def process_chat_response(
             )
 
             if (
-                STREAM_PROTOCOL_VERSION == "v2"
+                STREAM_PROTOCOL_VERSION == "v2.1"
                 and metadata.get("message_id")
                 and content_blocks
             ):
-                initial_v2_blocks = copy.deepcopy(_strip_tool_results(content_blocks))
-                v2_mirror = getattr(event_emitter, "_v2_mirror", None)
-                if v2_mirror is not None:
-                    v2_mirror["blocks"] = initial_v2_blocks
+                initial_v21_blocks = copy.deepcopy(_strip_tool_results(content_blocks))
+                v21_mirror = getattr(event_emitter, "_v21_mirror", None)
+                if v21_mirror is not None:
+                    v21_mirror["blocks"] = initial_v21_blocks
                 set_stream_state(
                     metadata["message_id"],
                     {
-                        "content_blocks": initial_v2_blocks,
+                        "content_blocks": initial_v21_blocks,
                         "status": "in_progress",
                     },
                 )
@@ -2906,11 +2921,11 @@ async def process_chat_response(
             # chunk. The structured block content is still updated for live
             # rendering/replay, but this legacy `content` string is only needed
             # when inline tag parsing is enabled and for final webhook text.
-            # Hidden v2 subagent runs never need that legacy string: the full
+            # Hidden v2.1 subagent runs never need that legacy string: the full
             # transcript is persisted from content_blocks, and parent transport
             # receives only slim subagent state.
             track_legacy_content = not (
-                STREAM_PROTOCOL_VERSION == "v2"
+                STREAM_PROTOCOL_VERSION == "v2.1"
                 and metadata.get("subagent_inner")
                 and not DETECT_REASONING_TAGS
                 and not DETECT_CODE_INTERPRETER
@@ -2955,7 +2970,7 @@ async def process_chat_response(
                     )
 
                     # Save message in the database
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
@@ -2984,8 +2999,8 @@ async def process_chat_response(
                     )
                     last_delta_data = None
 
-                    # ── Native v2 fast-path bookkeeping ────────────────────
-                    # Under STREAM_PROTOCOL_VERSION=="v2" we emit `chat:delta`
+                    # ── Native v2.1 fast-path bookkeeping ──────────────────
+                    # Under STREAM_PROTOCOL_VERSION=="v2.1" we emit `chat:delta`
                     # `text_append` ops directly at flush time, sidestepping the
                     # translator's O(N) full-content_blocks diff. We only take
                     # the fast path when the *only* change since the last flush
@@ -2998,21 +3013,21 @@ async def process_chat_response(
                     # We mirror the translator's mirror state when we emit
                     # natively so that subsequent translator-mediated flushes
                     # compute correct diffs.
-                    _v2_native = STREAM_PROTOCOL_VERSION == "v2" and getattr(
-                        event_emitter, "_v2_mirror", None
+                    _v21_native = STREAM_PROTOCOL_VERSION == "v2.1" and getattr(
+                        event_emitter, "_v21_mirror", None
                     ) is not None and metadata.get("message_id")
-                    _v2_mirror = getattr(event_emitter, "_v2_mirror", None) if _v2_native else None
-                    _v2_emit_raw = getattr(event_emitter, "_emit_raw_primary", None) if _v2_native else None
-                    _v2_message_id = metadata.get("message_id") if _v2_native else None
+                    _v21_mirror = getattr(event_emitter, "_v21_mirror", None) if _v21_native else None
+                    _v21_emit_raw = getattr(event_emitter, "_emit_raw_primary", None) if _v21_native else None
+                    _v21_message_id = metadata.get("message_id") if _v21_native else None
 
-                    def _v2_try_native_append():
+                    def _v21_try_native_append():
                         """Return (block_idx, appended_text) if the tail block
                         is a pure append since the last mirror snapshot AND no
                         earlier block changed; otherwise None to force a
                         translator-mediated full diff."""
-                        if not _v2_native or not content_blocks:
+                        if not _v21_native or not content_blocks:
                             return None
-                        mirror_blocks = _v2_mirror.get("blocks") or []
+                        mirror_blocks = _v21_mirror.get("blocks") or []
                         tail_idx = len(content_blocks) - 1
                         tail = content_blocks[tail_idx]
                         if tail.get("type") not in ("text", "reasoning"):
@@ -3045,17 +3060,17 @@ async def process_chat_response(
                                 log.error(f"❌ FLUSH ERROR: event_emitter is None! Cannot emit events!")
                             else:
                                 native = (
-                                    _v2_try_native_append()
-                                    if _v2_native and "content_blocks" in (last_delta_data or {})
+                                    _v21_try_native_append()
+                                    if _v21_native and "content_blocks" in (last_delta_data or {})
                                     else None
                                 )
                                 if native is not None:
                                     block_idx, appended, new_text = native
-                                    version = stream_version_incr(_v2_message_id)
+                                    version = stream_version_incr(_v21_message_id)
                                     payload = {
                                         "type": "chat:delta",
                                         "data": {
-                                            "message_id": _v2_message_id,
+                                            "message_id": _v21_message_id,
                                             "version": version,
                                             "op": "text_append",
                                             "payload": {
@@ -3064,11 +3079,11 @@ async def process_chat_response(
                                             },
                                         },
                                     }
-                                    await _v2_emit_raw(payload)
+                                    await _v21_emit_raw(payload)
                                     # Sync the translator's mirror so any
                                     # subsequent translator-mediated flush
                                     # diffs correctly.
-                                    _v2_mirror["blocks"][block_idx]["content"] = new_text
+                                    _v21_mirror["blocks"][block_idx]["content"] = new_text
                                 else:
                                     await event_emitter(
                                         {
@@ -3120,7 +3135,7 @@ async def process_chat_response(
 
                                 if "selected_model_id" in data:
                                     model_id = data["selected_model_id"]
-                                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                                         metadata["chat_id"],
                                         metadata["message_id"],
                                         {
@@ -3326,7 +3341,7 @@ async def process_chat_response(
                                                             "function"
                                                         ]
                                                         fn["name"] = _dedupe_repeated_tool_name(
-                                                            _merge_streamed_string(
+                                                            _merge_streamed_tool_call_field(
                                                                 fn.get("name", ""), delta_name
                                                             )
                                                         )
@@ -3337,7 +3352,7 @@ async def process_chat_response(
                                                         ]
                                                         fn[
                                                             "arguments"
-                                                        ] = _merge_streamed_string(
+                                                        ] = _merge_streamed_tool_call_field(
                                                             fn.get("arguments", ""),
                                                             delta_arguments,
                                                         )
@@ -3489,7 +3504,7 @@ async def process_chat_response(
 
                                         if ENABLE_REALTIME_CHAT_SAVE:
                                             # Save message in the database.
-                                            # Under v2, skip the `content`
+                                            # Under v2.1, skip the `content`
                                             # column write per-chunk —
                                             # serialize_content_blocks would
                                             # return "" (B9 short-circuit) and
@@ -3501,7 +3516,7 @@ async def process_chat_response(
                                             update_data = {
                                                 "content_blocks": content_blocks,
                                             }
-                                            if STREAM_PROTOCOL_VERSION != "v2":
+                                            if STREAM_PROTOCOL_VERSION != "v2.1":
                                                 update_data["content"] = (
                                                     serialize_content_blocks(
                                                         content_blocks
@@ -3524,7 +3539,7 @@ async def process_chat_response(
                                                 if flat:
                                                     update_data["reasoning_details"] = flat
 
-                                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                            await Chats.upsert_message_to_chat_by_id_and_message_id(
                                                 metadata["chat_id"],
                                                 metadata["message_id"],
                                                 update_data,
@@ -3532,8 +3547,8 @@ async def process_chat_response(
 
                                         # Regardless of realtime DB writes, the
                                         # stream event must carry content_blocks
-                                        # so the v2 wrapper can translate this
-                                        # chunk into chat:delta ops. The v2
+                                        # so the v2.1 wrapper can translate this
+                                        # chunk into chat:delta ops. The v2.1
                                         # serializer intentionally returns an
                                         # empty content string on the hot path;
                                         # frontends render from content_blocks.
@@ -3668,13 +3683,12 @@ async def process_chat_response(
 
                         tool_function_params = {}
                         try:
-                            # json.loads cannot be used because some models do not produce valid JSON
-                            tool_function_params = ast.literal_eval(tool_args)
+                            tool_function_params = json.loads(tool_args)
                         except Exception as e:
                             log.debug(e)
-                            # Fallback to JSON parsing
+                            # Compatibility fallback for older non-JSON tool args.
                             try:
-                                tool_function_params = json.loads(tool_args)
+                                tool_function_params = ast.literal_eval(tool_args)
                             except Exception as e:
                                 log.error(
                                     f"Error parsing tool call arguments: {tool_args}"
@@ -3837,12 +3851,12 @@ async def process_chat_response(
                         }
                     )
 
-                    if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                    if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
                         msg_id = metadata["message_id"]
-                        v2_mirror = getattr(event_emitter, "_v2_mirror", None)
+                        v21_mirror = getattr(event_emitter, "_v21_mirror", None)
                         emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
-                        if v2_mirror is not None and emit_raw is not None:
-                            sent = v2_mirror.setdefault("tool_results_sent", set())
+                        if v21_mirror is not None and emit_raw is not None:
+                            sent = v21_mirror.setdefault("tool_results_sent", set())
                             for r in results:
                                 if not r:
                                     continue
@@ -4357,7 +4371,7 @@ async def process_chat_response(
                             })
                             break
 
-                title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                title = await Chats.get_chat_title_by_id(metadata["chat_id"])
                 data = {
                     "done": True,
                     # force=True: end-of-stream final emit. The serialize
@@ -4405,7 +4419,7 @@ async def process_chat_response(
                         if flat:
                             update_data["reasoning_details"] = flat
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         update_data,
@@ -4414,7 +4428,7 @@ async def process_chat_response(
                     # Realtime-save mode writes content on the hot path; still
                     # persist final usage so opened full subagent chats and
                     # future rebuilds can recover provider/cache details.
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         {"usage": response_usage},
@@ -4447,7 +4461,7 @@ async def process_chat_response(
                     }
                 )
 
-                if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
                     msg_id = metadata["message_id"]
                     emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
                     final_blocks = data.get("content_blocks") or content_blocks
@@ -4458,7 +4472,7 @@ async def process_chat_response(
                     version = stream_version_incr(msg_id)
                     chat_obj = None
                     try:
-                        chat_obj = Chats.get_chat_by_id(metadata["chat_id"])
+                        chat_obj = await Chats.get_chat_by_id(metadata["chat_id"])
                     except Exception:
                         chat_obj = None
                     chat_updated_at = (
@@ -4535,7 +4549,7 @@ async def process_chat_response(
                 log.warning("Task was cancelled!")
                 await event_emitter({"type": "chat:tasks:cancel"})
 
-                if STREAM_PROTOCOL_VERSION == "v2" and metadata.get("message_id"):
+                if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
                     clear_stream_state(metadata["message_id"])
 
                 if not ENABLE_REALTIME_CHAT_SAVE:
@@ -4564,7 +4578,7 @@ async def process_chat_response(
                         if flat:
                             update_data["reasoning_details"] = flat
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
                         update_data,

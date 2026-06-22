@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import re
 import threading
 import time
@@ -499,18 +500,31 @@ def throttle(interval: float = 10.0):
         last_calls = {}
         lock = threading.Lock()
 
-        def wrapper(*args, **kwargs):
+        def should_call(args, kwargs):
             if interval is None:
-                return func(*args, **kwargs)
+                return True
 
             key = (args, freeze(kwargs))
             now = time.time()
             if now - last_calls.get(key, 0) < interval:
-                return None
+                return False
             with lock:
                 if now - last_calls.get(key, 0) < interval:
-                    return None
+                    return False
                 last_calls[key] = now
+            return True
+
+        if inspect.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                if not should_call(args, kwargs):
+                    return None
+                return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        def wrapper(*args, **kwargs):
+            if not should_call(args, kwargs):
+                return None
             return func(*args, **kwargs)
 
         return wrapper

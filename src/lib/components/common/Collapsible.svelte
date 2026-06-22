@@ -46,6 +46,7 @@
 	import CodeBlock from '../chat/Messages/CodeBlock.svelte';
 	import Markdown from '../chat/Messages/Markdown.svelte';
 	import SubagentBlock from '../chat/Messages/Markdown/SubagentBlock.svelte';
+	import AskUserBlock from '../chat/Messages/Markdown/AskUserBlock.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import { settings } from '$lib/stores';
@@ -178,6 +179,13 @@
 			reads its state live from `$subagentLiveStates` keyed on the
 			tool_call_id attribute that `serialize_content_blocks` stamps. -->
 		<SubagentBlock attributes={attributes ?? {}} />
+	{:else if attributes?.type === 'ask_user'}
+		<!-- Ask-user block: an interactive question card. The question lives in
+			the tool-call `arguments`; the answer (once submitted) is the tool
+			`result`/`done`. The card autosaves drafts and submits the final
+			answer through the durable set_question_state patch op so the running
+			generation resumes. Reads/writes draft state from `$questionStates`. -->
+		<AskUserBlock attributes={attributes ?? {}} />
 	{:else if attributes?.type === 'tool_calls'}
 		{@const args = decode(attributes?.arguments)}
 		{@const rawResult = attributes?.result ?? ''}

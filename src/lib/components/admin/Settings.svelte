@@ -20,6 +20,7 @@
 	import StudyMode from './Settings/StudyMode.svelte';
 	import DataViz from './Settings/DataViz.svelte';
 	import Subagents from './Settings/Subagents.svelte';
+	import Pricing from './Settings/Pricing.svelte';
 
 	import ChartBar from '../icons/ChartBar.svelte';
 	import Evaluations from './Settings/Evaluations.svelte';
@@ -46,6 +47,7 @@
 			'study',
 			'data-viz',
 			'subagents',
+			'pricing',
 			'interface',
 			'audio',
 			'images',
@@ -362,6 +364,33 @@
 		</button>
 
 		<button
+			id="pricing"
+			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
+			'pricing'
+				? ''
+				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
+			on:click={() => {
+				goto('/admin/settings/pricing');
+			}}
+		>
+			<div class=" self-center mr-2">
+				<svg
+					xmlns="http://www.w3.org/2000/svg"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.75"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					class="size-4"
+				>
+					<path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6" />
+				</svg>
+			</div>
+			<div class=" self-center">{$i18n.t('Pricing')}</div>
+		</button>
+
+		<button
 			id="interface"
 			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
 			'interface'
@@ -574,6 +603,12 @@
 
 					await tick();
 					await config.set(await getBackendConfig());
+				}}
+			/>
+		{:else if selectedTab === 'pricing'}
+			<Pricing
+				on:save={() => {
+					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>
 		{:else if selectedTab === 'interface'}

@@ -122,7 +122,7 @@ async def rerun_subagent(
     # silently swallow auth/lookup errors inside the background task.
     from open_webui.models.chats import Chats
 
-    parent_chat = Chats.get_chat_by_id_and_user_id(
+    parent_chat = await Chats.get_chat_by_id_and_user_id(
         form_data.parent_chat_id, user.id
     )
     if parent_chat is None:

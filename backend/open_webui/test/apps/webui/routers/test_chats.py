@@ -1,7 +1,23 @@
 import uuid
+import asyncio
 
 from test.util.abstract_integration_test import AbstractPostgresTest
 from test.util.mock_user import mock_webui_user
+
+
+class _SyncChats:
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
+
+        def _call(*args, **kwargs):
+            return asyncio.run(attr(*args, **kwargs))
+
+        return _call
 
 
 class TestChats(AbstractPostgresTest):
@@ -14,7 +30,7 @@ class TestChats(AbstractPostgresTest):
         super().setup_method()
         from open_webui.models.chats import ChatForm, Chats
 
-        self.chats = Chats
+        self.chats = _SyncChats(Chats)
         self.chats.insert_new_chat(
             "2",
             ChatForm(
@@ -88,9 +104,6 @@ class TestChats(AbstractPostgresTest):
 
     def test_get_user_archived_chats(self):
         self.chats.archive_all_chats_by_user_id("2")
-        from open_webui.internal.db import Session
-
-        Session.commit()
         with mock_webui_user(id="2"):
             response = self.fast_api_client.get(self.create_url("/all/archived"))
         assert response.status_code == 200

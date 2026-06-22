@@ -6,7 +6,7 @@ import aiohttp
 from typing import Optional
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.config import get_config, save_config
+from open_webui.config import get_config_async, save_config_async
 from open_webui.config import BannerModel
 
 from open_webui.utils.tools import (
@@ -44,8 +44,8 @@ class ImportConfigForm(BaseModel):
 
 @router.post("/import", response_model=dict)
 async def import_config(form_data: ImportConfigForm, user=Depends(get_admin_user)):
-    save_config(form_data.config)
-    return get_config()
+    await save_config_async(form_data.config)
+    return await get_config_async()
 
 
 ############################
@@ -55,7 +55,7 @@ async def import_config(form_data: ImportConfigForm, user=Depends(get_admin_user
 
 @router.get("/export", response_model=dict)
 async def export_config(user=Depends(get_admin_user)):
-    return get_config()
+    return await get_config_async()
 
 
 ############################

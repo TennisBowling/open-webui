@@ -456,6 +456,47 @@ export const getStreamSnapshot = async (
 	return res;
 };
 
+export const getStreamDeltas = async (
+	token: string,
+	message_id: string,
+	chat_id?: string | null,
+	after_version: number = 0
+) => {
+	let error = null;
+	const params = new URLSearchParams();
+	if (chat_id) params.set('chat_id', chat_id);
+	params.set('after_version', `${Math.max(0, after_version || 0)}`);
+	const query = params.toString();
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/streams/${message_id}/deltas?${query}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			if (err && typeof err === 'object' && 'detail' in err) {
+				error = (err as any).detail;
+			} else {
+				error = err;
+			}
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 // Live browser frame for reattach. Returns null on 204 (nothing available) or
 // any error — callers seed the live panel only when a frame is present.
 export const getBrowserFrame = async (

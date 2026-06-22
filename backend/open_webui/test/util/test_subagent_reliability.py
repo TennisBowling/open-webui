@@ -10,17 +10,9 @@ These are pure-function tests (no DB / no event loop needed). DB env is still
 pointed at a temp copy in case importing the modules touches it.
 """
 
-import os
-import shutil
-import tempfile
+from test.util.db import configure_test_database
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "subagent_reliability_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+configure_test_database()
 
 from open_webui.utils.subagent import reconcile_block_results_from_runs  # noqa: E402
 
@@ -377,16 +369,20 @@ def test_visible_reasoning_from_nonstreaming_reasoning_details_ignores_encrypted
 def test_visible_nonstreaming_reasoning_prefers_string_reasoning_fields():
     from open_webui.utils.middleware import _visible_nonstreaming_reasoning
 
-    assert _visible_nonstreaming_reasoning(
-        {"reasoning": " shown ", "reasoning_details": [{"summary": "fallback"}]}
+    assert asyncio.run(
+        _visible_nonstreaming_reasoning(
+            {"reasoning": " shown ", "reasoning_details": [{"summary": "fallback"}]}
+        )
     ) == "shown"
 
 
 def test_visible_nonstreaming_reasoning_ignores_non_string_reasoning_field():
     from open_webui.utils.middleware import _visible_nonstreaming_reasoning
 
-    assert _visible_nonstreaming_reasoning(
-        {"reasoning": {"not": "text"}, "reasoning_details": [{"summary": "fallback"}]}
+    assert asyncio.run(
+        _visible_nonstreaming_reasoning(
+            {"reasoning": {"not": "text"}, "reasoning_details": [{"summary": "fallback"}]}
+        )
     ) == "fallback"
 
 
@@ -421,3 +417,179 @@ def test_mcp_disconnect_closes_stack_under_pending_task_cancellation():
 
     assert observed["cancelling_during_close"] == 0
     assert observed["cancelling_after_close"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 0: atomic subagent_runs merge + slot reservation (the lost-update fix).
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+import open_webui.utils.subagent as subagent_module  # noqa: E402
+
+
+class _FakeAtomicChats:
+    """Stand-in for the Chats async proxy that runs the mutator against a single
+    shared message dict (read-mutate-write), mirroring update_message_fields_atomic.
+    Because each call re-reads the live message, a correct mutator never loses a
+    sibling entry — which is exactly what the real per-message lock guarantees."""
+
+    def __init__(self, message=None):
+        self.message = dict(message or {})
+
+    async def update_message_fields_atomic(self, _id, _mid, mutator):
+        partial = mutator(dict(self.message))  # fresh read each call
+        if partial:
+            self.message.update(partial)
+        return partial
+
+
+def test_upsert_reserves_distinct_num_and_name_and_keeps_siblings(monkeypatch):
+    fake = _FakeAtomicChats({"id": "pm1"})
+    monkeypatch.setattr(subagent_module, "Chats", fake)
+
+    # Two parallel launches reserve their slot from the SAME fresh map. The
+    # second sees the first → distinct num + disambiguated name (no "Subagent 1"
+    # collision, no duplicate "Berkeley").
+    a = asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1", "pm1", "saA",
+            {"subagent_id": "saA", "status": "running", "started_at": 100},
+            sync_placeholder=False,
+            reserve={"desired_name": "Berkeley", "other_runs": {}},
+        )
+    )
+    b = asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1", "pm1", "saB",
+            {"subagent_id": "saB", "status": "running", "started_at": 101},
+            sync_placeholder=False,
+            reserve={"desired_name": "Berkeley", "other_runs": {}},
+        )
+    )
+    assert a["num"] == 1 and a["name"] == "Berkeley"
+    assert b["num"] == 2 and b["name"] == "Berkeley_2"
+
+    runs = fake.message["subagent_runs"]
+    assert set(runs) == {"saA", "saB"}  # neither sibling lost
+
+
+def test_upsert_terminal_preserves_started_at_and_siblings(monkeypatch):
+    fake = _FakeAtomicChats({"id": "pm1"})
+    monkeypatch.setattr(subagent_module, "Chats", fake)
+
+    asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1", "pm1", "saA",
+            {"subagent_id": "saA", "status": "running", "started_at": 100},
+            sync_placeholder=False,
+        )
+    )
+    asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1", "pm1", "saB",
+            {"subagent_id": "saB", "status": "running", "started_at": 101},
+            sync_placeholder=False,
+        )
+    )
+    # saA finishes. The terminal patch carries no started_at of its own, but the
+    # atomic merge over the prior entry keeps it — so the timer always has both
+    # bounds (this is the "Done vs Researched for 7m" root cause).
+    asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1", "pm1", "saA",
+            {"subagent_id": "saA", "status": "done", "ended_at": 200, "final_text": "x"},
+            sync_placeholder=False,
+        )
+    )
+    runs = fake.message["subagent_runs"]
+    assert runs["saA"]["started_at"] == 100  # not lost on terminal write
+    assert runs["saA"]["ended_at"] == 200
+    assert runs["saA"]["status"] == "done"
+    assert "saB" in runs  # concurrent sibling untouched
+
+
+def test_upsert_skips_local_chat(monkeypatch):
+    fake = _FakeAtomicChats({"id": "pm1"})
+    monkeypatch.setattr(subagent_module, "Chats", fake)
+    out = asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "local:abc", "pm1", "saA", {"status": "running"}, sync_placeholder=False
+        )
+    )
+    assert out is None
+    assert "subagent_runs" not in fake.message
+
+
+def test_message_write_lock_serializes_same_key():
+    """The per-(chat,message) lock must give mutual exclusion for the same key
+    and run different keys concurrently."""
+    from open_webui.models.chats import _message_write_locks
+
+    order = []
+
+    async def worker(key, tag, hold):
+        async with _message_write_locks.lock_for("c", key):
+            order.append(f"{tag}-enter")
+            await asyncio.sleep(hold)
+            order.append(f"{tag}-exit")
+
+    async def _run():
+        # Two workers on the SAME key must not interleave.
+        await asyncio.gather(
+            worker("m1", "a", 0.02),
+            worker("m1", "b", 0.0),
+        )
+
+    asyncio.run(_run())
+    # 'a' acquired first; 'b' cannot enter until 'a' exits.
+    assert order == ["a-enter", "a-exit", "b-enter", "b-exit"]
+
+
+def test_message_write_lock_reaped_when_idle():
+    from open_webui.models.chats import _message_write_locks
+
+    async def _run():
+        async with _message_write_locks.lock_for("c", "reapme"):
+            pass
+
+    asyncio.run(_run())
+    # No coroutine holds/waits → the entry is reaped (no unbounded growth).
+    assert ("c", "reapme") not in _message_write_locks._locks
+
+
+def test_emit_subagent_terminal_builds_error_event():
+    captured = []
+
+    async def emitter(payload):
+        captured.append(payload)
+
+    asyncio.run(
+        subagent_module._emit_subagent_terminal(
+            emitter,
+            {"subagent_id": "sa1", "tool_call_id": "tc1"},
+            status="error",
+            message="boom",
+        )
+    )
+    assert len(captured) == 1
+    data = captured[0]["data"]
+    assert captured[0]["type"] == "chat:subagent:update"
+    assert data["subagent_id"] == "sa1"
+    inner = data["inner_event"]
+    assert inner["type"] == "chat:message:error"
+    assert inner["data"]["error"] == "boom"
+
+
+def test_emit_subagent_terminal_builds_cancel_event():
+    captured = []
+
+    async def emitter(payload):
+        captured.append(payload)
+
+    asyncio.run(
+        subagent_module._emit_subagent_terminal(
+            emitter, {"subagent_id": "sa1"}, status="cancelled"
+        )
+    )
+    assert captured[0]["data"]["inner_event"]["type"] == "chat:tasks:cancel"

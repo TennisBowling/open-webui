@@ -11,7 +11,7 @@ every chat's full message history on every query.
 
 import json
 import sqlalchemy as sa
-from alembic import op
+from alembic import op, context
 
 revision = "e5a9c8b2f14d"
 down_revision = "merge_analytics_001"
@@ -66,11 +66,17 @@ def _build_search_text(title: str, chat_data) -> str:
 
 
 def upgrade():
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    chat_columns = {c['name'] for c in inspector.get_columns('chat')}
+    if context.is_offline_mode():
+        chat_columns = set()
+    else:
+        bind = op.get_bind()
+        inspector = sa.inspect(bind)
+        chat_columns = {c['name'] for c in inspector.get_columns('chat')}
     if 'search_text' not in chat_columns:
         op.add_column("chat", sa.Column("search_text", sa.Text(), nullable=True))
+
+    if context.is_offline_mode():
+        return
 
     # Backfill rows that don't yet have a search_text value (covers both fresh
     # adds and re-applies after the column was created out-of-band).
@@ -90,8 +96,11 @@ def upgrade():
 
 
 def downgrade():
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    chat_columns = {c['name'] for c in inspector.get_columns('chat')}
+    if context.is_offline_mode():
+        chat_columns = {'search_text'}
+    else:
+        bind = op.get_bind()
+        inspector = sa.inspect(bind)
+        chat_columns = {c['name'] for c in inspector.get_columns('chat')}
     if 'search_text' in chat_columns:
         op.drop_column("chat", "search_text")

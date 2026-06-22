@@ -16,7 +16,7 @@ import re
 from typing import Any
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import op, context
 
 
 revision = "7b5f4d2a9c31"
@@ -231,6 +231,8 @@ def _update_chat_message_rows(bind) -> None:
 
 
 def upgrade():
+    if context.is_offline_mode():
+        return
     bind = op.get_bind()
     _update_chat_json(bind)
     _update_chat_message_rows(bind)

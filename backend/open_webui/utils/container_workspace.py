@@ -18,7 +18,11 @@ from urllib.parse import quote, unquote
 import aiohttp
 from fastapi import Request
 
-from open_webui.env import SRC_LOG_LEVELS
+from open_webui.env import (
+    SRC_LOG_LEVELS,
+    STREAM_BROWSER_FRAME_MAX_BYTES,
+    STREAM_BROWSER_FRAME_MAX_FPS,
+)
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
@@ -224,18 +228,18 @@ def _file_id_from_item(item: dict) -> Optional[str]:
     return str(file_id) if file_id else None
 
 
-def _current_user_message(chat_id: str, assistant_message_id: str | None) -> tuple[str | None, dict | None]:
+async def _current_user_message(chat_id: str, assistant_message_id: str | None) -> tuple[str | None, dict | None]:
     if not assistant_message_id:
         return None, None
 
-    assistant_msg = Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
+    assistant_msg = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
     parent_id = assistant_msg.get("parentId") if isinstance(assistant_msg, dict) else None
     if parent_id:
-        parent_msg = Chats.get_message_by_id_and_message_id(chat_id, parent_id)
+        parent_msg = await Chats.get_message_by_id_and_message_id(chat_id, parent_id)
         if isinstance(parent_msg, dict):
             return parent_id, parent_msg
 
-    messages_map = Chats.get_messages_map_by_chat_id(chat_id) or {}
+    messages_map = await Chats.get_messages_map_by_chat_id(chat_id) or {}
     for mid, msg in messages_map.items():
         if not isinstance(msg, dict):
             continue
@@ -280,7 +284,7 @@ def _build_input_location_context(input_records: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def _append_to_last_user_message(messages: list[dict], content: str) -> list[dict]:
+async def _append_to_last_user_message(messages: list[dict], content: str) -> list[dict]:
     if not content:
         return messages
     updated = list(messages or [])
@@ -329,7 +333,7 @@ async def prepare_container_workspace_for_turn(
     inputs_dir.mkdir(parents=True, exist_ok=True)
     (workspace / "outputs").mkdir(parents=True, exist_ok=True)
 
-    user_message_id, user_message = _current_user_message(
+    user_message_id, user_message = await _current_user_message(
         chat_id, _workspace_message_id(metadata)
     )
     attached_files = []
@@ -363,7 +367,7 @@ async def prepare_container_workspace_for_turn(
                 continue
             seen_file_ids.add(file_id)
 
-            file_record = Files.get_file_by_id(file_id)
+            file_record = await Files.get_file_by_id(file_id)
             if not file_record or not _user_can_read_file(file_record, user):
                 continue
             if not file_record.path:
@@ -409,7 +413,7 @@ async def prepare_container_workspace_for_turn(
     }
 
     if input_records and user_message_id and not reuse_existing_inputs:
-        Chats.upsert_message_to_chat_by_id_and_message_id(
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id,
             user_message_id,
             {"container_workspace_inputs": [*existing_input_records, *input_records]}, return_model=False
@@ -417,7 +421,7 @@ async def prepare_container_workspace_for_turn(
 
     input_context = _build_input_location_context(input_records)
     if input_context:
-        form_data["messages"] = _append_to_last_user_message(
+        form_data["messages"] = await _append_to_last_user_message(
             form_data.get("messages", []), input_context
         )
 
@@ -434,7 +438,7 @@ async def prepare_container_workspace_for_turn(
     return _build_workspace_prompt(system_prompt, output_paths)
 
 
-def _container_connection_url(request: Request, server_id: str) -> Optional[str]:
+async def _container_connection_url(request: Request, server_id: str) -> Optional[str]:
     for connection in getattr(request.app.state.config, "TOOL_SERVER_CONNECTIONS", []) or []:
         if not isinstance(connection, dict):
             continue
@@ -447,7 +451,7 @@ def _container_connection_url(request: Request, server_id: str) -> Optional[str]
 
 
 async def _reclaim_outputs(request: Request, chat_id: str, server_id: str) -> None:
-    url = _container_connection_url(request, server_id)
+    url = await _container_connection_url(request, server_id)
     if not url:
         return
     base = url.rstrip("/")
@@ -593,7 +597,7 @@ def _is_office_preview_file(filename: str, content_type: str) -> bool:
     return ext in _OFFICE_PREVIEW_EXTS or normalized in _OFFICE_PREVIEW_MIME_TYPES
 
 
-def _create_pdf_preview_file(
+async def _create_pdf_preview_file(
     request: Request,
     user: UserModel,
     source_path: Path,
@@ -654,7 +658,7 @@ def _create_pdf_preview_file(
                     },
                 )
 
-            preview_item = Files.insert_new_file(
+            preview_item = await Files.insert_new_file(
                 user.id,
                 FileForm(
                     id=preview_id,
@@ -678,7 +682,7 @@ def _create_pdf_preview_file(
         return None, str(exc)
 
 
-def _store_output_file(
+async def _store_output_file(
     request: Request,
     user: UserModel,
     source_path: Path,
@@ -726,7 +730,7 @@ def _store_output_file(
     if _is_office_preview_file(display_name, content_type):
         data["preview_status"] = "pending"
 
-    file_item = Files.insert_new_file(
+    file_item = await Files.insert_new_file(
         user.id,
         FileForm(
             id=file_id,
@@ -745,7 +749,7 @@ def _store_output_file(
         return None
 
     if _is_office_preview_file(display_name, content_type):
-        preview_id, preview_error = _create_pdf_preview_file(
+        preview_id, preview_error = await _create_pdf_preview_file(
             request, user, source_path, display_name, file_id
         )
         if preview_id:
@@ -759,7 +763,7 @@ def _store_output_file(
             metadata["preview_status"] = "failed"
             metadata["preview_error"] = preview_error
         data["container_workspace"] = metadata
-        Files.update_file_data_by_id(file_id, data)
+        await Files.update_file_data_by_id(file_id, data)
 
     return {
         "type": "file",
@@ -805,7 +809,7 @@ async def import_changed_container_outputs(
 
     await _reclaim_outputs(request, chat_id, server_id)
 
-    chat = Chats.get_chat_by_id(chat_id)
+    chat = await Chats.get_chat_by_id(chat_id)
     if chat is None:
         return []
     chat_meta = dict(chat.meta or {})
@@ -881,8 +885,7 @@ async def import_changed_container_outputs(
             # I/O, a DB insert, AND (for office docs) a LibreOffice subprocess
             # that can run up to 120s. On the event loop that stalls EVERY other
             # chat on the worker until it finishes.
-            descriptor = await asyncio.to_thread(
-                _store_output_file,
+            descriptor = await _store_output_file(
                 request,
                 user,
                 path,
@@ -932,12 +935,12 @@ async def import_changed_container_outputs(
         container_meta["data_root"] = data_root
         container_meta["server_id"] = server_id
         chat_meta["container_workspace"] = container_meta
-        Chats.update_chat_meta_by_id(chat_id, chat_meta)
+        await Chats.update_chat_meta_by_id(chat_id, chat_meta)
 
     if imported:
-        message = Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
+        message = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
         files = _merge_files(message.get("files"), imported)
-        Chats.upsert_message_to_chat_by_id_and_message_id(
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id, message_id, {"files": files}, return_model=False
         )
 
@@ -1032,7 +1035,7 @@ def _safe_session_token(session: str) -> str:
     return token or _DEFAULT_BROWSER_SESSION
 
 
-def read_browser_live_sessions(data_root: str, chat_id: str) -> dict[str, dict]:
+async def read_browser_live_sessions(data_root: str, chat_id: str) -> dict[str, dict]:
     """Read EVERY active session's live frame + state for a chat.
 
     Enumerates the per-session state-<session>.json files in the chat's
@@ -1115,6 +1118,9 @@ async def browser_progress_poller(
     if not event_emitter or not data_root or not _safe_chat_id(chat_id):
         return
     poll_session = session or _DEFAULT_BROWSER_SESSION
+    effective_interval = max(0.2, interval)
+    if STREAM_BROWSER_FRAME_MAX_FPS > 0:
+        effective_interval = max(effective_interval, 1.0 / STREAM_BROWSER_FRAME_MAX_FPS)
     last_stat: Optional[tuple[int, int]] = None
 
     async def _emit_frame(state: dict, frame: Optional[str], *, done: bool) -> None:
@@ -1159,12 +1165,17 @@ async def browser_progress_poller(
                 is_stale = bool(state.get("stale"))
                 done_flag = bool(state.get("done")) or is_stale
 
-                # Frame: emit only when the JPEG changed.
+                # Frame: emit only when the JPEG changed. Optional byte cap keeps
+                # pathological screenshots from dominating socket bandwidth; the
+                # metadata event still reaches the panel, and reattach can fetch
+                # the latest frame on demand.
                 if frame and stat is not None and stat != last_stat:
                     last_stat = stat
+                    if STREAM_BROWSER_FRAME_MAX_BYTES > 0 and stat[0] > STREAM_BROWSER_FRAME_MAX_BYTES:
+                        frame = None
                     await _emit_frame(state, frame, done=done_flag)
 
-            await asyncio.sleep(max(0.2, interval))
+            await asyncio.sleep(effective_interval)
     except asyncio.CancelledError:
         # The tool call returned. Do ONE final read and emit a terminal frame
         # (done:true) for this session. Shielded so cancellation still completes

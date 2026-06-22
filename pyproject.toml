@@ -31,8 +31,8 @@ dependencies = [
 
     "sqlalchemy==2.0.38",
     "alembic==1.14.0",
-    "peewee==3.18.1",
-    "peewee-migrate==1.12.2",
+    "asyncpg==0.30.0",
+    "pgvector==0.4.1",
 
     "pycrdt==0.12.25",
     "redis",
@@ -130,14 +130,14 @@ classifiers = [
 
 [project.optional-dependencies]
 postgres = [
-    "psycopg2-binary==2.9.10",
+    "asyncpg==0.30.0",
     "pgvector==0.4.1",
 ]
 
 all = [
     "pymongo",
-    "psycopg2-binary==2.9.9",
-    "pgvector==0.4.0",
+    "asyncpg==0.30.0",
+    "pgvector==0.4.1",
     "moto[s3]>=5.0.26",
     "gcp-storage-emulator>=2024.8.3",
     "docker~=7.1.0",

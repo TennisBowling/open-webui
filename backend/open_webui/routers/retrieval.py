@@ -1172,7 +1172,7 @@ async def update_rag_config(
 ####################################
 
 
-def save_docs_to_vector_db(
+async def save_docs_to_vector_db(
     request: Request,
     docs,
     collection_name,
@@ -1204,7 +1204,7 @@ def save_docs_to_vector_db(
 
     # Check if entries with the same hash (metadata.hash) already exist
     if metadata and "hash" in metadata:
-        result = VECTOR_DB_CLIENT.query(
+        result = await VECTOR_DB_CLIENT.query(
             collection_name=collection_name,
             filter={"hash": metadata["hash"]},
         )
@@ -1302,11 +1302,11 @@ def save_docs_to_vector_db(
     ]
 
     try:
-        if VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+        if await VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
             log.info(f"collection {collection_name} already exists")
 
             if overwrite:
-                VECTOR_DB_CLIENT.delete_collection(collection_name=collection_name)
+                await VECTOR_DB_CLIENT.delete_collection(collection_name=collection_name)
                 log.info(f"deleting existing collection {collection_name}")
             elif add is False:
                 log.info(
@@ -1363,7 +1363,7 @@ def save_docs_to_vector_db(
         ]
 
         log.info(f"adding to collection {collection_name}")
-        VECTOR_DB_CLIENT.insert(
+        await VECTOR_DB_CLIENT.insert(
             collection_name=collection_name,
             items=items,
         )
@@ -1382,15 +1382,15 @@ class ProcessFileForm(BaseModel):
 
 
 @router.post("/process/file")
-def process_file(
+async def process_file(
     request: Request,
     form_data: ProcessFileForm,
     user=Depends(get_verified_user),
 ):
     if user.role == "admin":
-        file = Files.get_file_by_id(form_data.file_id)
+        file = await Files.get_file_by_id(form_data.file_id)
     else:
-        file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id)
+        file = await Files.get_file_by_id_and_user_id(form_data.file_id, user.id)
 
     if file:
         try:
@@ -1406,7 +1406,7 @@ def process_file(
 
                 try:
                     # /files/{file_id}/data/content/update
-                    VECTOR_DB_CLIENT.delete_collection(
+                    await VECTOR_DB_CLIENT.delete_collection(
                         collection_name=f"file-{file.id}"
                     )
                 except:
@@ -1431,7 +1431,7 @@ def process_file(
                 # Check if the file has already been processed and save the content
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
-                result = VECTOR_DB_CLIENT.query(
+                result = await VECTOR_DB_CLIENT.query(
                     collection_name=f"file-{file.id}", filter={"file_id": file.id}
                 )
 
@@ -1465,8 +1465,11 @@ def process_file(
                 if file_path:
                     file_path = Storage.get_file(file_path)
                     loader = _build_loader_from_request_config(request)
-                    docs = loader.load(
-                        file.filename, file.meta.get("content_type"), file_path
+                    docs = await asyncio.to_thread(
+                        loader.load,
+                        file.filename,
+                        file.meta.get("content_type"),
+                        file_path,
                     )
 
                     docs = [
@@ -1498,15 +1501,15 @@ def process_file(
                 text_content = " ".join([doc.page_content for doc in docs])
 
             log.debug(f"text_content: {text_content}")
-            Files.update_file_data_by_id(
+            await Files.update_file_data_by_id(
                 file.id,
                 {"content": text_content},
             )
             hash = calculate_sha256_string(text_content)
-            Files.update_file_hash_by_id(file.id, hash)
+            await Files.update_file_hash_by_id(file.id, hash)
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-                Files.update_file_data_by_id(file.id, {"status": "completed"})
+                await Files.update_file_data_by_id(file.id, {"status": "completed"})
                 return {
                     "status": True,
                     "collection_name": None,
@@ -1515,7 +1518,7 @@ def process_file(
                 }
             else:
                 try:
-                    result = save_docs_to_vector_db(
+                    result = await save_docs_to_vector_db(
                         request,
                         docs=docs,
                         collection_name=collection_name,
@@ -1530,14 +1533,14 @@ def process_file(
                     log.info(f"added {len(docs)} items to collection {collection_name}")
 
                     if result:
-                        Files.update_file_metadata_by_id(
+                        await Files.update_file_metadata_by_id(
                             file.id,
                             {
                                 "collection_name": collection_name,
                             },
                         )
 
-                        Files.update_file_data_by_id(
+                        await Files.update_file_data_by_id(
                             file.id,
                             {"status": "completed"},
                         )
@@ -1555,7 +1558,7 @@ def process_file(
 
         except Exception as e:
             log.exception(e)
-            Files.update_file_data_by_id(
+            await Files.update_file_data_by_id(
                 file.id,
                 {"status": "failed"},
             )
@@ -1584,7 +1587,7 @@ class ProcessTextForm(BaseModel):
 
 
 @router.post("/process/text")
-def process_text(
+async def process_text(
     request: Request,
     form_data: ProcessTextForm,
     user=Depends(get_verified_user),
@@ -1602,7 +1605,7 @@ def process_text(
     text_content = form_data.content
     log.debug(f"text_content: {text_content}")
 
-    result = save_docs_to_vector_db(request, docs, collection_name, user=user)
+    result = await save_docs_to_vector_db(request, docs, collection_name, user=user)
     if result:
         return {
             "status": True,
@@ -1618,7 +1621,7 @@ def process_text(
 
 @router.post("/process/youtube")
 @router.post("/process/web")
-def process_web(
+async def process_web(
     request: Request, form_data: ProcessUrlForm, user=Depends(get_verified_user)
 ):
     try:
@@ -1630,7 +1633,7 @@ def process_web(
         log.debug(f"text_content: {content}")
 
         if not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-            save_docs_to_vector_db(
+            await save_docs_to_vector_db(
                 request,
                 docs,
                 collection_name,
@@ -1791,7 +1794,7 @@ class QueryDocForm(BaseModel):
 
 
 @router.post("/query/doc")
-def query_doc_handler(
+async def query_doc_handler(
     request: Request,
     form_data: QueryDocForm,
     user=Depends(get_verified_user),
@@ -1801,10 +1804,10 @@ def query_doc_handler(
             form_data.hybrid is None or form_data.hybrid
         ):
             collection_results = {}
-            collection_results[form_data.collection_name] = VECTOR_DB_CLIENT.get(
+            collection_results[form_data.collection_name] = await VECTOR_DB_CLIENT.get(
                 collection_name=form_data.collection_name
             )
-            return query_doc_with_hybrid_search(
+            return await query_doc_with_hybrid_search(
                 collection_name=form_data.collection_name,
                 collection_result=collection_results[form_data.collection_name],
                 query=form_data.query,
@@ -1836,7 +1839,7 @@ def query_doc_handler(
                 user=user,
             )
         else:
-            return query_doc(
+            return await query_doc(
                 collection_name=form_data.collection_name,
                 query_embedding=request.app.state.EMBEDDING_FUNCTION(
                     form_data.query, prefix=RAG_EMBEDDING_QUERY_PREFIX, user=user
@@ -1863,7 +1866,7 @@ class QueryCollectionsForm(BaseModel):
 
 
 @router.post("/query/collection")
-def query_collection_handler(
+async def query_collection_handler(
     request: Request,
     form_data: QueryCollectionsForm,
     user=Depends(get_verified_user),
@@ -1872,7 +1875,7 @@ def query_collection_handler(
         if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
             form_data.hybrid is None or form_data.hybrid
         ):
-            return query_collection_with_hybrid_search(
+            return await query_collection_with_hybrid_search(
                 collection_names=form_data.collection_names,
                 queries=[form_data.query],
                 embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
@@ -1902,7 +1905,7 @@ def query_collection_handler(
                 ),
             )
         else:
-            return query_collection(
+            return await query_collection(
                 collection_names=form_data.collection_names,
                 queries=[form_data.query],
                 embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
@@ -1932,15 +1935,15 @@ class DeleteForm(BaseModel):
 
 
 @router.post("/delete")
-def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin_user)):
+async def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin_user)):
     try:
-        if VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
-            file = Files.get_file_by_id(form_data.file_id)
+        if await VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
+            file = await Files.get_file_by_id(form_data.file_id)
             hash = file.hash
 
-            VECTOR_DB_CLIENT.delete(
+            await VECTOR_DB_CLIENT.delete(
                 collection_name=form_data.collection_name,
-                metadata={"hash": hash},
+                filter={"hash": hash},
             )
             return {"status": True}
         else:
@@ -1951,8 +1954,8 @@ def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin
 
 
 @router.post("/reset/db")
-def reset_vector_db(user=Depends(get_admin_user)):
-    VECTOR_DB_CLIENT.reset()
+async def reset_vector_db(user=Depends(get_admin_user)):
+    await VECTOR_DB_CLIENT.reset()
 
 
 @router.post("/reset/uploads")
@@ -2006,7 +2009,7 @@ class BatchProcessFilesResponse(BaseModel):
 
 
 @router.post("/process/files/batch")
-def process_files_batch(
+async def process_files_batch(
     request: Request,
     form_data: BatchProcessFilesForm,
     user=Depends(get_verified_user),
@@ -2038,8 +2041,8 @@ def process_files_batch(
             ]
 
             hash = calculate_sha256_string(text_content)
-            Files.update_file_hash_by_id(file.id, hash)
-            Files.update_file_data_by_id(file.id, {"content": text_content})
+            await Files.update_file_hash_by_id(file.id, hash)
+            await Files.update_file_data_by_id(file.id, {"content": text_content})
 
             all_docs.extend(docs)
             results.append(BatchProcessFilesResult(file_id=file.id, status="prepared"))
@@ -2053,7 +2056,7 @@ def process_files_batch(
     # Save all documents in one batch
     if all_docs:
         try:
-            save_docs_to_vector_db(
+            await save_docs_to_vector_db(
                 request=request,
                 docs=all_docs,
                 collection_name=collection_name,
@@ -2063,7 +2066,7 @@ def process_files_batch(
 
             # Update all files with collection name
             for result in results:
-                Files.update_file_metadata_by_id(
+                await Files.update_file_metadata_by_id(
                     result.file_id, {"collection_name": collection_name}
                 )
                 result.status = "completed"

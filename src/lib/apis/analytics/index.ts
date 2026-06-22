@@ -15,6 +15,7 @@ export interface ChatTokenStats {
 	last_output_tokens: number;
 	last_cache_read_tokens: number;
 	message_count: number;
+	cost?: number;
 	created_at: number;
 	updated_at: number;
 }
@@ -51,6 +52,9 @@ export interface ModelUsage {
 	conversation_count: number;
 	message_count: number;
 	percentage: number;
+	cost?: number;
+	unpriced_tokens?: number;
+	rate_source?: string | null;
 }
 
 /**
@@ -66,6 +70,7 @@ export interface TopChat {
 	total_cache_read_tokens: number;
 	last_cache_read_tokens: number;
 	message_count: number;
+	cost?: number;
 }
 
 /**
@@ -131,6 +136,78 @@ export interface UserUsage {
 	avg_tokens_per_message: number;
 	cache_read_rate: number;
 	last_active_at: number | null;
+	cost?: number;
+	unpriced_tokens?: number;
+}
+
+/**
+ * Total spend KPI (Admin only)
+ */
+export interface TotalSpend {
+	total_cost: number;
+	embedded_cost: number;
+	rate_card_cost: number;
+	total_tokens: number;
+	unpriced_tokens: number;
+	priced_model_count: number;
+	unpriced_model_count: number;
+	start_ts: number | null;
+	end_ts: number | null;
+}
+
+/**
+ * Single day of spend for the cost trend
+ */
+export interface DailySpendPoint {
+	date: string;
+	cost: number;
+	embedded_cost: number;
+	rate_card_cost: number;
+}
+
+/**
+ * Pricing catalog row (synced from OpenRouter)
+ */
+export interface PricingCatalogRow {
+	slug: string;
+	model_name: string | null;
+	prompt_rate: number | null;
+	completion_rate: number | null;
+	cache_read_rate: number | null;
+	web_search_rate: number | null;
+	is_free: boolean;
+	synced_at: number | null;
+}
+
+/**
+ * Pricing override row (admin-managed)
+ */
+export interface PricingOverrideRow {
+	model_id: string;
+	mode: string;
+	alias_slug: string | null;
+	prompt_rate: number | null;
+	completion_rate: number | null;
+	cache_read_rate: number | null;
+	note: string | null;
+	updated_by: string | null;
+	updated_at: number | null;
+}
+
+/**
+ * Per-model pricing resolution status (admin mapping cockpit)
+ */
+export interface ResolvedModelStatus {
+	model_id: string;
+	total_tokens: number;
+	rate_card_tokens: number;
+	priced: boolean;
+	rate_source: string | null;
+	effective_rate: {
+		prompt: number | null;
+		completion: number | null;
+		cache_read: number | null;
+	} | null;
 }
 
 /**
@@ -396,12 +473,16 @@ export const getGlobalWrapped = async (
 export const getGlobalModelUsage = async (
 	token: string,
 	limit: number = 20,
-	year?: number
+	year?: number,
+	window?: { start_ts?: number; end_ts?: number }
 ): Promise<ModelUsage[]> => {
 	let error = null;
 
 	const params = new URLSearchParams();
-	if (year) {
+	if (window?.start_ts != null && window?.end_ts != null) {
+		params.append('start_ts', Math.floor(window.start_ts).toString());
+		params.append('end_ts', Math.floor(window.end_ts).toString());
+	} else if (year) {
 		params.append('year', year.toString());
 	}
 	params.append('limit', limit.toString());
@@ -438,12 +519,16 @@ export const getGlobalModelUsage = async (
 export const getGlobalUserUsage = async (
 	token: string,
 	year?: number,
-	limit: number = 100
+	limit: number = 100,
+	window?: { start_ts?: number; end_ts?: number }
 ): Promise<UserUsage[]> => {
 	let error = null;
 
 	const params = new URLSearchParams();
-	if (year) {
+	if (window?.start_ts != null && window?.end_ts != null) {
+		params.append('start_ts', Math.floor(window.start_ts).toString());
+		params.append('end_ts', Math.floor(window.end_ts).toString());
+	} else if (year) {
 		params.append('year', year.toString());
 	}
 	params.append('limit', limit.toString());
@@ -565,4 +650,199 @@ export const formatTokenCount = (count: number): string => {
 	} else {
 		return (count / 1000000).toFixed(1) + 'M';
 	}
+};
+
+/**
+ * Format a USD cost value. Returns '—' for null/undefined.
+ */
+export const formatCost = (cost: number | null | undefined): string => {
+	if (cost == null) return '—';
+	if (cost === 0) return '$0.00';
+	if (cost > 0 && cost < 0.01) return '<$0.01';
+	const digits = cost < 100 ? 2 : 2;
+	return (
+		'$' +
+		cost.toLocaleString(undefined, {
+			minimumFractionDigits: digits,
+			maximumFractionDigits: digits
+		})
+	);
+};
+
+const _windowParams = (year?: number, window?: { start_ts?: number; end_ts?: number }) => {
+	const params = new URLSearchParams();
+	if (window?.start_ts != null && window?.end_ts != null) {
+		params.append('start_ts', Math.floor(window.start_ts).toString());
+		params.append('end_ts', Math.floor(window.end_ts).toString());
+	} else if (year) {
+		params.append('year', year.toString());
+	}
+	return params;
+};
+
+const _getJSON = async (token: string, path: string, fallback: any) => {
+	let error = null;
+	const res = await fetch(`${WEBUI_API_BASE_URL}${path}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			console.error(`Error fetching ${path}:`, err);
+			return fallback;
+		});
+	if (error) return fallback;
+	return res ?? fallback;
+};
+
+/**
+ * Get site-wide spend KPI (Admin only)
+ */
+export const getGlobalSpend = async (
+	token: string,
+	year?: number,
+	window?: { start_ts?: number; end_ts?: number }
+): Promise<TotalSpend | null> => {
+	const params = _windowParams(year, window);
+	return await _getJSON(token, `/analytics/global/spend?${params.toString()}`, null);
+};
+
+/**
+ * Get daily spend trend (Admin only)
+ */
+export const getGlobalSpendTrend = async (
+	token: string,
+	year?: number,
+	window?: { start_ts?: number; end_ts?: number }
+): Promise<DailySpendPoint[]> => {
+	const params = _windowParams(year, window);
+	return await _getJSON(token, `/analytics/global/spend-trend?${params.toString()}`, []);
+};
+
+/**
+ * Get most expensive chats (Admin only)
+ */
+export const getTopChatsByCost = async (
+	token: string,
+	limit: number = 10,
+	year?: number,
+	window?: { start_ts?: number; end_ts?: number }
+): Promise<TopChat[]> => {
+	const params = _windowParams(year, window);
+	params.append('limit', limit.toString());
+	return await _getJSON(token, `/analytics/global/top-chats-by-cost?${params.toString()}`, []);
+};
+
+/**
+ * Get the synced OpenRouter pricing catalog (Admin only)
+ */
+export const getPricingCatalog = async (
+	token: string
+): Promise<{ catalog: PricingCatalogRow[]; synced_at: number | null }> => {
+	return await _getJSON(token, `/analytics/pricing/catalog`, { catalog: [], synced_at: null });
+};
+
+/**
+ * Get overrides + per-model resolution status (Admin only)
+ */
+export const getPricingOverrides = async (
+	token: string
+): Promise<{ overrides: PricingOverrideRow[]; resolution: ResolvedModelStatus[] }> => {
+	return await _getJSON(token, `/analytics/pricing/overrides`, { overrides: [], resolution: [] });
+};
+
+/**
+ * Create/update a pricing override (Admin only)
+ */
+export const upsertPricingOverride = async (
+	token: string,
+	override: {
+		model_id: string;
+		mode: string;
+		alias_slug?: string | null;
+		prompt_rate?: number | null;
+		completion_rate?: number | null;
+		cache_read_rate?: number | null;
+		note?: string | null;
+	}
+): Promise<any> => {
+	let error = null;
+	const res = await fetch(`${WEBUI_API_BASE_URL}/analytics/pricing/overrides`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify(override)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			return null;
+		});
+	if (error) throw error;
+	return res;
+};
+
+/**
+ * Delete a pricing override (Admin only)
+ */
+export const deletePricingOverride = async (token: string, modelId: string): Promise<any> => {
+	let error = null;
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/analytics/pricing/overrides/${encodeURIComponent(modelId)}`,
+		{
+			method: 'DELETE',
+			headers: {
+				Accept: 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			return null;
+		});
+	if (error) throw error;
+	return res;
+};
+
+/**
+ * Trigger an immediate OpenRouter catalog sync (Admin only)
+ */
+export const syncPricing = async (token: string): Promise<any> => {
+	let error = null;
+	const res = await fetch(`${WEBUI_API_BASE_URL}/analytics/pricing/sync`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			return null;
+		});
+	if (error) throw error;
+	return res;
 };

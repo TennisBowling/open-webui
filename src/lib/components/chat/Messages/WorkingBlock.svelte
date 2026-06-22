@@ -11,14 +11,15 @@
 	const i18n: any = getContext('i18n');
 
 	// One render member of the burst. `projection` is the pre-computed markdown
-	// string for non-tool blocks; `toolPayload` is the JSON string for a
-	// tool_calls block. Both come straight from ContentRenderer's projection
-	// cache (indexed by the original block index) so we never re-project here.
+	// string for non-tool blocks; `blockRev` changes when a tool_calls block's
+	// render-relevant fields mutate in place. Both come straight from
+	// ContentRenderer's projection cache (indexed by the original block index) so
+	// we never re-project here.
 	export let members: {
 		index: number;
 		block: any;
 		projection: string;
-		toolPayload: string;
+		blockRev?: string;
 	}[] = [];
 
 	// True while this burst is the live, trailing agentic work in an actively
@@ -66,9 +67,7 @@
 	$: startedAts = members
 		.map((m) => num(m.block?.started_at))
 		.filter((v): v is number => v != null);
-	$: endedAts = members
-		.map((m) => num(m.block?.ended_at))
-		.filter((v): v is number => v != null);
+	$: endedAts = members.map((m) => num(m.block?.ended_at)).filter((v): v is number => v != null);
 	$: startedAt = startedAts.length ? Math.min(...startedAts) : null;
 	// A member that has started but not ended means the burst is still open even
 	// if the caller hasn't flagged `working` yet (brief race at stream tail).
@@ -263,7 +262,8 @@
 				{#if member.block?.type === 'tool_calls'}
 					<ToolCallsBlock
 						id={`${idPrefix}-b${member.index}`}
-						blockJson={member.toolPayload ?? ''}
+						block={member.block}
+						blockRev={member.blockRev ?? ''}
 						{chatId}
 						{messageId}
 					/>
@@ -285,7 +285,7 @@
 						{onTaskClick}
 						{onSave}
 						onUpdate={onArtifactDetected}
-						onPreview={onPreview}
+						{onPreview}
 					/>
 				{/if}
 				<!-- empty placeholder text members render nothing -->

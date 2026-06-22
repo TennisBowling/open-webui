@@ -1087,3 +1087,45 @@ def test_subagent_reconciliation_does_not_perturb_reasoning_dedup():
     assert _ids(out[0]) == ["rs_S"]
     tool_msg = next(m for m in out if m["role"] == "tool")
     assert tool_msg["content"] == [{"type": "text", "text": "ans"}]
+
+
+def test_missing_subagent_result_body_degrades_instead_of_raising():
+    """A subagent result whose offloaded body went missing must NOT blow up the
+    whole outbound conversion — it degrades to empty so the subagent_runs
+    final_text recovery (or the "[No output...]" placeholder) can fill it. A
+    missing body for a REGULAR tool still raises (genuine data-loss signal)."""
+    from open_webui.utils.messages import _hydrate_tool_result_refs
+
+    # Subagent ref with no body present -> no raise, content stays empty.
+    blocks = [
+        {
+            "type": "tool_calls",
+            "content": [
+                {"id": "tc1", "type": "function",
+                 "function": {"name": "subagent_launch", "arguments": "{}"}}
+            ],
+            "results": [
+                {"tool_call_id": "tc1", "result_ref": "tc1",
+                 "subagent_id": "sa1", "content": ""}
+            ],
+        }
+    ]
+    out = _hydrate_tool_result_refs(blocks, bodies={})  # body missing
+    assert out[0]["results"][0].get("content", "") == ""
+
+    # A regular tool with a missing body still raises (unchanged behavior).
+    reg = [
+        {
+            "type": "tool_calls",
+            "content": [
+                {"id": "tc2", "type": "function",
+                 "function": {"name": "web_search", "arguments": "{}"}}
+            ],
+            "results": [
+                {"tool_call_id": "tc2", "result_ref": "tc2", "content": ""}
+            ],
+        }
+    ]
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        _hydrate_tool_result_refs(reg, bodies={})

@@ -1,19 +1,14 @@
-import json
 import time
 import uuid
 from typing import Optional
 
-from open_webui.internal.db import Base, get_db
-from open_webui.utils.access_control import has_access
-
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Boolean, Column, String, Text, JSON
-from sqlalchemy import or_, func, select, and_, text
-from sqlalchemy.sql import exists
+from sqlalchemy import BigInteger, Column, Text, delete, select
+from sqlalchemy.dialects.postgresql import JSONB
 
-####################
-# Channel DB Schema
-####################
+from open_webui.internal.db import Base, get_db
+from open_webui.models.groups import Groups
+from open_webui.utils.access_control import has_access
 
 
 class Channel(Base):
@@ -22,39 +17,27 @@ class Channel(Base):
     id = Column(Text, primary_key=True)
     user_id = Column(Text)
     type = Column(Text, nullable=True)
-
     name = Column(Text)
     description = Column(Text, nullable=True)
-
-    data = Column(JSON, nullable=True)
-    meta = Column(JSON, nullable=True)
-    access_control = Column(JSON, nullable=True)
-
+    data = Column(JSONB, nullable=True)
+    meta = Column(JSONB, nullable=True)
+    access_control = Column(JSONB, nullable=True)
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
 
 
 class ChannelModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-
     id: str
     user_id: str
     type: Optional[str] = None
-
     name: str
     description: Optional[str] = None
-
     data: Optional[dict] = None
     meta: Optional[dict] = None
     access_control: Optional[dict] = None
-
-    created_at: int  # timestamp in epoch
-    updated_at: int  # timestamp in epoch
-
-
-####################
-# Forms
-####################
+    created_at: int
+    updated_at: int
 
 
 class ChannelResponse(ChannelModel):
@@ -70,70 +53,68 @@ class ChannelForm(BaseModel):
 
 
 class ChannelTable:
-    def insert_new_channel(
+    async def insert_new_channel(
         self, type: Optional[str], form_data: ChannelForm, user_id: str
     ) -> Optional[ChannelModel]:
-        with get_db() as db:
-            channel = ChannelModel(
-                **{
-                    **form_data.model_dump(),
-                    "type": type,
-                    "name": form_data.name.lower(),
-                    "id": str(uuid.uuid4()),
-                    "user_id": user_id,
-                    "created_at": int(time.time_ns()),
-                    "updated_at": int(time.time_ns()),
-                }
+        async with get_db() as db:
+            now = int(time.time_ns())
+            row = Channel(
+                **form_data.model_dump(),
+                type=type,
+                name=form_data.name.lower(),
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                created_at=now,
+                updated_at=now,
             )
+            db.add(row)
+            await db.commit()
+            await db.refresh(row)
+            return ChannelModel.model_validate(row)
 
-            new_channel = Channel(**channel.model_dump())
+    async def get_channels(self) -> list[ChannelModel]:
+        async with get_db() as db:
+            rows = (await db.execute(select(Channel))).scalars().all()
+            return [ChannelModel.model_validate(row) for row in rows]
 
-            db.add(new_channel)
-            db.commit()
-            return channel
-
-    def get_channels(self) -> list[ChannelModel]:
-        with get_db() as db:
-            channels = db.query(Channel).all()
-            return [ChannelModel.model_validate(channel) for channel in channels]
-
-    def get_channels_by_user_id(
+    async def get_channels_by_user_id(
         self, user_id: str, permission: str = "read"
     ) -> list[ChannelModel]:
-        channels = self.get_channels()
+        channels = await self.get_channels()
+        user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user_id)}
         return [
             channel
             for channel in channels
             if channel.user_id == user_id
-            or has_access(user_id, permission, channel.access_control)
+            or has_access(user_id, permission, channel.access_control, user_group_ids)
         ]
 
-    def get_channel_by_id(self, id: str) -> Optional[ChannelModel]:
-        with get_db() as db:
-            channel = db.query(Channel).filter(Channel.id == id).first()
-            return ChannelModel.model_validate(channel) if channel else None
+    async def get_channel_by_id(self, id: str) -> Optional[ChannelModel]:
+        async with get_db() as db:
+            row = await db.get(Channel, id)
+            return ChannelModel.model_validate(row) if row else None
 
-    def update_channel_by_id(
+    async def update_channel_by_id(
         self, id: str, form_data: ChannelForm
     ) -> Optional[ChannelModel]:
-        with get_db() as db:
-            channel = db.query(Channel).filter(Channel.id == id).first()
-            if not channel:
+        async with get_db() as db:
+            row = await db.get(Channel, id)
+            if not row:
                 return None
+            row.name = form_data.name
+            row.description = form_data.description
+            row.data = form_data.data
+            row.meta = form_data.meta
+            row.access_control = form_data.access_control
+            row.updated_at = int(time.time_ns())
+            await db.commit()
+            await db.refresh(row)
+            return ChannelModel.model_validate(row)
 
-            channel.name = form_data.name
-            channel.data = form_data.data
-            channel.meta = form_data.meta
-            channel.access_control = form_data.access_control
-            channel.updated_at = int(time.time_ns())
-
-            db.commit()
-            return ChannelModel.model_validate(channel) if channel else None
-
-    def delete_channel_by_id(self, id: str):
-        with get_db() as db:
-            db.query(Channel).filter(Channel.id == id).delete()
-            db.commit()
+    async def delete_channel_by_id(self, id: str):
+        async with get_db() as db:
+            await db.execute(delete(Channel).where(Channel.id == id))
+            await db.commit()
             return True
 
 

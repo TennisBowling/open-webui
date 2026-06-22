@@ -57,7 +57,7 @@ async def get_chat_token_stats(chat_id: str, user=Depends(get_verified_user)):
     log.info(f"📊 [get_chat_token_stats] Called for chat_id={chat_id}, user_id={user.id}")
     
     # Verify user has access to this chat
-    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
     log.info(f"📊 [get_chat_token_stats] Chat access check: {chat is not None}")
     
     if not chat and user.role != "admin":
@@ -69,14 +69,14 @@ async def get_chat_token_stats(chat_id: str, user=Depends(get_verified_user)):
     
     # Admin can access any chat
     if not chat and user.role == "admin":
-        chat = Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=ERROR_MESSAGES.NOT_FOUND,
             )
     
-    stats = Analytics.get_conversation_token_usage(chat_id)
+    stats = await Analytics.get_conversation_token_usage(chat_id)
     log.info(f"📊 [get_chat_token_stats] Stats from DB: {stats}")
     
     # Return empty stats if no token data yet
@@ -128,12 +128,12 @@ async def get_user_wrapped(
     if year is None:
         year = datetime.now(timezone.utc).year
     
-    wrapped = Analytics.get_user_wrapped(user.id, year)
+    wrapped = await Analytics.get_user_wrapped(user.id, year)
     
     # Enrich top chats with titles from Chats table
     enriched_chats = []
     for chat in wrapped.top_chats:
-        chat_data = Chats.get_chat_by_id(chat.chat_id)
+        chat_data = await Chats.get_chat_by_id(chat.chat_id)
         title = chat_data.title if chat_data else None
         enriched_chats.append(TopChatResponse(
             chat_id=chat.chat_id,
@@ -170,7 +170,7 @@ async def get_user_heatmap(
     if year is None:
         year = datetime.now(timezone.utc).year
     
-    return Analytics.get_heatmap_data(user.id, year)
+    return await Analytics.get_heatmap_data(user.id, year)
 
 
 @router.get("/user/models", response_model=list[ModelUsageResponse])
@@ -188,7 +188,7 @@ async def get_user_model_usage(
     
     Sorted by total tokens descending.
     """
-    return Analytics.get_model_usage_by_user(user.id, year)
+    return await Analytics.get_model_usage_by_user(user.id, year)
 
 
 @router.get("/user/top-chats", response_model=list[TopChatResponse])
@@ -204,12 +204,12 @@ async def get_user_top_chats(
         year: Optional year filter
         limit: Max results (default 10)
     """
-    chats = Analytics.get_top_chats_by_user(user.id, year, limit)
+    chats = await Analytics.get_top_chats_by_user(user.id, year, limit)
     
     # Enrich with chat titles
     enriched = []
     for chat in chats:
-        chat_data = Chats.get_chat_by_id(chat.chat_id)
+        chat_data = await Chats.get_chat_by_id(chat.chat_id)
         title = chat_data.title if chat_data else None
         enriched.append(TopChatResponse(
             chat_id=chat.chat_id,
@@ -251,7 +251,7 @@ async def get_global_wrapped(
     if year is None:
         year = datetime.now(timezone.utc).year
     
-    return Analytics.get_global_wrapped(year)
+    return await Analytics.get_global_wrapped(year)
 
 
 @router.get("/global/models", response_model=list[ModelUsageResponse])
@@ -267,7 +267,7 @@ async def get_global_model_usage(
     
     Returns top models by total token count with percentages.
     """
-    return Analytics.get_global_model_usage(limit, year)
+    return await Analytics.get_global_model_usage(limit, year)
 
 
 @router.get("/global/users", response_model=list[UserUsageResponse])
@@ -279,7 +279,7 @@ async def get_global_user_usage(
     """Get per-user token/cache/message stats for admins."""
     if year is None:
         year = datetime.now(timezone.utc).year
-    return Analytics.get_global_user_usage(year, limit)
+    return await Analytics.get_global_user_usage(year, limit)
 
 
 @router.get("/global/subagents", response_model=SubagentAnalyticsResponse)
@@ -290,7 +290,7 @@ async def get_global_subagent_usage(
     """Get site-wide subagent usage analytics."""
     if year is None:
         year = datetime.now(timezone.utc).year
-    return Analytics.get_global_subagent_usage(year)
+    return await Analytics.get_global_subagent_usage(year)
 
 
 @router.get("/global/heatmap", response_model=HeatmapResponse)

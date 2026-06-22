@@ -416,6 +416,15 @@ def _hydrate_tool_result_refs(
                 merged.update(body)
                 new_results[idx] = merged
             elif result.get("result_ref"):
+                if result.get("subagent_id"):
+                    # A subagent result whose offloaded body went missing (e.g. a
+                    # meta-column write race dropped tool_result_bodies). Do NOT
+                    # raise — leave content empty so the subagent_runs.final_text
+                    # recovery in _expand_assistant fills it (or the "[No output…]"
+                    # placeholder is substituted). Raising here would blow up the
+                    # ENTIRE parent outbound conversion (breaking the next turn)
+                    # over one recoverable subagent result.
+                    continue
                 raise ValueError(
                     f"Missing tool result body for ref {result.get('result_ref')}"
                 )

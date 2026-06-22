@@ -29,6 +29,15 @@ const isEmptyText = (block: any): boolean =>
 const isAgentic = (block: any): boolean =>
 	block?.type === 'reasoning' || block?.type === 'tool_calls';
 
+// A tool_calls block that contains an `ask_user` call renders an interactive
+// question card the user must see and act on. It must NOT be absorbed into a
+// collapsible "Working" group (those auto-collapse when finished, hiding the
+// card) — so it breaks the burst and renders standalone, like a user_steer.
+const hasAskUserCall = (block: any): boolean =>
+	block?.type === 'tool_calls' &&
+	Array.isArray(block?.content) &&
+	block.content.some((call: any) => call?.function?.name === 'ask_user');
+
 // Decide how to render a message's content_blocks.
 //
 // `enabled === false` reproduces the legacy flat layout exactly: one
@@ -62,7 +71,13 @@ export const computeAgenticRenderItems = (
 
 	for (let i = 0; i < list.length; i++) {
 		const block = list[i];
-		if (isAgentic(block)) {
+		if (hasAskUserCall(block)) {
+			// An ask_user question card must render standalone and stay visible
+			// (it's interactive and may be blocking the generation). Close any
+			// open burst and emit it on its own, like a user_steer.
+			flush();
+			items.push({ kind: 'block', index: i });
+		} else if (isAgentic(block)) {
 			pending.push(i);
 			if (block?.type === 'tool_calls') pendingHasToolCalls = true;
 		} else if (isEmptyText(block)) {

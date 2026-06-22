@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from open_webui.env import AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL, SRC_LOG_LEVELS
 from open_webui.models.files import FileForm, Files
+from open_webui.retrieval.web.session import session_for_current_loop
 from open_webui.storage.provider import Storage
 from open_webui.utils.container_workspace import _reclaim_outputs
 from open_webui.utils.image_conversion import (
@@ -175,7 +176,7 @@ async def _fetch_web_image_bytes(
     current_url = source.strip()
     _validate_web_image_url(current_url)
 
-    session = getattr(request.app.state, "http_session", None)
+    session = session_for_current_loop(getattr(request.app.state, "http_session", None))
     owns_session = session is None
     if owns_session:
         timeout = aiohttp.ClientTimeout(total=VIEW_IMAGE_FETCH_TIMEOUT_SECONDS)
@@ -213,7 +214,7 @@ async def _fetch_web_image_bytes(
             await session.close()
 
 
-def _store_image_file(
+async def _store_image_file(
     request: Request,
     user_dict: dict,
     image_data: bytes,
@@ -238,7 +239,7 @@ def _store_image_file(
         },
     )
 
-    file_item = Files.insert_new_file(
+    file_item = await Files.insert_new_file(
         str(user_dict.get("id") or ""),
         FileForm(
             id=file_id,
@@ -348,7 +349,7 @@ class ViewImageTools:
             image_data, provider_mime = _prepare_image_for_attachment(
                 raw, mime_type, display_name
             )
-            stored = _store_image_file(
+            stored = await _store_image_file(
                 __request__, user_dict, image_data, provider_mime, display_name, source
             )
             attachment = {

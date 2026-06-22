@@ -6,7 +6,7 @@ Create Date: 2024-10-09 21:02:35.241684
 
 """
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 from sqlalchemy.sql import table, select, update
 
@@ -19,11 +19,13 @@ depends_on = None
 
 
 def upgrade():
-    conn = op.get_bind()
-    inspector = sa.inspect(conn)
-
-    columns = inspector.get_columns("chat")
-    column_dict = {col["name"]: col for col in columns}
+    if context.is_offline_mode():
+        column_dict = {"chat": {"type": sa.Text()}}
+    else:
+        conn = op.get_bind()
+        inspector = sa.inspect(conn)
+        columns = inspector.get_columns("chat")
+        column_dict = {col["name"]: col for col in columns}
 
     chat_column = column_dict.get("chat")
     old_chat_exists = "old_chat" in column_dict
@@ -56,6 +58,11 @@ def upgrade():
         sa.Column("old_chat", sa.Text()),
         sa.Column("chat", sa.JSON()),
     )
+
+    if context.is_offline_mode():
+        print("Dropping 'old_chat' column")
+        op.drop_column("chat", "old_chat")
+        return
 
     # - Selecting all data from the table
     connection = op.get_bind()

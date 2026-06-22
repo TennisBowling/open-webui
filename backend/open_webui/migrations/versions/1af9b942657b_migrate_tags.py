@@ -6,7 +6,7 @@ Create Date: 2024-10-09 21:02:35.241684
 
 """
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 from sqlalchemy.sql import table, select, update, column
 from sqlalchemy.engine.reflection import Inspector
@@ -20,6 +20,12 @@ depends_on = None
 
 
 def upgrade():
+    if context.is_offline_mode():
+        op.add_column("tag", sa.Column("meta", sa.JSON(), nullable=True))
+        op.add_column("chat", sa.Column("pinned", sa.Boolean(), nullable=True))
+        op.add_column("chat", sa.Column("meta", sa.JSON(), nullable=False, server_default="{}"))
+        return
+
     # Setup an inspection on the existing table to avoid issues
     conn = op.get_bind()
     inspector = Inspector.from_engine(conn)

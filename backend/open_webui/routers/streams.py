@@ -9,12 +9,14 @@ from open_webui.socket.main import (
     STREAM_VERSION,
     clear_stream_state,
     get_active_streams_for_chat,
+    get_stream_runtime_metrics,
+    get_stream_replay_events,
     get_stream_state,
     get_tool_results,
     set_stream_state,
     stream_version_get,
 )
-from open_webui.utils.auth import get_verified_user
+from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.stream_state import terminal_status_from_message
 
 
@@ -24,11 +26,16 @@ log.setLevel(SRC_LOG_LEVELS["MODELS"])
 router = APIRouter()
 
 
+@router.get("/metrics")
+async def get_stream_metrics(user=Depends(get_admin_user)):
+    return {"metrics": get_stream_runtime_metrics()}
+
+
 def _clear_stale_active_stream(chat_id: str, message_id: str, message: Optional[dict]) -> Optional[str]:
     """Clear RAM stream state when DB already has a terminal message.
 
     A browser stop or provider/setup error can persist ``done``/``error`` before
-    the v2 stream cleanup path runs. Without this guard, reloads keep seeing the
+    the v2.1 stream cleanup path runs. Without this guard, reloads keep seeing the
     message in ``/active`` and repeatedly request snapshots for a dead stream.
     """
     status = terminal_status_from_message(message)
@@ -49,12 +56,12 @@ def _clear_stale_active_stream(chat_id: str, message_id: str, message: Optional[
     return status
 
 
-def _find_chat_id_for_message(message_id: str, user_id: str) -> Optional[str]:
+async def _find_chat_id_for_message(message_id: str, user_id: str) -> Optional[str]:
     # No direct index from message_id to chat_id, so walk the user's recent
     # chats. Snapshot fetch is rare (reconnect/reload), and callers pass
     # chat_id on the hot path to skip this scan.
-    for chat in Chats.get_chat_list_by_user_id(user_id, include_archived=True):
-        msg = Chats.get_message_by_id_and_message_id(chat.id, message_id)
+    for chat in await Chats.get_chat_list_by_user_id(user_id, include_archived=True):
+        msg = await Chats.get_message_by_id_and_message_id(chat.id, message_id)
         if msg:
             return chat.id
     return None
@@ -65,7 +72,7 @@ async def get_active_streams(
     chat_id: str,
     user=Depends(get_verified_user),
 ):
-    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
     if chat is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -75,7 +82,7 @@ async def get_active_streams(
     for stream in get_active_streams_for_chat(chat_id):
         message_id = stream.get("message_id")
         persisted = (
-            Chats.get_message_by_id_and_message_id(chat_id, message_id)
+            await Chats.get_message_by_id_and_message_id(chat_id, message_id)
             if message_id
             else None
         )
@@ -91,33 +98,33 @@ async def get_stream_snapshot(
     chat_id: Optional[str] = None,
     user=Depends(get_verified_user),
 ):
-    """Wire Contract #2 — stream v2 snapshot endpoint.
+    """Wire Contract #2 — stream v2.1 snapshot endpoint.
 
     Returns the current state of an in-flight (or completed) assistant
     message so the client can reconcile a missed delta window. Reads the
     version counter + tool-result bodies from Redis (populated by B9's
-    v2 emitter); content_blocks come from Redis STREAM_STATE when the
+    v2.1 emitter); content_blocks come from Redis STREAM_STATE when the
     in-memory snapshot is authoritative, otherwise from the persisted
     chat_message row written by realtime save.
     """
 
     resolved_chat_id = chat_id
     if resolved_chat_id:
-        chat = Chats.get_chat_by_id_and_user_id(resolved_chat_id, user.id)
+        chat = await Chats.get_chat_by_id_and_user_id(resolved_chat_id, user.id)
         if chat is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Chat not found",
             )
     else:
-        resolved_chat_id = _find_chat_id_for_message(message_id, user.id)
+        resolved_chat_id = await _find_chat_id_for_message(message_id, user.id)
         if resolved_chat_id is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Message not found",
             )
 
-    persisted = Chats.get_message_by_id_and_message_id(
+    persisted = await Chats.get_message_by_id_and_message_id(
         resolved_chat_id, message_id
     )
     in_flight_state = get_stream_state(message_id)
@@ -177,7 +184,7 @@ async def get_stream_snapshot(
     # materializing a not-yet-loaded message (e.g. attaching to a server-drained
     # generation) label it with the RIGHT model rather than guessing from the
     # tab's current selection.
-    model = (persisted or {}).get("model")
+    model = (persisted or {}).get("model") or in_flight_state.get("model")
 
     response: dict = {
         "version": version,
@@ -196,6 +203,46 @@ async def get_stream_snapshot(
     if model is not None:
         response["model"] = model
     return response
+
+
+@router.get("/{message_id}/deltas")
+async def get_stream_deltas(
+    message_id: str,
+    chat_id: Optional[str] = None,
+    after_version: int = 0,
+    user=Depends(get_verified_user),
+):
+    resolved_chat_id = chat_id
+    if resolved_chat_id:
+        chat = await Chats.get_chat_by_id_and_user_id(resolved_chat_id, user.id)
+        if chat is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chat not found",
+            )
+    else:
+        resolved_chat_id = await _find_chat_id_for_message(message_id, user.id)
+        if resolved_chat_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Message not found",
+            )
+
+    in_flight_state = get_stream_state(message_id)
+    state_chat_id = in_flight_state.get("chat_id") if in_flight_state else None
+    if state_chat_id and state_chat_id != resolved_chat_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message not found",
+        )
+    persisted = await Chats.get_message_by_id_and_message_id(resolved_chat_id, message_id)
+    if not persisted and not in_flight_state:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message not found",
+        )
+
+    return await get_stream_replay_events(message_id, after_version)
 
 
 @router.get("/browser/{message_id}/frame")
@@ -222,13 +269,13 @@ async def get_browser_frame(
 
     resolved_chat_id = chat_id
     if resolved_chat_id:
-        chat = Chats.get_chat_by_id_and_user_id(resolved_chat_id, user.id)
+        chat = await Chats.get_chat_by_id_and_user_id(resolved_chat_id, user.id)
         if chat is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found"
             )
     else:
-        resolved_chat_id = _find_chat_id_for_message(message_id, user.id)
+        resolved_chat_id = await _find_chat_id_for_message(message_id, user.id)
         if resolved_chat_id is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Message not found"
@@ -240,7 +287,7 @@ async def get_browser_frame(
     if not data_root:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    sessions = read_browser_live_sessions(data_root, resolved_chat_id)
+    sessions = await read_browser_live_sessions(data_root, resolved_chat_id)
     # Build a per-session payload list; only include sessions that have a frame.
     session_payloads: list[dict] = []
     for session_id_key, live in sessions.items():

@@ -7,11 +7,10 @@ from typing import Any, Optional
 
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import BigInteger, Boolean, Column, Index, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, Index, String, Text, delete, select, update
 
 from open_webui.env import OAUTH_SESSION_TOKEN_ENCRYPTION_KEY, SRC_LOG_LEVELS
 from open_webui.internal.db import Base, JSONField, get_db
-
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -175,14 +174,14 @@ def _slug_id(value: str) -> str:
 
 
 class MCPConnectionsTable:
-    def insert_new_connection(
+    async def insert_new_connection(
         self, user_id: str, form_data: MCPConnectionForm
     ) -> Optional[MCPConnectionModel]:
         now = int(time.time())
         base_id = _slug_id(form_data.id or form_data.name)
         user_digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:8]
         connection_id = f"{base_id}-{user_digest}"
-        if self.get_connection_by_id(connection_id):
+        if await self.get_connection_by_id(connection_id):
             connection_id = f"{base_id}-{user_digest}-{hashlib.sha1(str(now).encode()).hexdigest()[:6]}"
         row_data = {
             **form_data.model_dump(exclude={"key", "headers", "env"}),
@@ -200,22 +199,22 @@ class MCPConnectionsTable:
             "created_at": now,
         }
         try:
-            with get_db() as db:
-                result = MCPConnection(**row_data)
-                db.add(result)
-                db.commit()
-                db.refresh(result)
-                return _public_from_row(result)
+            async with get_db() as db:
+                row = MCPConnection(**row_data)
+                db.add(row)
+                await db.commit()
+                await db.refresh(row)
+                return _public_from_row(row)
         except Exception:
             log.exception("Error creating MCP connection")
             return None
 
-    def get_connection_by_id(
+    async def get_connection_by_id(
         self, id: str, *, include_secrets: bool = False
     ) -> Optional[MCPConnectionModel | MCPConnectionWithSecrets]:
         try:
-            with get_db() as db:
-                row = db.get(MCPConnection, id)
+            async with get_db() as db:
+                row = await db.get(MCPConnection, id)
                 if not row:
                     return None
                 return _with_secrets_from_row(row) if include_secrets else _public_from_row(row)
@@ -223,12 +222,12 @@ class MCPConnectionsTable:
             log.exception("Error getting MCP connection")
             return None
 
-    def get_connection_by_id_and_user_id(
+    async def get_connection_by_id_and_user_id(
         self, id: str, user_id: str, *, include_secrets: bool = False
     ) -> Optional[MCPConnectionModel | MCPConnectionWithSecrets]:
         try:
-            with get_db() as db:
-                row = db.get(MCPConnection, id)
+            async with get_db() as db:
+                row = await db.get(MCPConnection, id)
                 if not row or row.user_id != user_id:
                     return None
                 return _with_secrets_from_row(row) if include_secrets else _public_from_row(row)
@@ -236,51 +235,56 @@ class MCPConnectionsTable:
             log.exception("Error getting MCP connection")
             return None
 
-    def get_connections_by_user_id(
+    async def get_connections_by_user_id(
         self, user_id: str, *, include_secrets: bool = False, enabled_only: bool = False
     ) -> list[MCPConnectionModel | MCPConnectionWithSecrets]:
-        with get_db() as db:
-            query = db.query(MCPConnection).filter_by(user_id=user_id)
+        async with get_db() as db:
+            stmt = select(MCPConnection).where(MCPConnection.user_id == user_id)
             if enabled_only:
-                query = query.filter_by(enabled=True)
-            rows = query.order_by(MCPConnection.updated_at.desc()).all()
+                stmt = stmt.where(MCPConnection.enabled == True)
+            rows = (await db.execute(stmt.order_by(MCPConnection.updated_at.desc()))).scalars().all()
             return [
                 _with_secrets_from_row(row) if include_secrets else _public_from_row(row)
                 for row in rows
             ]
 
-    def update_connection_by_id_and_user_id(
+    async def update_connection_by_id_and_user_id(
         self, id: str, user_id: str, updated: dict
     ) -> Optional[MCPConnectionModel]:
         secret_updates = {}
+        updated = dict(updated)
         for field_name in ("key", "headers", "env", "oauth"):
             if field_name in updated:
                 secret_updates[field_name] = encrypt_secret(updated.pop(field_name))
         try:
-            with get_db() as db:
-                row = db.get(MCPConnection, id)
-                if not row or row.user_id != user_id:
-                    return None
-                db.query(MCPConnection).filter_by(id=id, user_id=user_id).update(
-                    {**updated, **secret_updates, "updated_at": int(time.time())}
-                )
-                db.commit()
-            return self.get_connection_by_id_and_user_id(id, user_id)
+            async with get_db() as db:
+                row = (
+                    await db.execute(
+                        update(MCPConnection)
+                        .where(MCPConnection.id == id, MCPConnection.user_id == user_id)
+                        .values({**updated, **secret_updates, "updated_at": int(time.time())})
+                        .returning(MCPConnection)
+                    )
+                ).scalars().first()
+                await db.commit()
+                return _public_from_row(row) if row else None
         except Exception:
             log.exception("Error updating MCP connection")
             return None
 
-    def update_oauth_by_id_and_user_id(
+    async def update_oauth_by_id_and_user_id(
         self, id: str, user_id: str, oauth: dict
     ) -> Optional[MCPConnectionModel]:
-        return self.update_connection_by_id_and_user_id(id, user_id, {"oauth": oauth})
+        return await self.update_connection_by_id_and_user_id(id, user_id, {"oauth": oauth})
 
-    def delete_connection_by_id_and_user_id(self, id: str, user_id: str) -> bool:
+    async def delete_connection_by_id_and_user_id(self, id: str, user_id: str) -> bool:
         try:
-            with get_db() as db:
-                deleted = db.query(MCPConnection).filter_by(id=id, user_id=user_id).delete()
-                db.commit()
-                return deleted > 0
+            async with get_db() as db:
+                result = await db.execute(
+                    delete(MCPConnection).where(MCPConnection.id == id, MCPConnection.user_id == user_id)
+                )
+                await db.commit()
+                return result.rowcount > 0
         except Exception:
             log.exception("Error deleting MCP connection")
             return False

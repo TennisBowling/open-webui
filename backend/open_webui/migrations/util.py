@@ -1,12 +1,13 @@
 from alembic import op
-from sqlalchemy import Inspector
+from alembic import context
+from sqlalchemy import inspect
 
 
 def get_existing_tables():
+    if context.is_offline_mode():
+        return set()
     con = op.get_bind()
-    inspector = Inspector.from_engine(con)
-    tables = set(inspector.get_table_names())
-    return tables
+    return set(inspect(con).get_table_names())
 
 
 def get_revision_id():

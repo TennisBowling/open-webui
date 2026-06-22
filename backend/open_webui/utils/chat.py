@@ -65,7 +65,7 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
 # ---------------------------------------------------------------------------
-# B10: server-side conversation assembly (v2 chat/completions body shape)
+# B10: server-side conversation assembly (v2.1 chat/completions body shape)
 #
 # Ports `expandMessagesForToolResumption` and `buildTextFileBlocks` from
 # `src/lib/components/chat/Chat.svelte` so the frontend can stop shipping the
@@ -142,7 +142,7 @@ def _escape_xml_attr(s: str) -> str:
     )
 
 
-def _read_file_text(file: dict) -> str:
+async def _read_file_text(file: dict) -> str:
     """Best-effort plaintext read for a file dict that's already passed
     ``_is_text_file``. Prefers the cached extracted content on ``file.data``;
     falls back to reading the storage path directly.
@@ -157,7 +157,7 @@ def _read_file_text(file: dict) -> str:
     try:
         from open_webui.storage.provider import Storage
 
-        record = Files.get_file_by_id(file_id)
+        record = await Files.get_file_by_id(file_id)
         if record is None:
             return ""
 
@@ -181,7 +181,7 @@ def _read_file_text(file: dict) -> str:
     return ""
 
 
-def build_text_file_blocks(files: Optional[list]) -> str:
+async def build_text_file_blocks(files: Optional[list]) -> str:
     """Ported from Chat.svelte:buildTextFileBlocks. Returns the
     ``<document filename="...">...</document>`` prefix to prepend to a user
     message's text content, or '' if there are no inlineable text files.
@@ -195,7 +195,7 @@ def build_text_file_blocks(files: Optional[list]) -> str:
     blocks = []
     for f in text_files:
         name = f.get("name") or (f.get("file") or {}).get("filename") or "file"
-        text = _read_file_text(f)
+        text = await _read_file_text(f)
         blocks.append(
             f'<document filename="{_escape_xml_attr(name)}">\n{text}\n</document>'
         )
@@ -409,7 +409,7 @@ def _message_image_files(message: dict) -> list:
     return [f for f in (message.get("files") or []) if f.get("type") == "image"]
 
 
-def _message_pdf_files(message: dict) -> list:
+async def _message_pdf_files(message: dict) -> list:
     out = []
     for f in message.get("files") or []:
         if f.get("type") != "file":
@@ -480,11 +480,11 @@ async def preprocess_nonvision_files(
                 return (choices[0].get("message") or {}).get("content") or ""
         return ""
 
-    def _persist(content: str, **flags) -> None:
+    async def _persist(content: str, **flags) -> None:
         update = {"content": content, **flags}
         if chat_id and not str(chat_id).startswith("local:") and message_id:
             try:
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     chat_id, message_id, update, return_model=False
                 )
             except Exception:
@@ -523,7 +523,7 @@ async def preprocess_nonvision_files(
             user_message["content"] = new_content
             user_message["vision_processed"] = True
             base_content = new_content
-            _persist(new_content, vision_processed=True)
+            await _persist(new_content, vision_processed=True)
         except Exception:
             log.exception(
                 "preprocess_nonvision_files: image OCR failed for %s; sending text-only",
@@ -531,10 +531,10 @@ async def preprocess_nonvision_files(
             )
             # Degrade gracefully — mark processed=False, leave content as-is.
             user_message["vision_processed"] = False
-            _persist(base_content, vision_processed=False)
+            await _persist(base_content, vision_processed=False)
 
     # --- PDFs -----------------------------------------------------------------
-    pdfs = _message_pdf_files(user_message)
+    pdfs = await _message_pdf_files(user_message)
     if pdfs and not user_message.get("pdf_processed"):
         try:
             ocr_messages = [
@@ -574,7 +574,7 @@ async def preprocess_nonvision_files(
             )
             user_message["content"] = new_content
             user_message["pdf_processed"] = True
-            _persist(new_content, pdf_processed=True)
+            await _persist(new_content, pdf_processed=True)
         except Exception as e:
             log.exception(
                 "preprocess_nonvision_files: PDF OCR failed for %s", chat_id
@@ -590,7 +590,7 @@ async def preprocess_nonvision_files(
             }
             if chat_id and not str(chat_id).startswith("local:") and message_id:
                 try:
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         chat_id, message_id, {"error": err}, return_model=False
                     )
                 except Exception:
@@ -614,7 +614,7 @@ async def assemble_conversation_from_leaf(
     ready to feed into ``generate_chat_completion``.
 
     ``new_user_message`` (when provided) is persisted via
-    ``Chats.upsert_message_to_chat_by_id_and_message_id`` AND appended to the
+    ``await Chats.upsert_message_to_chat_by_id_and_message_id`` AND appended to the
     walk so the first send of a new turn works without a separate save round-trip
     from the frontend.
 
@@ -624,7 +624,7 @@ async def assemble_conversation_from_leaf(
     what makes queued multimodal messages work under the zero-tab server drain;
     it also runs for normal tab-driven sends so behavior is identical.
     """
-    messages_map = Chats.get_messages_map_by_chat_id(chat_id) or {}
+    messages_map = await Chats.get_messages_map_by_chat_id(chat_id) or {}
 
     chain = (
         _walk_messages_from_leaf(messages_map, leaf_message_id)
@@ -651,11 +651,11 @@ async def assemble_conversation_from_leaf(
 
             # Detect migrated vs legacy: migrated chats keep messages in the
             # chat_message table where childrenIds is *derived* from parent_id
-            # on read (see Chats.get_chat_meta_by_id_and_user_id in
+            # on read (see await Chats.get_chat_meta_by_id_and_user_id in
             # models/chats.py), so there is nothing to link on the parent row.
             # Legacy chats keep the tree inside the JSON blob and need an
             # explicit childrenIds append on the parent.
-            chat_row = Chats.get_chat_by_id(chat_id)
+            chat_row = await Chats.get_chat_by_id(chat_id)
             migrated = bool(
                 chat_row is not None
                 and getattr(chat_row, "messages_migrated", 0)
@@ -676,7 +676,7 @@ async def assemble_conversation_from_leaf(
                         # merges via {**existing, **incoming}, so this is a
                         # surgical partial update.
                         try:
-                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                            await Chats.upsert_message_to_chat_by_id_and_message_id(
                                 chat_id,
                                 parent_id,
                                 {"childrenIds": existing_children}, return_model=False
@@ -694,7 +694,7 @@ async def assemble_conversation_from_leaf(
             # call is what stamps history.currentId = new_id, so no
             # follow-up update_chat_by_id is needed.
             try:
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     chat_id, new_id, persisted, return_model=False
                 )
             except Exception as e:
@@ -803,7 +803,7 @@ async def assemble_conversation_from_leaf(
         should_attach_pdf_files = is_user and has_pdf and model_supports_vision
         should_attach_extractable_files = should_send_files_to_model and has_extractable
 
-        text_prefix = build_text_file_blocks(files) if should_send_files_to_model else ""
+        text_prefix = await build_text_file_blocks(files) if should_send_files_to_model else ""
         base_text = (message.get("merged") or {}).get("content") or message.get("content") or ""
 
         if is_user and (
@@ -983,7 +983,17 @@ async def generate_chat_completion(
         bypass_filter = True
 
     if hasattr(request.state, "metadata"):
-        if "metadata" not in form_data:
+        fd_meta = form_data.get("metadata") if isinstance(form_data, dict) else None
+        if isinstance(fd_meta, dict) and fd_meta.get("subagent_inner"):
+            # A subagent's inner rounds carry their OWN authoritative metadata in
+            # form_data. `request.state` is a per-Request singleton SHARED across a
+            # parallel subagent fan-out (all gather branches use the same Request),
+            # so a sibling subagent may have just swapped `request.state.metadata`
+            # to ITS chat/message/emitter. Merging that here would route this
+            # subagent's continuation round to the wrong chat — emitting its events
+            # and writing its transcript into a sibling. Trust form_data only.
+            pass
+        elif "metadata" not in form_data:
             form_data["metadata"] = request.state.metadata
         else:
             form_data["metadata"] = {
@@ -1033,7 +1043,7 @@ async def generate_chat_completion(
         # Check if user has access to the model
         if not bypass_filter and user.role == "user":
             try:
-                check_model_access(user, model)
+                await check_model_access(user, model)
             except Exception as e:
                 raise e
 
@@ -1162,8 +1172,8 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
 
     try:
         filter_functions = [
-            Functions.get_function_by_id(filter_id)
-            for filter_id in get_sorted_filter_ids(
+            await Functions.get_function_by_id(filter_id)
+            for filter_id in await get_sorted_filter_ids(
                 request, model, metadata.get("filter_ids", [])
             )
         ]
@@ -1242,8 +1252,8 @@ async def run_outlet_filters_on_completed_stream(
 
     try:
         filter_functions = [
-            Functions.get_function_by_id(filter_id)
-            for filter_id in get_sorted_filter_ids(
+            await Functions.get_function_by_id(filter_id)
+            for filter_id in await get_sorted_filter_ids(
                 request, model, filter_ids or []
             )
         ]
@@ -1297,7 +1307,7 @@ async def run_outlet_filters_on_completed_stream(
     merged_serialized = serialize_content_blocks(merged_blocks, force=True)
 
     try:
-        Chats.upsert_message_to_chat_by_id_and_message_id(
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
             metadata["chat_id"],
             metadata["message_id"],
             {
@@ -1311,7 +1321,7 @@ async def run_outlet_filters_on_completed_stream(
     try:
         from open_webui.env import STREAM_PROTOCOL_VERSION
 
-        if STREAM_PROTOCOL_VERSION == "v2":
+        if STREAM_PROTOCOL_VERSION == "v2.1":
             # The merge is non-incremental and may have added/removed text
             # blocks; emit a single `replace` covering the full block list
             # (B9 wire contract #1 — `replace` with block_idx=0 and a
@@ -1616,7 +1626,7 @@ def _apply_outlet_text_to_blocks(
     return new_blocks
 
 
-def _merge_outlet_filter_into_content_blocks(
+async def _merge_outlet_filter_into_content_blocks(
     content_blocks, original_serialized, filter_serialized
 ):
     """Back-compat wrapper. The previous version could return None to
@@ -1635,7 +1645,7 @@ async def chat_action(request: Request, action_id: str, form_data: dict, user: A
     else:
         sub_action_id = None
 
-    action = Functions.get_function_by_id(action_id)
+    action = await Functions.get_function_by_id(action_id)
     if not action:
         raise Exception(f"Action not found: {action_id}")
 
@@ -1673,10 +1683,10 @@ async def chat_action(request: Request, action_id: str, form_data: dict, user: A
         }
     )
 
-    function_module, _, _ = get_function_module_from_cache(request, action_id)
+    function_module, _, _ = await get_function_module_from_cache(request, action_id)
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
-        valves = Functions.get_function_valves_by_id(action_id)
+        valves = await Functions.get_function_valves_by_id(action_id)
         function_module.valves = function_module.Valves(**(valves if valves else {}))
 
     if hasattr(function_module, "action"):
@@ -1707,7 +1717,7 @@ async def chat_action(request: Request, action_id: str, form_data: dict, user: A
                 try:
                     if hasattr(function_module, "UserValves"):
                         __user__["valves"] = function_module.UserValves(
-                            **Functions.get_user_valves_by_id_and_user_id(
+                            **await Functions.get_user_valves_by_id_and_user_id(
                                 action_id, user.id
                             )
                         )

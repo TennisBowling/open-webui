@@ -23,8 +23,8 @@ starsessions[redis]==2.2.1
 
 sqlalchemy==2.0.38
 alembic==1.14.0
-peewee==3.18.1
-peewee-migrate==1.12.2
+asyncpg==0.30.0
+pgvector==0.4.1
 
 pycrdt==0.12.25
 redis
@@ -108,8 +108,6 @@ azure-storage-blob==12.24.1
 
 
 pymongo
-psycopg2-binary==2.9.10
-pgvector==0.4.1
 
 PyMySQL==1.1.1
 boto3==1.40.5

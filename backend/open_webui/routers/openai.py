@@ -598,7 +598,7 @@ async def get_filtered_models(models, user):
     # Filter models based on user access control
     filtered_models = []
     for model in models.get("data", []):
-        model_info = Models.get_model_by_id(model["id"])
+        model_info = await Models.get_model_by_id(model["id"])
         if model_info:
             if user.id == model_info.user_id or has_access(
                 user.id, type="read", access_control=model_info.access_control
@@ -969,7 +969,7 @@ def convert_to_azure_payload(url, payload: dict, api_version: str):
 
 async def trigger_title_generation(request, user, model_id, messages, chat_id):
     try:
-        chat = Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id(chat_id)
         if not chat:
             return
 
@@ -1006,7 +1006,7 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
             # Clean up title similar to frontend logic
             title = title.strip().replace('"', "")
             # Update DB
-            updated_chat = Chats.update_chat_title_by_id(chat.id, title)
+            updated_chat = await Chats.update_chat_title_by_id(chat.id, title)
             if updated_chat:
                 await broadcast_sidebar_event(
                     user.id,
@@ -1054,7 +1054,7 @@ async def trigger_title_generation(request, user, model_id, messages, chat_id):
                         tags_json = json.loads(json_part)
                         tags = tags_json.get("tags", [])
                         if tags:
-                            Chats.update_chat_tags_by_id(chat_id, tags, user)
+                            await Chats.update_chat_tags_by_id(chat_id, tags, user)
                             await broadcast_sidebar_event(
                                 user.id,
                                 {
@@ -1305,7 +1305,7 @@ async def generate_chat_completion(
                             log.debug(
                                 f"Resolving local file URL to base64: file_id={file_id}"
                             )
-                            file = Files.get_file_by_id(file_id)
+                            file = await Files.get_file_by_id(file_id)
                             if not file:
                                 log.warning(f"File not found in database: {file_id}")
                                 raise image_input_error(
@@ -1400,7 +1400,7 @@ async def generate_chat_completion(
                             continue
 
                         file_id = match.group(1)
-                        file = Files.get_file_by_id(file_id)
+                        file = await Files.get_file_by_id(file_id)
                         if not file or not user_can_read_file(file, user):
                             continue
 
@@ -1508,7 +1508,7 @@ async def generate_chat_completion(
                                 else:
                                     # Conversion failed → fall back to text mode
                                     # with a visible error marker.
-                                    refreshed = Files.get_file_by_id(file_id)
+                                    refreshed = await Files.get_file_by_id(file_id)
                                     pdf_error = (
                                         (refreshed.data if refreshed else {}) or {}
                                     ).get("pdf_error", "PDF conversion failed")
@@ -1552,7 +1552,7 @@ async def generate_chat_completion(
                                         display_filename, text
                                     )
                                 else:
-                                    refreshed = Files.get_file_by_id(file_id)
+                                    refreshed = await Files.get_file_by_id(file_id)
                                     err = (
                                         (refreshed.data if refreshed else {}) or {}
                                     ).get("error", "extraction failed or empty")
@@ -1572,7 +1572,7 @@ async def generate_chat_completion(
                                 )
 
     model_id = form_data.get("model")
-    model_info = Models.get_model_by_id(model_id)
+    model_info = await Models.get_model_by_id(model_id)
 
     # Check model info and override the payload
     if model_info:

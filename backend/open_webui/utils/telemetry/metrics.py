@@ -18,8 +18,11 @@ high-cardinality label sets.
 from __future__ import annotations
 
 import time
+import asyncio
 from typing import Dict, List, Sequence, Any
 from base64 import b64encode
+
+import asyncpg
 
 from fastapi import FastAPI, Request
 from opentelemetry import metrics
@@ -38,6 +41,7 @@ from opentelemetry.sdk.metrics.export import (
 from opentelemetry.sdk.resources import Resource
 
 from open_webui.env import (
+    DATABASE_URL,
     OTEL_SERVICE_NAME,
     OTEL_METRICS_EXPORTER_OTLP_ENDPOINT,
     OTEL_METRICS_BASIC_AUTH_USERNAME,
@@ -46,9 +50,25 @@ from open_webui.env import (
     OTEL_METRICS_EXPORTER_OTLP_INSECURE,
 )
 from open_webui.socket.main import get_active_user_ids
-from open_webui.models.users import Users
 
 _EXPORT_INTERVAL_MILLIS = 10_000  # 10 seconds
+
+
+async def _count_registered_users() -> int:
+    conn = await asyncpg.connect(
+        DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+    )
+    try:
+        return int(await conn.fetchval('SELECT COUNT(*) FROM "user"') or 0)
+    finally:
+        await conn.close()
+
+
+def _count_registered_users_sync() -> int:
+    try:
+        return asyncio.run(_count_registered_users())
+    except Exception:
+        return 0
 
 
 def _build_meter_provider(resource: Resource) -> MeterProvider:
@@ -141,7 +161,7 @@ def setup_metrics(app: FastAPI, resource: Resource) -> None:
     ) -> Sequence[metrics.Observation]:
         return [
             metrics.Observation(
-                value=len(Users.get_users()["users"]),
+                value=_count_registered_users_sync(),
             )
         ]
 

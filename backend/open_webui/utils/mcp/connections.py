@@ -123,7 +123,7 @@ async def resolve_personal_bearer_token(
         "expires_at": token_expires_at(refreshed),
     }
     oauth["tokens"] = tokens
-    MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
+    await MCPConnections.update_oauth_by_id_and_user_id(connection.id, connection.user_id, oauth)
     return tokens.get("access_token")
 
 

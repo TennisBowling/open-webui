@@ -76,14 +76,12 @@
 	let contentContainerElement;
 	let floatingButtonsElement;
 
-	// Cached per-block markdown projections. The important nuance for v2 is that
+	// Cached per-block markdown projections. The important nuance for v2.1 is that
 	// not only the tail block can change: a tool_calls block may receive results
 	// after later text/reasoning blocks have opened. Track a cheap signature per
 	// block and only re-project blocks whose render-relevant data changed.
 	/** @type {string[]} */
 	let blockProjections = [];
-	/** @type {string[]} */
-	let blockToolPayloads = [];
 	/** @type {string[]} */
 	let blockProjectionSignatures = [];
 	/** @type {WeakMap<object, { tag: string; signature: string }>} */
@@ -196,41 +194,12 @@
 		return signature;
 	};
 
-	const toolBlockPayload = (block) => {
-		const calls = Array.isArray(block?.content)
-			? block.content.map((call) => ({
-					id: call?.id ?? '',
-					tool_call_id: call?.tool_call_id ?? '',
-					function: {
-						name: call?.function?.name ?? '',
-						arguments: call?.function?.arguments ?? ''
-					}
-				}))
-			: [];
-		const results = Array.isArray(block?.results)
-			? block.results.map((result) => ({
-					tool_call_id: result?.tool_call_id ?? '',
-					content: result?.content ?? '',
-					result_ref: result?.result_ref ?? '',
-					result_lazy: result?.result_lazy === true,
-					size: result?.size ?? '',
-					sha256: result?.sha256 ?? '',
-					summary: result?.summary ?? null,
-					files: Array.isArray(result?.files) ? result.files : [],
-					embeds: Array.isArray(result?.embeds) ? result.embeds : [],
-					subagent_id: result?.subagent_id ?? '',
-					error: result?.error === true,
-					error_reason: result?.error_reason ?? '',
-					notice: result?.notice ?? ''
-				}))
-			: [];
-
-		return JSON.stringify({ content: calls, results });
-	};
-
 	const blockProjectionSignature = (block) => {
 		if (!block || typeof block !== 'object') return 'null';
 		const type = block.type ?? '';
+		if (typeof block.__owui_rev === 'number') {
+			return `${type}:rev:${block.__owui_rev}`;
+		}
 
 		if (type === 'text') {
 			return `text:${textSig(block.content)}`;
@@ -262,13 +231,10 @@
 		const blocks = Array.isArray(content_blocks) ? content_blocks : [];
 		if (blocks.length === 0) {
 			if (blockProjections.length !== 0) blockProjections = [];
-			if (blockToolPayloads.length !== 0) blockToolPayloads = [];
 			if (blockProjectionSignatures.length !== 0) blockProjectionSignatures = [];
 		} else {
 			/** @type {string[]} */
 			const next = [];
-			/** @type {string[]} */
-			const nextToolPayloads = [];
 			/** @type {string[]} */
 			const nextSignatures = [];
 			for (let i = 0; i < blocks.length; i++) {
@@ -276,21 +242,14 @@
 				nextSignatures[i] = signature;
 				if (blocks[i]?.type === 'tool_calls') {
 					next[i] = '';
-					nextToolPayloads[i] =
-						signature !== blockProjectionSignatures[i] || blockToolPayloads[i] == null
-							? toolBlockPayload(blocks[i])
-							: blockToolPayloads[i];
 				} else if (signature !== blockProjectionSignatures[i] || blockProjections[i] == null) {
 					next[i] = blocksToDisplayMarkdown([blocks[i]]);
-					nextToolPayloads[i] = '';
 				} else {
 					next[i] = blockProjections[i];
-					nextToolPayloads[i] = '';
 				}
 			}
 			blockProjectionSignatures = nextSignatures;
 			blockProjections = next;
-			blockToolPayloads = nextToolPayloads;
 		}
 		streamPerfEnd('render.content_projection', perf, blocks.length || 1);
 	}
@@ -521,15 +480,17 @@
 						index: bi,
 						block: structuredBlocks[bi],
 						projection: blockProjections[bi] ?? '',
-						toolPayload: blockToolPayloads[bi] ?? ''
+						blockRev: blockProjectionSignatures[bi] ?? ''
 					}))}
 				/>
 			{:else if structuredBlocks[item.index]?.type === 'tool_calls'}
 				<ToolCallsBlock
 					id={`${id}-b${item.index}`}
-					blockJson={blockToolPayloads[item.index] ?? ''}
+					block={structuredBlocks[item.index]}
+					blockRev={blockProjectionSignatures[item.index] ?? ''}
 					{chatId}
 					{messageId}
+					messageTerminated={messageDone || messageStopped || messageErrored}
 				/>
 			{:else if structuredBlocks[item.index]?.type === 'user_steer'}
 				<!-- Mid-task user interjection (steering): the user sent this while the
@@ -537,10 +498,7 @@
 				     boundary. Render as an inline user bubble so the transcript shows
 				     exactly what the model saw, in order. -->
 				<div class="flex justify-end my-2.5" dir="ltr">
-					<div
-						class="flex flex-col items-end max-w-[80%]"
-						aria-label="Steered message"
-					>
+					<div class="flex flex-col items-end max-w-[80%]" aria-label="Steered message">
 						<div
 							class="flex items-center gap-1 mb-1 text-[11px] text-gray-400 dark:text-gray-500 pr-0.5"
 						>
@@ -550,9 +508,7 @@
 								fill="currentColor"
 								class="size-3"
 							>
-								<path
-									d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z"
-								/>
+								<path d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z" />
 							</svg>
 							<span>{$i18n.t('Steered')}</span>
 						</div>

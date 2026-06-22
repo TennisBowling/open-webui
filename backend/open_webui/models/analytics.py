@@ -12,17 +12,19 @@ Tables:
 """
 
 import logging
+import inspect
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
-from open_webui.internal.db import Base, get_db
+from open_webui.internal.db import Base, get_db, run_sync_db
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.models.users import User
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, Integer, Index, JSON, func, desc, text as sql_text
+from sqlalchemy import BigInteger, Column, String, Text, Integer, Index, JSON, Float, func, desc, text as sql_text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
@@ -156,6 +158,9 @@ class TokenUsageEvent(Base):
     request_count = Column(Integer, default=1)
     source_type = Column(String, default="chat")
     raw_usage = Column(JSON)
+    # Authoritative per-call USD cost for OpenRouter-routed rows (NULL = rate-card
+    # row, priced at read time). Precomputed at ingestion so reads never parse JSON.
+    embedded_cost = Column(Float, nullable=True)
     created_at = Column(BigInteger)
 
     __table_args__ = (
@@ -186,6 +191,7 @@ class ConversationTokenUsageResponse(BaseModel):
     last_output_tokens: int = 0
     last_cache_read_tokens: int = 0
     message_count: int = 0
+    cost: float = 0.0
     created_at: int
     updated_at: int
 
@@ -229,6 +235,9 @@ class ModelUsageResponse(BaseModel):
     conversation_count: int = 0
     message_count: int = 0
     percentage: float = 0.0
+    cost: float = 0.0
+    unpriced_tokens: int = 0
+    rate_source: Optional[str] = None
 
 
 class TopChatResponse(BaseModel):
@@ -242,6 +251,7 @@ class TopChatResponse(BaseModel):
     total_cache_read_tokens: int = 0
     last_cache_read_tokens: int = 0
     message_count: int
+    cost: float = 0.0
 
 
 class WrappedSummaryResponse(BaseModel):
@@ -289,6 +299,8 @@ class UserUsageResponse(BaseModel):
     avg_tokens_per_message: int = 0
     cache_read_rate: float = 0.0
     last_active_at: Optional[int] = None
+    cost: float = 0.0
+    unpriced_tokens: int = 0
 
 
 class SubagentAnalyticsResponse(BaseModel):
@@ -313,6 +325,29 @@ class SubagentAnalyticsResponse(BaseModel):
     top_models: List[ModelUsageResponse] = []
 
 
+class TotalSpendResponse(BaseModel):
+    """Admin response model for total spend over a window."""
+
+    total_cost: float = 0.0
+    embedded_cost: float = 0.0
+    rate_card_cost: float = 0.0
+    total_tokens: int = 0
+    unpriced_tokens: int = 0
+    priced_model_count: int = 0
+    unpriced_model_count: int = 0
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+
+
+class DailySpendPoint(BaseModel):
+    """Single day of spend for the cost trend chart."""
+
+    date: str
+    cost: float = 0.0
+    embedded_cost: float = 0.0
+    rate_card_cost: float = 0.0
+
+
 ####################
 # Analytics Table Class
 ####################
@@ -328,7 +363,7 @@ class AnalyticsTable:
     # Per-request Token Usage Events
     # ==================
 
-    def record_token_usage_event(
+    async def record_token_usage_event(
         self,
         user_id: Optional[str],
         source_chat_id: Optional[str],
@@ -342,6 +377,7 @@ class AnalyticsTable:
         parent_message_id: Optional[str] = None,
         source_type: str = "chat",
         raw_usage: Optional[dict] = None,
+        embedded_cost: Optional[float] = None,
     ) -> bool:
         """Persist one provider usage payload/model-call.
 
@@ -353,26 +389,28 @@ class AnalyticsTable:
             return False
         try:
             now = int(time.time())
-            with get_db() as db:
-                event = TokenUsageEvent(
-                    id=str(uuid.uuid4()),
-                    user_id=user_id,
-                    source_chat_id=source_chat_id or attributed_chat_id,
-                    attributed_chat_id=attributed_chat_id,
-                    message_id=message_id,
-                    parent_message_id=parent_message_id,
-                    model_id=model_id or "unknown",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    request_count=1,
-                    source_type=source_type or "chat",
-                    raw_usage=raw_usage or {},
-                    created_at=now,
+            async with get_db() as db:
+                db.add(
+                    TokenUsageEvent(
+                        id=str(uuid.uuid4()),
+                        user_id=user_id,
+                        source_chat_id=source_chat_id or attributed_chat_id,
+                        attributed_chat_id=attributed_chat_id,
+                        message_id=message_id,
+                        parent_message_id=parent_message_id,
+                        model_id=model_id or "unknown",
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        request_count=1,
+                        source_type=source_type or "chat",
+                        raw_usage=raw_usage or {},
+                        embedded_cost=embedded_cost,
+                        created_at=now,
+                    )
                 )
-                db.add(event)
-                db.commit()
+                await db.commit()
                 return True
         except Exception as e:
             # Older DBs may not have the event table until migrations run. Do
@@ -384,23 +422,28 @@ class AnalyticsTable:
     # Conversation Token Usage
     # ==================
 
-    def get_conversation_token_usage(self, chat_id: str) -> Optional[ConversationTokenUsageResponse]:
+    async def get_conversation_token_usage(self, chat_id: str) -> Optional[ConversationTokenUsageResponse]:
         """Get token usage stats for a specific conversation"""
         log.info(f"📊 [Analytics.get_conversation_token_usage] Looking up chat_id={chat_id}")
         try:
-            with get_db() as db:
-                record = db.query(ConversationTokenUsage).filter_by(chat_id=chat_id).first()
+            async with get_db() as db:
+                record = (
+                    await db.execute(
+                        sql_text("SELECT * FROM conversation_token_usage WHERE chat_id = :chat_id"),
+                        {"chat_id": chat_id},
+                    )
+                ).mappings().first()
                 log.info(f"📊 [Analytics.get_conversation_token_usage] Query result: {record}")
                 if record:
-                    log.info(f"📊 [Analytics.get_conversation_token_usage] Found record with total_tokens={record.total_tokens}")
-                    return ConversationTokenUsageResponse.model_validate(record)
+                    log.info(f"📊 [Analytics.get_conversation_token_usage] Found record with total_tokens={record['total_tokens']}")
+                    return ConversationTokenUsageResponse(**dict(record))
                 log.info(f"📊 [Analytics.get_conversation_token_usage] No record found for chat_id={chat_id}")
                 return None
         except Exception as e:
             log.error(f"📊 [Analytics.get_conversation_token_usage] Error getting conversation token usage for chat {chat_id}: {e}", exc_info=True)
             return None
 
-    def update_conversation_token_usage(
+    async def update_conversation_token_usage(
         self,
         chat_id: str,
         user_id: str,
@@ -417,31 +460,9 @@ class AnalyticsTable:
         log.info(f"📊 [Analytics.update_conversation] Starting: chat_id={chat_id}, user_id={user_id}, model_id={model_id}")
         log.info(f"📊 [Analytics.update_conversation] Tokens: in={token_in}, out={token_out}, total={token_total}")
         try:
-            with get_db() as db:
-                log.info(f"📊 [Analytics.update_conversation] Got DB session")
-                record = db.query(ConversationTokenUsage).filter_by(chat_id=chat_id).first()
+            async with get_db() as db:
                 now = int(time.time())
-                log.info(f"📊 [Analytics.update_conversation] Existing record: {record}")
-
-                if record:
-                    # Update existing record
-                    log.info(f"📊 [Analytics.update_conversation] Updating existing record")
-                    record.total_input_tokens += token_in
-                    record.total_output_tokens += token_out
-                    record.total_tokens += token_total
-                    record.total_cache_read_tokens += cache_read_tokens
-                    record.last_input_tokens = token_in
-                    record.last_output_tokens = token_out
-                    record.last_cache_read_tokens = cache_read_tokens
-                    record.message_count += 1
-                    record.updated_at = now
-                    # Update model if changed
-                    if model_id:
-                        record.model_id = model_id
-                else:
-                    # Create new record
-                    log.info(f"📊 [Analytics.update_conversation] Creating new record")
-                    record = ConversationTokenUsage(
+                stmt = pg_insert(ConversationTokenUsage).values(
                         id=str(uuid.uuid4()),
                         chat_id=chat_id,
                         user_id=user_id,
@@ -456,14 +477,27 @@ class AnalyticsTable:
                         message_count=1,
                         created_at=now,
                         updated_at=now
-                    )
-                    db.add(record)
-
-                log.info(f"📊 [Analytics.update_conversation] Committing...")
-                db.commit()
-                db.refresh(record)
-                log.info(f"📊 [Analytics.update_conversation] SUCCESS! total_tokens now={record.total_tokens}")
-                return ConversationTokenUsageResponse.model_validate(record)
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[ConversationTokenUsage.chat_id],
+                    set_={
+                        "user_id": user_id,
+                        "model_id": model_id or ConversationTokenUsage.model_id,
+                        "total_input_tokens": ConversationTokenUsage.total_input_tokens + token_in,
+                        "total_output_tokens": ConversationTokenUsage.total_output_tokens + token_out,
+                        "total_tokens": ConversationTokenUsage.total_tokens + token_total,
+                        "total_cache_read_tokens": ConversationTokenUsage.total_cache_read_tokens + cache_read_tokens,
+                        "last_input_tokens": token_in,
+                        "last_output_tokens": token_out,
+                        "last_cache_read_tokens": cache_read_tokens,
+                        "message_count": ConversationTokenUsage.message_count + 1,
+                        "updated_at": now,
+                    },
+                ).returning(ConversationTokenUsage)
+                result = await db.execute(stmt)
+                await db.commit()
+                record = result.scalars().first()
+                return ConversationTokenUsageResponse.model_validate(record) if record else None
         except Exception as e:
             log.error(f"📊 [Analytics.update_conversation] ERROR: {e}", exc_info=True)
             return None
@@ -539,7 +573,7 @@ class AnalyticsTable:
     # Daily Token Usage
     # ==================
 
-    def update_daily_token_usage(
+    async def update_daily_token_usage(
         self,
         user_id: str,
         token_in: int,
@@ -556,23 +590,8 @@ class AnalyticsTable:
             today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             now = int(time.time())
 
-            with get_db() as db:
-                record = db.query(DailyTokenUsage).filter_by(
-                    user_id=user_id,
-                    date=today
-                ).first()
-
-                if record:
-                    record.total_input_tokens += token_in
-                    record.total_output_tokens += token_out
-                    record.total_tokens += token_total
-                    record.total_cache_read_tokens += cache_read_tokens
-                    record.message_count += 1
-                    record.updated_at = now
-                    # Increment conversation_count only if it's a new chat for today
-                    # This is tracked separately in update_conversation_token_usage
-                else:
-                    record = DailyTokenUsage(
+            async with get_db() as db:
+                stmt = pg_insert(DailyTokenUsage).values(
                         id=str(uuid.uuid4()),
                         user_id=user_id,
                         date=today,
@@ -584,10 +603,20 @@ class AnalyticsTable:
                         message_count=1,
                         created_at=now,
                         updated_at=now
-                    )
-                    db.add(record)
-
-                db.commit()
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[DailyTokenUsage.user_id, DailyTokenUsage.date],
+                    set_={
+                        "total_input_tokens": DailyTokenUsage.total_input_tokens + token_in,
+                        "total_output_tokens": DailyTokenUsage.total_output_tokens + token_out,
+                        "total_tokens": DailyTokenUsage.total_tokens + token_total,
+                        "total_cache_read_tokens": DailyTokenUsage.total_cache_read_tokens + cache_read_tokens,
+                        "message_count": DailyTokenUsage.message_count + 1,
+                        "updated_at": now,
+                    },
+                )
+                await db.execute(stmt)
+                await db.commit()
                 log.debug(f"Updated daily token usage for user {user_id} on {today}")
                 return True
         except Exception as e:
@@ -719,7 +748,7 @@ class AnalyticsTable:
     # Model Token Usage
     # ==================
 
-    def update_model_token_usage(
+    async def update_model_token_usage(
         self,
         user_id: Optional[str],
         model_id: str,
@@ -735,23 +764,9 @@ class AnalyticsTable:
         try:
             now = int(time.time())
 
-            with get_db() as db:
-                # Update user-specific record
+            async with get_db() as db:
                 if user_id:
-                    user_record = db.query(ModelTokenUsage).filter_by(
-                        user_id=user_id,
-                        model_id=model_id
-                    ).first()
-
-                    if user_record:
-                        user_record.total_input_tokens += token_in
-                        user_record.total_output_tokens += token_out
-                        user_record.total_tokens += token_total
-                        user_record.total_cache_read_tokens += cache_read_tokens
-                        user_record.message_count += 1
-                        user_record.updated_at = now
-                    else:
-                        user_record = ModelTokenUsage(
+                    user_stmt = pg_insert(ModelTokenUsage).values(
                             id=str(uuid.uuid4()),
                             user_id=user_id,
                             model_id=model_id,
@@ -763,24 +778,22 @@ class AnalyticsTable:
                             message_count=1,
                             created_at=now,
                             updated_at=now
-                        )
-                        db.add(user_record)
+                    )
+                    user_stmt = user_stmt.on_conflict_do_update(
+                        index_elements=[ModelTokenUsage.user_id, ModelTokenUsage.model_id],
+                        index_where=ModelTokenUsage.user_id.is_not(None),
+                        set_={
+                            "total_input_tokens": ModelTokenUsage.total_input_tokens + token_in,
+                            "total_output_tokens": ModelTokenUsage.total_output_tokens + token_out,
+                            "total_tokens": ModelTokenUsage.total_tokens + token_total,
+                            "total_cache_read_tokens": ModelTokenUsage.total_cache_read_tokens + cache_read_tokens,
+                            "message_count": ModelTokenUsage.message_count + 1,
+                            "updated_at": now,
+                        },
+                    )
+                    await db.execute(user_stmt)
 
-                # Update global record (user_id=None)
-                global_record = db.query(ModelTokenUsage).filter_by(
-                    user_id=None,
-                    model_id=model_id
-                ).first()
-
-                if global_record:
-                    global_record.total_input_tokens += token_in
-                    global_record.total_output_tokens += token_out
-                    global_record.total_tokens += token_total
-                    global_record.total_cache_read_tokens += cache_read_tokens
-                    global_record.message_count += 1
-                    global_record.updated_at = now
-                else:
-                    global_record = ModelTokenUsage(
+                global_stmt = pg_insert(ModelTokenUsage).values(
                         id=str(uuid.uuid4()),
                         user_id=None,
                         model_id=model_id,
@@ -792,10 +805,21 @@ class AnalyticsTable:
                         message_count=1,
                         created_at=now,
                         updated_at=now
-                    )
-                    db.add(global_record)
-
-                db.commit()
+                )
+                global_stmt = global_stmt.on_conflict_do_update(
+                    index_elements=[ModelTokenUsage.model_id],
+                    index_where=ModelTokenUsage.user_id.is_(None),
+                    set_={
+                        "total_input_tokens": ModelTokenUsage.total_input_tokens + token_in,
+                        "total_output_tokens": ModelTokenUsage.total_output_tokens + token_out,
+                        "total_tokens": ModelTokenUsage.total_tokens + token_total,
+                        "total_cache_read_tokens": ModelTokenUsage.total_cache_read_tokens + cache_read_tokens,
+                        "message_count": ModelTokenUsage.message_count + 1,
+                        "updated_at": now,
+                    },
+                )
+                await db.execute(global_stmt)
+                await db.commit()
                 log.debug(f"Updated model token usage for model {model_id}")
                 return True
         except Exception as e:
@@ -1233,16 +1257,15 @@ class AnalyticsTable:
                         sql_text(
                             """
                             SELECT
-                                COALESCE(json_extract(j.value, '$.status'), 'unknown') AS status,
+                                COALESCE(j.value->>'status', 'unknown') AS status,
                                 COUNT(*) AS count
                             FROM chat_message cm
                             JOIN chat c ON c.id = cm.chat_id
-                            JOIN json_each(cm.meta, '$.subagent_runs') j
+                            JOIN LATERAL jsonb_each(COALESCE(cm.meta->'subagent_runs', '{}'::jsonb)) j(key, value) ON true
                             WHERE c.user_id NOT LIKE 'shared-%'
-                              AND json_valid(cm.meta) = 1
-                              AND json_type(cm.meta, '$.subagent_runs') = 'object'
-                              AND COALESCE(json_extract(j.value, '$.started_at'), cm.timestamp, c.updated_at, c.created_at, 0) >= :start_ts
-                              AND COALESCE(json_extract(j.value, '$.started_at'), cm.timestamp, c.updated_at, c.created_at, 0) < :end_ts
+                              AND jsonb_typeof(COALESCE(cm.meta->'subagent_runs', '{}'::jsonb)) = 'object'
+                              AND COALESCE((j.value->>'started_at')::bigint, cm.timestamp, c.updated_at, c.created_at, 0) >= :start_ts
+                              AND COALESCE((j.value->>'started_at')::bigint, cm.timestamp, c.updated_at, c.created_at, 0) < :end_ts
                             GROUP BY status
                             """
                         ),
@@ -1479,6 +1502,250 @@ class AnalyticsTable:
             log.error(f"Error incrementing model conversation count: {e}")
             return False
 
+    # ==================
+    # Cost aggregation (USD)
+    # ==================
+
+    # Shared per-(dimension, model_id) cost aggregate. Typed columns ONLY — the
+    # embedded/rate-card split is the typed predicate ``embedded_cost IS NULL``,
+    # so the read path never parses JSON.
+    _COST_SELECT = """
+        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(embedded_cost), 0) AS embedded_cost,
+        COALESCE(SUM(CASE WHEN embedded_cost IS NULL
+            THEN GREATEST(prompt_tokens - cache_read_tokens, 0) ELSE 0 END), 0) AS rc_prompt,
+        COALESCE(SUM(CASE WHEN embedded_cost IS NULL
+            THEN cache_read_tokens ELSE 0 END), 0) AS rc_cache_read,
+        COALESCE(SUM(CASE WHEN embedded_cost IS NULL
+            THEN completion_tokens ELSE 0 END), 0) AS rc_completion,
+        COALESCE(SUM(CASE WHEN embedded_cost IS NULL
+            THEN total_tokens ELSE 0 END), 0) AS rc_total_tokens
+    """
+
+    def _cost_rows(self, db, dim_expr: str, start_ts: int, end_ts: int,
+                   extra_where: str = "", params: Optional[dict] = None) -> list:
+        """Run the shared cost group-by and return mapping rows with a 'dim' key."""
+        where = "user_id NOT LIKE 'shared-%' AND created_at >= :start_ts AND created_at < :end_ts"
+        if extra_where:
+            where += f" AND {extra_where}"
+        sql = f"""
+            SELECT {dim_expr} AS dim, model_id,
+            {self._COST_SELECT}
+            FROM token_usage_event
+            WHERE {where}
+            GROUP BY {dim_expr}, model_id
+        """
+        q = {"start_ts": start_ts, "end_ts": end_ts}
+        if params:
+            q.update(params)
+        return [dict(r) for r in db.execute(sql_text(sql), q).mappings().all()]
+
+    def get_global_model_cost(self, start_ts: int, end_ts: int, limit: int = 50) -> List[ModelUsageResponse]:
+        """Per-model token + cost breakdown over a window (admin)."""
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        try:
+            with get_db() as db:
+                # token columns per model (for the response), plus cost via fold.
+                rows = self._cost_rows(db, "model_id", start_ts, end_ts)
+                # also need input/output split per model for the UI
+                tok = db.execute(sql_text(
+                    """
+                    SELECT COALESCE(NULLIF(model_id, ''), 'unknown') AS model_id,
+                        CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS total_input_tokens,
+                        CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS total_output_tokens,
+                        CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
+                        CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS total_cache_read_tokens,
+                        CAST(COALESCE(SUM(request_count), 0) AS BIGINT) AS message_count,
+                        COUNT(DISTINCT attributed_chat_id) AS conversation_count
+                    FROM token_usage_event
+                    WHERE user_id NOT LIKE 'shared-%' AND created_at >= :start_ts AND created_at < :end_ts
+                    GROUP BY model_id
+                    """
+                ), {"start_ts": start_ts, "end_ts": end_ts}).mappings().all()
+
+                pricing_map = get_cached_pricing_map()
+                # fold cost per model_id (dim == model_id)
+                folded = fold_cost_rows(
+                    [{**r, "dim": r["model_id"]} for r in rows], pricing_map
+                )
+                total_all = sum(int(t["total_tokens"] or 0) for t in tok)
+                result = []
+                for t in tok:
+                    mid = t["model_id"]
+                    c = folded.get(mid, {})
+                    result.append(ModelUsageResponse(
+                        model_id=mid,
+                        total_input_tokens=int(t["total_input_tokens"] or 0),
+                        total_output_tokens=int(t["total_output_tokens"] or 0),
+                        total_tokens=int(t["total_tokens"] or 0),
+                        total_cache_read_tokens=int(t["total_cache_read_tokens"] or 0),
+                        conversation_count=int(t["conversation_count"] or 0),
+                        message_count=int(t["message_count"] or 0),
+                        percentage=round((int(t["total_tokens"] or 0) / total_all * 100), 1) if total_all else 0.0,
+                        cost=round(c.get("cost", 0.0), 6),
+                        unpriced_tokens=int(c.get("unpriced_tokens", 0)),
+                        rate_source=c.get("rate_source"),
+                    ))
+                result.sort(key=lambda x: x.cost, reverse=True)
+                return result[:limit]
+        except Exception as e:
+            log.error(f"Error getting global model cost: {e}")
+            return []
+
+    def get_user_cost_map(self, start_ts: int, end_ts: int) -> Dict[str, Dict]:
+        """Per-user cost folded from token_usage_event over a window.
+
+        Returns {user_id: {cost, unpriced_tokens, ...}} for joining onto the
+        existing per-user token leaderboard.
+        """
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        try:
+            with get_db() as db:
+                rows = self._cost_rows(db, "user_id", start_ts, end_ts)
+                return fold_cost_rows(rows, get_cached_pricing_map())
+        except Exception as e:
+            log.error(f"Error getting user cost map: {e}")
+            return {}
+
+    def get_total_spend(self, start_ts: int, end_ts: int) -> TotalSpendResponse:
+        """Site-wide spend KPI over a window (admin)."""
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        try:
+            with get_db() as db:
+                rows = self._cost_rows(db, "model_id", start_ts, end_ts)
+                pricing_map = get_cached_pricing_map()
+                folded = fold_cost_rows(
+                    [{**r, "dim": r["model_id"]} for r in rows], pricing_map
+                )
+                total_cost = sum(b["cost"] for b in folded.values())
+                embedded = sum(b["embedded_cost"] for b in folded.values())
+                rate_card = sum(b["rate_card_cost"] for b in folded.values())
+                total_tokens = sum(b["total_tokens"] for b in folded.values())
+                unpriced = sum(b["unpriced_tokens"] for b in folded.values())
+                priced_models = sum(1 for b in folded.values() if b["unpriced_tokens"] == 0)
+                unpriced_models = sum(1 for b in folded.values() if b["unpriced_tokens"] > 0)
+                return TotalSpendResponse(
+                    total_cost=round(total_cost, 6),
+                    embedded_cost=round(embedded, 6),
+                    rate_card_cost=round(rate_card, 6),
+                    total_tokens=int(total_tokens),
+                    unpriced_tokens=int(unpriced),
+                    priced_model_count=priced_models,
+                    unpriced_model_count=unpriced_models,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
+        except Exception as e:
+            log.error(f"Error getting total spend: {e}")
+            return TotalSpendResponse(start_ts=start_ts, end_ts=end_ts)
+
+    def get_spend_trend(self, start_ts: int, end_ts: int) -> List[DailySpendPoint]:
+        """Daily spend series over a window (admin)."""
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        try:
+            with get_db() as db:
+                # dim = day string (UTC) from created_at
+                dim_expr = "to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
+                rows = self._cost_rows(db, dim_expr, start_ts, end_ts)
+                folded = fold_cost_rows(rows, get_cached_pricing_map())
+                points = [
+                    DailySpendPoint(
+                        date=day,
+                        cost=round(b["cost"], 6),
+                        embedded_cost=round(b["embedded_cost"], 6),
+                        rate_card_cost=round(b["rate_card_cost"], 6),
+                    )
+                    for day, b in folded.items()
+                ]
+                points.sort(key=lambda p: p.date)
+                return points
+        except Exception as e:
+            log.error(f"Error getting spend trend: {e}")
+            return []
+
+    def get_top_chats_by_cost(self, start_ts: int, end_ts: int, limit: int = 10) -> List[TopChatResponse]:
+        """Most expensive chats over a window (admin), by attributed_chat_id."""
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        try:
+            with get_db() as db:
+                rows = self._cost_rows(db, "attributed_chat_id", start_ts, end_ts)
+                folded = fold_cost_rows(rows, get_cached_pricing_map())
+                # token split per chat for the response
+                tok = db.execute(sql_text(
+                    """
+                    SELECT attributed_chat_id AS chat_id,
+                        CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS total_input_tokens,
+                        CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS total_output_tokens,
+                        CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
+                        CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS total_cache_read_tokens,
+                        CAST(COALESCE(SUM(request_count), 0) AS BIGINT) AS message_count
+                    FROM token_usage_event
+                    WHERE user_id NOT LIKE 'shared-%' AND created_at >= :start_ts AND created_at < :end_ts
+                    GROUP BY attributed_chat_id
+                    """
+                ), {"start_ts": start_ts, "end_ts": end_ts}).mappings().all()
+                tok_by_id = {t["chat_id"]: t for t in tok}
+                ranked = sorted(folded.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:limit]
+                result = []
+                for chat_id, b in ranked:
+                    if not chat_id:
+                        continue
+                    t = tok_by_id.get(chat_id, {})
+                    result.append(TopChatResponse(
+                        chat_id=chat_id,
+                        model_id=None,
+                        total_tokens=int(t.get("total_tokens") or 0),
+                        total_input_tokens=int(t.get("total_input_tokens") or 0),
+                        total_output_tokens=int(t.get("total_output_tokens") or 0),
+                        total_cache_read_tokens=int(t.get("total_cache_read_tokens") or 0),
+                        message_count=int(t.get("message_count") or 0),
+                        cost=round(b["cost"], 6),
+                    ))
+                return result
+        except Exception as e:
+            log.error(f"Error getting top chats by cost: {e}")
+            return []
+
+    def get_chat_cost(self, chat_id: str) -> float:
+        """Per-chat USD cost (folds subagent spend via attributed_chat_id)."""
+        from open_webui.utils.pricing import fold_cost_rows, get_cached_pricing_map
+        if not chat_id:
+            return 0.0
+        try:
+            with get_db() as db:
+                sql = f"""
+                    SELECT :chat_id AS dim, model_id,
+                    {self._COST_SELECT}
+                    FROM token_usage_event
+                    WHERE attributed_chat_id = :chat_id
+                    GROUP BY model_id
+                """
+                rows = [dict(r) for r in db.execute(
+                    sql_text(sql), {"chat_id": chat_id}
+                ).mappings().all()]
+                folded = fold_cost_rows(rows, get_cached_pricing_map())
+                return round(folded.get(chat_id, {}).get("cost", 0.0), 6)
+        except Exception as e:
+            log.error(f"Error getting chat cost for {chat_id}: {e}")
+            return 0.0
+
+
+class _AsyncAnalyticsProxy:
+    def __init__(self, impl: AnalyticsTable):
+        self._impl = impl
+
+    def __getattr__(self, name):
+        attr = getattr(self._impl, name)
+        if not callable(attr):
+            return attr
+
+        async def _wrapped(*args, **kwargs):
+            if inspect.iscoroutinefunction(attr):
+                return await attr(*args, **kwargs)
+            return await run_sync_db(lambda: attr(*args, **kwargs))
+
+        return _wrapped
+
 
 # Global instance
-Analytics = AnalyticsTable()
+Analytics = _AsyncAnalyticsProxy(AnalyticsTable())

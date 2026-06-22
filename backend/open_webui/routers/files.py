@@ -60,10 +60,10 @@ router = APIRouter()
 ############################
 
 
-def has_access_to_file(
+async def has_access_to_file(
     file_id: Optional[str], access_type: str, user=Depends(get_verified_user)
 ) -> bool:
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     log.debug(f"Checking if user has {access_type} access to file")
 
     if not file:
@@ -87,7 +87,7 @@ def has_access_to_file(
 ############################
 
 @router.post("/", response_model=FileModelResponse)
-def upload_file(
+async def upload_file(
     request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -96,7 +96,7 @@ def upload_file(
     process_in_background: bool = Query(True),
     user=Depends(get_verified_user),
 ):
-    return upload_file_handler(
+    return await upload_file_handler(
         request,
         file=file,
         metadata=metadata,
@@ -127,7 +127,7 @@ def uploaded_file_id(file_item) -> str:
     return fid
 
 
-def upload_file_handler(
+async def upload_file_handler(
     request: Request,
     file: UploadFile = File(...),
     metadata: Optional[dict | str] = Form(None),
@@ -339,7 +339,7 @@ def upload_file_handler(
         needs_extraction = file_needs_extraction(content_type, file_extension)
         initial_status = "pending" if needs_extraction and process else "completed"
 
-        file_item = Files.insert_new_file(
+        file_item = await Files.insert_new_file(
             user.id,
             FileForm(
                 **{
@@ -377,7 +377,7 @@ def upload_file_handler(
                         extract_and_cache_file_content, request, file_item.id
                     )
                 else:
-                    extract_and_cache_file_content(request, file_item.id)
+                    await extract_and_cache_file_content(request, file_item.id)
 
             return {"status": True, **file_item.model_dump()}
 
@@ -404,9 +404,9 @@ def upload_file_handler(
 @router.get("/", response_model=list[FileModelResponse])
 async def list_files(user=Depends(get_verified_user), content: bool = Query(True)):
     if user.role == "admin":
-        files = Files.get_files()
+        files = await Files.get_files()
     else:
-        files = Files.get_files_by_user_id(user.id)
+        files = await Files.get_files_by_user_id(user.id)
 
     if not content:
         for file in files:
@@ -435,9 +435,9 @@ async def search_files(
     """
     # Get files according to user role
     if user.role == "admin":
-        files = Files.get_files()
+        files = await Files.get_files()
     else:
-        files = Files.get_files_by_user_id(user.id)
+        files = await Files.get_files_by_user_id(user.id)
 
     # Get matching files
     matching_files = [
@@ -465,7 +465,7 @@ async def search_files(
 
 @router.delete("/all")
 async def delete_all_files(user=Depends(get_admin_user)):
-    result = Files.delete_all_files()
+    result = await Files.delete_all_files()
     if result:
         try:
             Storage.delete_all_files()
@@ -491,7 +491,7 @@ async def delete_all_files(user=Depends(get_admin_user)):
 
 @router.get("/{id}", response_model=Optional[FileModel])
 async def get_file_by_id(id: str, user=Depends(get_verified_user)):
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
 
     if not file:
         raise HTTPException(
@@ -502,7 +502,7 @@ async def get_file_by_id(id: str, user=Depends(get_verified_user)):
     if (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         return file
     else:
@@ -559,7 +559,7 @@ async def ensure_file_preview_by_id(
     Used for model-produced artifacts. The original file stays the download;
     the preview file is a cached PDF sidecar.
     """
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -568,7 +568,7 @@ async def ensure_file_preview_by_id(
     if not (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -594,7 +594,7 @@ async def ensure_file_preview_by_id(
 
 
 @router.post("/{id}/process-mode")
-def set_file_processing_mode(
+async def set_file_processing_mode(
     request: Request,
     id: str,
     form_data: ProcessModeForm,
@@ -611,7 +611,7 @@ def set_file_processing_mode(
     For ``mode == "text"``, this is a no-op: text extraction always runs at
     upload time (or lazily at chat-completion time for old files).
     """
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -621,7 +621,7 @@ def set_file_processing_mode(
     if not (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -654,12 +654,12 @@ def set_file_processing_mode(
             already_converted = True
 
         if not already_converted and not in_progress:
-            Files.update_file_data_by_id(id, {"pdf_status": "pending"})
+            await Files.update_file_data_by_id(id, {"pdf_status": "pending"})
             background_tasks.add_task(
                 convert_and_cache_file_to_pdf, request, id
             )
 
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
     return {
         "status": True,
         "file_id": id,
@@ -678,7 +678,7 @@ def set_file_processing_mode(
 async def get_file_content_by_id(
     id: str, user=Depends(get_verified_user), attachment: bool = Query(False)
 ):
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
 
     if not file:
         raise HTTPException(
@@ -689,7 +689,7 @@ async def get_file_content_by_id(
     if (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         try:
             file_path = Storage.get_file(file.path)
@@ -754,7 +754,7 @@ async def get_file_content_by_id(
 
 @router.get("/{id}/content/html")
 async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
 
     if not file:
         raise HTTPException(
@@ -762,7 +762,7 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    file_user = Users.get_user_by_id(file.user_id)
+    file_user = await Users.get_user_by_id(file.user_id)
     if not file_user.role == "admin":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -772,7 +772,7 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
     if (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         try:
             file_path = Storage.get_file(file.path)
@@ -803,7 +803,7 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
 
 @router.get("/{id}/content/{file_name}")
 async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
 
     if not file:
         raise HTTPException(
@@ -814,7 +814,7 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
     if (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "read", user)
+        or await has_access_to_file(id, "read", user)
     ):
         file_path = file.path
 
@@ -865,7 +865,7 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
 
 @router.delete("/{id}")
 async def delete_file_by_id(id: str, user=Depends(get_verified_user)):
-    file = Files.get_file_by_id(id)
+    file = await Files.get_file_by_id(id)
 
     if not file:
         raise HTTPException(
@@ -876,10 +876,10 @@ async def delete_file_by_id(id: str, user=Depends(get_verified_user)):
     if (
         file.user_id == user.id
         or user.role == "admin"
-        or has_access_to_file(id, "write", user)
+        or await has_access_to_file(id, "write", user)
     ):
 
-        result = Files.delete_file_by_id(id)
+        result = await Files.delete_file_by_id(id)
         if result:
             try:
                 Storage.delete_file(file.path)

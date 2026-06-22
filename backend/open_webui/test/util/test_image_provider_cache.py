@@ -13,18 +13,11 @@ is byte-identical across rounds.
 
 import asyncio
 import io
-import os
-import shutil
-import tempfile
 from unittest.mock import MagicMock, patch
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "image_cache_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+from test.util.db import configure_test_database
+
+configure_test_database()
 
 import pytest  # noqa: E402
 

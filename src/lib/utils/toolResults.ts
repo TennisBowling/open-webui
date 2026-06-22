@@ -259,7 +259,7 @@ export const mergeToolResultEntries = (
 				tool_call_id: id
 			};
 
-			// Stream-v2 content_blocks intentionally carry slim result placeholders
+			// Stream-v2.1 content_blocks intentionally carry slim result placeholders
 			// (`{ tool_call_id }`) while the heavy body travels via tool_call:result.
 			// Never let those placeholders erase a full body that arrived earlier or
 			// was supplied by the snapshot endpoint.
@@ -373,6 +373,85 @@ export const formatCount = (count: number, singular: string, plural = `${singula
 	return `${count} ${count === 1 ? singular : plural}`;
 };
 
+const PARSE_CACHE_MAX_ENTRIES = 16;
+const PARSE_CACHE_MAX_RAW_CHARS = 4_000_000;
+
+type ParseCache<T> = {
+	entries: Map<string, { value: T; cost: number }>;
+	totalCost: number;
+};
+
+const webSearchParseCache: ParseCache<ParsedWebSearchResult> = { entries: new Map(), totalCost: 0 };
+const webFetchParseCache: ParseCache<ParsedWebFetchResult> = { entries: new Map(), totalCost: 0 };
+const browserParseCache: ParseCache<ParsedBrowserResult> = { entries: new Map(), totalCost: 0 };
+
+const hashString = (value: string) => {
+	let hash = 2166136261;
+	for (let i = 0; i < value.length; i += 1) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return (hash >>> 0).toString(36);
+};
+
+const stableText = (value: unknown) => {
+	if (value == null) return '';
+	if (typeof value === 'string') return value;
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return String(value);
+	}
+};
+
+const cacheKey = (kind: string, raw: string, args?: unknown) => {
+	const argsText = stableText(args);
+	return `${kind}:${raw.length}:${hashString(raw)}:${argsText.length}:${hashString(argsText)}`;
+};
+
+const getCachedParse = <T>(cache: ParseCache<T>, key: string): T | null => {
+	const entry = cache.entries.get(key);
+	if (!entry) return null;
+	cache.entries.delete(key);
+	cache.entries.set(key, entry);
+	return entry.value;
+};
+
+const setCachedParse = <T>(cache: ParseCache<T>, key: string, value: T, cost: number) => {
+	if (cost > PARSE_CACHE_MAX_RAW_CHARS) return value;
+	const existing = cache.entries.get(key);
+	if (existing) {
+		cache.totalCost -= existing.cost;
+		cache.entries.delete(key);
+	}
+	cache.entries.set(key, { value, cost });
+	cache.totalCost += cost;
+	while (
+		cache.entries.size > PARSE_CACHE_MAX_ENTRIES ||
+		cache.totalCost > PARSE_CACHE_MAX_RAW_CHARS
+	) {
+		const oldestKey = cache.entries.keys().next().value;
+		if (!oldestKey) break;
+		const oldest = cache.entries.get(oldestKey);
+		cache.entries.delete(oldestKey);
+		cache.totalCost -= oldest?.cost ?? 0;
+	}
+	return value;
+};
+
+export const clearToolResultParseCaches = () => {
+	for (const cache of [webSearchParseCache, webFetchParseCache, browserParseCache]) {
+		cache.entries.clear();
+		cache.totalCost = 0;
+	}
+};
+
+export const getToolResultParseCacheStats = () => ({
+	webSearch: { entries: webSearchParseCache.entries.size, chars: webSearchParseCache.totalCost },
+	webFetch: { entries: webFetchParseCache.entries.size, chars: webFetchParseCache.totalCost },
+	browser: { entries: browserParseCache.entries.size, chars: browserParseCache.totalCost }
+});
+
 const parseDeclaredSearchCount = (text: string) => {
 	const match = text.match(/\bFound\s+(\d+)\s+results?\b/i);
 	return match ? Number.parseInt(match[1], 10) : null;
@@ -388,6 +467,9 @@ export const parseWebSearchResult = (
 	rawArgs?: unknown
 ): ParsedWebSearchResult => {
 	const raw = decodeToolResultText(rawResult);
+	const key = cacheKey('web_search', raw, rawArgs);
+	const cached = getCachedParse(webSearchParseCache, key);
+	if (cached) return cached;
 	const args = getToolArgumentsObject(rawArgs);
 	const queryFromArgs = typeof args.query === 'string' ? args.query : '';
 	const queryFromHeader = raw.match(/^##\s*Search Results for:\s*(.+?)\s*$/im)?.[1]?.trim() ?? '';
@@ -420,17 +502,25 @@ export const parseWebSearchResult = (
 		});
 	}
 
-	return {
-		ok: results.length > 0,
-		query: queryFromArgs || queryFromHeader,
-		declaredCount,
-		results,
-		raw
-	};
+	return setCachedParse(
+		webSearchParseCache,
+		key,
+		{
+			ok: results.length > 0,
+			query: queryFromArgs || queryFromHeader,
+			declaredCount,
+			results,
+			raw
+		},
+		raw.length
+	);
 };
 
 export const parseWebFetchResult = (rawResult: unknown): ParsedWebFetchResult => {
 	const raw = decodeToolResultText(rawResult);
+	const key = cacheKey('web_fetch', raw);
+	const cached = getCachedParse(webFetchParseCache, key);
+	if (cached) return cached;
 	const declaredCount = parseDeclaredFetchCount(raw);
 	const pages: WebFetchPage[] = [];
 	const pageHeadingRegex = /^###\s*Page\s+(\d+)\s*:\s*(.*?)\s*$/gim;
@@ -485,13 +575,18 @@ export const parseWebFetchResult = (rawResult: unknown): ParsedWebFetchResult =>
 		});
 	}
 
-	return {
-		ok: pages.length > 0,
-		declaredCount,
-		pages,
-		totalCharacters: pages.reduce((sum, page) => sum + page.characters, 0),
-		raw
-	};
+	return setCachedParse(
+		webFetchParseCache,
+		key,
+		{
+			ok: pages.length > 0,
+			declaredCount,
+			pages,
+			totalCharacters: pages.reduce((sum, page) => sum + page.characters, 0),
+			raw
+		},
+		raw.length
+	);
 };
 
 // The container browser tools return a text block shaped by the CAM daemon's
@@ -502,11 +597,11 @@ export const parseWebFetchResult = (rawResult: unknown): ParsedWebFetchResult =>
 //     <accessibility snapshot tree>
 // `Title:`/`URL:` may be absent (e.g. screenshot-only actions, error recovery
 // text). Everything after the leading metadata lines is treated as the body.
-export const parseBrowserResult = (
-	rawResult: unknown,
-	rawArgs?: unknown
-): ParsedBrowserResult => {
+export const parseBrowserResult = (rawResult: unknown, rawArgs?: unknown): ParsedBrowserResult => {
 	const raw = decodeToolResultText(rawResult);
+	const key = cacheKey('browser', raw, rawArgs);
+	const cached = getCachedParse(browserParseCache, key);
+	if (cached) return cached;
 	const args = getToolArgumentsObject(rawArgs);
 	const urlFromArgs = typeof args.url === 'string' ? args.url.trim() : '';
 
@@ -539,13 +634,18 @@ export const parseBrowserResult = (
 	if (!title && !url) snapshot = raw.trim();
 
 	const finalUrl = url || urlFromArgs;
-	return {
-		url: finalUrl,
-		domain: getDomain(finalUrl),
-		title,
-		snapshot,
-		raw
-	};
+	return setCachedParse(
+		browserParseCache,
+		key,
+		{
+			url: finalUrl,
+			domain: getDomain(finalUrl),
+			title,
+			snapshot,
+			raw
+		},
+		raw.length
+	);
 };
 
 export const getToolCallSummary = (
@@ -651,7 +751,11 @@ const getBrowserToolCallSummary = (
 	// collapsed-row path from decoding big snapshots on every render.
 	const onSuffix = (host: string) => (host ? ` on ${host}` : '');
 
-	const summary = (title: string): ToolCallSummary => ({ kind: 'browser', title, badge: 'browser' });
+	const summary = (title: string): ToolCallSummary => ({
+		kind: 'browser',
+		title,
+		badge: 'browser'
+	});
 
 	switch (name) {
 		case 'browser_navigate': {

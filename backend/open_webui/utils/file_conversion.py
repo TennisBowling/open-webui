@@ -51,17 +51,17 @@ def _get_libreoffice_bin(request: Request) -> Optional[str]:
     return getattr(request.app.state, "LIBREOFFICE_BIN", None)
 
 
-def _convert_now(request: Request, file_id: str) -> None:
+async def _convert_now(request: Request, file_id: str) -> None:
     """Run LibreOffice on a file and cache the result. No idempotency check —
     callers should gate on ``file.data.pdf_status`` if they want one.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file or not file.path:
         return
 
     libreoffice_bin = _get_libreoffice_bin(request)
     if not libreoffice_bin:
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             file_id,
             {
                 "pdf_status": "failed",
@@ -70,7 +70,7 @@ def _convert_now(request: Request, file_id: str) -> None:
         )
         return
 
-    Files.update_file_data_by_id(file_id, {"pdf_status": "processing"})
+    await Files.update_file_data_by_id(file_id, {"pdf_status": "processing"})
 
     try:
         input_path = Storage.get_file(file.path)
@@ -96,7 +96,8 @@ def _convert_now(request: Request, file_id: str) -> None:
                 input_path,
             ]
 
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 cmd,
                 timeout=_CONVERSION_TIMEOUT_SECONDS,
                 capture_output=True,
@@ -129,7 +130,8 @@ def _convert_now(request: Request, file_id: str) -> None:
             storage_name = f"{new_id}_{display_name}"
 
             with open(pdf_path_in_workdir, "rb") as f:
-                size, stored_path = Storage.upload_file(
+                size, stored_path = await asyncio.to_thread(
+                    Storage.upload_file,
                     f,
                     storage_name,
                     {
@@ -139,7 +141,7 @@ def _convert_now(request: Request, file_id: str) -> None:
                     },
                 )
 
-            new_file_item = Files.insert_new_file(
+            new_file_item = await Files.insert_new_file(
                 file.user_id,
                 FileForm(
                     id=new_id,
@@ -160,7 +162,7 @@ def _convert_now(request: Request, file_id: str) -> None:
             if not new_file_item:
                 raise Exception("Failed to persist converted PDF file row")
 
-            Files.update_file_data_by_id(
+            await Files.update_file_data_by_id(
                 file_id,
                 {
                     "pdf_status": "completed",
@@ -170,7 +172,7 @@ def _convert_now(request: Request, file_id: str) -> None:
 
     except subprocess.TimeoutExpired:
         log.warning("LibreOffice conversion timed out for file %s", file_id)
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             file_id,
             {
                 "pdf_status": "failed",
@@ -181,18 +183,18 @@ def _convert_now(request: Request, file_id: str) -> None:
         log.exception(
             "file_conversion: failed to convert %s to PDF: %s", file_id, e
         )
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             file_id,
             {"pdf_status": "failed", "pdf_error": str(e)},
         )
 
 
-def convert_and_cache_file_to_pdf(request: Request, file_id: str) -> None:
+async def convert_and_cache_file_to_pdf(request: Request, file_id: str) -> None:
     """BackgroundTask entry. Idempotent — skips if already converted or
     currently running. Triggered by the ``/process-mode`` endpoint when the
     user picks PDF mode on a file chip.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return
     data = file.data or {}
@@ -200,7 +202,7 @@ def convert_and_cache_file_to_pdf(request: Request, file_id: str) -> None:
         return
     if data.get("pdf_status") == "processing":
         return
-    _convert_now(request, file_id)
+    await _convert_now(request, file_id)
 
 
 async def get_or_convert_to_pdf(
@@ -215,14 +217,14 @@ async def get_or_convert_to_pdf(
     :func:`open_webui.utils.file_extraction.get_or_extract_file_content`:
     cached → return; processing → poll; pending → run inline.
     """
-    file = Files.get_file_by_id(file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return None
 
     data = file.data or {}
     pdf_file_id = data.get("pdf_file_id")
     if pdf_file_id:
-        return Files.get_file_by_id(pdf_file_id)
+        return await Files.get_file_by_id(pdf_file_id)
 
     pdf_status = data.get("pdf_status")
 
@@ -235,13 +237,13 @@ async def get_or_convert_to_pdf(
         while time.monotonic() < deadline:
             await asyncio.sleep(delay)
             delay = min(delay * 1.5, 5.0)
-            file = Files.get_file_by_id(file_id)
+            file = await Files.get_file_by_id(file_id)
             if not file:
                 return None
             data = file.data or {}
             new_pdf_id = data.get("pdf_file_id")
             if new_pdf_id:
-                return Files.get_file_by_id(new_pdf_id)
+                return await Files.get_file_by_id(new_pdf_id)
             if data.get("pdf_status") == "failed":
                 return None
         log.warning(
@@ -249,10 +251,10 @@ async def get_or_convert_to_pdf(
         )
         return None
 
-    # Pending / unknown — run inline in a worker thread.
-    await asyncio.to_thread(_convert_now, request, file_id)
-    file = Files.get_file_by_id(file_id)
+    # Pending / unknown — run inline; blocking LibreOffice work is pushed to a worker.
+    await _convert_now(request, file_id)
+    file = await Files.get_file_by_id(file_id)
     if not file:
         return None
     pdf_file_id = (file.data or {}).get("pdf_file_id")
-    return Files.get_file_by_id(pdf_file_id) if pdf_file_id else None
+    return await Files.get_file_by_id(pdf_file_id) if pdf_file_id else None

@@ -7,7 +7,7 @@ Create Date: 2025-11-24 12:00:00.000000
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 import open_webui.internal.db
 
@@ -22,17 +22,23 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     # Add window_duration column to token_group table
     # flexible unit, implies seconds if not specified otherwise by UI, but defined as BigInteger
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    existing_columns = {c['name'] for c in inspector.get_columns('token_group')}
+    if context.is_offline_mode():
+        existing_columns = set()
+    else:
+        bind = op.get_bind()
+        inspector = sa.inspect(bind)
+        existing_columns = {c['name'] for c in inspector.get_columns('token_group')}
     if 'window_duration' not in existing_columns:
         op.add_column('token_group', sa.Column('window_duration', sa.BigInteger(), nullable=True))
 
 
 def downgrade() -> None:
     # Remove window_duration column
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    existing_columns = {c['name'] for c in inspector.get_columns('token_group')}
+    if context.is_offline_mode():
+        existing_columns = {'window_duration'}
+    else:
+        bind = op.get_bind()
+        inspector = sa.inspect(bind)
+        existing_columns = {c['name'] for c in inspector.get_columns('token_group')}
     if 'window_duration' in existing_columns:
         op.drop_column('token_group', 'window_duration')

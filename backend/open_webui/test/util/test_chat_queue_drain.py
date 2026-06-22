@@ -18,29 +18,34 @@ open_webui module, so the engine binds to our throwaway file with the correct
 (Alembic-migrated) schema and the real dev DB is never touched.
 """
 
-import os
-import shutil
-import tempfile
 import uuid
-
-# --- Bind the DB to a throwaway copy of the migrated dev DB BEFORE imports ----
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "queue_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
+import asyncio
 
 import pytest
 
-from open_webui.internal.db import Base, engine  # noqa: E402
+from test.util.db import configure_test_database
+
+configure_test_database(required=True)
+
 from open_webui.models.chats import Chats, ChatForm  # noqa: E402
 
-# If we couldn't seed from the dev DB, create the schema fresh. (CI without a
-# checked-in dev DB falls here; create_all is best-effort for these columns.)
-if not os.path.exists(_DEV_DB):
-    Base.metadata.create_all(bind=engine)
+
+class _SyncChats:
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
+
+        def _call(*args, **kwargs):
+            return asyncio.run(attr(*args, **kwargs))
+
+        return _call
+
+
+Chats = _SyncChats(Chats)
 
 
 @pytest.fixture()

@@ -12,18 +12,12 @@ the real functions against a temp workspace.
 
 import asyncio
 import json
-import os
-import shutil
 import tempfile
 from pathlib import Path
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "browser_live_test.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
+from test.util.db import configure_test_database
+
+configure_test_database()
 
 import open_webui.utils.container_workspace as cw  # noqa: E402
 
@@ -141,6 +135,95 @@ def test_poller_emits_changed_frames_only():
         # Live files are polled, never deleted.
         assert (live_dir / "live.jpg").exists()
         assert (live_dir / "state.json").exists()
+
+    asyncio.run(run())
+
+
+def test_poller_respects_max_fps(monkeypatch):
+    async def run():
+        tmp = Path(tempfile.mkdtemp())
+        live_dir = _live_dir(tmp, "chat1")
+        events = []
+
+        async def emitter(e):
+            events.append(e)
+
+        monkeypatch.setattr(cw, "STREAM_BROWSER_FRAME_MAX_FPS", 1.0)
+        _write(
+            live_dir,
+            b"\xff\xd8\xff\xe0FRAME1",
+            {"action": "navigate", "url": "https://example.com", "phase": "navigating"},
+        )
+        task = asyncio.create_task(
+            cw.browser_progress_poller(
+                data_root=str(tmp),
+                chat_id="chat1",
+                message_id="m1",
+                session_id="s1",
+                event_emitter=emitter,
+                interval=0.2,
+            )
+        )
+        await asyncio.sleep(0.35)
+        _write(
+            live_dir,
+            b"\xff\xd8\xff\xe0FRAME2",
+            {"action": "navigate", "url": "https://example.com", "phase": "loaded"},
+        )
+        await asyncio.sleep(0.35)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        live_frames = [e for e in events if e["type"] == "browser:frame" and not e["data"].get("done")]
+        assert len(live_frames) == 1
+
+    asyncio.run(run())
+
+
+def test_poller_omits_oversize_live_frame_but_keeps_metadata(monkeypatch):
+    async def run():
+        tmp = Path(tempfile.mkdtemp())
+        live_dir = _live_dir(tmp, "chat1")
+        events = []
+
+        async def emitter(e):
+            events.append(e)
+
+        monkeypatch.setattr(cw, "STREAM_BROWSER_FRAME_MAX_BYTES", 8)
+        _write(
+            live_dir,
+            b"\xff\xd8\xff\xe0FRAME-TOO-LARGE",
+            {
+                "action": "navigate",
+                "url": "https://example.com",
+                "phase": "navigating",
+                "done": False,
+            },
+        )
+        task = asyncio.create_task(
+            cw.browser_progress_poller(
+                data_root=str(tmp),
+                chat_id="chat1",
+                message_id="m1",
+                session_id="s1",
+                event_emitter=emitter,
+                interval=0.2,
+            )
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        live_frames = [e for e in events if e["type"] == "browser:frame" and not e["data"].get("done")]
+        assert live_frames
+        assert live_frames[0]["data"].get("frame") is None
+        assert live_frames[0]["data"].get("url") == "https://example.com"
 
     asyncio.run(run())
 
@@ -442,7 +525,7 @@ def test_subagent_forwarding_emitter_routes_browser_frame_to_parent():
         orig = sa.get_event_emitter
         sa.get_event_emitter = fake_get_event_emitter
         try:
-            emitter = sa._build_forwarding_emitter(
+            emitter = await sa._build_forwarding_emitter(
                 subagent_socket_info={
                     "user_id": "u1",
                     "session_id": "s1",

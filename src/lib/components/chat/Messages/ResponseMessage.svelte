@@ -15,7 +15,15 @@
 	import { getChatById } from '$lib/apis/chats';
 	import { generateTags } from '$lib/apis';
 
-	import { config, models, settings, temporaryChatEnabled, TTSWorker, user } from '$lib/stores';
+	import {
+		config,
+		models,
+		settings,
+		temporaryChatEnabled,
+		TTSWorker,
+		user,
+		getMessageRevisionStore
+	} from '$lib/stores';
 	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
 	import { imageGenerations } from '$lib/apis/images';
 	import {
@@ -102,10 +110,15 @@
 	export let history;
 	export let messageId;
 	export let selectedModels = [];
+	let messageRevisionStore = getMessageRevisionStore(messageId);
+	$: messageRevisionStore = getMessageRevisionStore(messageId);
 
 	let message: MessageType = history.messages[messageId];
-	$: if (history.messages?.[messageId] && message !== history.messages[messageId]) {
-		message = history.messages[messageId];
+	$: {
+		$messageRevisionStore;
+		if (history.messages?.[messageId]) {
+			message = history.messages[messageId];
+		}
 	}
 
 	export let siblings;
@@ -719,7 +732,6 @@
 								expand={message?.content === ''}
 							/>
 						{/if}
-
 
 						{#if message?.embeds && message.embeds.length > 0}
 							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">

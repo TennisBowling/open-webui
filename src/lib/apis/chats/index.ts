@@ -755,7 +755,8 @@ export const getChatMeta = async (token: string, id: string) => {
 export const getChatMessagesBranch = async (
 	token: string,
 	id: string,
-	{ leaf, before, limit = 7 }: { leaf?: string; before?: string; limit?: number } = {}
+	{ leaf, before, limit = 7 }: { leaf?: string; before?: string; limit?: number } = {},
+	signal?: AbortSignal
 ) => {
 	let error = null;
 
@@ -773,7 +774,8 @@ export const getChatMessagesBranch = async (
 				'Content-Type': 'application/json',
 				...(token && { authorization: `Bearer ${token}` }),
 				...sessionHeader()
-			}
+			},
+			signal
 		}
 	)
 		.then(async (res) => {
@@ -781,6 +783,7 @@ export const getChatMessagesBranch = async (
 			return res.json();
 		})
 		.catch((err) => {
+			if (err?.name === 'AbortError') throw err;
 			error = err.detail ?? err;
 			console.error(err);
 			return null;
@@ -1254,6 +1257,7 @@ export type PatchChatOp =
 	| { op: 'set_queue'; queue: unknown[] }
 	| { op: 'append_queue_item'; item: Record<string, unknown> }
 	| { op: 'remove_queue_item'; item_id: string }
+	| { op: 'set_question_state'; tool_call_id: string; patch: Record<string, unknown> }
 	| { op: 'set_tags'; tags: unknown[] }
 	| { op: 'set_history_current_id'; current_id: string }
 	| {

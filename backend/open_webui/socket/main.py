@@ -1,7 +1,11 @@
 import asyncio
 import copy
+import hashlib
 import json
+import os
 import random
+import tempfile
+from collections import OrderedDict, deque
 
 import socketio
 import logging
@@ -33,6 +37,19 @@ from open_webui.env import (
     STREAM_STATE_TTL_SECONDS,
     STREAM_PROTOCOL_VERSION,
     STREAM_DELTA_BATCH_ENABLED,
+    STREAM_DELTA_BATCH_WINDOW_MS,
+    STREAM_DELTA_BATCH_MAX_DELAY_MS,
+    STREAM_DELTA_FIRST_TOKEN_IMMEDIATE,
+    STREAM_VERSION_STORE_FLUSH_EVERY,
+    STREAM_REPLAY_BUFFER_MAX_EVENTS,
+    STREAM_REPLAY_BUFFER_MAX_BYTES,
+    STREAM_REPLAY_BUFFER_TTL_SECONDS,
+    STREAM_CLIENT_ACK_INTERVAL_MS,
+    STREAM_CLIENT_LAG_MAX_VERSIONS,
+    STREAM_RUNTIME_METRICS,
+    STREAM_TOOL_RESULT_BODY_MAX_BYTES,
+    STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE,
+    STREAM_TOOL_RESULT_BODY_SPILL_DIR,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -143,7 +160,7 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
     )
 
-    # Stream v2 state: per-message version counter, slim content snapshot, and
+    # Stream v2.1 state: per-message version counter, slim content snapshot, and
     # tool result cache. All are keyed by message_id. Cleared on chat:done /
     # error / cancel. Snapshot endpoint (B1) reads from here.
     STREAM_VERSION = RedisDict(
@@ -336,12 +353,12 @@ def get_active_status_by_user_id(user_id):
     return False
 
 
-def get_token_groups():
+async def get_token_groups():
     """Get all token groups"""
-    return token_groups.get_token_groups()
+    return await token_groups.get_token_groups()
 
 
-def set_token_group(
+async def set_token_group(
     group_name: str,
     models: list,
     limit: int = None,
@@ -351,32 +368,30 @@ def set_token_group(
 ):
     """Set a token group"""
     # Try to update first, if not found create new
-    if not token_groups.update_token_group(group_name, models, limit, window_duration):
-        return token_groups.create_token_group(
+    if not await token_groups.update_token_group(group_name, models, limit, window_duration):
+        return await token_groups.create_token_group(
             group_name, models, limit or 0, reset_time, reset_timezone, window_duration
         )
 
 
-def update_token_group(
+async def update_token_group(
     group_name: str, models: list = None, limit: int = None, window_duration: int = None
 ):
     """Update an existing token group"""
-    return token_groups.update_token_group(group_name, models, limit, window_duration)
+    return await token_groups.update_token_group(group_name, models, limit, window_duration)
 
 
-def delete_token_group(group_name: str):
+async def delete_token_group(group_name: str):
     """Delete a token group"""
-    return token_groups.delete_token_group(group_name)
+    return await token_groups.delete_token_group(group_name)
 
 
-def get_token_usage():
+async def get_token_usage():
     """Get current token usage for all groups from database"""
     # Import here to avoid circular imports
     from open_webui.models.token_usage import token_groups as db_token_groups
 
-    groups = (
-        db_token_groups.get_token_groups()
-    )  # This returns groups WITH usage from DB
+    groups = await db_token_groups.get_token_groups()
     return {name: group_data["usage"] for name, group_data in groups.items()}
 
 
@@ -611,12 +626,18 @@ async def process_token_usage(
     token_out = int(completion_tokens or 0)
     token_total = int(usage_data.get("total_tokens", token_in + token_out) or 0)
 
+    # Authoritative per-call USD cost for OpenRouter-routed payloads (None for
+    # rate-card rows, which are priced at read time). Computed once here so the
+    # analytics read path never has to parse raw_usage JSON.
+    from open_webui.utils.pricing import embedded_cost as _embedded_cost
+    row_embedded_cost = _embedded_cost(usage_data)
+
     log.info(
         f"📊 [process_token_usage] Calculated: in={token_in}, out={token_out}, total={token_total}"
     )
 
     # 1. Update existing group-based token tracking (for rate limiting)
-    token_groups.update_token_usage(model_id, token_in, token_out, token_total)
+    await token_groups.update_token_usage(model_id, token_in, token_out, token_total)
 
     # 2-4. Update analytics tables for "Wrapped" feature
     try:
@@ -632,7 +653,7 @@ async def process_token_usage(
         # 2. Store immutable per-request event first. This is the source of
         # truth for future rebuilds and precise subagent analytics.
         if chat_id and user_id:
-            Analytics.record_token_usage_event(
+            await Analytics.record_token_usage_event(
                 user_id=user_id,
                 source_chat_id=event_source_chat_id,
                 attributed_chat_id=chat_id,
@@ -645,6 +666,7 @@ async def process_token_usage(
                 cache_read_tokens=cache_read_tokens,
                 source_type=event_source_type,
                 raw_usage=usage_data,
+                embedded_cost=row_embedded_cost,
             )
 
         # 3. Update conversation token usage (per-visible-chat tracking)
@@ -652,7 +674,7 @@ async def process_token_usage(
             log.info(
                 f"📊 [process_token_usage] Updating conversation token usage for chat={chat_id}, user={user_id}"
             )
-            result = Analytics.update_conversation_token_usage(
+            result = await Analytics.update_conversation_token_usage(
                 chat_id=chat_id,
                 user_id=user_id,
                 model_id=model_id,
@@ -672,7 +694,7 @@ async def process_token_usage(
             log.info(
                 f"📊 [process_token_usage] Updating daily token usage for user={user_id}"
             )
-            Analytics.update_daily_token_usage(
+            await Analytics.update_daily_token_usage(
                 user_id=user_id,
                 token_in=token_in,
                 token_out=token_out,
@@ -685,7 +707,7 @@ async def process_token_usage(
         log.info(
             f"📊 [process_token_usage] Updating model token usage for model={model_id}"
         )
-        Analytics.update_model_token_usage(
+        await Analytics.update_model_token_usage(
             user_id=user_id,
             model_id=model_id,
             token_in=token_in,
@@ -706,7 +728,7 @@ async def process_token_usage(
     # so the frontend doesn't have to poll. Wire Contract #6.
     if user_id:
         try:
-            groups = token_groups.get_token_groups()
+            groups = await token_groups.get_token_groups()
             await push_token_usage_update(user_id, groups)
         except Exception as e:
             log.error(
@@ -741,7 +763,7 @@ async def connect(sid, environ, auth):
         data = decode_token(auth["token"])
 
         if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+            user = await Users.get_user_by_id(data["id"])
 
         if user:
             _register_user_session(user, sid)
@@ -758,14 +780,14 @@ async def user_join(sid, data):
     if data is None or "id" not in data:
         return
 
-    user = Users.get_user_by_id(data["id"])
+    user = await Users.get_user_by_id(data["id"])
     if not user:
         return
 
     primary_sid = _register_user_session(user, sid)
 
     # Join all the channels
-    channels = Channels.get_channels_by_user_id(user.id)
+    channels = await Channels.get_channels_by_user_id(user.id)
     log.debug(f"{channels=}")
     for channel in channels:
         await sio.enter_room(sid, f"channel:{channel.id}")
@@ -782,11 +804,26 @@ async def stream_subscribe(sid, data):
     if not chat_id:
         return {"status": False, "error": "Missing chat_id"}
 
-    if not Chats.user_owns_chat(chat_id, user.get("id")):
+    if not await Chats.user_owns_chat(chat_id, user.get("id")):
         return {"status": False, "error": "Chat not found"}
 
     await sio.enter_room(sid, stream_room(chat_id))
-    return {"status": True, "streams": get_active_streams_for_chat(chat_id)}
+    capabilities = (data or {}).get("capabilities") or {}
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    STREAM_SUBSCRIPTION_STATE.setdefault(chat_id, {})[sid] = {
+        "visible": bool((data or {}).get("visible", True)),
+        "capabilities": capabilities,
+        "updated_at": time.time(),
+    }
+    return {
+        "status": True,
+        "streams": get_active_streams_for_chat(chat_id),
+        "runtime": {
+            "ack_interval_ms": STREAM_CLIENT_ACK_INTERVAL_MS,
+            "lag_max_versions": STREAM_CLIENT_LAG_MAX_VERSIONS,
+        },
+    }
 
 
 @sio.on("stream:unsubscribe")
@@ -798,6 +835,51 @@ async def stream_unsubscribe(sid, data):
         await sio.leave_room(sid, stream_room(chat_id))
     except Exception:
         pass
+    try:
+        subscribers = STREAM_SUBSCRIPTION_STATE.get(chat_id) or {}
+        subscribers.pop(sid, None)
+        if not subscribers:
+            STREAM_SUBSCRIPTION_STATE.pop(chat_id, None)
+    except Exception:
+        pass
+    return {"status": True}
+
+
+@sio.on("stream:visibility")
+async def stream_visibility(sid, data):
+    user = SESSION_POOL.get(sid)
+    if not user:
+        return {"status": False, "error": "Session not found"}
+    chat_id = (data or {}).get("chat_id")
+    if not chat_id:
+        return {"status": False, "error": "Missing chat_id"}
+    if not await Chats.user_owns_chat(chat_id, user.get("id")):
+        return {"status": False, "error": "Chat not found"}
+    subscribers = STREAM_SUBSCRIPTION_STATE.setdefault(chat_id, {})
+    state = subscribers.setdefault(sid, {"capabilities": {}, "visible": True})
+    state["visible"] = bool((data or {}).get("visible", True))
+    state["updated_at"] = time.time()
+    return {"status": True}
+
+
+@sio.on("stream:ack")
+async def stream_ack(sid, data):
+    user = SESSION_POOL.get(sid)
+    if not user:
+        return {"status": False, "error": "Session not found"}
+    chat_id = (data or {}).get("chat_id")
+    message_id = (data or {}).get("message_id")
+    if not chat_id or not message_id:
+        return {"status": False, "error": "Missing chat_id or message_id"}
+    try:
+        version = int((data or {}).get("version") or 0)
+    except Exception:
+        version = 0
+    STREAM_CLIENT_ACKS.setdefault(sid, {})[str(message_id)] = max(0, version)
+    STREAM_SYNC_REQUIRED_SENT.discard((sid, str(message_id)))
+    subscribers = STREAM_SUBSCRIPTION_STATE.setdefault(chat_id, {})
+    state = subscribers.setdefault(sid, {"capabilities": {}, "visible": True})
+    state["updated_at"] = time.time()
     return {"status": True}
 
 
@@ -811,12 +893,12 @@ async def join_channel(sid, data):
     if data is None or "id" not in data:
         return
 
-    user = Users.get_user_by_id(data["id"])
+    user = await Users.get_user_by_id(data["id"])
     if not user:
         return
 
     # Join all the channels
-    channels = Channels.get_channels_by_user_id(user.id)
+    channels = await Channels.get_channels_by_user_id(user.id)
     log.debug(f"{channels=}")
     for channel in channels:
         await sio.enter_room(sid, f"channel:{channel.id}")
@@ -832,11 +914,11 @@ async def join_note(sid, data):
     if token_data is None or "id" not in token_data:
         return
 
-    user = Users.get_user_by_id(token_data["id"])
+    user = await Users.get_user_by_id(token_data["id"])
     if not user:
         return
 
-    note = Notes.get_note_by_id(data["note_id"])
+    note = await Notes.get_note_by_id(data["note_id"])
     if not note:
         log.error(f"Note {data['note_id']} not found for user {user.id}")
         return
@@ -891,7 +973,7 @@ async def ydoc_document_join(sid, data):
 
         if document_id.startswith("note:"):
             note_id = document_id.split(":")[1]
-            note = Notes.get_note_by_id(note_id)
+            note = await Notes.get_note_by_id(note_id)
             if not note:
                 log.error(f"Note {note_id} not found")
                 return
@@ -961,7 +1043,7 @@ async def ydoc_document_join(sid, data):
 async def document_save_handler(document_id, data, user):
     if document_id.startswith("note:"):
         note_id = document_id.split(":")[1]
-        note = Notes.get_note_by_id(note_id)
+        note = await Notes.get_note_by_id(note_id)
         if not note:
             log.error(f"Note {note_id} not found")
             return
@@ -976,7 +1058,7 @@ async def document_save_handler(document_id, data, user):
             log.error(f"User {user.get('id')} does not have access to note {note_id}")
             return
 
-        Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+        await Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
 
 
 @sio.on("ydoc:document:state")
@@ -1119,6 +1201,18 @@ async def yjs_awareness_update(sid, data):
 
 @sio.event
 async def disconnect(sid):
+    try:
+        for chat_id, subscribers in list(STREAM_SUBSCRIPTION_STATE.items()):
+            subscribers.pop(sid, None)
+            if not subscribers:
+                STREAM_SUBSCRIPTION_STATE.pop(chat_id, None)
+        STREAM_CLIENT_ACKS.pop(sid, None)
+        for key in list(STREAM_SYNC_REQUIRED_SENT):
+            if key[0] == sid:
+                STREAM_SYNC_REQUIRED_SENT.discard(key)
+    except Exception:
+        pass
+
     if sid in SESSION_POOL:
         user = SESSION_POOL[sid]
         del SESSION_POOL[sid]
@@ -1171,34 +1265,44 @@ def get_event_emitter(request_info, update_db=True):
         chat_id = request_info.get("chat_id", None)
         message_id = request_info.get("message_id", None)
 
-        emit_tasks = [
-            sio.emit(
-                "events",
-                {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "data": event_data,
-                },
-                to=session_id,
-            )
-            for session_id in session_ids
-        ]
+        envelope = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "session_id": request_info.get("session_id"),
+            "data": event_data,
+        }
 
-        await asyncio.gather(*emit_tasks)
+        if _is_stream_scoped_payload(envelope):
+            await emit_to_primary(user_id, envelope)
+        else:
+            emit_tasks = [
+                sio.emit(
+                    "events",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "data": event_data,
+                    },
+                    to=session_id,
+                )
+                for session_id in session_ids
+            ]
+
+            await asyncio.gather(*emit_tasks)
         if (
             update_db
             and message_id
             and not request_info.get("chat_id", "").startswith("local:")
         ):
             if "type" in event_data and event_data["type"] == "status":
-                Chats.add_message_status_to_chat_by_id_and_message_id(
+                await Chats.add_message_status_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     event_data.get("data", {}),
                 )
 
             if "type" in event_data and event_data["type"] == "message":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1207,7 +1311,7 @@ def get_event_emitter(request_info, update_db=True):
                     content = message.get("content", "")
                     content += event_data.get("data", {}).get("content", "")
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1218,7 +1322,7 @@ def get_event_emitter(request_info, update_db=True):
             if "type" in event_data and event_data["type"] == "replace":
                 content = event_data.get("data", {}).get("content", "")
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1227,7 +1331,7 @@ def get_event_emitter(request_info, update_db=True):
                 )
 
             if "type" in event_data and event_data["type"] == "embeds":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1237,7 +1341,7 @@ def get_event_emitter(request_info, update_db=True):
                 embeds = event_data.get("data", {}).get("embeds", [])
                 embeds.extend(message.get("embeds", []))
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1246,7 +1350,7 @@ def get_event_emitter(request_info, update_db=True):
                 )
 
             if "type" in event_data and event_data["type"] == "data_viz:override":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1261,7 +1365,7 @@ def get_event_emitter(request_info, update_db=True):
                         overrides = {}
                     overrides[key] = widget_code
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1270,7 +1374,7 @@ def get_event_emitter(request_info, update_db=True):
                     )
 
             if "type" in event_data and event_data["type"] == "files":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1280,7 +1384,7 @@ def get_event_emitter(request_info, update_db=True):
                 files = event_data.get("data", {}).get("files", [])
                 files.extend(message.get("files", []))
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1291,7 +1395,7 @@ def get_event_emitter(request_info, update_db=True):
             if event_data.get("type") in ["source", "citation"]:
                 data = event_data.get("data", {})
                 if data.get("type") == None:
-                    message = Chats.get_message_by_id_and_message_id(
+                    message = await Chats.get_message_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                     )
@@ -1301,7 +1405,7 @@ def get_event_emitter(request_info, update_db=True):
                     sources = message.get("sources", [])
                     sources.append(data)
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1388,7 +1492,7 @@ async def broadcast_queue_event(user_id, chat_id, event_data, skip_sid=None):
 
 def is_primary_session(user_id, sid) -> bool:
     """B8 helper. Defensive fallback: if no primary is recorded for the user,
-    treat every session as primary (so v2 emission still reaches the client
+    treat every session as primary (so v2.1 emission still reaches the client
     before B8 lands)."""
     try:
         primary = PRIMARY_SESSION_PER_USER.get(user_id)
@@ -1443,11 +1547,24 @@ def _schedule_stream_state_ttl_refresh() -> None:
 # runs by default.
 STREAM_MESSAGE_TO_CHAT: Dict[str, str] = {}
 STREAM_ACTIVE_BY_CHAT: Dict[str, Set[str]] = {}
+STREAM_SUBSCRIPTION_STATE: Dict[str, Dict[str, dict]] = {}
+STREAM_CLIENT_ACKS: Dict[str, Dict[str, int]] = {}
+STREAM_SYNC_REQUIRED_SENT: Set[tuple[str, str]] = set()
+STREAM_REPLAY_BUFFERS: Dict[str, deque] = {}
+STREAM_REPLAY_BUFFER_BYTES: Dict[str, int] = {}
+STREAM_FIRST_DELTA_SENT: Set[str] = set()
+STREAM_VERSION_LOCAL: Dict[str, int] = {}
+STREAM_VERSION_LAST_STORED: Dict[str, int] = {}
+STREAM_METRICS: Dict[str, int] = {}
 # Full large tool bodies are kept out of the socket hot path. Keyed by
 # message_id -> tool_call_id -> original result dict. In single-worker mode this
 # gives immediate lazy expansion during/after generation; final DB checkpoints
 # persist the same map for normal reloads.
 TOOL_RESULT_BODIES: Dict[str, Dict[str, dict]] = {}
+TOOL_RESULT_BODY_SIZES: Dict[str, Dict[str, int]] = {}
+TOOL_RESULT_BODY_ORDER: OrderedDict[tuple[str, str], int] = OrderedDict()
+TOOL_RESULT_BODY_SPILLS: Dict[str, Dict[str, dict]] = {}
+TOOL_RESULT_BODY_TOTAL_BYTES = 0
 _STREAM_CLEANUP_TASKS: Dict[str, asyncio.Task] = {}
 STREAM_DONE_GRACE_SECONDS = 300
 STREAM_ROOM_PREFIX = "stream:chat:"
@@ -1455,8 +1572,11 @@ STREAM_SCOPED_TYPES = frozenset(
     {
         "chat:delta",
         "chat:delta:batch",
+        "chat:delta:batch2",
         "tool_call:result",
         "chat:subagent:update",
+        "browser:frame",
+        "chat:stream:sync_required",
         "chat:done",
         "chat:message:error",
         "chat:tasks:cancel",
@@ -1466,6 +1586,19 @@ STREAM_SCOPED_TYPES = frozenset(
 
 def stream_room(chat_id: str) -> str:
     return f"{STREAM_ROOM_PREFIX}{chat_id}"
+
+
+def stream_metric(name: str, delta: int = 1) -> None:
+    if not STREAM_RUNTIME_METRICS:
+        return
+    try:
+        STREAM_METRICS[name] = int(STREAM_METRICS.get(name, 0) or 0) + int(delta)
+    except Exception:
+        pass
+
+
+def get_stream_runtime_metrics() -> dict:
+    return dict(STREAM_METRICS)
 
 
 def _payload_type(payload) -> Optional[str]:
@@ -1508,6 +1641,7 @@ def _index_stream(message_id: str, state: dict) -> None:
 
 
 def _delete_stream_state_now(message_id: str) -> None:
+    clear_tool_result_bodies(message_id)
     _cancel_stream_cleanup(message_id)
     chat_id = STREAM_MESSAGE_TO_CHAT.pop(message_id, None)
     if chat_id:
@@ -1516,13 +1650,87 @@ def _delete_stream_state_now(message_id: str) -> None:
             bucket.discard(message_id)
             if not bucket:
                 STREAM_ACTIVE_BY_CHAT.pop(chat_id, None)
-    TOOL_RESULT_BODIES.pop(message_id, None)
+    STREAM_REPLAY_BUFFERS.pop(message_id, None)
+    STREAM_REPLAY_BUFFER_BYTES.pop(message_id, None)
+    STREAM_FIRST_DELTA_SENT.discard(message_id)
+    STREAM_VERSION_LOCAL.pop(message_id, None)
+    STREAM_VERSION_LAST_STORED.pop(message_id, None)
+    if REDIS is not None:
+        try:
+            asyncio.ensure_future(_delete_redis_stream_replay_keys(message_id))
+        except Exception:
+            pass
+    for ack_map in list(STREAM_CLIENT_ACKS.values()):
+        try:
+            ack_map.pop(message_id, None)
+        except Exception:
+            pass
+    for key in list(STREAM_SYNC_REQUIRED_SENT):
+        if key[1] == message_id:
+            STREAM_SYNC_REQUIRED_SENT.discard(key)
     for store in (STREAM_VERSION, TOOL_RESULTS, STREAM_STATE):
         try:
             if message_id in store:
                 del store[message_id]
         except Exception:
             pass
+
+
+def _block_snapshot_signature(block) -> str:
+    try:
+        return json.dumps(block, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return repr(block)
+
+
+def _build_content_blocks_snapshot(existing: dict, blocks, dirty_from=None) -> dict:
+    incoming = list(blocks or [])
+    prev = existing.get("content_blocks_snapshot") if isinstance(existing, dict) else None
+    prev_blocks = prev.get("blocks") if isinstance(prev, dict) else None
+    prev_sigs = prev.get("signatures") if isinstance(prev, dict) else None
+    if not isinstance(prev_blocks, list) or not isinstance(prev_sigs, list):
+        prev_blocks = []
+        prev_sigs = []
+
+    if dirty_from is None:
+        dirty_from = 0
+        max_scan = min(len(prev_blocks), len(prev_sigs), len(incoming))
+        while dirty_from < max_scan:
+            sig = _block_snapshot_signature(incoming[dirty_from])
+            if sig != prev_sigs[dirty_from]:
+                break
+            dirty_from += 1
+        if len(incoming) != len(prev_blocks):
+            dirty_from = min(dirty_from, len(incoming), len(prev_blocks))
+    else:
+        try:
+            dirty_from = int(dirty_from)
+        except Exception:
+            dirty_from = 0
+        dirty_from = max(0, min(dirty_from, len(incoming), len(prev_blocks), len(prev_sigs)))
+
+    next_blocks = list(prev_blocks[:dirty_from])
+    next_sigs = list(prev_sigs[:dirty_from])
+    for block in incoming[dirty_from:]:
+        frozen = copy.deepcopy(block)
+        next_blocks.append(frozen)
+        next_sigs.append(_block_snapshot_signature(frozen))
+
+    return {
+        "format": "blocks-v2.1",
+        "blocks": next_blocks,
+        "signatures": next_sigs,
+    }
+
+
+def _materialize_stream_state(state: dict) -> dict:
+    if not isinstance(state, dict):
+        return {}
+    snapshot = state.pop("content_blocks_snapshot", None)
+    if "content_blocks" not in state and isinstance(snapshot, dict):
+        blocks = snapshot.get("blocks")
+        state["content_blocks"] = blocks if isinstance(blocks, list) else []
+    return state
 
 
 async def _delete_stream_state_later(message_id: str, delay: float) -> None:
@@ -1544,6 +1752,16 @@ def stream_version_init(
     content_blocks=None,
 ) -> int:
     _cancel_stream_cleanup(str(message_id))
+    STREAM_FIRST_DELTA_SENT.discard(str(message_id))
+    STREAM_REPLAY_BUFFERS.pop(str(message_id), None)
+    STREAM_REPLAY_BUFFER_BYTES.pop(str(message_id), None)
+    STREAM_VERSION_LOCAL[str(message_id)] = 0
+    STREAM_VERSION_LAST_STORED[str(message_id)] = 0
+    if REDIS is not None:
+        try:
+            asyncio.ensure_future(_delete_redis_stream_replay_keys(str(message_id)))
+        except Exception:
+            pass
     try:
         STREAM_VERSION[message_id] = 0
     except Exception:
@@ -1552,7 +1770,7 @@ def stream_version_init(
         "chat_id": chat_id,
         "user_id": user_id,
         "session_id": session_id,
-        "content_blocks": copy.deepcopy(content_blocks or []),
+        "content_blocks_snapshot": _build_content_blocks_snapshot({}, content_blocks or []),
         "status": "in_progress",
         "updated_at": time.time(),
     }
@@ -1566,19 +1784,43 @@ def stream_version_init(
 
 
 def stream_version_incr(message_id) -> int:
-    try:
-        current = STREAM_VERSION.get(message_id, 0) or 0
-    except Exception:
-        current = 0
+    key = str(message_id)
+    if key in STREAM_VERSION_LOCAL:
+        current = STREAM_VERSION_LOCAL.get(key, 0) or 0
+    else:
+        try:
+            current = STREAM_VERSION.get(message_id, 0) or 0
+        except Exception:
+            current = 0
     nxt = int(current) + 1
-    try:
-        STREAM_VERSION[message_id] = nxt
-    except Exception:
-        pass
+    STREAM_VERSION_LOCAL[key] = nxt
+    if nxt - int(STREAM_VERSION_LAST_STORED.get(key, 0) or 0) >= STREAM_VERSION_STORE_FLUSH_EVERY:
+        stream_version_flush(key)
     return nxt
 
 
+def stream_version_flush(message_id) -> int:
+    key = str(message_id)
+    if key in STREAM_VERSION_LOCAL:
+        value = int(STREAM_VERSION_LOCAL.get(key, 0) or 0)
+    else:
+        try:
+            value = int(STREAM_VERSION.get(message_id, 0) or 0)
+        except Exception:
+            value = 0
+    try:
+        STREAM_VERSION[message_id] = value
+        STREAM_VERSION_LAST_STORED[key] = value
+        stream_metric("version.flush")
+    except Exception:
+        pass
+    return value
+
+
 def stream_version_get(message_id) -> int:
+    key = str(message_id)
+    if key in STREAM_VERSION_LOCAL:
+        return int(STREAM_VERSION_LOCAL.get(key, 0) or 0)
     try:
         return int(STREAM_VERSION.get(message_id, 0) or 0)
     except Exception:
@@ -1605,7 +1847,17 @@ def set_stream_state(message_id, patch: dict) -> None:
             # *accumulated* state too (the old behavior) re-copied the whole
             # growing blocks list every token for nothing — O(N) per token,
             # O(N^2) per stream — since `update` immediately overwrote it.
-            merged.update(copy.deepcopy(patch))
+            content_blocks = patch.get("content_blocks")
+            dirty_from = patch.get("content_blocks_dirty_from")
+            for key, value in patch.items():
+                if key in {"content_blocks", "content_blocks_dirty_from"}:
+                    continue
+                merged[key] = copy.deepcopy(value)
+            if content_blocks is not None:
+                merged.pop("content_blocks", None)
+                merged["content_blocks_snapshot"] = _build_content_blocks_snapshot(
+                    existing, content_blocks, dirty_from=dirty_from
+                )
         merged["updated_at"] = time.time()
         STREAM_STATE[message_id] = merged
         _index_stream(str(message_id), merged)
@@ -1616,7 +1868,8 @@ def set_stream_state(message_id, patch: dict) -> None:
 def get_stream_state(message_id) -> dict:
     try:
         existing = STREAM_STATE.get(message_id, {}) or {}
-        return copy.deepcopy(existing) if isinstance(existing, dict) else {}
+        state = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+        return _materialize_stream_state(state)
     except Exception:
         return {}
 
@@ -1639,18 +1892,368 @@ def get_active_streams_for_chat(chat_id: str) -> list[dict]:
     return out
 
 
-def set_tool_result_body(message_id, tool_call_id, result) -> None:
+def _stream_replay_key(message_id: str) -> str:
+    return f"{REDIS_KEY_PREFIX}:stream_replay:{message_id}"
+
+
+def _stream_replay_size_key(message_id: str) -> str:
+    return f"{REDIS_KEY_PREFIX}:stream_replay_size:{message_id}"
+
+
+def _stream_replay_bytes_key(message_id: str) -> str:
+    return f"{REDIS_KEY_PREFIX}:stream_replay_bytes:{message_id}"
+
+
+async def _delete_redis_stream_replay_keys(message_id: str) -> None:
+    if REDIS is None:
+        return
     try:
-        by_message = TOOL_RESULT_BODIES.setdefault(str(message_id), {})
-        by_message[str(tool_call_id)] = copy.deepcopy(result)
+        await REDIS.delete(
+            _stream_replay_key(message_id),
+            _stream_replay_size_key(message_id),
+            _stream_replay_bytes_key(message_id),
+        )
+    except Exception:
+        pass
+
+
+def _coerce_replay_entry_size(size_value, raw_entry) -> int:
+    try:
+        return max(0, int(size_value or 0))
+    except Exception:
+        pass
+    try:
+        if raw_entry is None:
+            return 0
+        if isinstance(raw_entry, bytes):
+            return len(raw_entry)
+        return len(str(raw_entry).encode("utf-8", "replace"))
+    except Exception:
+        return 0
+
+
+async def _append_redis_stream_replay_event(
+    message_id: str, encoded: str, encoded_size: int
+) -> None:
+    key = _stream_replay_key(message_id)
+    track_bytes = STREAM_REPLAY_BUFFER_MAX_BYTES > 0
+    size_key = _stream_replay_size_key(message_id)
+    bytes_key = _stream_replay_bytes_key(message_id)
+
+    await REDIS.rpush(key, encoded)
+    total_bytes = 0
+    if track_bytes:
+        await REDIS.rpush(size_key, int(encoded_size))
+        total_bytes = int(await REDIS.incrby(bytes_key, int(encoded_size)) or 0)
+
+    length = int(await REDIS.llen(key) or 0)
+    trim_count = 0
+
+    if not track_bytes:
+        if STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and length > STREAM_REPLAY_BUFFER_MAX_EVENTS:
+            trim_count = length - STREAM_REPLAY_BUFFER_MAX_EVENTS
+            await REDIS.ltrim(key, -STREAM_REPLAY_BUFFER_MAX_EVENTS, -1)
+        if STREAM_REPLAY_BUFFER_TTL_SECONDS > 0:
+            await REDIS.expire(key, STREAM_REPLAY_BUFFER_TTL_SECONDS)
+        if trim_count:
+            stream_metric("replay.trim", trim_count)
+        return
+
+    while (
+        (STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and length > STREAM_REPLAY_BUFFER_MAX_EVENTS)
+        or (STREAM_REPLAY_BUFFER_MAX_BYTES > 0 and total_bytes > STREAM_REPLAY_BUFFER_MAX_BYTES)
+    ):
+        old_raw = await REDIS.lpop(key)
+        old_size = await REDIS.lpop(size_key)
+        if old_raw is None and old_size is None:
+            length = 0
+            total_bytes = 0
+            break
+        total_bytes = max(0, total_bytes - _coerce_replay_entry_size(old_size, old_raw))
+        length = max(0, length - 1)
+        trim_count += 1
+
+    await REDIS.set(bytes_key, total_bytes)
+    if STREAM_REPLAY_BUFFER_TTL_SECONDS > 0:
+        ttl = STREAM_REPLAY_BUFFER_TTL_SECONDS
+        await REDIS.expire(key, ttl)
+        await REDIS.expire(size_key, ttl)
+        await REDIS.expire(bytes_key, ttl)
+    if trim_count:
+        stream_metric("replay.trim", trim_count)
+
+
+def _stream_event_message_id(payload) -> Optional[str]:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        inner = data.get("data") if isinstance(data, dict) else None
+        if isinstance(inner, dict):
+            return str(inner.get("message_id") or payload.get("message_id") or "") or None
+        return str(payload.get("message_id") or "") or None
+    except Exception:
+        return None
+
+
+async def append_stream_replay_event(payload) -> None:
+    if STREAM_REPLAY_BUFFER_MAX_EVENTS <= 0:
+        return
+    event_type = _payload_type(payload)
+    if event_type not in {"chat:delta", "tool_call:result"}:
+        return
+    message_id = _stream_event_message_id(payload)
+    if not message_id:
+        return
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        inner = data.get("data") if isinstance(data, dict) else {}
+        if not isinstance(inner, dict):
+            return
+        replay_version = inner.get("version")
+        if not isinstance(replay_version, int):
+            replay_version = stream_version_get(message_id)
+        entry = {
+            "type": event_type,
+            "data": inner,
+            "replay_version": int(replay_version or 0),
+            "ts": time.time(),
+        }
+        encoded = json.dumps(entry, ensure_ascii=False, default=str)
+        encoded_size = len(encoded.encode("utf-8", "replace"))
+        while True:
+            entry["_size"] = encoded_size
+            encoded = json.dumps(entry, ensure_ascii=False, default=str)
+            next_size = len(encoded.encode("utf-8", "replace"))
+            if next_size == encoded_size:
+                break
+            encoded_size = next_size
+        if REDIS is not None:
+            await _append_redis_stream_replay_event(message_id, encoded, encoded_size)
+        else:
+            buf = STREAM_REPLAY_BUFFERS.get(message_id)
+            if buf is None:
+                buf = deque()
+                STREAM_REPLAY_BUFFERS[message_id] = buf
+            buf.append(entry)
+            STREAM_REPLAY_BUFFER_BYTES[message_id] = (
+                int(STREAM_REPLAY_BUFFER_BYTES.get(message_id, 0) or 0) + encoded_size
+            )
+            while STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and len(buf) > STREAM_REPLAY_BUFFER_MAX_EVENTS:
+                old = buf.popleft()
+                STREAM_REPLAY_BUFFER_BYTES[message_id] = max(
+                    0,
+                    int(STREAM_REPLAY_BUFFER_BYTES.get(message_id, 0) or 0)
+                    - int(old.get("_size") or 0),
+                )
+                stream_metric("replay.trim")
+            while (
+                STREAM_REPLAY_BUFFER_MAX_BYTES > 0
+                and buf
+                and int(STREAM_REPLAY_BUFFER_BYTES.get(message_id, 0) or 0)
+                > STREAM_REPLAY_BUFFER_MAX_BYTES
+            ):
+                old = buf.popleft()
+                STREAM_REPLAY_BUFFER_BYTES[message_id] = max(
+                    0,
+                    int(STREAM_REPLAY_BUFFER_BYTES.get(message_id, 0) or 0)
+                    - int(old.get("_size") or 0),
+                )
+                stream_metric("replay.trim")
+        stream_metric("replay.append")
+    except Exception:
+        log.exception("stream replay append failed")
+
+
+async def get_stream_replay_events(message_id: str, after_version: int) -> dict:
+    after_version = int(after_version or 0)
+    current_version = stream_version_get(message_id)
+    try:
+        if REDIS is not None:
+            raw_entries = await REDIS.lrange(_stream_replay_key(message_id), 0, -1)
+            entries = [json.loads(raw) for raw in raw_entries]
+        else:
+            entries = list(STREAM_REPLAY_BUFFERS.get(str(message_id), deque()))
+    except Exception:
+        log.exception("stream replay read failed")
+        entries = []
+
+    versioned = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and int(entry.get("replay_version") or 0) > 0
+    ]
+    if versioned:
+        current_version = max(
+            current_version,
+            max(int(entry.get("replay_version") or 0) for entry in versioned),
+        )
+    if after_version < current_version:
+        delta_versions = sorted(
+            int(entry.get("replay_version") or 0)
+            for entry in versioned
+            if (entry.get("type") == "chat:delta")
+        )
+        if not delta_versions or delta_versions[0] > after_version + 1:
+            stream_metric("replay.miss")
+            return {
+                "status": "miss",
+                "snapshot_required": True,
+                "from_version": after_version,
+                "to_version": current_version,
+                "events": [],
+            }
+
+    events = [
+        {"type": entry.get("type"), "data": entry.get("data")}
+        for entry in versioned
+        if int(entry.get("replay_version") or 0) > after_version
+    ]
+    stream_metric("replay.hit")
+    return {
+        "status": "ok",
+        "snapshot_required": False,
+        "from_version": after_version,
+        "to_version": current_version,
+        "events": events,
+    }
+
+
+def _tool_body_size(body) -> int:
+    try:
+        return len(json.dumps(body, ensure_ascii=False, default=str).encode("utf-8", "replace"))
+    except Exception:
+        return 0
+
+
+def _tool_body_key(message_id, tool_call_id) -> tuple[str, str]:
+    return (str(message_id), str(tool_call_id))
+
+
+def _spill_path(message_id: str, tool_call_id: str) -> str:
+    digest = hashlib.sha256(f"{message_id}:{tool_call_id}".encode("utf-8", "replace")).hexdigest()
+    return os.path.join(STREAM_TOOL_RESULT_BODY_SPILL_DIR, f"{digest}.json")
+
+
+def _spill_tool_result_body(message_id: str, tool_call_id: str, body: dict) -> None:
+    if not STREAM_TOOL_RESULT_BODY_SPILL_DIR:
+        return
+    try:
+        os.makedirs(STREAM_TOOL_RESULT_BODY_SPILL_DIR, exist_ok=True)
+        path = _spill_path(message_id, tool_call_id)
+        fd, tmp = tempfile.mkstemp(
+            prefix="tool-body-", suffix=".json.tmp", dir=STREAM_TOOL_RESULT_BODY_SPILL_DIR
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+        TOOL_RESULT_BODY_SPILLS.setdefault(message_id, {})[tool_call_id] = {
+            "path": path,
+            "size": _tool_body_size(body),
+        }
+        stream_metric("tool_body.spill")
+    except Exception:
+        log.exception("tool result body spill failed")
+
+
+def _read_spilled_tool_result_body(message_id: str, tool_call_id: str):
+    info = (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}).get(str(tool_call_id))
+    path = info.get("path") if isinstance(info, dict) else None
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        stream_metric("tool_body.spill_miss")
+        return None
+
+
+def _remove_spilled_tool_result_body(message_id: str, tool_call_id: str) -> None:
+    info = (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}).pop(str(tool_call_id), None)
+    if not (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}):
+        TOOL_RESULT_BODY_SPILLS.pop(str(message_id), None)
+    path = info.get("path") if isinstance(info, dict) else None
+    if path:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.debug("failed to remove spilled tool result body", exc_info=True)
+
+
+def _drop_live_tool_result_body(message_id: str, tool_call_id: str, *, spill: bool = True) -> None:
+    global TOOL_RESULT_BODY_TOTAL_BYTES
+    mid, tcid = str(message_id), str(tool_call_id)
+    body = (TOOL_RESULT_BODIES.get(mid) or {}).pop(tcid, None)
+    size = (TOOL_RESULT_BODY_SIZES.get(mid) or {}).pop(tcid, 0)
+    if not (TOOL_RESULT_BODIES.get(mid) or {}):
+        TOOL_RESULT_BODIES.pop(mid, None)
+    if not (TOOL_RESULT_BODY_SIZES.get(mid) or {}):
+        TOOL_RESULT_BODY_SIZES.pop(mid, None)
+    TOOL_RESULT_BODY_ORDER.pop((mid, tcid), None)
+    TOOL_RESULT_BODY_TOTAL_BYTES = max(0, TOOL_RESULT_BODY_TOTAL_BYTES - int(size or 0))
+    if spill and isinstance(body, dict):
+        _spill_tool_result_body(mid, tcid, body)
+
+
+def _enforce_tool_result_body_caps(message_id: str) -> None:
+    if STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE > 0:
+        sizes = TOOL_RESULT_BODY_SIZES.get(str(message_id)) or {}
+        while sum(sizes.values()) > STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE and sizes:
+            victim = next(
+                ((mid, tcid) for (mid, tcid) in TOOL_RESULT_BODY_ORDER.keys() if mid == str(message_id)),
+                None,
+            )
+            if victim is None:
+                break
+            _drop_live_tool_result_body(victim[0], victim[1], spill=True)
+            sizes = TOOL_RESULT_BODY_SIZES.get(str(message_id)) or {}
+
+    if STREAM_TOOL_RESULT_BODY_MAX_BYTES > 0:
+        while TOOL_RESULT_BODY_TOTAL_BYTES > STREAM_TOOL_RESULT_BODY_MAX_BYTES and TOOL_RESULT_BODY_ORDER:
+            victim_mid, victim_tcid = next(iter(TOOL_RESULT_BODY_ORDER.keys()))
+            _drop_live_tool_result_body(victim_mid, victim_tcid, spill=True)
+
+
+def set_tool_result_body(message_id, tool_call_id, result) -> None:
+    global TOOL_RESULT_BODY_TOTAL_BYTES
+    try:
+        mid, tcid = str(message_id), str(tool_call_id)
+        if not mid or not tcid or not isinstance(result, dict):
+            return
+        _remove_spilled_tool_result_body(mid, tcid)
+        existing_size = (TOOL_RESULT_BODY_SIZES.get(mid) or {}).get(tcid, 0)
+        body = copy.deepcopy(result)
+        size = _tool_body_size(body)
+        by_message = TOOL_RESULT_BODIES.setdefault(mid, {})
+        by_message[tcid] = body
+        TOOL_RESULT_BODY_SIZES.setdefault(mid, {})[tcid] = size
+        TOOL_RESULT_BODY_ORDER.pop((mid, tcid), None)
+        TOOL_RESULT_BODY_ORDER[(mid, tcid)] = size
+        TOOL_RESULT_BODY_TOTAL_BYTES = max(0, TOOL_RESULT_BODY_TOTAL_BYTES - int(existing_size or 0)) + size
+        stream_metric("tool_body.store")
+        stream_metric("tool_body.bytes", size)
+        _enforce_tool_result_body_caps(mid)
     except Exception:
         pass
 
 
 def get_tool_result_body(message_id, tool_call_id):
     try:
-        result = TOOL_RESULT_BODIES.get(str(message_id), {}).get(str(tool_call_id))
-        return copy.deepcopy(result)
+        mid, tcid = str(message_id), str(tool_call_id)
+        result = TOOL_RESULT_BODIES.get(mid, {}).get(tcid)
+        if isinstance(result, dict):
+            TOOL_RESULT_BODY_ORDER.move_to_end((mid, tcid), last=True)
+            return copy.deepcopy(result)
+        spilled = _read_spilled_tool_result_body(mid, tcid)
+        return copy.deepcopy(spilled) if isinstance(spilled, dict) else None
     except Exception:
         return None
 
@@ -1670,6 +2273,14 @@ def get_tool_result_bodies(message_id, *, deep_copy: bool = True) -> dict:
     change again, so sharing the live reference is safe."""
     try:
         bodies = TOOL_RESULT_BODIES.get(str(message_id), {}) or {}
+        spills = TOOL_RESULT_BODY_SPILLS.get(str(message_id), {}) or {}
+        if spills:
+            merged = dict(bodies)
+            for tool_call_id in list(spills.keys()):
+                spilled = _read_spilled_tool_result_body(str(message_id), tool_call_id)
+                if isinstance(spilled, dict):
+                    merged[tool_call_id] = spilled
+            bodies = merged
         if not deep_copy:
             return bodies
         return copy.deepcopy(bodies)
@@ -1679,7 +2290,11 @@ def get_tool_result_bodies(message_id, *, deep_copy: bool = True) -> dict:
 
 def clear_tool_result_bodies(message_id) -> None:
     try:
-        TOOL_RESULT_BODIES.pop(str(message_id), None)
+        mid = str(message_id)
+        for tool_call_id in list((TOOL_RESULT_BODIES.get(mid) or {}).keys()):
+            _drop_live_tool_result_body(mid, tool_call_id, spill=False)
+        for tool_call_id in list((TOOL_RESULT_BODY_SPILLS.get(mid) or {}).keys()):
+            _remove_spilled_tool_result_body(mid, tool_call_id)
     except Exception:
         pass
 
@@ -1725,25 +2340,265 @@ def clear_stream_state(message_id, delay: float = STREAM_DONE_GRACE_SECONDS) -> 
 
 
 async def emit_to_primary(user_id, payload):
-    """Emit a single events payload. Stream-scoped v2 events route to the
+    """Emit a single events payload. Stream-scoped v2.1 events route to the
     current chat room plus origin socket; unrelated tabs do not receive token
     deltas. Non-stream events retain the primary/fallback behavior."""
-    # v2 batching layer: collapse per-tick chat:delta / tool_call:result
+    # v2.1 batching layer: collapse per-tick chat:delta / tool_call:result
     # emissions into a single envelope per (user, chat). Batching by user only
     # can mix two chats and route a combined batch to the wrong stream room.
     if (
         STREAM_DELTA_BATCH_ENABLED
-        and STREAM_PROTOCOL_VERSION == "v2"
+        and STREAM_PROTOCOL_VERSION == "v2.1"
         and user_id
         and _is_batchable_payload(payload)
     ):
-        _enqueue_delta(user_id, payload)
+        await append_stream_replay_event(payload)
+        await _enqueue_delta(user_id, payload)
         return
+    if STREAM_PROTOCOL_VERSION == "v2.1" and user_id and _is_batchable_payload(payload):
+        await append_stream_replay_event(payload)
     # Non-batchable / terminal event: drain this chat's pending batch first so
     # order is preserved (deltas before the terminal envelope), then emit.
-    if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2" and user_id:
+    if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2.1" and user_id:
         await _flush_delta_buffers_for_payload(user_id, payload)
     await _emit_to_primary_raw(user_id, payload)
+
+
+_COMPACT_OP_CODES = {
+    "text_append": "t",
+    "block_open": "o",
+    "block_close": "c",
+    "tool_call_add": "a",
+    "tool_call_args_append": "g",
+    "reasoning_detail_merge": "r",
+    "sources": "s",
+    "selected_model_id": "m",
+    "usage": "u",
+    "replace": "p",
+    "snapshot": "x",
+}
+
+
+def _stream_payload_message_id(payload) -> Optional[str]:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        inner = data.get("data") if isinstance(data, dict) else None
+        if isinstance(inner, dict) and inner.get("message_id"):
+            return str(inner.get("message_id"))
+        if payload.get("message_id"):
+            return str(payload.get("message_id"))
+    except Exception:
+        pass
+    return None
+
+
+def _stream_payload_version(payload) -> Optional[int]:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        inner = data.get("data") if isinstance(data, dict) else None
+        if isinstance(inner, dict) and isinstance(inner.get("version"), int):
+            return int(inner.get("version"))
+    except Exception:
+        pass
+    return None
+
+
+def _stream_payload_versions(payload) -> list[tuple[str, int]]:
+    event_type = _payload_type(payload)
+    if event_type == "chat:delta":
+        message_id = _stream_payload_message_id(payload)
+        version = _stream_payload_version(payload)
+        return [(message_id, version)] if message_id and version is not None else []
+    if event_type == "chat:delta:batch":
+        out: list[tuple[str, int]] = []
+        for item in ((payload.get("data") or {}).get("batch") or []):
+            data = item.get("data") if isinstance(item, dict) else None
+            inner = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(inner, dict) or data.get("type") != "chat:delta":
+                continue
+            mid = str(inner.get("message_id") or item.get("message_id") or "")
+            version = inner.get("version")
+            if mid and isinstance(version, int):
+                out.append((mid, version))
+        return out
+    if event_type == "chat:delta:batch2":
+        out: list[tuple[str, int]] = []
+        for group in ((payload.get("data") or {}).get("groups") or []):
+            mid = str(group.get("message_id") or "") if isinstance(group, dict) else ""
+            base_version = int(group.get("base_version") or 0) if isinstance(group, dict) else 0
+            offset_versions = bool(group.get("version_mode") == "offset") if isinstance(group, dict) else False
+            for delta in group.get("deltas") or []:
+                if mid and isinstance(delta, list) and delta and isinstance(delta[0], int):
+                    version = base_version + int(delta[0]) if offset_versions else int(delta[0])
+                    out.append((mid, version))
+        return out
+    return []
+
+
+def _subscriber_state(chat_id: str, sid: str) -> dict:
+    return (STREAM_SUBSCRIPTION_STATE.get(chat_id) or {}).get(sid) or {
+        "visible": True,
+        "capabilities": {},
+    }
+
+
+def _subscriber_capabilities(chat_id: str, sid: str) -> dict:
+    caps = _subscriber_state(chat_id, sid).get("capabilities") or {}
+    return caps if isinstance(caps, dict) else {}
+
+
+def _is_visible_subscriber(chat_id: str, sid: str) -> bool:
+    return bool(_subscriber_state(chat_id, sid).get("visible", True))
+
+
+def _is_batch_payload(payload) -> bool:
+    return _payload_type(payload) in {"chat:delta:batch", "chat:delta:batch2"}
+
+
+def _is_live_delta_payload(payload) -> bool:
+    return _is_batchable_payload(payload) or _is_batch_payload(payload) or _payload_type(payload) == "browser:frame"
+
+
+def _make_sync_required_payload(payload, message_id: str, version: int) -> dict:
+    return {
+        "chat_id": payload.get("chat_id"),
+        "message_id": message_id,
+        "session_id": payload.get("session_id"),
+        "data": {
+            "type": "chat:stream:sync_required",
+            "data": {"message_id": message_id, "version": version},
+        },
+    }
+
+
+async def _emit_sync_required_once(sid: str, payload, message_id: str, version: int) -> None:
+    key = (sid, message_id)
+    if key in STREAM_SYNC_REQUIRED_SENT:
+        return
+    STREAM_SYNC_REQUIRED_SENT.add(key)
+    stream_metric("backpressure.sync_required")
+    await sio.emit("events", _make_sync_required_payload(payload, message_id, version), to=sid)
+
+
+async def _should_emit_stream_payload_to_sid(sid: str, payload) -> bool:
+    chat_id = str(payload.get("chat_id") or "") if isinstance(payload, dict) else ""
+    if not chat_id:
+        return True
+    if _is_live_delta_payload(payload) and not _is_visible_subscriber(chat_id, sid):
+        stream_metric("visibility.hidden_suppressed")
+        return False
+    caps = _subscriber_capabilities(chat_id, sid)
+    if not caps.get("ack"):
+        return True
+    versions = _stream_payload_versions(payload)
+    if not versions:
+        return True
+    for message_id, version in versions:
+        acked = int((STREAM_CLIENT_ACKS.get(sid) or {}).get(message_id) or 0)
+        if version - acked > STREAM_CLIENT_LAG_MAX_VERSIONS:
+            await _emit_sync_required_once(sid, payload, message_id, version)
+            return False
+    return True
+
+
+def _make_delta_batch2_envelope(batch: list) -> Optional[dict]:
+    head = batch[0] if isinstance(batch[0], dict) else {}
+    groups: dict[str, dict] = {}
+    for item in batch:
+        data = item.get("data") if isinstance(item, dict) else None
+        if not isinstance(data, dict) or data.get("type") not in {"chat:delta", "tool_call:result"}:
+            return None
+        inner = data.get("data") or {}
+        if not isinstance(inner, dict):
+            return None
+        message_id = str(inner.get("message_id") or item.get("message_id") or "")
+        if not message_id:
+            return None
+        group = groups.setdefault(message_id, {"message_id": message_id, "deltas": [], "tool_results": []})
+        if data.get("type") == "chat:delta":
+            version = int(inner.get("version") or 0)
+            if "base_version" not in group:
+                group["base_version"] = max(0, version - 1) if version > 0 else 0
+                group["version_mode"] = "offset"
+            frame_version = version - int(group.get("base_version") or 0)
+            group["deltas"].append(
+                _compact_delta_frame(
+                    frame_version,
+                    inner.get("op") or "",
+                    inner.get("payload") or {},
+                )
+            )
+        else:
+            group["tool_results"].append(inner)
+
+    compact_groups = []
+    for group in groups.values():
+        group = dict(group)
+        if not group.get("deltas"):
+            group.pop("deltas", None)
+        if not group.get("tool_results"):
+            group.pop("tool_results", None)
+        compact_groups.append(group)
+
+    return {
+        "chat_id": head.get("chat_id"),
+        "message_id": head.get("message_id"),
+        "session_id": head.get("session_id"),
+        "data": {
+            "type": "chat:delta:batch2",
+            "format": "owui.stream.v2.1",
+            "groups": compact_groups,
+        },
+    }
+
+
+def _compact_delta_frame(version: int, op: str, payload: dict) -> list:
+    code = _COMPACT_OP_CODES.get(op, op or "")
+    payload = payload if isinstance(payload, dict) else {}
+    if op == "text_append":
+        return [version, code, payload.get("block_idx"), payload.get("text") or ""]
+    if op == "block_open":
+        return [version, code, payload.get("block_idx"), payload.get("type"), payload.get("attrs") or {}]
+    if op == "block_close":
+        return [
+            version,
+            code,
+            payload.get("block_idx"),
+            payload.get("duration"),
+            payload.get("output"),
+            payload.get("ended"),
+            payload.get("results") or [],
+        ]
+    if op == "tool_call_add":
+        return [version, code, payload.get("block_idx"), payload.get("tool_call")]
+    if op == "tool_call_args_append":
+        return [version, code, payload.get("tool_call_id"), payload.get("args_delta") or ""]
+    if op == "reasoning_detail_merge":
+        return [version, code, payload.get("detail") or {}]
+    if op == "sources":
+        return [version, code, payload.get("sources") or []]
+    if op == "selected_model_id":
+        return [version, code, payload.get("model_id")]
+    if op == "usage":
+        return [version, code, payload.get("usage") or {}]
+    if op == "replace":
+        return [version, code, payload.get("block_idx", 0), payload.get("content_blocks") or []]
+    if op == "snapshot":
+        return [version, code]
+    return [version, code, payload]
+
+
+def _payload_for_sid(chat_id: str, sid: str, payload):
+    if _payload_type(payload) != "chat:delta:batch":
+        return payload
+    caps = _subscriber_capabilities(chat_id, sid)
+    if not caps.get("compact_batch"):
+        return payload
+    batch = ((payload.get("data") or {}).get("batch") or []) if isinstance(payload, dict) else []
+    compact = _make_delta_batch2_envelope(batch)
+    if compact:
+        stream_metric("compact.batch2")
+    return compact or payload
 
 
 async def _emit_to_primary_raw(user_id, payload):
@@ -1788,7 +2643,15 @@ async def _emit_to_primary_raw(user_id, payload):
 
     if not targets:
         return
-    await asyncio.gather(*[sio.emit("events", payload, to=sid) for sid in targets])
+
+    emit_calls = []
+    chat_id = str(payload.get("chat_id") or "") if isinstance(payload, dict) else ""
+    for sid in targets:
+        if not await _should_emit_stream_payload_to_sid(sid, payload):
+            continue
+        emit_calls.append(sio.emit("events", _payload_for_sid(chat_id, sid, payload), to=sid))
+    if emit_calls:
+        await asyncio.gather(*emit_calls)
 
 
 # --- chat:delta batching --------------------------------------------------
@@ -1798,8 +2661,10 @@ async def _emit_to_primary_raw(user_id, payload):
 _BATCHABLE_TYPES = frozenset({"chat:delta", "tool_call:result", "chat:subagent:update"})
 DeltaBatchKey = tuple[str, str]
 _pending_delta_buffer: Dict[DeltaBatchKey, list] = {}
+_pending_delta_buffer_sizes: Dict[DeltaBatchKey, int] = {}
 _pending_delta_scheduled: Set[DeltaBatchKey] = set()
 SOCKET_BATCH_MAX_BYTES = max(65536, min(1_000_000, WEBSOCKET_MAX_MESSAGE_SIZE // 2))
+SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES = 256
 
 
 def _socket_payload_size(payload) -> int:
@@ -1829,18 +2694,17 @@ def _make_delta_batch_envelope(batch: list) -> dict:
 def _split_delta_batch(buf: list) -> list[dict]:
     envelopes: list[dict] = []
     current: list = []
+    current_size = SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES
 
     for item in buf:
-        candidate = [*current, item]
-        candidate_envelope = _make_delta_batch_envelope(candidate)
-        if (
-            current
-            and _socket_payload_size(candidate_envelope) > SOCKET_BATCH_MAX_BYTES
-        ):
+        item_size = _socket_payload_size(item) + 2
+        if current and current_size + item_size > SOCKET_BATCH_MAX_BYTES:
             envelopes.append(_make_delta_batch_envelope(current))
             current = [item]
+            current_size = SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES + item_size
         else:
-            current = candidate
+            current.append(item)
+            current_size += item_size
 
     if current:
         envelopes.append(_make_delta_batch_envelope(current))
@@ -1866,14 +2730,37 @@ def _delta_batch_key(user_id, payload) -> DeltaBatchKey:
     return (str(user_id), chat_id)
 
 
-def _enqueue_delta(user_id, payload) -> None:
+async def _enqueue_delta(user_id, payload) -> None:
     try:
         key = _delta_batch_key(user_id, payload)
         buf = _pending_delta_buffer.get(key)
         if buf is None:
             buf = []
             _pending_delta_buffer[key] = buf
+            _pending_delta_buffer_sizes[key] = SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES
+
+        message_id = _stream_payload_message_id(payload)
+        if (
+            STREAM_DELTA_FIRST_TOKEN_IMMEDIATE
+            and _payload_type(payload) == "chat:delta"
+            and message_id
+            and message_id not in STREAM_FIRST_DELTA_SENT
+            and not buf
+        ):
+            STREAM_FIRST_DELTA_SENT.add(message_id)
+            stream_metric("batch.first_delta_immediate")
+            await _emit_to_primary_raw(user_id, payload)
+            return
+
+        if message_id:
+            STREAM_FIRST_DELTA_SENT.add(message_id)
         buf.append(payload)
+        _pending_delta_buffer_sizes[key] = _pending_delta_buffer_sizes.get(
+            key, SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES
+        ) + _socket_payload_size(payload) + 2
+        if _pending_delta_buffer_sizes[key] >= SOCKET_BATCH_MAX_BYTES:
+            asyncio.create_task(_flush_delta_buffer(key))
+            return
         if key in _pending_delta_scheduled:
             return
         _pending_delta_scheduled.add(key)
@@ -1891,7 +2778,11 @@ def _enqueue_delta(user_id, payload) -> None:
             except Exception:
                 pass
             return
-        loop.call_soon(_schedule_flush, key)
+        delay = max(0, min(STREAM_DELTA_BATCH_WINDOW_MS, STREAM_DELTA_BATCH_MAX_DELAY_MS)) / 1000
+        if delay <= 0:
+            loop.call_soon(_schedule_flush, key)
+        else:
+            loop.call_later(delay, _schedule_flush, key)
     except Exception:
         log.exception("delta batch enqueue failed")
         # Fallback: drop the batch path and emit immediately so the event
@@ -1923,9 +2814,12 @@ async def _flush_delta_buffer(key: DeltaBatchKey) -> None:
     # Pop the buffer (preserve order) and clear the scheduled marker BEFORE
     # awaiting so a new enqueue during the await can reschedule.
     buf = _pending_delta_buffer.pop(key, None)
+    _pending_delta_buffer_sizes.pop(key, None)
     _pending_delta_scheduled.discard(key)
     if not buf:
         return
+    stream_metric("batch.flush")
+    stream_metric("batch.events", len(buf))
     user_id = key[0]
     if len(buf) == 1:
         # Single envelope — no point wrapping in a batch.

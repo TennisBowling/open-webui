@@ -1,16 +1,15 @@
 import logging
 import os
+import asyncio
 from typing import Optional, Union
 
 import requests
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 import time
 import re
 
 from urllib.parse import quote
 from huggingface_hub import snapshot_download
-from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
@@ -25,7 +24,7 @@ from open_webui.models.chats import Chats
 from open_webui.models.notes import Notes
 
 from open_webui.retrieval.vector.main import GetResult
-from open_webui.utils.access_control import has_access
+from open_webui.utils.access_control import has_access_async
 from open_webui.utils.misc import get_message_list
 
 from open_webui.retrieval.web.utils import get_web_loader
@@ -48,9 +47,6 @@ log.setLevel(SRC_LOG_LEVELS["RAG"])
 
 
 from typing import Any
-
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from langchain_core.retrievers import BaseRetriever
 
 
 def is_youtube_url(url: str) -> bool:
@@ -76,44 +72,12 @@ def get_content_from_url(request, url: str) -> str:
     return content, docs
 
 
-class VectorSearchRetriever(BaseRetriever):
-    collection_name: Any
-    embedding_function: Any
-    top_k: int
-
-    def _get_relevant_documents(
-        self,
-        query: str,
-        *,
-        run_manager: CallbackManagerForRetrieverRun,
-    ) -> list[Document]:
-        result = VECTOR_DB_CLIENT.search(
-            collection_name=self.collection_name,
-            vectors=[self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)],
-            limit=self.top_k,
-        )
-
-        ids = result.ids[0]
-        metadatas = result.metadatas[0]
-        documents = result.documents[0]
-
-        results = []
-        for idx in range(len(ids)):
-            results.append(
-                Document(
-                    metadata=metadatas[idx],
-                    page_content=documents[idx],
-                )
-            )
-        return results
-
-
-def query_doc(
+async def query_doc(
     collection_name: str, query_embedding: list[float], k: int, user: UserModel = None
 ):
     try:
         log.debug(f"query_doc:doc {collection_name}")
-        result = VECTOR_DB_CLIENT.search(
+        result = await VECTOR_DB_CLIENT.search(
             collection_name=collection_name,
             vectors=[query_embedding],
             limit=k,
@@ -128,10 +92,10 @@ def query_doc(
         raise e
 
 
-def get_doc(collection_name: str, user: UserModel = None):
+async def get_doc(collection_name: str, user: UserModel = None):
     try:
         log.debug(f"get_doc:doc {collection_name}")
-        result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+        result = await VECTOR_DB_CLIENT.get(collection_name=collection_name)
 
         if result:
             log.info(f"query_doc:result {result.ids} {result.metadatas}")
@@ -142,7 +106,7 @@ def get_doc(collection_name: str, user: UserModel = None):
         raise e
 
 
-def query_doc_with_hybrid_search(
+async def query_doc_with_hybrid_search(
     collection_name: str,
     collection_result: GetResult,
     query: str,
@@ -171,26 +135,31 @@ def query_doc_with_hybrid_search(
             metadatas=collection_result.metadatas[0],
         )
         bm25_retriever.k = k
+        candidates: list[Document] = []
+        if hybrid_bm25_weight > 0:
+            candidates.extend(bm25_retriever.invoke(query))
 
-        vector_search_retriever = VectorSearchRetriever(
-            collection_name=collection_name,
-            embedding_function=embedding_function,
-            top_k=k,
-        )
+        if hybrid_bm25_weight < 1:
+            vector_result = await query_doc(
+                collection_name=collection_name,
+                query_embedding=embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX),
+                k=k,
+            )
+            if vector_result:
+                for distance, metadata, document in zip(
+                    vector_result.distances[0],
+                    vector_result.metadatas[0],
+                    vector_result.documents[0],
+                ):
+                    meta = dict(metadata or {})
+                    meta["score"] = distance
+                    candidates.append(Document(page_content=document, metadata=meta))
 
-        if hybrid_bm25_weight <= 0:
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[vector_search_retriever], weights=[1.0]
-            )
-        elif hybrid_bm25_weight >= 1:
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever], weights=[1.0]
-            )
-        else:
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever, vector_search_retriever],
-                weights=[hybrid_bm25_weight, 1.0 - hybrid_bm25_weight],
-            )
+        deduped: dict[str, Document] = {}
+        for doc in candidates:
+            key = hashlib.sha256((doc.page_content or "").encode()).hexdigest()
+            if key not in deduped:
+                deduped[key] = doc
 
         compressor = RerankCompressor(
             embedding_function=embedding_function,
@@ -199,11 +168,7 @@ def query_doc_with_hybrid_search(
             r_score=r,
         )
 
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=compressor, base_retriever=ensemble_retriever
-        )
-
-        result = compression_retriever.invoke(query)
+        result = compressor.compress_documents(list(deduped.values()), query)
 
         distances = [d.metadata.get("score") for d in result]
         documents = [d.page_content for d in result]
@@ -305,24 +270,22 @@ def merge_and_sort_query_results(query_results: list[dict], k: int) -> dict:
     }
 
 
-def get_all_items_from_collections(collection_names: list[str]) -> dict:
+async def get_all_items_from_collections(collection_names: list[str]) -> dict:
     results = []
-
-    for collection_name in collection_names:
-        if collection_name:
-            try:
-                result = get_doc(collection_name=collection_name)
-                if result is not None:
-                    results.append(result.model_dump())
-            except Exception as e:
-                log.exception(f"Error when querying the collection: {e}")
-        else:
-            pass
+    fetched = await asyncio.gather(
+        *[get_doc(collection_name=collection_name) for collection_name in collection_names if collection_name],
+        return_exceptions=True,
+    )
+    for result in fetched:
+        if isinstance(result, Exception):
+            log.exception(f"Error when querying the collection: {result}")
+        elif result is not None:
+            results.append(result.model_dump())
 
     return merge_get_results(results)
 
 
-def query_collection(
+async def query_collection(
     collection_names: list[str],
     queries: list[str],
     embedding_function,
@@ -331,42 +294,28 @@ def query_collection(
     results = []
     error = False
 
-    def process_query_collection(collection_name, query_embedding):
-        try:
-            if collection_name:
-                result = query_doc(
-                    collection_name=collection_name,
-                    k=k,
-                    query_embedding=query_embedding,
-                )
-                if result is not None:
-                    return result.model_dump(), None
-            return None, None
-        except Exception as e:
-            log.exception(f"Error when querying the collection: {e}")
-            return None, e
-
     # Generate all query embeddings (in one call)
     query_embeddings = embedding_function(queries, prefix=RAG_EMBEDDING_QUERY_PREFIX)
     log.debug(
         f"query_collection: processing {len(queries)} queries across {len(collection_names)} collections"
     )
 
-    with ThreadPoolExecutor() as executor:
-        future_results = []
-        for query_embedding in query_embeddings:
-            for collection_name in collection_names:
-                result = executor.submit(
-                    process_query_collection, collection_name, query_embedding
-                )
-                future_results.append(result)
-        task_results = [future.result() for future in future_results]
+    task_results = await asyncio.gather(
+        *[
+            query_doc(collection_name=collection_name, k=k, query_embedding=query_embedding)
+            for query_embedding in query_embeddings
+            for collection_name in collection_names
+            if collection_name
+        ],
+        return_exceptions=True,
+    )
 
-    for result, err in task_results:
-        if err is not None:
+    for result in task_results:
+        if isinstance(result, Exception):
             error = True
+            log.exception(f"Error when querying the collection: {result}")
         elif result is not None:
-            results.append(result)
+            results.append(result.model_dump())
 
     if error and not results:
         log.warning("All collection queries failed. No results returned.")
@@ -374,7 +323,7 @@ def query_collection(
     return merge_and_sort_query_results(results, k=k)
 
 
-def query_collection_with_hybrid_search(
+async def query_collection_with_hybrid_search(
     collection_names: list[str],
     queries: list[str],
     embedding_function,
@@ -388,40 +337,21 @@ def query_collection_with_hybrid_search(
     error = False
     # Fetch collection data once per collection sequentially
     # Avoid fetching the same data multiple times later
+    fetched = await asyncio.gather(
+        *[VECTOR_DB_CLIENT.get(collection_name=collection_name) for collection_name in collection_names],
+        return_exceptions=True,
+    )
     collection_results = {}
-    for collection_name in collection_names:
-        try:
-            log.debug(
-                f"query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection_name}"
-            )
-            collection_results[collection_name] = VECTOR_DB_CLIENT.get(
-                collection_name=collection_name
-            )
-        except Exception as e:
-            log.exception(f"Failed to fetch collection {collection_name}: {e}")
+    for collection_name, result in zip(collection_names, fetched):
+        if isinstance(result, Exception):
+            log.exception(f"Failed to fetch collection {collection_name}: {result}")
             collection_results[collection_name] = None
+        else:
+            collection_results[collection_name] = result
 
     log.info(
         f"Starting hybrid search for {len(queries)} queries in {len(collection_names)} collections..."
     )
-
-    def process_query(collection_name, query):
-        try:
-            result = query_doc_with_hybrid_search(
-                collection_name=collection_name,
-                collection_result=collection_results[collection_name],
-                query=query,
-                embedding_function=embedding_function,
-                k=k,
-                reranking_function=reranking_function,
-                k_reranker=k_reranker,
-                r=r,
-                hybrid_bm25_weight=hybrid_bm25_weight,
-            )
-            return result, None
-        except Exception as e:
-            log.exception(f"Error when querying the collection with hybrid_search: {e}")
-            return None, e
 
     # Prepare tasks for all collections and queries
     # Avoid running any tasks for collections that failed to fetch data (have assigned None)
@@ -432,13 +362,28 @@ def query_collection_with_hybrid_search(
         for q in queries
     ]
 
-    with ThreadPoolExecutor() as executor:
-        future_results = [executor.submit(process_query, cn, q) for cn, q in tasks]
-        task_results = [future.result() for future in future_results]
+    task_results = await asyncio.gather(
+        *[
+            query_doc_with_hybrid_search(
+                collection_name=cn,
+                collection_result=collection_results[cn],
+                query=q,
+                embedding_function=embedding_function,
+                k=k,
+                reranking_function=reranking_function,
+                k_reranker=k_reranker,
+                r=r,
+                hybrid_bm25_weight=hybrid_bm25_weight,
+            )
+            for cn, q in tasks
+        ],
+        return_exceptions=True,
+    )
 
-    for result, err in task_results:
-        if err is not None:
+    for result in task_results:
+        if isinstance(result, Exception):
             error = True
+            log.exception(f"Error when querying the collection with hybrid_search: {result}")
         elif result is not None:
             results.append(result)
 
@@ -509,7 +454,7 @@ def get_reranking_function(reranking_engine, reranking_model, reranking_function
         return lambda sentences, user=None: reranking_function.predict(sentences)
 
 
-def get_sources_from_items(
+async def get_sources_from_items(
     request,
     items,
     queries,
@@ -572,12 +517,12 @@ def get_sources_from_items(
 
         elif item.get("type") == "note":
             # Note Attached
-            note = Notes.get_note_by_id(item.get("id"))
+            note = await Notes.get_note_by_id(item.get("id"))
 
             if note and (
                 user.role == "admin"
                 or note.user_id == user.id
-                or has_access(user.id, "read", note.access_control)
+                or await has_access_async(user.id, "read", note.access_control)
             ):
                 # User has access to the note
                 query_result = {
@@ -587,7 +532,7 @@ def get_sources_from_items(
 
         elif item.get("type") == "chat":
             # Chat Attached
-            chat = Chats.get_chat_by_id(item.get("id"))
+            chat = await Chats.get_chat_by_id(item.get("id"))
 
             if chat and (user.role == "admin" or chat.user_id == user.id):
                 messages_map = chat.chat.get("history", {}).get("messages", {})
@@ -641,7 +586,7 @@ def get_sources_from_items(
                         ],
                     }
                 elif item.get("id"):
-                    file_object = Files.get_file_by_id(item.get("id"))
+                    file_object = await Files.get_file_by_id(item.get("id"))
                     if file_object:
                         query_result = {
                             "documents": [[file_object.data.get("content", "")]],
@@ -689,12 +634,12 @@ def get_sources_from_items(
 
             try:
                 if full_context:
-                    query_result = get_all_items_from_collections(collection_names)
+                    query_result = await get_all_items_from_collections(collection_names)
                 else:
                     query_result = None  # Initialize to None
                     if hybrid_search:
                         try:
-                            query_result = query_collection_with_hybrid_search(
+                            query_result = await query_collection_with_hybrid_search(
                                 collection_names=collection_names,
                                 queries=queries,
                                 embedding_function=embedding_function,
@@ -711,7 +656,7 @@ def get_sources_from_items(
 
                     # fallback to non-hybrid search
                     if not hybrid_search and query_result is None:
-                        query_result = query_collection(
+                        query_result = await query_collection(
                             collection_names=collection_names,
                             queries=queries,
                             embedding_function=embedding_function,

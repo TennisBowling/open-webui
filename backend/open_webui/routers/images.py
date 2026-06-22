@@ -473,7 +473,7 @@ def load_url_image_data(url, headers=None):
         return None
 
 
-def upload_image(request, image_data, content_type, metadata, user):
+async def upload_image(request, image_data, content_type, metadata, user):
     image_format = mimetypes.guess_extension(content_type)
     file = UploadFile(
         file=io.BytesIO(image_data),
@@ -482,7 +482,7 @@ def upload_image(request, image_data, content_type, metadata, user):
             "content-type": content_type,
         },
     )
-    file_item = upload_file_handler(
+    file_item = await upload_file_handler(
         request,
         file=file,
         metadata=metadata,
@@ -574,7 +574,7 @@ async def image_generations(
                 else:
                     image_data, content_type = load_b64_image_data(image["b64_json"])
 
-                url = upload_image(request, image_data, content_type, data, user)
+                url = await upload_image(request, image_data, content_type, data, user)
                 images.append({"url": url})
             return images
 
@@ -607,7 +607,7 @@ async def image_generations(
                 image_data, content_type = load_b64_image_data(
                     image["bytesBase64Encoded"]
                 )
-                url = upload_image(request, image_data, content_type, data, user)
+                url = await upload_image(request, image_data, content_type, data, user)
                 images.append({"url": url})
 
             return images
@@ -656,7 +656,7 @@ async def image_generations(
                     }
 
                 image_data, content_type = load_url_image_data(image["url"], headers)
-                url = upload_image(
+                url = await upload_image(
                     request,
                     image_data,
                     content_type,
@@ -709,7 +709,7 @@ async def image_generations(
 
             for image in res["images"]:
                 image_data, content_type = load_b64_image_data(image)
-                url = upload_image(
+                url = await upload_image(
                     request,
                     image_data,
                     content_type,

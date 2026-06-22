@@ -61,6 +61,7 @@ export interface ChatTokenStatsData {
 	last_output_tokens: number;
 	last_cache_read_tokens: number;
 	message_count: number;
+	cost?: number;
 	loading: boolean;
 }
 
@@ -132,6 +133,23 @@ export interface SubagentRun {
 }
 
 export const subagentLiveStates: Writable<Record<string, SubagentRun>> = writable({});
+
+// Per-question draft + answer state for the built-in ask_user tool, keyed by
+// the tool_call_id of the ask_user call. Seeded from `chat.question_states` on
+// load and updated optimistically as the user fills in / submits the inline
+// question card. Mirrors how subagentLiveStates bridges persisted + live state.
+//   { selected: string[]; other: string }  per question index (as string key)
+export type QuestionAnswerEntry = {
+	selected?: string[];
+	other?: string;
+};
+export type QuestionState = {
+	draft?: Record<string, QuestionAnswerEntry>;
+	answer?: Record<string, QuestionAnswerEntry>;
+	skipped?: boolean;
+	submitted_at?: number | null;
+};
+export const questionStates: Writable<Record<string, QuestionState>> = writable({});
 
 export type BrowserLiveState = {
 	frame?: string; // data:image/jpeg;base64,...
@@ -210,6 +228,27 @@ export const currentChatPage = writable(1);
 
 export const isLastActiveTab = writable(true);
 export const playingNotificationSound = writable(false);
+
+const messageRevisionStores = new Map<string, Writable<number>>();
+
+export const getMessageRevisionStore = (messageId: string): Writable<number> => {
+	const key = messageId || '__missing__';
+	let store = messageRevisionStores.get(key);
+	if (!store) {
+		store = writable(0);
+		messageRevisionStores.set(key, store);
+	}
+	return store;
+};
+
+export const bumpMessageRevision = (messageId: string) => {
+	if (!messageId) return;
+	getMessageRevisionStore(messageId).update((n) => n + 1);
+};
+
+export const clearMessageRevisionStores = () => {
+	messageRevisionStores.clear();
+};
 
 export type Model = OpenAIModel | OllamaModel;
 

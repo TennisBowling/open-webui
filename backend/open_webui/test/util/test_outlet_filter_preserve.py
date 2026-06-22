@@ -8,6 +8,7 @@ Two unconditional invariants (NO fail-safe):
      dropped — even when the filter elides or reformats markers.
 """
 
+import asyncio
 import html
 import json
 import re
@@ -242,7 +243,7 @@ def test_compat_wrapper_never_returns_none_under_elision():
     ]
     orig = _serialize(blocks)
     filt = re.sub(r"<details.*?</details>", "", orig, flags=re.DOTALL).strip()
-    result = _merge_outlet_filter_into_content_blocks(blocks, orig, filt)
+    result = asyncio.run(_merge_outlet_filter_into_content_blocks(blocks, orig, filt))
     assert result is not None
     # Reasoning still there.
     assert any(b.get("type") == "reasoning" and b == blocks[1] for b in result)
@@ -257,7 +258,7 @@ def test_compat_wrapper_never_returns_none_when_marker_attr_changed():
     # Filter rewrites a struct marker attribute → original marker not
     # findable verbatim → treated as elided → structural still preserved.
     filt = orig.replace('done="true"', 'done="false"')
-    result = _merge_outlet_filter_into_content_blocks(blocks, orig, filt)
+    result = asyncio.run(_merge_outlet_filter_into_content_blocks(blocks, orig, filt))
     assert result is not None
     assert any(b == blocks[1] for b in result)
 
@@ -276,7 +277,7 @@ def test_multiple_consecutive_text_blocks_collapse_into_first():
     ]
     orig = _serialize(blocks)
     filt = orig + " more"
-    result = _merge_outlet_filter_into_content_blocks(blocks, orig, filt)
+    result = asyncio.run(_merge_outlet_filter_into_content_blocks(blocks, orig, filt))
     assert result is not None
     # Combined text appears somewhere in the resulting text blocks.
     text_content = "".join(b["content"] for b in result if b.get("type") == "text")

@@ -289,15 +289,9 @@ if FROM_INIT_PY:
 # Database
 ####################################
 
-# Check if the file exists
-if os.path.exists(f"{DATA_DIR}/ollama.db"):
-    # Rename the file
-    os.rename(f"{DATA_DIR}/ollama.db", f"{DATA_DIR}/webui.db")
-    log.info("Database migrated from Ollama-WebUI successfully.")
-else:
-    pass
-
-DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DATA_DIR}/webui.db")
+# PostgreSQL is required. The SQLite files under DATA_DIR are migration inputs
+# only; runtime code must never silently bind to them.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 DATABASE_TYPE = os.environ.get("DATABASE_TYPE")
 DATABASE_USER = os.environ.get("DATABASE_USER")
@@ -319,13 +313,22 @@ DB_VARS = {
 
 if all(DB_VARS.values()):
     DATABASE_URL = f"{DB_VARS['db_type']}://{DB_VARS['db_cred']}@{DB_VARS['db_host']}:{DB_VARS['db_port']}/{DB_VARS['db_name']}"
-elif DATABASE_TYPE == "sqlite+sqlcipher" and not os.environ.get("DATABASE_URL"):
-    # Handle SQLCipher with local file when DATABASE_URL wasn't explicitly set
-    DATABASE_URL = f"sqlite+sqlcipher:///{DATA_DIR}/webui.db"
 
-# Replace the postgres:// with postgresql://
-if "postgres://" in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
+if not DATABASE_URL:
+    raise ValueError(
+        "DATABASE_URL is required for the Postgres-only runtime. "
+        "Use postgresql+asyncpg://user:password@host:port/database."
+    )
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+if not DATABASE_URL.startswith("postgresql+asyncpg://"):
+    raise ValueError(
+        "DATABASE_URL must use postgresql+asyncpg:// for the Postgres-only async runtime."
+    )
 
 DATABASE_SCHEMA = os.environ.get("DATABASE_SCHEMA", None)
 
@@ -366,10 +369,6 @@ else:
         DATABASE_POOL_RECYCLE = int(DATABASE_POOL_RECYCLE)
     except Exception:
         DATABASE_POOL_RECYCLE = 3600
-
-DATABASE_ENABLE_SQLITE_WAL = (
-    os.environ.get("DATABASE_ENABLE_SQLITE_WAL", "False").lower() == "true"
-)
 
 DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = os.environ.get(
     "DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL", None
@@ -583,16 +582,23 @@ else:
         CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE = 1
 
 
-# Stream protocol selector. v1 emits full content_blocks every flush; v2 emits
-# only deltas (text_append, block_open/close, tool_call:result, chat:done).
-STREAM_PROTOCOL_VERSION = os.environ.get("STREAM_PROTOCOL_VERSION", "v2").strip() or "v2"
-if STREAM_PROTOCOL_VERSION not in ("v1", "v2"):
-    STREAM_PROTOCOL_VERSION = "v2"
+# Stream protocol selector. v1 emits full content_blocks every flush; v2.1 emits
+# compact deltas (text_append, block_open/close, tool_call:result, chat:done)
+# with replay, visibility, and backpressure support. Accept legacy `v2` as an
+# input alias, but canonicalize it so config/logs/UI all say v2.1.
+_stream_protocol_version = (
+    os.environ.get("STREAM_PROTOCOL_VERSION", "v2.1").strip().lower() or "v2.1"
+)
+if _stream_protocol_version == "v2":
+    _stream_protocol_version = "v2.1"
+if _stream_protocol_version not in ("v1", "v2.1"):
+    _stream_protocol_version = "v2.1"
+STREAM_PROTOCOL_VERSION = _stream_protocol_version
 
-# Under v2, coalesce per-tick `chat:delta` and `tool_call:result` socket
-# emissions into a single `chat:delta:batch` envelope per user. Reduces socket
-# I/O at high concurrency (many subagents streaming simultaneously). Opt-out
-# via STREAM_DELTA_BATCH_ENABLED=false for ops if anything regresses.
+# Under v2.1, coalesce per-tick `chat:delta` and `tool_call:result` socket
+# emissions into compact batch envelopes per user/chat. Reduces socket I/O at
+# high concurrency (many subagents streaming simultaneously). Opt-out via
+# STREAM_DELTA_BATCH_ENABLED=false for ops if anything regresses.
 STREAM_DELTA_BATCH_ENABLED = (
     os.environ.get("STREAM_DELTA_BATCH_ENABLED", "true").strip().lower()
     not in ("0", "false", "no", "off")
@@ -604,7 +610,7 @@ STREAM_DELTA_BATCH_ENABLED = (
 # expire after the TTL. Default 48h.
 STREAM_STATE_TTL_SECONDS = int(os.environ.get("STREAM_STATE_TTL_SECONDS", "172800"))
 
-# Keep the default parent-chat delta flush size at 1 so v2 still feels like
+# Keep the default parent-chat delta flush size at 1 so v2.1 still feels like
 # token streaming. High-throughput inner/subagent streams can opt into larger
 # batches via metadata.params.stream_delta_chunk_size.
 
@@ -623,6 +629,75 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+# Stream v2.1 runtime knobs. Defaults are conservative: first visible delta stays
+# immediate, then subsequent deltas get a tiny batching window below a 60 Hz
+# frame. Replay/backpressure/visibility are opt-in by client capability but the
+# server exposes the shared limits here.
+STREAM_DELTA_BATCH_WINDOW_MS = max(0, _int_env("STREAM_DELTA_BATCH_WINDOW_MS", 8))
+STREAM_DELTA_BATCH_MAX_DELAY_MS = max(
+    STREAM_DELTA_BATCH_WINDOW_MS,
+    _int_env("STREAM_DELTA_BATCH_MAX_DELAY_MS", 32),
+)
+STREAM_DELTA_FIRST_TOKEN_IMMEDIATE = (
+    os.environ.get("STREAM_DELTA_FIRST_TOKEN_IMMEDIATE", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+STREAM_VERSION_STORE_FLUSH_EVERY = max(
+    1, _int_env("STREAM_VERSION_STORE_FLUSH_EVERY", 64)
+)
+STREAM_REPLAY_BUFFER_MAX_EVENTS = max(
+    0, _int_env("STREAM_REPLAY_BUFFER_MAX_EVENTS", 2048)
+)
+STREAM_REPLAY_BUFFER_MAX_BYTES = max(
+    0, _int_env("STREAM_REPLAY_BUFFER_MAX_BYTES", 8 * 1024 * 1024)
+)
+STREAM_REPLAY_BUFFER_TTL_SECONDS = max(
+    0, _int_env("STREAM_REPLAY_BUFFER_TTL_SECONDS", 900)
+)
+STREAM_CLIENT_ACK_INTERVAL_MS = max(50, _int_env("STREAM_CLIENT_ACK_INTERVAL_MS", 250))
+STREAM_CLIENT_LAG_MAX_VERSIONS = max(
+    1, _int_env("STREAM_CLIENT_LAG_MAX_VERSIONS", 512)
+)
+STREAM_DB_CHECKPOINT_POLICY = (
+    os.environ.get("STREAM_DB_CHECKPOINT_POLICY", "periodic").strip().lower()
+    or "periodic"
+)
+if DISABLE_STREAM_SNAPSHOT_DB_WRITES:
+    STREAM_DB_CHECKPOINT_POLICY = "final_only"
+if STREAM_DB_CHECKPOINT_POLICY not in ("periodic", "final_only"):
+    STREAM_DB_CHECKPOINT_POLICY = "periodic"
+STREAM_DB_CHECKPOINT_INTERVAL_SECONDS = max(
+    0.1, _float_env("STREAM_DB_CHECKPOINT_INTERVAL_SECONDS", 2.0)
+)
+STREAM_DB_CHECKPOINT_CHAR_DELTA = max(
+    0, _int_env("STREAM_DB_CHECKPOINT_CHAR_DELTA", 16384)
+)
+STREAM_RUNTIME_METRICS = (
+    os.environ.get("STREAM_RUNTIME_METRICS", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+STREAM_TOOL_RESULT_BODY_MAX_BYTES = max(
+    0, _int_env("STREAM_TOOL_RESULT_BODY_MAX_BYTES", 256 * 1024 * 1024)
+)
+STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE = max(
+    0, _int_env("STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE", 64 * 1024 * 1024)
+)
+STREAM_TOOL_RESULT_BODY_SPILL_DIR = os.environ.get(
+    "STREAM_TOOL_RESULT_BODY_SPILL_DIR", str(DATA_DIR / "stream_tool_bodies")
+)
+STREAM_BROWSER_FRAME_MAX_FPS = max(0.0, _float_env("STREAM_BROWSER_FRAME_MAX_FPS", 2.0))
+STREAM_BROWSER_FRAME_MAX_BYTES = max(
+    0, _int_env("STREAM_BROWSER_FRAME_MAX_BYTES", 0)
+)
 
 
 # Hard cap on agentic tool-call rounds for a single chat turn. DISABLED by
@@ -666,6 +741,22 @@ SUBAGENT_MAX_CONCURRENCY = _int_env("SUBAGENT_MAX_CONCURRENCY", 0)
 SUBAGENT_PROVIDER_STREAM = (
     os.environ.get("SUBAGENT_PROVIDER_STREAM", "False").lower() == "true"
 )
+
+# Backstop wall-clock timeout (seconds) for the built-in `ask_user` tool, which
+# blocks the generation while it waits for the human to answer an inline
+# question card. The wait is genuinely open-ended (the user might step away and
+# come back), so this is generous by design — it only exists so an abandoned
+# generation can't pin a worker forever. On timeout the tool returns a notice
+# and the model proceeds without an answer. 0/negative disables the timeout
+# entirely (wait indefinitely until answered, skipped, or the user hits Stop).
+ASK_USER_TIMEOUT_SECONDS = _int_env("ASK_USER_TIMEOUT_SECONDS", 3600)
+
+# How often (seconds) the blocked `ask_user` callable re-reads the chat blob for
+# a submitted answer. This poll is the DURABLE backstop: an in-process event
+# wakes the callable immediately on same-worker submits, but a poll guarantees
+# delivery even across a reload/zero-tab gap or (latently) a multi-worker split.
+# Kept small for snappy resume without hammering the DB.
+ASK_USER_POLL_INTERVAL_SECONDS = _int_env("ASK_USER_POLL_INTERVAL_SECONDS", 2)
 
 
 ####################################

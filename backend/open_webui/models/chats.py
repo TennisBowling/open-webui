@@ -1,18 +1,20 @@
+import asyncio
 import copy
 import logging
 from open_webui.utils import fast_json as json
 import time
 import uuid
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from open_webui.internal.db import Base, get_db
-from open_webui.models.tags import TagModel, Tag, Tags
-from open_webui.models.folders import Folders
+from open_webui.internal.db import Base, get_db, run_sync_db
+from open_webui.models.tags import TagModel, Tag
+from open_webui.models.folders import Folder
 from open_webui.env import SRC_LOG_LEVELS
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import BigInteger, Boolean, Column, Integer, String, Text, JSON, Index
 from sqlalchemy import or_, func, select, and_, text, case
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import exists
 from sqlalchemy.sql.expression import bindparam
 
@@ -22,6 +24,70 @@ from sqlalchemy.sql.expression import bindparam
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
+
+
+def _tag_id(name: str) -> str:
+    return name.replace(" ", "_").lower()
+
+
+def _sync_get_tag_by_name_and_user_id(db, name: str, user_id: str) -> Optional[TagModel]:
+    tag = db.get(Tag, {"id": _tag_id(name), "user_id": user_id})
+    return TagModel.model_validate(tag) if tag else None
+
+
+def _sync_insert_new_tag(db, name: str, user_id: str) -> Optional[TagModel]:
+    tag = Tag(id=_tag_id(name), user_id=user_id, name=name)
+    try:
+        db.add(tag)
+        db.commit()
+        db.refresh(tag)
+        return TagModel.model_validate(tag)
+    except Exception:
+        db.rollback()
+        return _sync_get_tag_by_name_and_user_id(db, name, user_id)
+
+
+def _sync_delete_tag_by_name_and_user_id(db, name: str, user_id: str) -> bool:
+    try:
+        tag = db.get(Tag, {"id": _tag_id(name), "user_id": user_id})
+        if tag is None:
+            return True
+        db.delete(tag)
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+
+
+def _sync_get_tags_by_ids_and_user_id(db, ids: list[str], user_id: str) -> list[TagModel]:
+    if not ids:
+        return []
+    rows = db.execute(select(Tag).where(Tag.id.in_(ids), Tag.user_id == user_id)).scalars().all()
+    return [TagModel.model_validate(row) for row in rows]
+
+
+def _sync_search_folder_ids_by_names(user_id: str, names: list[str]) -> list[str]:
+    normalized = {name.replace("_", " ").strip().lower() for name in names if name}
+    if not normalized:
+        return []
+    with get_db() as db:
+        rows = db.execute(select(Folder).where(Folder.user_id == user_id)).scalars().all()
+        by_parent: dict[str | None, list[Folder]] = {}
+        for row in rows:
+            by_parent.setdefault(row.parent_id, []).append(row)
+
+        results: set[str] = set()
+
+        def include_subtree(row: Folder):
+            results.add(row.id)
+            for child in by_parent.get(row.id, []):
+                include_subtree(child)
+
+        for row in rows:
+            if row.name.replace("_", " ").strip().lower() in normalized:
+                include_subtree(row)
+        return list(results)
 
 
 class Chat(Base):
@@ -56,8 +122,8 @@ class Chat(Base):
         Index("folder_id_idx", "folder_id"),
         Index("user_id_pinned_idx", "user_id", "pinned"),
         Index("user_id_archived_idx", "user_id", "archived"),
-        # Leading column must be the equality predicate, trailing the
-        # ORDER BY, otherwise SQLite has to sort the whole filtered result.
+        # Leading column is the equality predicate, trailing column supports
+        # the sidebar ORDER BY.
         Index("user_id_updated_at_idx", "user_id", "updated_at"),
         Index("folder_id_user_id_idx", "folder_id", "user_id"),
         # Partial index for the sidebar's default chat list query.
@@ -65,9 +131,9 @@ class Chat(Base):
             "chat_sidebar_default_idx",
             "user_id",
             "updated_at",
-            sqlite_where=text(
-                "archived = 0 AND folder_id IS NULL AND "
-                "(pinned = 0 OR pinned IS NULL) AND subagent_of IS NULL"
+            postgresql_where=text(
+                "archived = false AND folder_id IS NULL AND "
+                "(pinned = false OR pinned IS NULL) AND subagent_of IS NULL"
             ),
         ),
     )
@@ -95,6 +161,19 @@ class ChatModel(BaseModel):
     model_id_primary: Optional[str] = None
     messages_migrated: int = 0
 
+    @field_validator("chat", "meta", mode="before")
+    @classmethod
+    def _coerce_json_dict(cls, value):
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, str):
+                    parsed = json.loads(parsed)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return value
+
 
 class ChatMessage(Base):
     """One row per logical chat message, replacing the per-message entries
@@ -119,8 +198,8 @@ class ChatMessage(Base):
     model = Column(String, nullable=True)
     timestamp = Column(BigInteger, nullable=True)
     sequence = Column(Integer, nullable=False)
-    status_history = Column(Text, nullable=True)
-    meta = Column(Text, nullable=True)
+    status_history = Column(JSON, nullable=True)
+    meta = Column(JSON, nullable=True)
 
     __table_args__ = (
         Index("chat_message_chat_seq_idx", "chat_id", "sequence"),
@@ -142,8 +221,8 @@ class ChatMessageModel(BaseModel):
     model: Optional[str] = None
     timestamp: Optional[int] = None
     sequence: int = 0
-    status_history: Optional[str] = None
-    meta: Optional[str] = None
+    status_history: Optional[Any] = None
+    meta: Optional[Any] = None
 
 
 ####################
@@ -242,7 +321,7 @@ def _extract_content_text(content) -> str:
 
 
 def _build_search_text(title: str, chat_data: dict) -> str:
-    """Build a flat lowercase string of title + all message content for fast LIKE search."""
+    """Build a bounded title + message body for Postgres search indexes."""
     parts = [title or ""]
 
     history = chat_data.get("history") or {}
@@ -258,41 +337,6 @@ def _build_search_text(title: str, chat_data: dict) -> str:
 
     # Limit to 64KB to keep DB size reasonable
     return " ".join(parts).lower()[:65536]
-
-
-_search_col_exists_cache: Optional[bool] = None
-
-
-def _search_text_column_exists(db) -> bool:
-    """Check (with caching) whether the search_text column exists in the chat table."""
-    global _search_col_exists_cache
-    if _search_col_exists_cache is not None:
-        return _search_col_exists_cache
-    try:
-        db.execute(text("SELECT search_text FROM chat LIMIT 0"))
-        _search_col_exists_cache = True
-    except Exception:
-        _search_col_exists_cache = False
-    return _search_col_exists_cache
-
-
-_fts_supported_cache: Optional[bool] = None
-
-
-def _fts_supported(db) -> bool:
-    """SQLite + chat_fts virtual table present. Cached after first call."""
-    global _fts_supported_cache
-    if _fts_supported_cache is not None:
-        return _fts_supported_cache
-    try:
-        if db.bind.dialect.name != "sqlite":
-            _fts_supported_cache = False
-            return False
-        db.execute(text("SELECT 1 FROM chat_fts LIMIT 0"))
-        _fts_supported_cache = True
-    except Exception:
-        _fts_supported_cache = False
-    return _fts_supported_cache
 
 
 def _iter_chat_messages(chat_data: dict):
@@ -319,16 +363,13 @@ def _iter_chat_messages(chat_data: dict):
                 )
 
 
-def _upsert_chat_fts(db, chat_id: str, title: str, chat_data: dict) -> None:
-    """Refresh all three FTS tables for one chat. No-op when FTS isn't present.
+def _upsert_chat_search(db, chat_id: str, title: str, chat_data: dict) -> None:
+    """Refresh Postgres chat/message search rows for one chat.
 
     Dual-read aware: if the chat is migrated to the ``chat_message`` table,
     we pull message text from there. Otherwise we fall back to iterating
     the messages embedded in ``chat_data['history']['messages']`` (legacy
     chats and freshly-inserted chats both go through this path)."""
-    if not _fts_supported(db):
-        return
-
     migrated = _is_chat_migrated(db, chat_id)
     if migrated:
         # Hydrate a shallow copy so _build_search_text sees the real messages.
@@ -350,70 +391,70 @@ def _upsert_chat_fts(db, chat_id: str, title: str, chat_data: dict) -> None:
     body = _build_search_text(title, chat_for_body)
 
     try:
-        db.execute(text("DELETE FROM chat_fts WHERE id = :id"), {"id": chat_id})
         db.execute(
-            text("INSERT INTO chat_fts (id, title, body) VALUES (:id, :t, :b)"),
-            {"id": chat_id, "t": title or "", "b": body},
+            text(
+                """
+                INSERT INTO chat_search (chat_id, title, body)
+                VALUES (:id, :title, :body)
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    body = EXCLUDED.body
+                """
+            ),
+            {"id": chat_id, "title": title or "", "body": body or ""},
         )
-        db.execute(text("DELETE FROM message_fts WHERE chat_id = :id"), {"id": chat_id})
+        db.execute(
+            text("DELETE FROM chat_message_search WHERE chat_id = :id"),
+            {"id": chat_id},
+        )
         for mid, role, content in _iter_chat_messages(chat_for_body):
-            if not content:
-                continue
-            db.execute(
-                text(
-                    "INSERT INTO message_fts (chat_id, message_id, role, content) "
-                    "VALUES (:cid, :mid, :role, :content)"
-                ),
-                {
-                    "cid": chat_id,
-                    "mid": mid,
-                    "role": role,
-                    "content": content[:65536],
-                },
-            )
-        db.execute(text("DELETE FROM chat_fts_tri WHERE id = :id"), {"id": chat_id})
-        db.execute(
-            text("INSERT INTO chat_fts_tri (id, content) VALUES (:id, :c)"),
-            {"id": chat_id, "c": body},
-        )
+            if content:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO chat_message_search (chat_id, message_id, role, content)
+                        VALUES (:cid, :mid, :role, :content)
+                        ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                            role = EXCLUDED.role,
+                            content = EXCLUDED.content
+                        """
+                    ),
+                    {
+                        "cid": chat_id,
+                        "mid": mid,
+                        "role": role or "",
+                        "content": content[:65536],
+                    },
+                )
     except Exception:
-        # FTS staleness is preferable to losing the underlying chat write.
+        # Search staleness is preferable to losing the underlying chat write.
         pass
 
 
-def _upsert_message_fts(
+def _upsert_message_search(
     db, chat_id: str, message_id: str, role: Optional[str], content: Optional[str]
 ) -> None:
-    """Refresh JUST one message in ``message_fts``. Skips the wholesale
-    chat-level FTS rebuild, which is catastrophic for chats with thousands
-    of messages being appended one token at a time. Used by the migrated
-    write-path so we don't rebuild every chat_fts/message_fts row on every
-    per-message upsert. We deliberately do NOT touch chat_fts or
-    chat_fts_tri here — those get rebuilt by ``_upsert_chat_fts`` only when
-    ``update_chat_by_id`` runs (i.e. when the underlying chat content
-    actually changes)."""
-    if not _fts_supported(db):
-        return
+    """Refresh one message search row without rebuilding the whole chat body."""
     try:
         db.execute(
-            text("DELETE FROM message_fts WHERE chat_id = :cid AND message_id = :mid"),
-            {"cid": chat_id, "mid": message_id},
+            text(
+                """
+                INSERT INTO chat_message_search (chat_id, message_id, role, content)
+                VALUES (:cid, :mid, :role, :content)
+                ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                    role = EXCLUDED.role,
+                    content = EXCLUDED.content
+                """
+            ),
+            {
+                "cid": chat_id,
+                "mid": message_id,
+                "role": role or "",
+                "content": (content or "")[:65536],
+            },
         )
-        if content:
-            db.execute(
-                text(
-                    "INSERT INTO message_fts (chat_id, message_id, role, content) "
-                    "VALUES (:cid, :mid, :role, :c)"
-                ),
-                {
-                    "cid": chat_id,
-                    "mid": message_id,
-                    "role": role or "",
-                    "c": content[:65536],
-                },
-            )
     except Exception:
-        # Staleness is preferable to losing the underlying chat write.
+        # Search staleness is preferable to losing the underlying chat write.
         pass
 
 
@@ -460,6 +501,17 @@ _CHAT_MESSAGE_SELECT_COLS = (
 )
 
 
+def _json_from_db(value):
+    if value is None or isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return None
+
+
 def _row_to_message_dict(row) -> dict:
     """Convert one chat_message row tuple (matching _CHAT_MESSAGE_SELECT_COLS)
     into the JSON-shape message dict used by the API and the legacy
@@ -494,20 +546,16 @@ def _row_to_message_dict(row) -> dict:
     if ts is not None:
         msg["timestamp"] = ts
     if status_history_raw:
-        try:
-            msg["statusHistory"] = json.loads(status_history_raw)
-        except Exception:
-            pass
+        status_history = _json_from_db(status_history_raw)
+        if isinstance(status_history, list):
+            msg["statusHistory"] = status_history
     if meta_raw:
-        try:
-            extra = json.loads(meta_raw)
-            if isinstance(extra, dict):
-                # Don't let meta clobber the dedicated columns.
-                for k, v in extra.items():
-                    if k not in msg:
-                        msg[k] = v
-        except Exception:
-            pass
+        extra = _json_from_db(meta_raw)
+        if isinstance(extra, dict):
+            # Don't let meta clobber the dedicated columns.
+            for k, v in extra.items():
+                if k not in msg:
+                    msg[k] = v
     return msg
 
 
@@ -619,7 +667,7 @@ def _project_message_slim(
 def _normalize_message_graph(messages: dict) -> dict:
     """Repair lightweight graph invariants for legacy/corrupt rows.
 
-    A stream-v2 race could create the assistant row via realtime upsert before
+    A stream-v2.1 race could create the assistant row via realtime upsert before
     the frontend's placeholder append landed. Those rows have saved
     content_blocks/model data but no role/parentId, which breaks branch
     pagination and makes the UI repeatedly try to load ancestors that the
@@ -867,126 +915,6 @@ def _split_message_for_table(message: dict) -> dict:
     }
 
 
-# FTS query characters that need to be stripped to avoid breaking the parser.
-# Keep `"` for quoted phrases and `-` for negation - those are handled by the
-# parser below.
-_FTS_SPECIAL = set('():\\*~^')
-
-# Words shorter than this are dropped from FTS queries (FTS5 ignores them
-# anyway but skipping client-side keeps the parser clean).
-_FTS_MIN_TOKEN_LEN = 2
-
-_GENERIC_TITLES = {
-    "",
-    "new chat",
-    "untitled",
-    "untitled chat",
-}
-
-
-def _tokenize_user_query(text: str) -> list[tuple[str, str]]:
-    """Split user query into ('phrase'|'word', payload) tuples.
-
-    Quoted phrases are preserved verbatim — FTS5's tokenizer handles
-    in-phrase punctuation correctly. Unquoted text is split on whitespace
-    *and* on FTS5's word-separator punctuation (`.`, `,`, `/`, `@`, ...), so
-    `vast.ai` becomes the two tokens [`vast`, `ai`] rather than a
-    syntactically-invalid FTS5 expression.
-    """
-    out: list[tuple[str, str]] = []
-    cur: list[str] = []
-    in_q = False
-    for ch in text:
-        if ch == '"':
-            if cur:
-                out.append(("phrase" if in_q else "word", "".join(cur)))
-                cur = []
-            in_q = not in_q
-        elif not in_q and (ch.isspace() or ch in _FTS_WORD_SPLITTERS):
-            if cur:
-                out.append(("word", "".join(cur)))
-                cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        out.append(("phrase" if in_q else "word", "".join(cur)))
-    return out
-
-
-def _clean_fts_token(s: str) -> str:
-    """Strip FTS5 operator chars from a token. For a *single* word; callers
-    that need to split punctuation-bearing words into multiple tokens should
-    go through _tokenize_user_query."""
-    return "".join(c for c in s if c not in _FTS_SPECIAL).strip()
-
-
-# Characters that FTS5's query parser treats as operators or that bear special
-# meaning. We pre-split user queries on them so an innocuous user-typed string
-# like ``vast.ai`` or ``key-value`` never reaches the parser as a bare ``.``
-# or ``-`` (which would be a NOT operator). Underscore stays in — that's the
-# one tokenchar we kept in the FTS schema for ``snake_case`` identifiers.
-_FTS_WORD_SPLITTERS = set(".,;:!?'\"`/\\@#$%&|()[]{}<>=+~^*-")
-
-
-def _build_fts_queries(search_text: str) -> tuple[str, str, str]:
-    """Return (primary, prefix, fuzzy) FTS5-safe query strings.
-
-    primary  - tokens joined with implicit AND, quoted phrases preserved
-    prefix   - same but each unquoted token gets a `*` suffix
-    fuzzy    - trigrams OR'd together for the trigram-tokenized index. We
-               can't just pass the raw text because FTS5's trigram tokenizer
-               treats the query as a *phrase* of trigrams - so `fastpi`
-               (trigrams: fas, ast, stp, tpi) never matches `fastapi`
-               (trigrams: fas, ast, sta, tap, api) even though the words are
-               obviously similar. Decomposing into OR'd trigrams + BM25
-               ranking gives the "did you mean" behaviour we want.
-    """
-    tokens = _tokenize_user_query(search_text)
-    primary, prefix, fuzzy_words = [], [], []
-    for kind, t in tokens:
-        c = _clean_fts_token(t)
-        if len(c) < _FTS_MIN_TOKEN_LEN:
-            continue
-        if kind == "phrase":
-            quoted = f'"{c}"'
-            primary.append(quoted)
-            prefix.append(quoted)
-            fuzzy_words.append(c)
-        else:
-            primary.append(c)
-            prefix.append(f"{c}*")
-            fuzzy_words.append(c)
-    fuzzy_query = _build_trigram_or_query(" ".join(fuzzy_words))
-    return (" ".join(primary), " ".join(prefix), fuzzy_query)
-
-
-def _build_trigram_or_query(text: str) -> str:
-    """Decompose ``text`` into unique trigrams joined with OR.
-
-    Trigram matching in FTS5 normally requires the indexed value to contain
-    *every* trigram of the query in order. That's too strict for the
-    "did you mean" use case; OR'ing the trigrams lets BM25 rank by overlap."""
-    grams: list[str] = []
-    seen: set[str] = set()
-    for word in (text or "").lower().split():
-        # Strip FTS specials so the OR'd trigrams don't accidentally re-enter
-        # the FTS5 query parser as operators.
-        cleaned = _clean_fts_token(word)
-        if not cleaned:
-            continue
-        if len(cleaned) < 3:
-            if cleaned not in seen:
-                grams.append(cleaned)
-                seen.add(cleaned)
-            continue
-        for i in range(len(cleaned) - 2):
-            g = cleaned[i : i + 3]
-            if g not in seen:
-                grams.append(g)
-                seen.add(g)
-    return " OR ".join(grams)
-
-
 def _strip_prefix_syntax(search_text: str, user_id: str) -> tuple[
     list[str], list[str], Optional[bool], Optional[bool], Optional[bool], str
 ]:
@@ -1000,8 +928,7 @@ def _strip_prefix_syntax(search_text: str, user_id: str) -> tuple[
         if w.startswith("tag:")
     ]
     folder_names = [w.replace("folder:", "") for w in words if w.startswith("folder:")]
-    folders = Folders.search_folders_by_names(user_id, folder_names) if folder_names else []
-    folder_ids = [f.id for f in folders]
+    folder_ids = _sync_search_folder_ids_by_names(user_id, folder_names)
 
     pinned: Optional[bool] = None
     if "pinned:true" in words:
@@ -1045,7 +972,7 @@ def _escape_html_text(s: str) -> str:
     )
 
 
-# FTS5 emits real `<mark>` and `</mark>` tags around hits. We HTML-escape
+# Postgres ts_headline emits real `<mark>` and `</mark>` tags around hits. We HTML-escape
 # everything else after the fact by splitting on the mark tags, escaping the
 # segments, then re-joining. This is XSS-safe and trivial.
 def _sanitize_snippet(raw: Optional[str]) -> Optional[str]:
@@ -1072,6 +999,58 @@ def _apply_subagent_filter(query, db, include_subagents: bool):
     if include_subagents:
         return query
     return query.filter(Chat.subagent_of.is_(None))
+
+
+# ── Chat-search relevance tuning ─────────────────────────────────────────────
+# Every rank term is normalized to [0,1) by ``ts_rank_cd(..., 32)`` (flag 32 =
+# rank/(rank+1)), so the weights below are directly comparable rather than the
+# old raw-ts_rank sum where bulk term-frequency in huge agentic chats dominated.
+# The final relevance score is:
+#     ( W_MSG*msg_rank + title_tier + min(BREADTH_COEFF*ln(1+n), BREADTH_CAP) )
+#     * (1 + RECENCY_AMP * exp(-(now - updated_at) / RECENCY_TAU))
+# Chats are ranked from the always-fresh ``chat_message_search`` rows + the live
+# ``chat.title`` — NOT the ``chat_search.body`` blob, which goes stale on long
+# streaming chats because the per-message write path never rebuilds it.
+_SEARCH_W_MSG = 2.0            # best matching message (MAX normalized ts_rank_cd)
+_SEARCH_TITLE_EXACT = 3.0     # lower(title) == lower(query)
+_SEARCH_TITLE_PREFIX = 1.5    # title starts with the query
+_SEARCH_TITLE_CONTAINS = 0.8  # query is a substring of the title
+# NOTE: title matching deliberately uses exact/prefix/substring only — NOT the
+# pg_trgm `title % :q` similarity operator. That operator is unindexable inside
+# the per-user candidate set and costs ~100ms/search on a 3500-chat user (it is
+# computed per row); it also leaked zero-token matches on multi-word queries.
+# Typo tolerance belongs in an explicit on-demand fallback, not the hot path.
+_SEARCH_BREADTH_COEFF = 0.1   # * ln(1 + match_count): diminishing breadth reward
+_SEARCH_BREADTH_CAP = 0.5     # hard cap so a 300-msg chat can't dwarf a precise hit
+_SEARCH_RECENCY_AMP = 0.5     # newest chats get up to +50%, old ones ~+0%
+_SEARCH_RECENCY_TAU = 2.6e6   # ~30-day decay; chat.updated_at is EPOCH SECONDS
+_SEARCH_RRF_K = 60            # reciprocal-rank-fusion constant (lexical + semantic)
+_SEARCH_SEM_MSG_POOL = 1000   # top in-scope message embeddings fetched per semantic ANN query
+# Max cosine distance for a message embedding to count as a semantic match. Measured on the
+# live corpus (qwen3-vl-embedding-8b): genuine matches land <=0.30 (strong) / <0.40 (topical),
+# while queries with NO real match bottom out at a ~0.42 "noise floor" — the nearest thing is
+# just short, generic, centre-of-space lint ("what to do", "how can i do that"). Applied AFTER
+# the ANN scan (on the per-chat MIN), so a no-match query contributes nothing semantic and
+# degrades to lexical instead of surfacing greetings. No effect on the index scan / latency.
+_SEARCH_SEM_MAX_DIST = 0.40
+
+
+def _pgvector_literal(vec: list[float]) -> str:
+    """Format a vector as a pgvector text literal (``[f1,f2,...]``) for ``::vector`` casts.
+    None / non-finite components are coerced to 0 so a malformed query embedding can't
+    500 the search request."""
+    import math
+
+    return (
+        "["
+        + ",".join(
+            (repr(float(x)) if (isinstance(x, (int, float)) and math.isfinite(x)) else "0")
+            for x in vec
+        )
+        + "]"
+    )
+_MIN_FTS_QUERY_LEN = 2        # single-char ASCII queries fall back to the plain list
+_SEARCH_STMT_TIMEOUT_MS = 5000  # per-search Postgres statement_timeout (SET LOCAL)
 
 
 class ChatTable:
@@ -1162,17 +1141,7 @@ class ChatTable:
                 except Exception:
                     pass
 
-            # Update search_text via raw SQL (column not in ORM to avoid breaking queries before migration)
-            try:
-                db.execute(
-                    text("UPDATE chat SET search_text = :st WHERE id = :id"),
-                    {"st": _build_search_text(title, enriched_chat), "id": id},
-                )
-                db.commit()
-            except Exception:
-                pass  # Column doesn't exist yet (migration pending)
-
-            _upsert_chat_fts(db, id, title, enriched_chat)
+            _upsert_chat_search(db, id, title, enriched_chat)
             try:
                 db.commit()
             except Exception:
@@ -1232,16 +1201,7 @@ class ChatTable:
                 except Exception:
                     pass
 
-            try:
-                db.execute(
-                    text("UPDATE chat SET search_text = :st WHERE id = :id"),
-                    {"st": _build_search_text(import_title, form_data.chat), "id": id},
-                )
-                db.commit()
-            except Exception:
-                pass
-
-            _upsert_chat_fts(db, id, import_title, form_data.chat)
+            _upsert_chat_search(db, id, import_title, form_data.chat)
             try:
                 db.commit()
             except Exception:
@@ -1287,16 +1247,7 @@ class ChatTable:
                     chat_item.subagent_of = meta.get("subagent_of")
                 db.commit()
 
-                try:
-                    db.execute(
-                        text("UPDATE chat SET search_text = :st WHERE id = :id"),
-                        {"st": _build_search_text(title, enriched_chat), "id": id},
-                    )
-                    db.commit()
-                except Exception:
-                    pass
-
-                _upsert_chat_fts(db, id, title, enriched_chat)
+                _upsert_chat_search(db, id, title, enriched_chat)
                 try:
                     db.commit()
                 except Exception:
@@ -1335,7 +1286,7 @@ class ChatTable:
                         " content_is_json, model, timestamp, sequence, "
                         " status_history, meta) "
                         "VALUES (:cid, :mid, :pid, :role, :c, :ij, "
-                        ":model, :ts, :seq, :sh, :meta)"
+                        ":model, :ts, :seq, CAST(:sh AS jsonb), CAST(:meta AS jsonb))"
                     ),
                     {
                         "cid": chat_id,
@@ -1366,54 +1317,21 @@ class ChatTable:
                 if chat_item is None:
                     return None
 
-                # Update the title on both the column and inside the JSON
-                # blob so old code paths reading chat.chat['title'] keep
-                # working.
-                if db.bind.dialect.name == "sqlite":
-                    db.execute(
-                        text(
-                            "UPDATE chat SET "
-                            "  title = :t, "
-                            "  chat = json_set(chat, '$.title', :t), "
-                            "  updated_at = :ts "
-                            "WHERE id = :id"
-                        ),
-                        {"t": title, "ts": int(time.time()), "id": id},
-                    )
-                    db.commit()
-                    db.refresh(chat_item)
-                else:
-                    # Fall back to the legacy round-trip on dialects without
-                    # json_set support; rare enough to not matter.
-                    cur = (
-                        copy.deepcopy(chat_item.chat)
-                        if isinstance(chat_item.chat, dict)
-                        else {}
-                    )
-                    cur["title"] = title
-                    chat_item.chat = cur
-                    chat_item.title = title
-                    chat_item.updated_at = int(time.time())
-                    db.commit()
-                    db.refresh(chat_item)
+                db.execute(
+                    text(
+                        "UPDATE chat SET "
+                        "  title = :t, "
+                        "  chat = jsonb_set(COALESCE(chat, '{}'::jsonb), '{title}', to_jsonb(CAST(:t AS text)), true), "
+                        "  updated_at = :ts "
+                        "WHERE id = :id"
+                    ),
+                    {"t": title, "ts": int(time.time()), "id": id},
+                )
+                db.commit()
+                db.refresh(chat_item)
 
-                try:
-                    db.execute(
-                        text("UPDATE chat SET search_text = :st WHERE id = :id"),
-                        {
-                            "st": _build_search_text(
-                                title,
-                                chat_item.chat if isinstance(chat_item.chat, dict) else {},
-                            ),
-                            "id": id,
-                        },
-                    )
-                    db.commit()
-                except Exception:
-                    pass
-
-                # Title changes need an FTS refresh too (chat_fts.title column).
-                _upsert_chat_fts(
+                # Title changes need a search-row refresh too.
+                _upsert_chat_search(
                     db, id, title, chat_item.chat if isinstance(chat_item.chat, dict) else {}
                 )
                 try:
@@ -1437,7 +1355,8 @@ class ChatTable:
 
         for tag in chat.meta.get("tags", []):
             if self.count_chats_by_tag_name_and_user_id(tag, user.id) == 0:
-                Tags.delete_tag_by_name_and_user_id(tag, user.id)
+                with get_db() as db:
+                    _sync_delete_tag_by_name_and_user_id(db, tag, user.id)
 
         for tag_name in tags:
             if tag_name.lower() == "none":
@@ -1458,38 +1377,24 @@ class ChatTable:
     def _write_queue_fields(
         self, db, id: str, chat_item, queue: list, draining
     ) -> None:
-        """Persist queue + draining onto the chat blob without re-syncing the
-        message table. SQLite uses json_set; other dialects round-trip the
-        dict (rare)."""
-        if db.bind.dialect.name == "sqlite":
-            db.execute(
-                text(
-                    "UPDATE chat SET "
-                    "  chat = json_set("
-                    "    json_set(chat, '$.queue', json(:q)), "
-                    "    '$.draining', json(:d)"
-                    "  ) "
-                    "WHERE id = :id"
-                ),
-                {
-                    "q": json.dumps(queue if isinstance(queue, list) else []),
-                    "d": json.dumps(draining),
-                    "id": id,
-                },
-            )
-            db.commit()
-            db.refresh(chat_item)
-        else:
-            cur = (
-                copy.deepcopy(chat_item.chat)
-                if isinstance(chat_item.chat, dict)
-                else {}
-            )
-            cur["queue"] = queue if isinstance(queue, list) else []
-            cur["draining"] = draining
-            chat_item.chat = cur
-            db.commit()
-            db.refresh(chat_item)
+        """Persist queue + draining without re-syncing message rows."""
+        db.execute(
+            text(
+                "UPDATE chat SET "
+                "  chat = jsonb_set("
+                "    jsonb_set(COALESCE(chat, '{}'::jsonb), '{queue}', CAST(:q AS jsonb), true), "
+                "    '{draining}', CAST(:d AS jsonb), true"
+                "  ) "
+                "WHERE id = :id"
+            ),
+            {
+                "q": json.dumps(queue if isinstance(queue, list) else []),
+                "d": json.dumps(draining),
+                "id": id,
+            },
+        )
+        db.commit()
+        db.refresh(chat_item)
 
     def get_queue_state_by_id(self, id: str) -> Optional[dict]:
         """Return {"queue": [...], "draining": <marker|None>} for a chat, or
@@ -1721,6 +1626,109 @@ class ChatTable:
             log.exception("clear_draining_by_id failed for %s", id)
             return None
 
+    # --- ask_user question state -----------------------------------------
+    # The built-in `ask_user` tool blocks the running generation while a human
+    # answers an inline question card. The model-visible Q&A ultimately lives in
+    # the assistant message's content_blocks (the tool call = the question, the
+    # tool result = the answer). This blob field is the TRANSIENT delivery +
+    # draft channel that bridges the still-running server-side generation and a
+    # frontend that may reload, close, or open in another tab mid-answer:
+    #
+    #   chat.chat["question_states"][<tool_call_id>] = {
+    #       "draft":   {<qIndex>: {"selected": [...], "other": "..."}},  # autosaved
+    #       "answer":  {<qIndex>: {"selected": [...], "other": "..."}},  # on submit
+    #       "skipped": <bool>,
+    #       "submitted_at": <ts|None>,
+    #   }
+    #
+    # Mirrors the queue helpers above: targeted jsonb_set, no message-table
+    # re-sync, O(1) regardless of chat size. Never raise from the read path — a
+    # failure there must not break the generation polling it each round.
+
+    def _write_question_states(self, db, id: str, chat_item, states: dict) -> None:
+        """Persist the whole question_states map via a targeted blob write."""
+        db.execute(
+            text(
+                "UPDATE chat SET "
+                "  chat = jsonb_set(COALESCE(chat, '{}'::jsonb), '{question_states}', "
+                "                   CAST(:s AS jsonb), true) "
+                "WHERE id = :id"
+            ),
+            {
+                "s": json.dumps(states if isinstance(states, dict) else {}),
+                "id": id,
+            },
+        )
+        db.commit()
+        db.refresh(chat_item)
+
+    def set_question_state_by_id(
+        self, id: str, tool_call_id: str, patch: dict
+    ) -> Optional[dict]:
+        """Atomically merge ``patch`` into ``question_states[tool_call_id]``
+        (read-modify-write of the blob). Used both for incremental draft saves
+        (partial selections, autosaved as the user clicks) and for the terminal
+        answer/skip submit. Shallow-merges top-level keys; ``draft`` is replaced
+        wholesale by the caller (it already carries the full draft snapshot).
+        Returns the new per-question entry, or None on failure."""
+        if not tool_call_id or not isinstance(patch, dict):
+            return None
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                states = blob.get("question_states")
+                states = dict(states) if isinstance(states, dict) else {}
+                existing = states.get(tool_call_id)
+                existing = dict(existing) if isinstance(existing, dict) else {}
+                existing.update(patch)
+                states[tool_call_id] = existing
+                self._write_question_states(db, id, chat_item, states)
+                return existing
+        except Exception:
+            log.exception(
+                "set_question_state_by_id failed for %s/%s", id, tool_call_id
+            )
+            return None
+
+    def get_question_state_by_id(
+        self, id: str, tool_call_id: str
+    ) -> Optional[dict]:
+        """Return the full state entry for one question (draft/answer/skipped),
+        or None if the chat or entry doesn't exist. Reads the raw blob without
+        hydrating the message table. Never raises."""
+        try:
+            with get_db() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                blob = chat_item.chat if isinstance(chat_item.chat, dict) else {}
+                states = blob.get("question_states")
+                if not isinstance(states, dict):
+                    return None
+                entry = states.get(tool_call_id)
+                return entry if isinstance(entry, dict) else None
+        except Exception:
+            return None
+
+    def get_question_answer_by_id(
+        self, id: str, tool_call_id: str
+    ) -> Optional[dict]:
+        """Return ``{"answer": {...}}`` or ``{"skipped": True}`` once the user
+        has submitted, else None. This is the terminal signal the blocked
+        ``ask_user`` callable polls for. Never raises."""
+        entry = self.get_question_state_by_id(id, tool_call_id)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("skipped"):
+            return {"skipped": True}
+        answer = entry.get("answer")
+        if isinstance(answer, dict):
+            return {"answer": answer, "submitted_at": entry.get("submitted_at")}
+        return None
+
     def get_chat_title_by_id(self, id: str) -> Optional[str]:
         chat = self.get_chat_by_id(id)
         if chat is None:
@@ -1827,7 +1835,7 @@ class ChatTable:
                             " content_is_json, model, timestamp, sequence, "
                             " status_history, meta) "
                             "VALUES (:cid, :mid, :pid, :role, :c, :ij, "
-                            ":model, :ts, :seq, :sh, :meta)"
+                            ":model, :ts, :seq, CAST(:sh AS jsonb), CAST(:meta AS jsonb))"
                         ),
                         {
                             "cid": id,
@@ -1857,8 +1865,8 @@ class ChatTable:
                             "  content_is_json = :ij, "
                             "  model = :model, "
                             "  timestamp = :ts, "
-                            "  status_history = :sh, "
-                            "  meta = :meta "
+                            "  status_history = CAST(:sh AS jsonb), "
+                            "  meta = CAST(:meta AS jsonb) "
                             "WHERE chat_id = :cid AND message_id = :mid"
                         ),
                         {
@@ -1875,7 +1883,7 @@ class ChatTable:
                         },
                     )
 
-                _upsert_message_fts(
+                _upsert_message_search(
                     db,
                     id,
                     message_id,
@@ -1888,32 +1896,18 @@ class ChatTable:
                 # path that might be re-enabled. Avoid touching the rest of
                 # the 100+ MB JSON blob.
                 try:
-                    if db.bind.dialect.name == "sqlite":
-                        db.execute(
-                            text(
-                                "UPDATE chat SET "
-                                "  chat = json_set(chat, '$.history.currentId', :mid), "
-                                "  updated_at = :ts "
-                                "WHERE id = :id"
-                            ),
-                            {"mid": message_id, "ts": int(time.time()), "id": id},
-                        )
-                    else:
-                        # Non-SQLite (or any dialect that doesn't support
-                        # json_set in this exact form): fall back to a
-                        # minimal read-modify-write of just the scaffolding.
-                        cur_chat = chat_obj.chat if isinstance(chat_obj.chat, dict) else {}
-                        cur_history = cur_chat.get("history") or {}
-                        if not isinstance(cur_history, dict):
-                            cur_history = {}
-                        cur_history["currentId"] = message_id
-                        # Don't pull message bodies; the source of truth is
-                        # the chat_message table and `_hydrate_chat_messages`
-                        # rebuilds the dict on read.
-                        cur_history.pop("messages", None)
-                        cur_chat["history"] = cur_history
-                        chat_obj.chat = cur_chat
-                        chat_obj.updated_at = int(time.time())
+                    db.execute(
+                        text(
+                            "UPDATE chat SET "
+                            "  chat = jsonb_set("
+                            "    COALESCE(chat, '{}'::jsonb) #- '{history,messages}', "
+                            "    '{history,currentId}', to_jsonb(CAST(:mid AS text)), true"
+                            "  ), "
+                            "  updated_at = :ts "
+                            "WHERE id = :id"
+                        ),
+                        {"mid": message_id, "ts": int(time.time()), "id": id},
+                    )
                 except Exception:
                     # As a final fallback, just bump updated_at via UPDATE.
                     try:
@@ -1945,10 +1939,10 @@ class ChatTable:
 
             # Legacy path: unmigrated chat. Hot path for streaming token
             # writes — we deliberately avoid ``update_chat_by_id`` here
-            # because its ``_upsert_chat_fts`` deletes and re-inserts every
-            # message in the chat — O(N) per token for an N-msg chat.
+            # because its ``_upsert_chat_search`` refreshes every message search
+            # row in the chat. That is O(N) for an N-message chat.
             # Instead we patch the JSON in place and refresh only the one
-            # changed message in ``message_fts``.
+            # changed message in ``chat_message_search``.
             try:
                 chat_data = dict(chat_obj.chat or {})
                 history = dict(chat_data.get("history") or {})
@@ -1971,9 +1965,9 @@ class ChatTable:
                 role = str(merged.get("role", ""))
                 content = _extract_content_text(merged.get("content", ""))
 
-                # search_text drifts slightly between message writes; per-message
-                # FTS keeps search recall correct in the meantime.
-                _upsert_message_fts(db, id, message_id, role, content)
+                # chat_search.body drifts slightly between message writes;
+                # per-message search keeps recall correct in the meantime.
+                _upsert_message_search(db, id, message_id, role, content)
                 try:
                     db.commit()
                 except Exception:
@@ -1986,11 +1980,46 @@ class ChatTable:
             except Exception:
                 return None
 
+    def update_message_fields_atomic(
+        self, id: str, message_id: str, mutator: Callable[[dict], Optional[dict]]
+    ) -> Optional[dict]:
+        """Read a message, compute a partial update from it, and merge-write it
+        back — as one logical operation.
+
+        ``mutator`` receives the CURRENT persisted message dict (``{}`` if the
+        message doesn't exist yet) and returns a partial-update dict of the
+        top-level keys to change (or ``None``/empty to skip the write). The
+        partial is then merged exactly like ``upsert_message_to_chat_by_id_and_message_id``.
+
+        The whole method runs under the per-message async write lock (applied by
+        ``_AsyncChatTableProxy``), so the read the mutator sees and the write it
+        produces cannot be interleaved by another fan-out branch's write to the
+        same parent message. This is what makes concurrent ``subagent_runs``
+        merges (and the parent's ``content_blocks`` checkpoint writes) lossless:
+        every writer reads the latest committed state and only replaces the keys
+        it actually computed from that fresh read.
+
+        Returns the merged run/patch the mutator produced (its return value),
+        or ``None`` when nothing was written.
+        """
+        existing = self.get_message_by_id_and_message_id(id, message_id) or {}
+        try:
+            partial = mutator(existing)
+        except Exception:
+            log.exception("update_message_fields_atomic mutator failed")
+            return None
+        if not partial:
+            return None
+        self.upsert_message_to_chat_by_id_and_message_id(
+            id, message_id, partial, return_model=False
+        )
+        return partial
+
     def add_message_status_to_chat_by_id_and_message_id(
         self, id: str, message_id: str, status: dict
     ) -> Optional[ChatModel]:
-        # Status updates don't touch message content, so message_fts is already
-        # current — just patch the JSON and skip the FTS rebuild entirely.
+        # Status updates don't touch message content, so search rows are already
+        # current.
         try:
             with get_db() as db:
                 chat_obj = db.get(Chat, id)
@@ -2014,18 +2043,12 @@ class ChatTable:
                     if row is None:
                         # Message doesn't exist; nothing to update.
                         return ChatModel.model_validate(chat_obj)
-                    cur_sh: list = []
-                    if row[0]:
-                        try:
-                            parsed = json.loads(row[0])
-                            if isinstance(parsed, list):
-                                cur_sh = parsed
-                        except Exception:
-                            cur_sh = []
+                    parsed = _json_from_db(row[0]) if row[0] else None
+                    cur_sh = parsed if isinstance(parsed, list) else []
                     cur_sh.append(status)
                     db.execute(
                         text(
-                            "UPDATE chat_message SET status_history = :sh "
+                            "UPDATE chat_message SET status_history = CAST(:sh AS jsonb) "
                             "WHERE chat_id = :cid AND message_id = :mid"
                         ),
                         {"sh": json.dumps(cur_sh), "cid": id, "mid": message_id},
@@ -2775,17 +2798,11 @@ class ChatTable:
         skip: int = 0,
         limit: int = 30,
         include_subagents: bool = False,
+        query_vector: Optional[list[float]] = None,
     ) -> "ChatSearchResponse":
-        """GOATED chat search.
-
-        Three-tier FTS (primary AND-ish, prefix-expansion, trigram fuzzy) with
-        dual-path ranking (chat_fts + message_fts), title-quality penalty, and
-        recency decay. Returns ChatSearchResponse with snippets, match counts,
-        and facet aggregates. Falls back to LIKE on non-SQLite dialects.
-        """
-        # Lowercase the entire query: FTS5's unicode61 tokenizer folds case at
-        # index time anyway, and this lets the hidden `tag:` / `folder:` /
-        # `pinned:` / `archived:` / `shared:` prefix detection work case-blind.
+        """Postgres search backed by tsvector GIN plus pg_trgm fallback. When a
+        ``query_vector`` is supplied, the lexical ranking is RRF-fused with a
+        semantic (vchordrq ANN) ranking over message embeddings."""
         raw_text = (search_text or "").replace("\u0000", "").strip().lower()
 
         # Hidden power-user prefix syntax
@@ -2802,24 +2819,9 @@ class ChatTable:
             shared = p_shr
 
         with get_db() as db:
-            if db.bind.dialect.name == "sqlite" and _fts_supported(db):
-                return self._search_chats_sqlite_fts(
-                    db,
-                    user_id=user_id,
-                    raw_text=raw_text,
-                    folder_ids=folder_ids,
-                    tag_ids=tag_ids,
-                    pinned=pinned,
-                    archived=archived,
-                    shared=shared,
-                    updated_after=updated_after,
-                    updated_before=updated_before,
-                    sort=sort,
-                    skip=skip,
-                    limit=limit,
-                    include_subagents=include_subagents,
-                )
-            return self._search_chats_like_fallback(
+            if db.bind.dialect.name != "postgresql":
+                raise RuntimeError("Chat search requires the Postgres-only runtime")
+            return self._search_chats_postgres_fts(
                 db,
                 user_id=user_id,
                 raw_text=raw_text,
@@ -2834,6 +2836,7 @@ class ChatTable:
                 skip=skip,
                 limit=limit,
                 include_subagents=include_subagents,
+                query_vector=query_vector,
             )
 
     def get_chats_by_user_id_and_search_text(
@@ -2877,7 +2880,6 @@ class ChatTable:
         updated_after: Optional[int],
         updated_before: Optional[int],
         include_subagents: bool,
-        dialect: str,
     ) -> tuple[str, dict]:
         clauses = ["c.user_id = :user_id"]
         params: dict = {"user_id": user_id}
@@ -2886,14 +2888,14 @@ class ChatTable:
             clauses.append("c.subagent_of IS NULL")
 
         if archived is True:
-            clauses.append("c.archived = 1")
+            clauses.append("c.archived = true")
         elif archived is False:
-            clauses.append("c.archived = 0")
+            clauses.append("c.archived = false")
 
         if pinned is True:
-            clauses.append("c.pinned = 1")
+            clauses.append("c.pinned = true")
         elif pinned is False:
-            clauses.append("(c.pinned = 0 OR c.pinned IS NULL)")
+            clauses.append("(c.pinned = false OR c.pinned IS NULL)")
 
         if shared is True:
             clauses.append("c.share_id IS NOT NULL")
@@ -2908,14 +2910,9 @@ class ChatTable:
 
         if tag_ids:
             for i, tid in enumerate(tag_ids):
-                if dialect == "sqlite":
-                    clauses.append(
-                        f"EXISTS (SELECT 1 FROM json_each(c.meta, '$.tags') WHERE value = :tid_{i})"
-                    )
-                elif dialect == "postgresql":
-                    clauses.append(
-                        f"EXISTS (SELECT 1 FROM json_array_elements_text(c.meta->'tags') AS t WHERE t = :tid_{i})"
-                    )
+                clauses.append(
+                    f"EXISTS (SELECT 1 FROM json_array_elements_text(c.meta->'tags') AS t WHERE t = :tid_{i})"
+                )
                 params[f"tid_{i}"] = tid
 
         if updated_after:
@@ -2927,112 +2924,7 @@ class ChatTable:
 
         return (" AND ".join(clauses), params)
 
-    def _search_chats_sqlite_fts(
-        self,
-        db,
-        *,
-        user_id: str,
-        raw_text: str,
-        folder_ids: Optional[list[str]],
-        tag_ids: Optional[list[str]],
-        pinned: Optional[bool],
-        archived: Optional[bool],
-        shared: Optional[bool],
-        updated_after: Optional[int],
-        updated_before: Optional[int],
-        sort: str,
-        skip: int,
-        limit: int,
-        include_subagents: bool,
-    ) -> "ChatSearchResponse":
-        filter_sql, filter_params = self._build_chat_filter_sql(
-            user_id=user_id,
-            folder_ids=folder_ids,
-            tag_ids=tag_ids,
-            pinned=pinned,
-            archived=archived,
-            shared=shared,
-            updated_after=updated_after,
-            updated_before=updated_before,
-            include_subagents=include_subagents,
-            dialect="sqlite",
-        )
-
-        if not raw_text:
-            return self._sqlite_filtered_list(db, filter_sql, filter_params, skip, limit)
-
-        primary_q, prefix_q, fuzzy_q = _build_fts_queries(raw_text)
-        if not primary_q:
-            return self._sqlite_filtered_list(db, filter_sql, filter_params, skip, limit)
-
-        now = int(time.time())
-        used_fuzzy = False
-
-        # Tier 1
-        hits = self._sqlite_run_tier(
-            db, fts_q=primary_q, filter_sql=filter_sql,
-            filter_params=filter_params, now=now, msg_boost=1.2,
-        )
-
-        # Tier 2 (gated)
-        if len(hits) < 5 and prefix_q and prefix_q != primary_q:
-            t2 = self._sqlite_run_tier(
-                db, fts_q=prefix_q, filter_sql=filter_sql,
-                filter_params=filter_params, now=now, msg_boost=1.2,
-                global_scale=0.7,
-            )
-            seen = {h["id"] for h in hits}
-            hits.extend(h for h in t2 if h["id"] not in seen)
-
-        # Tier 3 (gated)
-        if len(hits) < 5 and fuzzy_q:
-            t3 = self._sqlite_run_fuzzy(
-                db, fuzzy_q=fuzzy_q, filter_sql=filter_sql,
-                filter_params=filter_params, now=now,
-            )
-            seen = {h["id"] for h in hits}
-            new_hits = [h for h in t3 if h["id"] not in seen]
-            if new_hits and not hits:
-                used_fuzzy = True
-            hits.extend(new_hits)
-
-        if sort == "recent":
-            hits.sort(key=lambda h: h["updated_at"], reverse=True)
-        else:
-            hits.sort(key=lambda h: (h["final_score"], h["updated_at"]), reverse=True)
-        total = len(hits)
-        page = hits[skip : skip + limit]
-
-        enrichment = self._sqlite_enrich_snippets(db, [h["id"] for h in page], primary_q)
-        facets = self._sqlite_facets(db, [h["id"] for h in hits])
-
-        out_hits: list[ChatSearchHit] = []
-        for h in page:
-            enrich = enrichment.get(h["id"], {})
-            out_hits.append(
-                ChatSearchHit(
-                    id=h["id"],
-                    title=h["title"] or "",
-                    updated_at=h["updated_at"],
-                    created_at=h["created_at"],
-                    archived=bool(h["archived"]),
-                    pinned=bool(h["pinned"]),
-                    folder_id=h["folder_id"],
-                    snippet=enrich.get("snippet"),
-                    match_count=enrich.get("match_count", 0),
-                    matched_message_id=enrich.get("matched_message_id"),
-                    matched_role=enrich.get("matched_role"),
-                    score=h["final_score"],
-                )
-            )
-
-        return ChatSearchResponse(
-            total=total, hits=out_hits, facets=facets,
-            used_fuzzy=used_fuzzy,
-            did_you_mean=raw_text if used_fuzzy else None,
-        )
-
-    def _sqlite_filtered_list(
+    def _postgres_filtered_list(
         self, db, filter_sql: str, filter_params: dict, skip: int, limit: int
     ) -> "ChatSearchResponse":
         total = db.execute(
@@ -3054,265 +2946,9 @@ class ChatTable:
             )
             for r in rows
         ]
-        facets = self._sqlite_facets(db, [h.id for h in hits])
-        return ChatSearchResponse(total=int(total), hits=hits, facets=facets)
+        return ChatSearchResponse(total=int(total), hits=hits, facets=self._postgres_facets(db, [h.id for h in hits]))
 
-    def _sqlite_run_tier(
-        self,
-        db,
-        *,
-        fts_q: str,
-        filter_sql: str,
-        filter_params: dict,
-        now: int,
-        msg_boost: float,
-        global_scale: float = 1.0,
-    ) -> list[dict]:
-        # SQLite FTS5 quirk: bm25() is an auxiliary function that can only be
-        # used in a SELECT that directly evaluates `... MATCH ...`. Aggregating
-        # bm25 output inside a CTE (`MAX(-bm25(...))`) or chaining CTEs that
-        # consume bm25 results breaks the planner's "FTS context" tracking and
-        # raises "unable to use function bm25 in the requested context". So we
-        # emit raw per-message rows in SQL and aggregate per-chat in Python.
-        params = {**filter_params, "q": fts_q}
-        sql = f"""
-            WITH chat_scored AS (
-                SELECT chat_fts.id AS id,
-                       -bm25(chat_fts, 3.0, 1.0) AS s
-                FROM chat_fts WHERE chat_fts MATCH :q
-            ),
-            msg_rows AS (
-                SELECT message_fts.chat_id AS id,
-                       message_fts.message_id AS mid,
-                       -bm25(message_fts) AS s
-                FROM message_fts WHERE message_fts MATCH :q
-            )
-            SELECT c.id, c.title, c.updated_at, c.created_at,
-                   c.archived, c.pinned, c.folder_id,
-                   COALESCE(cs.s, 0.0) AS chat_s,
-                   msg_rows.s AS msg_s
-            FROM chat c
-            LEFT JOIN chat_scored cs ON cs.id = c.id
-            LEFT JOIN msg_rows ON msg_rows.id = c.id
-            WHERE {filter_sql}
-              AND (cs.s IS NOT NULL OR msg_rows.s IS NOT NULL)
-            LIMIT 1500
-        """
-        rows = db.execute(text(sql), params).fetchall()
-
-        # Aggregate per chat: take chat-level score as-is, take max msg score,
-        # and count distinct messages that matched.
-        agg: dict[str, dict] = {}
-        for r in rows:
-            cid = r[0]
-            slot = agg.get(cid)
-            if slot is None:
-                title = (r[1] or "").strip()
-                title_l = title.lower()
-                if title_l in _GENERIC_TITLES:
-                    title_penalty = 1.5
-                elif len(title) <= 3:
-                    title_penalty = 1.3
-                else:
-                    title_penalty = 1.0
-                slot = {
-                    "id": cid,
-                    "title": title,
-                    "updated_at": r[2] or 0,
-                    "created_at": r[3] or 0,
-                    "archived": r[4],
-                    "pinned": r[5],
-                    "folder_id": r[6],
-                    "chat_score": float(r[7] or 0.0),
-                    "msg_score": 0.0,
-                    "match_count": 0,
-                    "title_penalty": title_penalty,
-                }
-                agg[cid] = slot
-            if r[8] is not None:
-                msg_s = float(r[8])
-                if msg_s > slot["msg_score"]:
-                    slot["msg_score"] = msg_s
-                slot["match_count"] += 1
-
-        out: list[dict] = []
-        for slot in agg.values():
-            raw = max(slot["chat_score"], slot["msg_score"] * msg_boost)
-            age_days = max(0, (now - (slot["updated_at"] or now)) / 86400.0)
-            decay = 2.71828 ** (-age_days / 90.0)
-            final = (raw / slot["title_penalty"]) * decay * global_scale
-            out.append({
-                "id": slot["id"],
-                "title": slot["title"],
-                "updated_at": slot["updated_at"],
-                "created_at": slot["created_at"],
-                "archived": slot["archived"],
-                "pinned": slot["pinned"],
-                "folder_id": slot["folder_id"],
-                "raw_score": raw,
-                "final_score": final,
-                "match_count": slot["match_count"],
-            })
-        return out
-
-    def _sqlite_run_fuzzy(
-        self, db, *, fuzzy_q: str, filter_sql: str, filter_params: dict, now: int,
-    ) -> list[dict]:
-        params = {**filter_params, "q": fuzzy_q}
-        sql = f"""
-            SELECT c.id, c.title, c.updated_at, c.created_at,
-                   c.archived, c.pinned, c.folder_id,
-                   -bm25(chat_fts_tri) AS s
-            FROM chat_fts_tri JOIN chat c ON c.id = chat_fts_tri.id
-            WHERE chat_fts_tri MATCH :q AND {filter_sql}
-            LIMIT 100
-        """
-        rows = db.execute(text(sql), params).fetchall()
-        out: list[dict] = []
-        for r in rows:
-            raw = float(r[7] or 0.0)
-            age_days = max(0, (now - (r[2] or now)) / 86400.0)
-            decay = 2.71828 ** (-age_days / 90.0)
-            final = raw * decay * 0.4
-            out.append({
-                "id": r[0], "title": r[1] or "",
-                "updated_at": r[2] or 0, "created_at": r[3] or 0,
-                "archived": r[4], "pinned": r[5], "folder_id": r[6],
-                "raw_score": raw, "final_score": final, "match_count": 0,
-            })
-        return out
-
-    def _sqlite_enrich_snippets(
-        self, db, chat_ids: list[str], fts_q: str
-    ) -> dict[str, dict]:
-        if not chat_ids or not fts_q:
-            return {}
-        placeholders = ",".join(f":cid_{i}" for i in range(len(chat_ids)))
-        params: dict = {"q": fts_q}
-        for i, cid in enumerate(chat_ids):
-            params[f"cid_{i}"] = cid
-
-        sql = f"""
-            WITH ranked AS (
-                SELECT message_fts.chat_id AS chat_id,
-                       message_fts.message_id AS message_id,
-                       message_fts.role AS role,
-                       snippet(message_fts, 3, '<mark>', '</mark>', '…', 14) AS snip,
-                       -bm25(message_fts) AS s
-                FROM message_fts
-                WHERE message_fts MATCH :q
-                  AND message_fts.chat_id IN ({placeholders})
-            ),
-            counts AS (
-                SELECT chat_id, COUNT(*) AS cnt FROM ranked GROUP BY chat_id
-            ),
-            tops AS (
-                SELECT chat_id, message_id, role, snip, s,
-                       ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY s DESC) AS rn
-                FROM ranked
-            )
-            SELECT t.chat_id, t.message_id, t.role, t.snip, COALESCE(c.cnt, 0)
-            FROM tops t
-            LEFT JOIN counts c ON c.chat_id = t.chat_id
-            WHERE t.rn = 1
-        """
-        rows = db.execute(text(sql), params).fetchall()
-        out: dict[str, dict] = {}
-        for r in rows:
-            out[r[0]] = {
-                "matched_message_id": r[1],
-                "matched_role": r[2],
-                "snippet": _sanitize_snippet(r[3]),
-                "match_count": int(r[4] or 0),
-            }
-
-        missing = [cid for cid in chat_ids if cid not in out]
-        if missing:
-            placeholders2 = ",".join(f":cid_{i}" for i in range(len(missing)))
-            params2: dict = {"q": fts_q}
-            for i, cid in enumerate(missing):
-                params2[f"cid_{i}"] = cid
-            sql2 = f"""
-                SELECT id, snippet(chat_fts, 1, '<mark>', '</mark>', '…', 16) AS snip
-                FROM chat_fts
-                WHERE chat_fts MATCH :q AND id IN ({placeholders2})
-            """
-            try:
-                rows2 = db.execute(text(sql2), params2).fetchall()
-                for r in rows2:
-                    out[r[0]] = {
-                        "matched_message_id": None,
-                        "matched_role": None,
-                        "snippet": _sanitize_snippet(r[1]),
-                        "match_count": 0,
-                    }
-            except Exception:
-                pass
-        return out
-
-    def _sqlite_facets(self, db, chat_ids: list[str]) -> "ChatSearchFacets":
-        if not chat_ids:
-            return ChatSearchFacets()
-        placeholders = ",".join(f":cid_{i}" for i in range(len(chat_ids)))
-        params: dict = {}
-        for i, cid in enumerate(chat_ids):
-            params[f"cid_{i}"] = cid
-
-        try:
-            folder_rows = db.execute(
-                text(
-                    f"SELECT c.folder_id, f.name, COUNT(*) "
-                    f"FROM chat c LEFT JOIN folder f ON f.id = c.folder_id "
-                    f"WHERE c.id IN ({placeholders}) AND c.folder_id IS NOT NULL "
-                    f"GROUP BY c.folder_id, f.name "
-                    f"ORDER BY COUNT(*) DESC LIMIT 20"
-                ),
-                params,
-            ).fetchall()
-            folders = [
-                FacetBucket(id=r[0], name=(r[1] or r[0]), count=int(r[2]))
-                for r in folder_rows
-            ]
-        except Exception:
-            folders = []
-
-        try:
-            tag_rows = db.execute(
-                text(
-                    f"SELECT tag.value, COUNT(*) "
-                    f"FROM chat c, json_each(c.meta, '$.tags') AS tag "
-                    f"WHERE c.id IN ({placeholders}) "
-                    f"GROUP BY tag.value "
-                    f"ORDER BY COUNT(*) DESC LIMIT 20"
-                ),
-                params,
-            ).fetchall()
-            tags = [
-                FacetBucket(id=str(r[0]), name=str(r[0]), count=int(r[1]))
-                for r in tag_rows if r[0]
-            ]
-        except Exception:
-            tags = []
-
-        try:
-            model_rows = db.execute(
-                text(
-                    f"SELECT c.model_id_primary AS m, COUNT(*) "
-                    f"FROM chat c WHERE c.id IN ({placeholders}) AND m IS NOT NULL "
-                    f"GROUP BY m ORDER BY COUNT(*) DESC LIMIT 20"
-                ),
-                params,
-            ).fetchall()
-            models = [
-                FacetBucket(id=str(r[0]), name=str(r[0]), count=int(r[1]))
-                for r in model_rows if r[0]
-            ]
-        except Exception:
-            models = []
-
-        return ChatSearchFacets(folders=folders, tags=tags, models=models)
-
-    def _search_chats_like_fallback(
+    def _search_chats_postgres_fts(
         self,
         db,
         *,
@@ -3329,68 +2965,266 @@ class ChatTable:
         skip: int,
         limit: int,
         include_subagents: bool,
+        query_vector: Optional[list[float]] = None,
     ) -> "ChatSearchResponse":
-        """Postgres/MySQL fallback: previous LIKE-based behavior. No snippets,
-        no facets, no fuzzy. Will be replaced in a follow-up migration."""
-        query = db.query(Chat).filter(Chat.user_id == user_id)
-        query = _apply_subagent_filter(query, db, include_subagents)
+        # Cap every search query so a pathological/over-broad term can't hold its
+        # pooled connection (and a sync threadpool worker) indefinitely. SET LOCAL
+        # scopes it to this transaction only — a plain SET would leak onto the
+        # pooled asyncpg connection and throttle unrelated queries.
+        db.execute(text(f"SET LOCAL statement_timeout = '{_SEARCH_STMT_TIMEOUT_MS}ms'"))
 
-        if archived is True:
-            query = query.filter(Chat.archived == True)
-        elif archived is False:
-            query = query.filter(Chat.archived == False)
-        if pinned is True:
-            query = query.filter(Chat.pinned == True)
-        elif pinned is False:
-            query = query.filter(or_(Chat.pinned == False, Chat.pinned == None))
-        if shared is True:
-            query = query.filter(Chat.share_id.isnot(None))
-        elif shared is False:
-            query = query.filter(Chat.share_id.is_(None))
-        if folder_ids:
-            query = query.filter(Chat.folder_id.in_(folder_ids))
-        if updated_after:
-            query = query.filter(Chat.updated_at >= updated_after)
-        if updated_before:
-            query = query.filter(Chat.updated_at <= updated_before)
+        filter_sql, filter_params = self._build_chat_filter_sql(
+            user_id=user_id,
+            folder_ids=folder_ids,
+            tag_ids=tag_ids,
+            pinned=pinned,
+            archived=archived,
+            shared=shared,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            include_subagents=include_subagents,
+        )
+        # Empty queries, and single-character ASCII queries (worst FTS/trigram
+        # selectivity, never useful), fall back to the plain recency-ordered list.
+        # Non-ASCII single chars (CJK/logographic words) still search.
+        if not raw_text or (len(raw_text) < _MIN_FTS_QUERY_LEN and raw_text.isascii()):
+            return self._postgres_filtered_list(db, filter_sql, filter_params, skip, limit)
 
-        words = [w for w in raw_text.lower().split(" ") if w]
-        _has_search_col = _search_text_column_exists(db)
-        for word in words:
-            if _has_search_col:
-                query = query.filter(
-                    or_(
-                        text("chat.search_text LIKE :w").params(w=f"%{word}%"),
-                        and_(
-                            text("chat.search_text IS NULL"),
-                            Chat.title.ilike(f"%{word}%"),
-                        ),
-                    )
-                )
-            else:
-                query = query.filter(Chat.title.ilike(f"%{word}%"))
+        order_sql = "h.updated_at DESC, h.id" if sort == "recent" else "h.score DESC, h.updated_at DESC, h.id"
+        params = {**filter_params, "q": raw_text, "limit": limit, "skip": skip}
+        # Drive everything from the per-user ``filtered`` set and reach the search
+        # tables by their chat_id PK — this keeps cost proportional to the user's
+        # own corpus instead of scanning every user's rows, and lets the planner
+        # use the PK / GIN indexes. Ranking comes from the always-fresh
+        # chat_message_search rows + live chat.title (never the stale chat_search.body).
+        common_ctes = f"""
+            WITH q AS (SELECT websearch_to_tsquery('simple', :q) AS query),
+            filtered AS (
+                SELECT c.id, c.title, c.updated_at, c.created_at, c.archived, c.pinned, c.folder_id
+                FROM chat c
+                WHERE {filter_sql}
+            ),
+            msg_hits AS (
+                SELECT
+                    ms.chat_id AS id,
+                    MAX(ts_rank_cd(ms.search_vector, q.query, 32)) AS msg_rank,
+                    COUNT(*) AS match_count
+                FROM chat_message_search ms
+                CROSS JOIN q
+                JOIN filtered f ON f.id = ms.chat_id
+                WHERE ms.search_vector @@ q.query
+                GROUP BY ms.chat_id
+            ),
+            scored AS (
+                SELECT
+                    f.id, f.title, f.updated_at, f.created_at, f.archived, f.pinned, f.folder_id,
+                    (
+                        (
+                            COALESCE(m.msg_rank, 0) * {_SEARCH_W_MSG}
+                          + CASE
+                                WHEN lower(f.title) = lower(:q)                THEN {_SEARCH_TITLE_EXACT}
+                                WHEN lower(f.title) LIKE lower(:q) || '%'      THEN {_SEARCH_TITLE_PREFIX}
+                                WHEN position(lower(:q) IN lower(f.title)) > 0 THEN {_SEARCH_TITLE_CONTAINS}
+                                ELSE 0
+                            END
+                          + LEAST(ln(1 + COALESCE(m.match_count, 0)) * {_SEARCH_BREADTH_COEFF}, {_SEARCH_BREADTH_CAP})
+                        )
+                        * (1 + {_SEARCH_RECENCY_AMP} * exp(-(extract(epoch FROM now()) - f.updated_at) / {_SEARCH_RECENCY_TAU}))
+                    ) AS score,
+                    COALESCE(m.match_count, 0) AS match_count
+                FROM filtered f
+                LEFT JOIN msg_hits m ON m.id = f.id
+                WHERE m.id IS NOT NULL
+                   OR position(lower(:q) IN lower(f.title)) > 0
+            )"""
 
-        if db.bind.dialect.name == "postgresql" and tag_ids:
-            for i, tag_id in enumerate(tag_ids):
-                query = query.filter(
-                    text(
-                        f"EXISTS (SELECT 1 FROM json_array_elements_text(chat.meta->'tags') AS t WHERE t = :tagp_{i})"
-                    ).params(**{f"tagp_{i}": tag_id})
-                )
+        if query_vector:
+            # Hybrid: fuse the lexical ranking with a semantic (vchordrq ANN) ranking
+            # via reciprocal-rank fusion. The semantic side pulls the user's nearest
+            # message embeddings, collapses to best-per-chat, and ranks; a chat
+            # surfaces if it matches lexically OR semantically.
+            params["qvec"] = _pgvector_literal(query_vector)
+            db.execute(text("SET LOCAL vchordrq.prefilter = on"))
+            sql = f"""{common_ctes},
+            lex AS (
+                SELECT s.*, ROW_NUMBER() OVER (ORDER BY s.score DESC, s.updated_at DESC) AS lex_rank
+                FROM scored s
+            ),
+            sem AS (
+                SELECT sg.id, ROW_NUMBER() OVER (ORDER BY sg.d) AS sem_rank
+                FROM (
+                    SELECT tm.chat_id AS id, MIN(tm.dist) AS d
+                    FROM (
+                        SELECT e.chat_id, (e.embedding <=> (:qvec)::vector) AS dist
+                        FROM chat_message_embedding e
+                        WHERE e.user_id = :user_id
+                          AND e.embedding IS NOT NULL
+                          AND e.chat_id IN (SELECT id FROM filtered)
+                        ORDER BY e.embedding <=> (:qvec)::vector
+                        LIMIT {_SEARCH_SEM_MSG_POOL}
+                    ) tm
+                    GROUP BY tm.chat_id
+                ) sg
+                WHERE sg.d < {_SEARCH_SEM_MAX_DIST}
+            ),
+            cand AS (
+                SELECT
+                    COALESCE(lex.id, sem.id) AS id,
+                    COALESCE(1.0 / ({_SEARCH_RRF_K} + lex.lex_rank), 0)
+                  + COALESCE(1.0 / ({_SEARCH_RRF_K} + sem.sem_rank), 0) AS score,
+                    COALESCE(lex.match_count, 0) AS match_count
+                FROM lex FULL OUTER JOIN sem ON lex.id = sem.id
+            ),
+            hits AS (
+                SELECT
+                    f.id, f.title, f.updated_at, f.created_at, f.archived, f.pinned, f.folder_id,
+                    cand.score, cand.match_count, COUNT(*) OVER () AS total_n
+                FROM cand JOIN filtered f ON f.id = cand.id
+            )
+            SELECT h.id, h.title, h.updated_at, h.created_at, h.archived, h.pinned, h.folder_id,
+                   h.score, h.match_count, h.total_n
+            FROM hits h
+            ORDER BY {order_sql}
+            LIMIT :limit OFFSET :skip
+        """
+        else:
+            sql = f"""{common_ctes},
+            hits AS (
+                SELECT s.*, COUNT(*) OVER () AS total_n
+                FROM scored s
+            )
+            SELECT h.id, h.title, h.updated_at, h.created_at, h.archived, h.pinned, h.folder_id,
+                   h.score, h.match_count, h.total_n
+            FROM hits h
+            ORDER BY {order_sql}
+            LIMIT :limit OFFSET :skip
+        """
+        try:
+            rows = db.execute(text(sql), params).fetchall()
+        except SQLAlchemyError:
+            # Timed-out / malformed query aborts the transaction; return an empty
+            # result rather than 500-ing the modal, and do NOT fall through to the
+            # snippet/facet queries on the now-aborted session.
+            log.exception("chat search query failed for user %s", user_id)
+            return ChatSearchResponse(total=0, hits=[], facets=ChatSearchFacets())
 
-        query = query.order_by(Chat.updated_at.desc())
-        total = query.count()
-        rows = query.offset(skip).limit(limit).all()
+        total = int(rows[0][-1]) if rows else 0
+        ids = [r[0] for r in rows]
+        try:
+            snippets = self._postgres_enrich_snippets(db, ids, raw_text)
+        except SQLAlchemyError:
+            snippets = {}
         hits = [
             ChatSearchHit(
-                id=r.id, title=r.title or "",
-                updated_at=r.updated_at or 0, created_at=r.created_at or 0,
-                archived=bool(r.archived), pinned=bool(r.pinned),
-                folder_id=r.folder_id,
+                id=r[0],
+                title=r[1] or "",
+                updated_at=r[2] or 0,
+                created_at=r[3] or 0,
+                archived=bool(r[4]),
+                pinned=bool(r[5]),
+                folder_id=r[6],
+                score=float(r[7] or 0),
+                match_count=int(r[8] or 0),
+                snippet=snippets.get(r[0], {}).get("snippet"),
+                matched_message_id=snippets.get(r[0], {}).get("matched_message_id"),
+                matched_role=snippets.get(r[0], {}).get("matched_role"),
             )
             for r in rows
         ]
-        return ChatSearchResponse(total=int(total), hits=hits)
+        return ChatSearchResponse(total=total, hits=hits, facets=self._postgres_facets(db, ids))
+
+    def _postgres_enrich_snippets(self, db, chat_ids: list[str], raw_text: str) -> dict[str, dict]:
+        if not chat_ids:
+            return {}
+        rows = db.execute(
+            text(
+                """
+                WITH q AS (SELECT websearch_to_tsquery('simple', :q) AS query), ranked AS (
+                    SELECT
+                        ms.chat_id,
+                        ms.message_id,
+                        ms.role,
+                        ms.content,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ms.chat_id
+                            ORDER BY ts_rank_cd(ms.search_vector, q.query, 32) DESC, ms.message_id
+                        ) AS rn
+                    FROM chat_message_search ms CROSS JOIN q
+                    WHERE ms.chat_id = ANY(:ids) AND ms.search_vector @@ q.query
+                )
+                SELECT
+                    ranked.chat_id,
+                    ranked.message_id,
+                    ranked.role,
+                    ts_headline('simple', ranked.content, q.query,
+                        'StartSel=<mark>, StopSel=</mark>, MaxWords=18, MinWords=8') AS snippet
+                FROM ranked CROSS JOIN q
+                WHERE ranked.rn = 1
+                """
+            ),
+            {"q": raw_text, "ids": chat_ids},
+        ).fetchall()
+        return {
+            r[0]: {
+                "matched_message_id": r[1],
+                "matched_role": r[2],
+                "snippet": _sanitize_snippet(r[3]),
+            }
+            for r in rows
+        }
+
+    def _postgres_facets(self, db, chat_ids: list[str]) -> "ChatSearchFacets":
+        if not chat_ids:
+            return ChatSearchFacets()
+        params = {"ids": chat_ids}
+        try:
+            folder_rows = db.execute(
+                text(
+                    """
+                    SELECT c.folder_id, f.name, COUNT(*)
+                    FROM chat c LEFT JOIN folder f ON f.id = c.folder_id
+                    WHERE c.id = ANY(:ids) AND c.folder_id IS NOT NULL
+                    GROUP BY c.folder_id, f.name
+                    ORDER BY COUNT(*) DESC LIMIT 20
+                    """
+                ),
+                params,
+            ).fetchall()
+            folders = [FacetBucket(id=r[0], name=(r[1] or r[0]), count=int(r[2])) for r in folder_rows]
+        except Exception:
+            folders = []
+        try:
+            tag_rows = db.execute(
+                text(
+                    """
+                    SELECT tag.value, COUNT(*)
+                    FROM chat c
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.meta->'tags', '[]'::jsonb)) AS tag(value)
+                    WHERE c.id = ANY(:ids)
+                    GROUP BY tag.value ORDER BY COUNT(*) DESC LIMIT 20
+                    """
+                ),
+                params,
+            ).fetchall()
+            tags = [FacetBucket(id=str(r[0]), name=str(r[0]), count=int(r[1])) for r in tag_rows if r[0]]
+        except Exception:
+            tags = []
+        try:
+            model_rows = db.execute(
+                text(
+                    """
+                    SELECT c.model_id_primary, COUNT(*)
+                    FROM chat c
+                    WHERE c.id = ANY(:ids) AND c.model_id_primary IS NOT NULL
+                    GROUP BY c.model_id_primary ORDER BY COUNT(*) DESC LIMIT 20
+                    """
+                ),
+                params,
+            ).fetchall()
+            models = [FacetBucket(id=str(r[0]), name=str(r[0]), count=int(r[1])) for r in model_rows if r[0]]
+        except Exception:
+            models = []
+        return ChatSearchFacets(folders=folders, tags=tags, models=models)
 
     def get_chats_by_folder_id_and_user_id(
         self, folder_id: str, user_id: str, skip: int = 0, limit: int = 60
@@ -3444,7 +3278,7 @@ class ChatTable:
         with get_db() as db:
             chat = db.get(Chat, id)
             tags = chat.meta.get("tags", [])
-            return [Tags.get_tag_by_name_and_user_id(tag, user_id) for tag in tags]
+            return _sync_get_tags_by_ids_and_user_id(db, tags, user_id)
 
     def get_chat_list_by_user_id_and_tag_name(
         self, user_id: str, tag_name: str, skip: int = 0, limit: int = 50
@@ -3453,25 +3287,11 @@ class ChatTable:
             query = db.query(Chat).filter_by(user_id=user_id)
             tag_id = tag_name.replace(" ", "_").lower()
 
-            log.info(f"DB dialect name: {db.bind.dialect.name}")
-            if db.bind.dialect.name == "sqlite":
-                # SQLite JSON1 querying for tags within the meta JSON field
-                query = query.filter(
-                    text(
-                        f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
-                    )
-                ).params(tag_id=tag_id)
-            elif db.bind.dialect.name == "postgresql":
-                # PostgreSQL JSON query for tags within the meta JSON field (for `json` type)
-                query = query.filter(
-                    text(
-                        "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
-                    )
-                ).params(tag_id=tag_id)
-            else:
-                raise NotImplementedError(
-                    f"Unsupported dialect: {db.bind.dialect.name}"
+            query = query.filter(
+                text(
+                    "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                 )
+            ).params(tag_id=tag_id)
 
             all_chats = query.all()
             log.debug(f"all_chats: {all_chats}")
@@ -3480,11 +3300,13 @@ class ChatTable:
     def add_chat_tag_by_id_and_user_id_and_tag_name(
         self, id: str, user_id: str, tag_name: str
     ) -> Optional[ChatModel]:
-        tag = Tags.get_tag_by_name_and_user_id(tag_name, user_id)
-        if tag is None:
-            tag = Tags.insert_new_tag(tag_name, user_id)
         try:
             with get_db() as db:
+                tag = _sync_get_tag_by_name_and_user_id(db, tag_name, user_id)
+                if tag is None:
+                    tag = _sync_insert_new_tag(db, tag_name, user_id)
+                if tag is None:
+                    return None
                 chat = db.get(Chat, id)
 
                 tag_id = tag.id
@@ -3507,26 +3329,11 @@ class ChatTable:
             # Normalize the tag_name for consistency
             tag_id = tag_name.replace(" ", "_").lower()
 
-            if db.bind.dialect.name == "sqlite":
-                # SQLite JSON1 support for querying the tags inside the `meta` JSON field
-                query = query.filter(
-                    text(
-                        f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
-                    )
-                ).params(tag_id=tag_id)
-
-            elif db.bind.dialect.name == "postgresql":
-                # PostgreSQL JSONB support for querying the tags inside the `meta` JSON field
-                query = query.filter(
-                    text(
-                        "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
-                    )
-                ).params(tag_id=tag_id)
-
-            else:
-                raise NotImplementedError(
-                    f"Unsupported dialect: {db.bind.dialect.name}"
+            query = query.filter(
+                text(
+                    "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                 )
+            ).params(tag_id=tag_id)
 
             # Get the count of matching records
             count = query.count()
@@ -3642,4 +3449,97 @@ class ChatTable:
             return False
 
 
-Chats = ChatTable()
+# Methods whose writes target a single (chat_id, message_id) and therefore must
+# be serialized against each other so concurrent subagent fan-out branches don't
+# lose updates to the shared parent-message `meta` JSON. The lock lives on the
+# event loop (acquired BEFORE the threadpool dispatch) so blocked writers never
+# occupy a threadpool worker — an unbounded subagent fan-out can't exhaust the
+# pool. args[0] is the chat_id, args[1] the message_id for all of these.
+_MESSAGE_SCOPED_WRITE_METHODS = frozenset(
+    {
+        "upsert_message_to_chat_by_id_and_message_id",
+        "update_message_fields_atomic",
+    }
+)
+
+
+class _MessageWriteLockRegistry:
+    """Refcounted per-(chat_id, message_id) ``asyncio.Lock`` registry.
+
+    A lock is created on first use and reaped once no coroutine holds or waits
+    on it, so the registry doesn't grow without bound over the process lifetime.
+    Single-process only (the deployment runs one uvicorn worker); cross-process
+    safety would need a DB advisory lock, but the field-scoped merge already
+    keeps each write to a single subagent_runs key.
+    """
+
+    def __init__(self):
+        self._locks: dict[tuple, list] = {}
+
+    def _acquire_entry(self, key):
+        entry = self._locks.get(key)
+        if entry is None:
+            entry = [asyncio.Lock(), 0]
+            self._locks[key] = entry
+        entry[1] += 1
+        return entry
+
+    def _release_entry(self, key):
+        entry = self._locks.get(key)
+        if entry is None:
+            return
+        entry[1] -= 1
+        if entry[1] <= 0 and not entry[0].locked():
+            self._locks.pop(key, None)
+
+    def lock_for(self, chat_id, message_id):
+        registry = self
+        key = (chat_id, message_id)
+
+        class _Ctx:
+            async def __aenter__(self):
+                self._entry = registry._acquire_entry(key)
+                await self._entry[0].acquire()
+                return self
+
+            async def __aexit__(self, *exc):
+                self._entry[0].release()
+                registry._release_entry(key)
+                return False
+
+        return _Ctx()
+
+
+_message_write_locks = _MessageWriteLockRegistry()
+
+
+class _AsyncChatTableProxy:
+    def __init__(self, impl: ChatTable):
+        self._impl = impl
+
+    def __getattr__(self, name):
+        attr = getattr(self._impl, name)
+        if not callable(attr) or name.startswith("_"):
+            return attr
+
+        if name in _MESSAGE_SCOPED_WRITE_METHODS:
+
+            async def _wrapped(*args, **kwargs):
+                chat_id = args[0] if len(args) > 0 else kwargs.get("id")
+                message_id = args[1] if len(args) > 1 else kwargs.get("message_id")
+                # Defensive: if we can't key the lock, fall back to an unlocked
+                # call rather than crashing (shouldn't happen for these methods).
+                if chat_id is None or message_id is None:
+                    return await run_sync_db(lambda: attr(*args, **kwargs))
+                async with _message_write_locks.lock_for(chat_id, message_id):
+                    return await run_sync_db(lambda: attr(*args, **kwargs))
+
+            return _wrapped
+
+        async def _wrapped(*args, **kwargs):
+            return await run_sync_db(lambda: attr(*args, **kwargs))
+
+        return _wrapped
+
+
+Chats = _AsyncChatTableProxy(ChatTable())

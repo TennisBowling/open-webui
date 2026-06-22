@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
 	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import SearchInput from './Sidebar/SearchInput.svelte';
 	import {
-		getChatById,
+		getChatMessagesBranch,
+		getChatMeta,
 		getChatCount,
 		searchChats,
 		type ChatSearchHit,
@@ -73,13 +73,54 @@
 	let selectedIdx: number | null = null;
 
 	// ── Preview pane ──────────────────────────────────────────────────────
+	// The preview shows only the matched message + a few ancestors (fetched via
+	// the lightweight branch endpoint), NOT the whole multi-MB chat blob through
+	// the full renderer — that froze/crashed the tab on big agentic chats.
+	const PREVIEW_LIMIT = 6;
+	const PREVIEW_CACHE_MAX = 30;
 	let selectedHit: ChatSearchHit | null = null;
 	let selectedModels = [''];
 	let history: any = null;
 	let messages: any[] | null = null;
-	let chatCache: Record<string, any> = {};
+	let chatCache: Map<string, any> = new Map();
 	let previewDebounce: ReturnType<typeof setTimeout> | null = null;
 	let previewRequestId = 0;
+	let previewController: AbortController | null = null;
+
+	const chatCacheSet = (id: string, value: any) => {
+		if (chatCache.has(id)) chatCache.delete(id);
+		chatCache.set(id, value);
+		while (chatCache.size > PREVIEW_CACHE_MAX) {
+			const oldest = chatCache.keys().next().value;
+			if (oldest === undefined) break;
+			chatCache.delete(oldest);
+		}
+	};
+
+	// Build a minimal history ({ currentId, messages }) from a branch page so the
+	// <Messages> renderer only ever mounts the handful of fetched messages.
+	const buildPreviewHistory = (branch: any, leaf: string | null) => {
+		const arr = Array.isArray(branch)
+			? branch
+			: Array.isArray(branch?.messages)
+				? branch.messages
+				: [];
+		if (!arr.length || !leaf) return null;
+		const messagesMap: Record<string, any> = {};
+		for (const m of arr) {
+			if (m?.id) messagesMap[m.id] = { ...m };
+		}
+		if (!messagesMap[leaf]) return null;
+		// We only fetched the matched message + a few ancestors. The oldest fetched
+		// message's parentId points at a message we deliberately did NOT fetch, which
+		// makes the renderer treat the chain as "incomplete" and show a perpetual
+		// loading spinner (pagination is disabled in the preview). Root any dangling
+		// parent so the fetched window is a self-contained, complete thread.
+		for (const m of Object.values(messagesMap)) {
+			if (m.parentId && !messagesMap[m.parentId]) m.parentId = null;
+		}
+		return { currentId: leaf, messages: messagesMap };
+	};
 
 	const computeDateRange = (): { updated_after: number | null; updated_before: number | null } => {
 		const now = Math.floor(Date.now() / 1000);
@@ -139,8 +180,10 @@
 		};
 
 		// First-character optimism: render title-prefix matches from the
-		// already-loaded sidebar chats immediately, then fire backend after a
-		// short 50ms gap. Subsequent keystrokes use 150ms debounce.
+		// already-loaded sidebar chats immediately for instant feedback, then let
+		// the normal debounce fire the backend search. (We no longer fire a special
+		// 50ms backend request on the first character — the cheapest, least useful
+		// query was hammering the DB on every search session.)
 		const text = query.trim();
 		if (text.length > 0 && !firstCharFired) {
 			firstCharFired = true;
@@ -163,8 +206,6 @@
 					matched_role: null,
 					score: 0
 				}));
-			debounceTimer = setTimeout(fire, 50);
-			return;
 		}
 
 		if (text.length === 0) {
@@ -175,7 +216,7 @@
 		if (immediate) {
 			fire();
 		} else {
-			debounceTimer = setTimeout(fire, 150);
+			debounceTimer = setTimeout(fire, 220);
 		}
 	};
 
@@ -183,7 +224,7 @@
 		if (previewDebounce) clearTimeout(previewDebounce);
 		previewDebounce = setTimeout(() => {
 			loadChatPreview(idx);
-		}, 120);
+		}, 150);
 	};
 
 	const loadChatPreview = async (idx: number | null) => {
@@ -202,27 +243,48 @@
 		if (!hit) return;
 		const requestId = ++previewRequestId;
 
-		let chat = chatCache[hit.id];
-		if (!chat) {
-			chat = await getChatById(localStorage.token, hit.id).catch(() => null);
-			if (chat) chatCache[hit.id] = chat;
+		// Abort any preview fetch still in flight for a previously-selected hit.
+		if (previewController) previewController.abort();
+		previewController = new AbortController();
+		const signal = previewController.signal;
+
+		let previewHistory = chatCache.get(hit.id);
+		if (!previewHistory) {
+			try {
+				let leaf = hit.matched_message_id;
+				if (!leaf) {
+					// Title-only match (no matched message): preview the chat's tail.
+					const meta = await getChatMeta(localStorage.token, hit.id).catch(() => null);
+					leaf = meta?.history?.currentId ?? null;
+				}
+				const branch = leaf
+					? await getChatMessagesBranch(
+							localStorage.token,
+							hit.id,
+							{ leaf, limit: PREVIEW_LIMIT },
+							signal
+						)
+					: [];
+				previewHistory = buildPreviewHistory(branch, leaf);
+				if (previewHistory) chatCacheSet(hit.id, previewHistory);
+			} catch (err: any) {
+				if (err?.name === 'AbortError') return;
+				console.error(err);
+				previewHistory = null;
+			}
 		}
 		if (requestId !== previewRequestId) return;
 
-		if (chat) {
+		if (previewHistory && previewHistory.currentId) {
 			selectedHit = hit;
-			selectedModels =
-				(chat?.chat?.models ?? undefined) !== undefined
-					? chat?.chat?.models
-					: [chat?.chat?.models ?? ''];
-			history = chat?.chat?.history;
-			messages = createMessagesList(chat?.chat?.history, chat?.chat?.history?.currentId);
+			selectedModels = [''];
+			history = previewHistory;
+			messages = createMessagesList(previewHistory, previewHistory.currentId);
 
 			await tick();
 			scrollPreviewToMatch(hit.matched_message_id);
 		} else {
-			toast.error($i18n.t('Failed to load chat preview'));
-			selectedHit = null;
+			selectedHit = hit;
 			messages = null;
 			history = null;
 		}
@@ -333,6 +395,9 @@
 		history = null;
 		selectedIdx = null;
 		firstCharFired = false;
+		// Drop cached preview histories so the modal doesn't hold large message
+		// maps across opens.
+		chatCache.clear();
 		chatCount = await getChatCount(localStorage.token).catch(() => null);
 		recentSearchesRef?.reload();
 		// Initial: fetch with whatever query/filters are set (usually empty)
@@ -372,6 +437,7 @@
 		if (debounceTimer) clearTimeout(debounceTimer);
 		if (previewDebounce) clearTimeout(previewDebounce);
 		if (inFlightController) inFlightController.abort();
+		if (previewController) previewController.abort();
 		document.removeEventListener('keydown', onKeyDown);
 	});
 </script>
@@ -520,6 +586,7 @@
 							bind:history
 							bind:messages
 							autoScroll={false}
+							allowPagination={false}
 							sendMessage={() => {}}
 							continueResponse={() => {}}
 							regenerateResponse={() => {}}

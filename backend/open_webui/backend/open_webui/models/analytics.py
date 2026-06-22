@@ -1163,16 +1163,15 @@ class AnalyticsTable:
                         sql_text(
                             """
                             SELECT
-                                COALESCE(json_extract(j.value, '$.status'), 'unknown') AS status,
+                                COALESCE(j.value->>'status', 'unknown') AS status,
                                 COUNT(*) AS count
                             FROM chat_message cm
                             JOIN chat c ON c.id = cm.chat_id
-                            JOIN json_each(cm.meta, '$.subagent_runs') j
+                            JOIN LATERAL jsonb_each(COALESCE(cm.meta->'subagent_runs', '{}'::jsonb)) j(key, value) ON true
                             WHERE c.user_id NOT LIKE 'shared-%'
-                              AND json_valid(cm.meta) = 1
-                              AND json_type(cm.meta, '$.subagent_runs') = 'object'
-                              AND COALESCE(json_extract(j.value, '$.started_at'), cm.timestamp, c.updated_at, c.created_at, 0) >= :start_ts
-                              AND COALESCE(json_extract(j.value, '$.started_at'), cm.timestamp, c.updated_at, c.created_at, 0) < :end_ts
+                              AND jsonb_typeof(COALESCE(cm.meta->'subagent_runs', '{}'::jsonb)) = 'object'
+                              AND COALESCE((j.value->>'started_at')::bigint, cm.timestamp, c.updated_at, c.created_at, 0) >= :start_ts
+                              AND COALESCE((j.value->>'started_at')::bigint, cm.timestamp, c.updated_at, c.created_at, 0) < :end_ts
                             GROUP BY status
                             """
                         ),

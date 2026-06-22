@@ -6,7 +6,7 @@ Create Date: 2024-10-20 17:02:35.241684
 
 """
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 import json
 from sqlalchemy.sql import table, column
@@ -34,6 +34,9 @@ def upgrade():
             nullable=True,
             postgresql_using="meta::json",
         )
+
+    if context.is_offline_mode():
+        return
 
     # 3. Migrate legacy data from `meta` JSONField
     # Fetch and process `meta` data from the table, add values to the new `path` column as necessary.

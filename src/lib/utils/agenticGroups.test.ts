@@ -6,6 +6,10 @@ const text = (content = '') => ({ type: 'text', content });
 const reasoning = (content = 'thinking') => ({ type: 'reasoning', content });
 const toolCalls = () => ({ type: 'tool_calls', content: [{ id: 'c1' }] });
 const steer = (content = 'focus on tests') => ({ type: 'user_steer', content });
+const askUser = () => ({
+	type: 'tool_calls',
+	content: [{ id: 'q1', function: { name: 'ask_user' } }]
+});
 
 describe('computeAgenticRenderItems', () => {
 	it('returns nothing for empty input', () => {
@@ -102,5 +106,30 @@ describe('computeAgenticRenderItems', () => {
 			{ kind: 'group', indices: [4, 5] },
 			{ kind: 'block', index: 6 }
 		]);
+	});
+
+	it('an ask_user tool_calls block renders standalone, never bundled into a Working group', () => {
+		// A regular tool_calls block bundles into the collapsible Working group,
+		// but an ask_user call carries an interactive question card the user must
+		// see and act on — it must break the burst and render on its own.
+		const blocks = [
+			reasoning(),
+			toolCalls(),
+			text(''),
+			askUser(),
+			text(''),
+			toolCalls(),
+			text('done')
+		];
+		expect(computeAgenticRenderItems(blocks, true)).toEqual([
+			{ kind: 'group', indices: [0, 1, 2] },
+			{ kind: 'block', index: 3 },
+			{ kind: 'group', indices: [4, 5] },
+			{ kind: 'block', index: 6 }
+		]);
+	});
+
+	it('a lone ask_user block renders standalone', () => {
+		expect(computeAgenticRenderItems([askUser()], true)).toEqual([{ kind: 'block', index: 0 }]);
 	});
 });

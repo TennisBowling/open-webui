@@ -6,7 +6,7 @@ from open_webui.utils.redis import (
     parse_redis_service_url,
     get_redis_connection,
     get_sentinels_from_env,
-    MAX_RETRY_COUNT,
+    REDIS_SENTINEL_MAX_RETRY_COUNT,
 )
 import inspect
 
@@ -131,7 +131,7 @@ class TestSentinelRedisProxy:
         with pytest.raises(redis.exceptions.ConnectionError):
             get_method("test_key")
 
-        assert mock_master.get.call_count == MAX_RETRY_COUNT
+        assert mock_master.get.call_count == REDIS_SENTINEL_MAX_RETRY_COUNT
 
     @patch("redis.sentinel.Sentinel")
     def test_sentinel_redis_proxy_readonly_error_retry(self, mock_sentinel_class):
@@ -458,7 +458,7 @@ class TestSentinelRedisProxyCommands:
         assert mock_master.hget.call_count == 2
 
         # Verify both calls were made with same parameters
-        expected_calls = [(("test_hash", "field1"),), (("test_hash", "field1"),)]
+        expected_calls = [("test_hash", "field1"), ("test_hash", "field1")]
         actual_calls = [call.args for call in mock_master.hget.call_args_list]
         assert actual_calls == expected_calls
 
@@ -489,8 +489,8 @@ class TestSentinelRedisProxyCommands:
 
         # Verify both calls were made with same parameters
         expected_calls = [
-            (("test_hash", "field1", "value1"),),
-            (("test_hash", "field1", "value1"),),
+            ("test_hash", "field1", "value1"),
+            ("test_hash", "field1", "value1"),
         ]
         actual_calls = [call.args for call in mock_master.hset.call_args_list]
         assert actual_calls == expected_calls
@@ -522,7 +522,7 @@ class TestSentinelRedisProxyCommands:
         assert mock_master.hget.call_count == 2
 
         # Verify both calls were made with same parameters
-        expected_calls = [(("test_hash", "field1"),), (("test_hash", "field1"),)]
+        expected_calls = [("test_hash", "field1"), ("test_hash", "field1")]
         actual_calls = [call.args for call in mock_master.hget.call_args_list]
         assert actual_calls == expected_calls
 

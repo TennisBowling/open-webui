@@ -63,6 +63,13 @@ class WebSearchTools:
         self._jina_usage_lock = asyncio.Lock()
         self._exa_status_lock = asyncio.Lock()
 
+    async def _set_config_value(self, config, key: str, value) -> None:
+        setter = getattr(config, "set_async", None)
+        if callable(setter):
+            await setter(key, value)
+        else:
+            setattr(config, key, value)
+
     async def web_search(
         self,
         query: str,
@@ -223,7 +230,7 @@ class WebSearchTools:
                 new_status = dict(current)
                 new_status[slot] = {"error": reason, "at": int(time.time())}
 
-            config.EXA_KEY_STATUS = new_status
+            await self._set_config_value(config, "EXA_KEY_STATUS", new_status)
 
     async def web_fetch(
         self,
@@ -383,7 +390,11 @@ class WebSearchTools:
                 current_usage = int(getattr(config, 'JINA_READER_TOKEN_USAGE', 0) or 0)
             except Exception:
                 current_usage = 0
-            config.JINA_READER_TOKEN_USAGE = current_usage + int(tokens)
+            await self._set_config_value(
+                config,
+                "JINA_READER_TOKEN_USAGE",
+                current_usage + int(tokens),
+            )
 
 
 # Singleton instance

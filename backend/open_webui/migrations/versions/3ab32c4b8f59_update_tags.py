@@ -6,7 +6,7 @@ Create Date: 2024-10-09 21:02:35.241684
 
 """
 
-from alembic import op
+from alembic import op, context
 import sqlalchemy as sa
 from sqlalchemy.sql import table, select, update, column
 from sqlalchemy.engine.reflection import Inspector
@@ -20,6 +20,8 @@ depends_on = None
 
 
 def upgrade():
+    if context.is_offline_mode():
+        return
     conn = op.get_bind()
     inspector = Inspector.from_engine(conn)
 
@@ -64,6 +66,8 @@ def upgrade():
 
 
 def downgrade():
+    if context.is_offline_mode():
+        return
     conn = op.get_bind()
     inspector = Inspector.from_engine(conn)
 

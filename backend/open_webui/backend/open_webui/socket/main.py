@@ -138,7 +138,7 @@ if WEBSOCKET_MANAGER == "redis":
         redis_sentinels=redis_sentinels,
     )
 
-    # Stream v2 state: per-message version counter, slim content snapshot, and
+    # Stream v2.1 state: per-message version counter, slim content snapshot, and
     # tool result cache. All are keyed by message_id. Cleared on chat:done /
     # error / cancel. Snapshot endpoint (B1) reads from here.
     STREAM_VERSION = RedisDict(
@@ -569,7 +569,7 @@ async def process_token_usage(
         # 2. Store immutable per-request event first. This is the source of
         # truth for future rebuilds and precise subagent analytics.
         if chat_id and user_id:
-            Analytics.record_token_usage_event(
+            await Analytics.record_token_usage_event(
                 user_id=user_id,
                 source_chat_id=event_source_chat_id,
                 attributed_chat_id=chat_id,
@@ -587,7 +587,7 @@ async def process_token_usage(
         # 3. Update conversation token usage (per-visible-chat tracking)
         if chat_id and user_id:
             log.info(f"📊 [process_token_usage] Updating conversation token usage for chat={chat_id}, user={user_id}")
-            result = Analytics.update_conversation_token_usage(
+            result = await Analytics.update_conversation_token_usage(
                 chat_id=chat_id,
                 user_id=user_id,
                 model_id=model_id,
@@ -603,7 +603,7 @@ async def process_token_usage(
         # 4. Update daily token usage (for heatmaps)
         if user_id:
             log.info(f"📊 [process_token_usage] Updating daily token usage for user={user_id}")
-            Analytics.update_daily_token_usage(
+            await Analytics.update_daily_token_usage(
                 user_id=user_id,
                 token_in=token_in,
                 token_out=token_out,
@@ -614,7 +614,7 @@ async def process_token_usage(
         
         # 5. Update model token usage (for model breakdowns)
         log.info(f"📊 [process_token_usage] Updating model token usage for model={model_id}")
-        Analytics.update_model_token_usage(
+        await Analytics.update_model_token_usage(
             user_id=user_id,
             model_id=model_id,
             token_in=token_in,
@@ -701,7 +701,7 @@ async def user_join(sid, data):
     primary_sid = _elect_primary_session(user.id, sid)
 
     # Join all the channels
-    channels = Channels.get_channels_by_user_id(user.id)
+    channels = await Channels.get_channels_by_user_id(user.id)
     log.debug(f"{channels=}")
     for channel in channels:
         await sio.enter_room(sid, f"channel:{channel.id}")
@@ -723,7 +723,7 @@ async def join_channel(sid, data):
         return
 
     # Join all the channels
-    channels = Channels.get_channels_by_user_id(user.id)
+    channels = await Channels.get_channels_by_user_id(user.id)
     log.debug(f"{channels=}")
     for channel in channels:
         await sio.enter_room(sid, f"channel:{channel.id}")
@@ -1098,14 +1098,14 @@ def get_event_emitter(request_info, update_db=True):
             and not request_info.get("chat_id", "").startswith("local:")
         ):
             if "type" in event_data and event_data["type"] == "status":
-                Chats.add_message_status_to_chat_by_id_and_message_id(
+                await Chats.add_message_status_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     event_data.get("data", {}),
                 )
 
             if "type" in event_data and event_data["type"] == "message":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1114,7 +1114,7 @@ def get_event_emitter(request_info, update_db=True):
                     content = message.get("content", "")
                     content += event_data.get("data", {}).get("content", "")
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1125,7 +1125,7 @@ def get_event_emitter(request_info, update_db=True):
             if "type" in event_data and event_data["type"] == "replace":
                 content = event_data.get("data", {}).get("content", "")
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1134,7 +1134,7 @@ def get_event_emitter(request_info, update_db=True):
                 )
 
             if "type" in event_data and event_data["type"] == "embeds":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1142,7 +1142,7 @@ def get_event_emitter(request_info, update_db=True):
                 embeds = event_data.get("data", {}).get("embeds", [])
                 embeds.extend(message.get("embeds", []))
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1151,7 +1151,7 @@ def get_event_emitter(request_info, update_db=True):
                 )
 
             if "type" in event_data and event_data["type"] == "data_viz:override":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1166,7 +1166,7 @@ def get_event_emitter(request_info, update_db=True):
                         overrides = {}
                     overrides[key] = widget_code
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1175,7 +1175,7 @@ def get_event_emitter(request_info, update_db=True):
                     )
 
             if "type" in event_data and event_data["type"] == "files":
-                message = Chats.get_message_by_id_and_message_id(
+                message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                 )
@@ -1183,7 +1183,7 @@ def get_event_emitter(request_info, update_db=True):
                 files = event_data.get("data", {}).get("files", [])
                 files.extend(message.get("files", []))
 
-                Chats.upsert_message_to_chat_by_id_and_message_id(
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
@@ -1194,7 +1194,7 @@ def get_event_emitter(request_info, update_db=True):
             if event_data.get("type") in ["source", "citation"]:
                 data = event_data.get("data", {})
                 if data.get("type") == None:
-                    message = Chats.get_message_by_id_and_message_id(
+                    message = await Chats.get_message_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                     )
@@ -1202,7 +1202,7 @@ def get_event_emitter(request_info, update_db=True):
                     sources = message.get("sources", [])
                     sources.append(data)
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
                         request_info["chat_id"],
                         request_info["message_id"],
                         {
@@ -1244,7 +1244,7 @@ async def broadcast_sidebar_event(user_id, event_data, skip_sid=None):
 
 def is_primary_session(user_id, sid) -> bool:
     """B8 helper. Defensive fallback: if no primary is recorded for the user,
-    treat every session as primary (so v2 emission still reaches the client
+    treat every session as primary (so v2.1 emission still reaches the client
     before B8 lands)."""
     try:
         primary = PRIMARY_SESSION_PER_USER.get(user_id)
@@ -1363,13 +1363,13 @@ def clear_stream_state(message_id) -> None:
 
 async def emit_to_primary(user_id, payload):
     """Emit a single events payload to the user's primary session only. Falls
-    back to all sessions if no primary is registered (defensive — keeps v2
+    back to all sessions if no primary is registered (defensive — keeps v2.1
     working before B8 ships the election logic)."""
-    # v2 batching layer: collapse per-tick chat:delta / tool_call:result
+    # v2.1 batching layer: collapse per-tick chat:delta / tool_call:result
     # emissions into a single envelope per user. See _flush_delta_buffer.
     if (
         STREAM_DELTA_BATCH_ENABLED
-        and STREAM_PROTOCOL_VERSION == "v2"
+        and STREAM_PROTOCOL_VERSION == "v2.1"
         and user_id
         and _is_batchable_payload(payload)
     ):
@@ -1377,7 +1377,7 @@ async def emit_to_primary(user_id, payload):
         return
     # Non-batchable / terminal event: drain any pending batch first so order
     # is preserved (deltas before the terminal envelope), then emit directly.
-    if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2" and user_id:
+    if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2.1" and user_id:
         await _flush_delta_buffer(user_id)
     await _emit_to_primary_raw(user_id, payload)
 
@@ -1388,12 +1388,12 @@ async def _emit_to_primary_raw(user_id, payload):
     except Exception:
         primary = None
 
-    # Stream-v2 chat responses are initiated by one concrete browser session,
+    # Stream-v2.1 chat responses are initiated by one concrete browser session,
     # but are normally routed through the elected primary session so that the
     # primary tab can BroadcastChannel-relay to sibling tabs. If the submitting
     # tab is not primary (or the primary entry is stale), primary-only delivery
     # makes that tab wait forever. When an envelope carries the originating
-    # session_id, deliver to both the primary and the origin. Versioned v2
+    # session_id, deliver to both the primary and the origin. Versioned v2.1
     # deltas are idempotent on the client, so a same-browser BroadcastChannel
     # replay plus this direct emit will not double-append content.
     origin_sid = None

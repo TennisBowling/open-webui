@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Start Modified OpenWebUI with Token Usage Tracking and Reasoning Effort
-# This script ensures the modified version uses your existing database and settings
+# This script expects the migrated Postgres database URL in DATABASE_URL.
 # It also builds the frontend if needed
 
 set -e
@@ -41,8 +41,18 @@ fi
 # high-throughput reasoning models. Opt in explicitly if needed:
 #   ENABLE_API_DEBUG_LOGGING=true ./start_modified.sh
 export ENABLE_API_DEBUG_LOGGING="${ENABLE_API_DEBUG_LOGGING:-false}"
+export VECTOR_DB="${VECTOR_DB:-pgvector}"
+export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://tennisbowling:tennispass@192.168.10.2:5432/openllm}"
+export DATABASE_POOL_SIZE="${DATABASE_POOL_SIZE:-20}"
+export DATABASE_POOL_MAX_OVERFLOW="${DATABASE_POOL_MAX_OVERFLOW:-20}"
 
-# Set up environment to use existing OpenWebUI data (Ubuntu-specific paths)
+if [ -z "${DATABASE_URL:-}" ]; then
+    echo "❌ DATABASE_URL is required for the Postgres-only runtime."
+    echo "   Example: postgresql+asyncpg://openwebui:password@host:5432/openwebui"
+    exit 1
+fi
+
+# Set up environment to use existing OpenWebUI data files/uploads (Ubuntu-specific paths)
 if [ -d "/home/tennisbowling" ]; then
     export DATA_DIR="/home/tennisbowling/.local/lib/python3.12/site-packages/open_webui/data"
     export PYTHONPATH="/home/tennisbowling/open-webui/backend"
@@ -53,14 +63,17 @@ else
     cd "$SCRIPT_DIR/backend"
 fi
 
-# Activate virtual environment
-if [ -f "../venv/bin/activate" ]; then
+# Use system Python by default. This host keeps the Open WebUI data directory
+# under the user site-packages path, and the Postgres runtime deps are installed
+# into the system/user Python environment.
+if [ "${USE_VENV:-false}" = "true" ] && [ -f "../venv/bin/activate" ]; then
     source ../venv/bin/activate
 else
-    echo "⚠️  Virtual environment not found, using system Python"
+    echo "✅ Using system Python"
 fi
 
 # Start the server
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 echo ""
 echo "============================================================"
 echo "📊 Starting server with enhanced features..."
@@ -77,4 +90,4 @@ echo "Press Ctrl+C to stop the server"
 echo "============================================================"
 echo ""
 
-exec python -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 75 --loop uvloop --http httptools
+exec "$PYTHON_BIN" -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 75 --loop uvloop --http httptools

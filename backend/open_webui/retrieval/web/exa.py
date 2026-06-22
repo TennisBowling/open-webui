@@ -12,6 +12,7 @@ from typing import Optional, List
 import aiohttp
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.retrieval.web.main import SearchResult
+from open_webui.retrieval.web.session import session_for_current_loop
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
@@ -74,10 +75,11 @@ async def _post_exa_json(
             except Exception as e:
                 raise Exception(f"Exa API {path} returned invalid JSON: {e}")
 
-    if session is not None and not session.closed:
-        return await run_with_session(session)
+    active_session = session_for_current_loop(session)
+    if active_session is not None:
+        return await run_with_session(active_session)
 
-    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as owned_session:
         return await run_with_session(owned_session)
 
 

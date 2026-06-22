@@ -209,7 +209,7 @@ def get_http_authorization_cred(auth_header: Optional[str]):
         return None
 
 
-def get_current_user(
+async def get_current_user(
     request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
@@ -251,7 +251,7 @@ def get_current_user(
                     status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED
                 )
 
-        user = get_current_user_by_api_key(token)
+        user = await get_current_user_by_api_key(token)
 
         # Add user info to current span
         current_span = trace.get_current_span()
@@ -275,7 +275,7 @@ def get_current_user(
             )
 
         if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+            user = await Users.get_user_by_id(data["id"])
             if user is None:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -327,8 +327,8 @@ def get_current_user(
         raise e
 
 
-def get_current_user_by_api_key(api_key: str):
-    user = Users.get_user_by_api_key(api_key)
+async def get_current_user_by_api_key(api_key: str):
+    user = await Users.get_user_by_api_key(api_key)
 
     if user is None:
         raise HTTPException(
@@ -344,12 +344,12 @@ def get_current_user_by_api_key(api_key: str):
             current_span.set_attribute("client.user.role", user.role)
             current_span.set_attribute("client.auth.type", "api_key")
 
-        Users.update_user_last_active_by_id(user.id)
+        await Users.update_user_last_active_by_id(user.id)
 
     return user
 
 
-def get_verified_user(user=Depends(get_current_user)):
+async def get_verified_user(user=Depends(get_current_user)):
     if user.role not in {"user", "admin"}:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -358,7 +358,7 @@ def get_verified_user(user=Depends(get_current_user)):
     return user
 
 
-def get_admin_user(user=Depends(get_current_user)):
+async def get_admin_user(user=Depends(get_current_user)):
     if user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -367,7 +367,7 @@ def get_admin_user(user=Depends(get_current_user)):
     return user
 
 
-def get_optional_user(
+async def get_optional_user(
     request: Request,
     auth_token: HTTPAuthorizationCredentials = Depends(bearer_security),
 ):
@@ -404,14 +404,14 @@ def get_optional_user(
                 ):
                     return None
 
-            user = get_current_user_by_api_key(token)
+            user = await get_current_user_by_api_key(token)
             return user
 
         # auth by jwt token
         data = decode_token(token)
         
         if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+            user = await Users.get_user_by_id(data["id"])
             if user is None:
                 return None
             else:

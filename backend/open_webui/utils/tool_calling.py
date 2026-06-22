@@ -10,6 +10,27 @@ _MCP_TOOL_NAME_MAX = 64
 _MCP_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def merge_streamed_tool_call_field(existing: str | None, chunk: str | None) -> str:
+    """Merge streamed tool-call name/argument fragments without overlap loss.
+
+    ``function.arguments`` is an executable JSON string. OpenAI-compatible
+    streams normally send true deltas, which must append byte-for-byte; generic
+    suffix-overlap dedupe corrupts repeated text like ``https://``, ``rooms``,
+    ``<<``, and long runs. The only compatibility case handled here is a
+    provider resending a cumulative full prefix.
+    """
+    if not chunk:
+        return existing or ""
+    existing = existing or ""
+    if not existing:
+        return chunk
+    if chunk == existing:
+        return existing
+    if chunk.startswith(existing):
+        return chunk
+    return existing + chunk
+
+
 def mcp_tool_alias(server_id: str, tool_name: str) -> str:
     """Build a model-facing MCP tool name within provider constraints."""
     safe_name = _MCP_TOOL_NAME_INVALID.sub("_", tool_name or "")

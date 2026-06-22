@@ -14,16 +14,10 @@ util tests).
 
 import asyncio
 import os
-import shutil
-import tempfile
 
-_TMPDIR = tempfile.mkdtemp()
-_DB_PATH = os.path.join(_TMPDIR, "headless_event_call.db")
-_HERE = os.path.dirname(__file__)
-_DEV_DB = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "data", "webui.db"))
-if os.path.exists(_DEV_DB):
-    shutil.copy(_DEV_DB, _DB_PATH)
-os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
+from test.util.db import configure_test_database
+
+configure_test_database()
 os.environ.pop("WEBSOCKET_REDIS_URL", None)
 
 from open_webui.socket.main import get_headless_event_call  # noqa: E402

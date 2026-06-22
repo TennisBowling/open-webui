@@ -45,12 +45,15 @@
 		chatTokenStats,
 		chatTokenStatsRefreshTrigger,
 		subagentLiveStates,
+		questionStates,
 		browserLiveStates,
 		showBrowserPanel,
 		browserPanelDismissed,
 		isLastActiveTab,
 		folderChatListInvalidation,
-		tokenUsageGroups as tokenUsageGroupsStore
+		tokenUsageGroups as tokenUsageGroupsStore,
+		bumpMessageRevision,
+		clearMessageRevisionStores
 	} from '$lib/stores';
 	import {
 		convertMessagesToHistory,
@@ -94,6 +97,7 @@
 		getTaskIdsByChatId,
 		getActiveStreamsByChatId,
 		getStreamSnapshot,
+		getStreamDeltas,
 		getBrowserFrame
 	} from '$lib/apis';
 	import type { ReasoningEffort } from '$lib/apis';
@@ -528,7 +532,7 @@
 	const streamFlushes = new Map<string, StreamFlushState>();
 	const streamTTSPartCounts = new Map<string, number>();
 
-	// Stream protocol v2: per-message mirror of the backend's
+	// Stream protocol v2.1: per-message mirror of the backend's
 	// `STREAM_VERSION[message_id]` + `content_blocks` + `TOOL_RESULTS` state.
 	// Used by chatDeltaHandler to apply ops in-order and recover from gaps
 	// via the snapshot endpoint (Phase 0 wire contracts #1 + #2 in the plan).
@@ -632,6 +636,7 @@
 	const releaseStreamMirror = (messageId: string) => {
 		if (!messageId) return;
 		streamMirrors.delete(messageId);
+		clearStreamCache(messageId);
 	};
 
 	const flushStreamingMessage = (messageId: string, force = false) => {
@@ -670,14 +675,11 @@
 			emitPendingTTSParts(message);
 		}
 
-		(history.messages as Record<string, any>)[messageId] = { ...message };
-		// Reassign history so bound consumers (ResponseMessage reads
-		// history.messages[messageId]) re-evaluate and the streaming leaf
-		// repaints. This does NOT bump messageStructureRevision, and
-		// Messages.svelte's chain walk is gated on a content-independent
-		// structural key — so this per-frame flush repaints only the streaming
-		// leaf instead of re-walking + re-rendering the entire message list.
-		history = { ...history };
+		(history.messages as Record<string, any>)[messageId] = message;
+		// Wake only the affected ResponseMessage. This avoids reassigning the whole
+		// history object on every streaming frame, so the message list and sibling
+		// responses do not re-evaluate for each token/tool delta.
+		bumpMessageRevision(messageId);
 		streamFlushes.delete(messageId);
 
 		if (autoScroll) {
@@ -806,6 +808,7 @@
 				last_output_tokens: completionTokens,
 				last_cache_read_tokens: cacheReadTokens,
 				message_count: (base?.message_count ?? 0) + (isFirstSighting ? 1 : 0),
+				cost: base?.cost ?? 0,
 				loading: false
 			};
 		});
@@ -863,6 +866,9 @@
 					}
 				} else {
 					taskIds = activeTaskIds;
+					if (($config as any)?.features?.stream_protocol_version === 'v2.1') {
+						await snapshotActiveStreamsForChat(chatIdToWatch).catch(() => []);
+					}
 				}
 			} finally {
 				resumeTaskPollInFlight = false;
@@ -1232,6 +1238,7 @@
 		initialScrollSettled = false;
 		stopSubagentUpdateBatching();
 		stopResumeTaskPolling();
+		clearMessageRevisionStores();
 		lastPersistedSelectedToolIds = null;
 		lastPersistedWebSearchEnabled = null;
 		lastPersistedStudyModeEnabled = null;
@@ -1281,12 +1288,15 @@
 			// layout-driven settle loop that re-pins to the true bottom as each
 			// band of content-visibility:auto messages realizes its real height.
 			await tick();
+			settleInterrupted = false;
 			await settleAtBottom(myGeneration);
 			if (myGeneration !== navigateGeneration) return;
 
 			messagesReady = true; // reveal — already at the bottom, no visible motion
 			initialScrollSettled = true; // allow the pagination loader to grow the window
-			autoScroll = true; // streaming / late additions stay pinned to bottom
+			// Pin to the bottom for streaming / late additions — unless the user
+			// already pulled away during the reveal, in which case honor that.
+			if (!settleInterrupted) autoScroll = true;
 
 			await tick();
 
@@ -1482,9 +1492,11 @@
 		subagentServiceTier = '';
 		subagentExternalToolsEnabled = true;
 		subagentLiveStates.set({});
+		questionStates.set({});
 		browserLiveStates.set({});
 		showBrowserPanel.set(false);
 		browserPanelDismissed.set(false);
+		clearMessageRevisionStores();
 		imageGenerationEnabled = false;
 
 		flexAutoFlipUndoneForChat = false;
@@ -1699,6 +1711,11 @@
 			if (messageElement) {
 				messageElement.scrollIntoView({ behavior: 'smooth' });
 			}
+			// Navigating to a branch message that isn't the conversation leaf means
+			// the user wants to read here, not tail the bottom — stop following so a
+			// concurrent stream / late content can't yank them off it. (The old
+			// position-based onScroll used to disengage here as a side effect.)
+			if (message.id !== _messageId) autoScroll = false;
 		}
 
 		await tick();
@@ -1835,8 +1852,8 @@
 		}
 	};
 
-	// Stream v2: apply one chat:delta op into a subagent's content_blocks
-	// mirror. Mirrors the parent-message applyDeltaOp logic. The v2 wire format
+	// Stream v2.1: apply one chat:delta op into a subagent's content_blocks
+	// mirror. Mirrors the parent-message applyDeltaOp logic. The v2.1 wire format
 	// deliberately strips heavy tool result bodies out of content_blocks and
 	// sends them via tool_call:result, so slim `{ tool_call_id }` placeholders
 	// must never overwrite a full result that the mirror already has.
@@ -1881,8 +1898,10 @@
 					block.content = existing.content;
 				}
 				mirror.content_blocks[payload.block_idx] = block;
+				changedBlocks.push(block);
 			} else {
 				mirror.content_blocks.push(block);
+				changedBlocks.push(block);
 			}
 		} else if (op === 'block_close') {
 			const block = mirror.content_blocks[payload.block_idx];
@@ -1917,6 +1936,7 @@
 					if (tc?.id === payload.tool_call_id || tc?.tool_call_id === payload.tool_call_id) {
 						const fn = tc.function || (tc.function = {});
 						fn.arguments = (fn.arguments || '') + (payload.args_delta || '');
+						changedBlocks.push(block);
 						found = true;
 						break;
 					}
@@ -1965,9 +1985,14 @@
 				num: sd.num,
 				name: sd.name,
 				chat_id: sd.chat_id ?? sd.subagent_id,
-				status: 'running'
+				status: 'running',
+				// Seed timing from the event if an update raced ahead of the
+				// `chat:subagent:start` (otherwise a done-before-start leaves the
+				// run with ended_at but no started_at → bare "Done" not a timer).
+				started_at: sd.started_at
 			})
 		};
+		if (cur.started_at == null && sd.started_at != null) cur.started_at = sd.started_at;
 
 		cur.subagent_id = cur.subagent_id ?? sd.subagent_id;
 		cur.entry_key = cur.entry_key ?? sd.entry_key ?? sd.subagent_id;
@@ -1982,7 +2007,7 @@
 			cur.statusHistory = [...sh, ...pending.statuses].slice(-SUBAGENT_STATUS_HISTORY_LIMIT);
 		}
 
-		// Stream-v2 inner events: apply deltas + tool results to the per-run
+		// Stream-v2.1 inner events: apply deltas + tool results to the per-run
 		// mirror so SubagentBlock keeps rendering off `content_blocks`.
 		if (Array.isArray(pending.deltas) && pending.deltas.length > 0) {
 			let blocks = Array.isArray(cur.content_blocks) ? cur.content_blocks.slice() : [];
@@ -2064,7 +2089,7 @@
 		}
 
 		if (pending.doneEvent) {
-			// v2 terminal: chat:done finalizes the subagent's mirror.
+			// v2.1 terminal: chat:done finalizes the subagent's mirror.
 			const doneData = pending.doneEvent?.data ?? {};
 			cur.status = 'done';
 			cur.ended_at = Math.floor(Date.now() / 1000);
@@ -2196,7 +2221,30 @@
 
 		const resolvedMessageId = resolveChatEventMessageId(event.message_id);
 		const message = resolvedMessageId ? history.messages[resolvedMessageId] : null;
-		if (!message || message.retrying) return true;
+		if (!message) {
+			const messageId = event.message_id ?? data?.message_id;
+			if (messageId && type === 'chat:delta') {
+				const mirror = getOrCreateStreamMirror(messageId);
+				mirror.pending_deltas.push({
+					op: data?.op || '',
+					version: typeof data?.version === 'number' ? data.version : 0,
+					payload: data?.payload
+				});
+				void requestStreamSnapshot(messageId, event.chat_id);
+				return true;
+			}
+			if (messageId && type === 'tool_call:result' && data?.tool_call_id) {
+				const mirror = getOrCreateStreamMirror(messageId);
+				mirror.tool_results.set(
+					data.tool_call_id,
+					normalizeToolResultEntry(data.tool_call_id, data)
+				);
+				void requestStreamSnapshot(messageId, event.chat_id);
+				return true;
+			}
+			return true;
+		}
+		if (message.retrying) return true;
 
 		if (type === 'chat:delta') {
 			chatDeltaHandler(data, message, event.chat_id);
@@ -2223,10 +2271,56 @@
 		const data = event?.data?.data ?? null;
 		streamPerfCount(`chat.event.${type ?? 'unknown'}`);
 
-		// Stream-v2 batching: socket.main may coalesce consecutive chat:delta /
+		// Stream-v2.1 batching: socket.main may coalesce consecutive chat:delta /
 		// tool_call:result envelopes into one chat:delta:batch. Chat.svelte owns
 		// the live message mirror, so it must unpack the batch itself; the global
 		// layout handler cannot mutate this component's history.
+		if (type === 'chat:delta:batch2') {
+			const groups = Array.isArray(event?.data?.groups) ? event.data.groups : [];
+			let innerCount = 0;
+			for (const group of groups) {
+				const messageId = group?.message_id ?? event.message_id;
+				const baseVersion = typeof group?.base_version === 'number' ? group.base_version : 0;
+				const offsetVersions = group?.version_mode === 'offset';
+				for (const delta of Array.isArray(group?.deltas) ? group.deltas : []) {
+					if (!Array.isArray(delta) || delta.length < 2) continue;
+					const [encodedVersion, opCode] = delta;
+					if (typeof encodedVersion !== 'number') continue;
+					const version = offsetVersions ? baseVersion + encodedVersion : encodedVersion;
+					const op = compactStreamOps[opCode] ?? opCode;
+					const payload = decodeCompactStreamPayload(op, delta);
+					const innerEvent = {
+						chat_id: event.chat_id,
+						message_id: messageId,
+						data: {
+							type: 'chat:delta',
+							data: {
+								message_id: messageId,
+								version,
+								op,
+								payload
+							}
+						}
+					};
+					innerCount += 1;
+					if (applyBatchedStreamEvent(innerEvent)) continue;
+					await chatEventHandler(innerEvent, cb, { skipTick: true });
+				}
+				for (const result of Array.isArray(group?.tool_results) ? group.tool_results : []) {
+					const innerEvent = {
+						chat_id: event.chat_id,
+						message_id: messageId,
+						data: { type: 'tool_call:result', data: { ...result, message_id: messageId } }
+					};
+					innerCount += 1;
+					if (applyBatchedStreamEvent(innerEvent)) continue;
+					await chatEventHandler(innerEvent, cb, { skipTick: true });
+				}
+			}
+			streamPerfEnd('chat.event_handler', perf, innerCount || 1);
+			return;
+		}
+
 		if (type === 'chat:delta:batch') {
 			const batch = Array.isArray(event?.data?.batch) ? event.data.batch : [];
 			streamPerfCount('chat.event.batch_inner', batch.length);
@@ -2279,10 +2373,7 @@
 			// each subagent is its subagent_id) so concurrent browsers don't
 			// overwrite each other. Legacy frames without a session fall back to the
 			// message id (single-tab behavior, unchanged).
-			const bid =
-				data?.session ||
-				resolveChatEventMessageId(event.message_id) ||
-				event.message_id;
+			const bid = data?.session || resolveChatEventMessageId(event.message_id) || event.message_id;
 			if (bid) {
 				// Derive startedAt from the daemon's elapsedMs so the timer (a)
 				// resets per browser call within a turn and (b) is immune to
@@ -2324,7 +2415,18 @@
 			return;
 		}
 
-				// Server-driven queue reflection. The backend owns draining for DB chats;
+		if (type === 'chat:stream:sync_required') {
+			const messageId = data?.message_id ?? event.message_id;
+			if (messageId) {
+				const replayed = await requestStreamReplay(messageId, event.chat_id).catch(() => false);
+				if (!replayed) {
+					await requestStreamSnapshot(messageId, event.chat_id, { force: true });
+				}
+			}
+			return;
+		}
+
+		// Server-driven queue reflection. The backend owns draining for DB chats;
 		// these events let every tab (and a later-opened tab) mirror the queue
 		// state and attach to a generation it didn't start.
 		if (type === 'chat:queue:updated') {
@@ -2471,7 +2573,19 @@
 						// authoritative over the parent message's persisted
 						// `<details done="true">` placeholder (not rewritten on redo).
 						live: true,
-						started_at: existing.started_at || now
+						// Prefer the event's start time (the backend stamps it on every
+						// start, including reruns) so a redo times from the REDO, not the
+						// original launch — and every tab agrees. Falls back to a prior
+						// value, then the local clock.
+						started_at: sd.started_at ?? existing.started_at ?? now,
+						// A (re)start resets the terminal state so a redo observed in any
+						// tab clears the prior answer/timer instead of showing stale data.
+						ended_at: undefined,
+						final_text: undefined,
+						error: undefined,
+						stale: false,
+						content_blocks: [],
+						content: ''
 					};
 					persistedRun = next;
 					const out = { ...s };
@@ -2494,6 +2608,10 @@
 		let message = resolvedMessageId ? history.messages[resolvedMessageId] : null;
 
 		if (!message) {
+			if ((type === 'chat:delta' || type === 'tool_call:result') && event.message_id) {
+				applyBatchedStreamEvent(event);
+				return;
+			}
 			// CRITICAL: with the tightened resolveChatEventMessageId, an event
 			// reaches this "no message" branch only when it (a) had no
 			// message_id, or (b) named a message id we don't have. Case (b) is
@@ -2593,17 +2711,17 @@
 			// would overwrite the done=true state set inside chatCompletionEventHandler.
 			return;
 		} else if (type === 'chat:delta') {
-			// Stream protocol v2: backend emits per-op deltas instead of resending
+			// Stream protocol v2.1: backend emits per-op deltas instead of resending
 			// the full content_blocks every tick. See plan Phase 0 wire contract #1.
 			chatDeltaHandler(data, message, event.chat_id);
 			return;
 		} else if (type === 'tool_call:result') {
-			// Stream protocol v2: tool results are emitted once, by id; subsequent
+			// Stream protocol v2.1: tool results are emitted once, by id; subsequent
 			// deltas reference the tool_call_id without resending the body.
 			toolCallResultHandler(data, message);
 			return;
 		} else if (type === 'chat:done') {
-			// Stream protocol v2 terminal event. Mirrors the v1 `chat:completion`
+			// Stream protocol v2.1 terminal event. Mirrors the v1 `chat:completion`
 			// `done:true` finalize path.
 			await chatDoneHandler(data, message, event.chat_id);
 			return;
@@ -2774,6 +2892,102 @@
 	let selectedFolderSubscribe = null;
 	let socketSubscribe = null;
 	let subscribedStreamChatId: string | null = null;
+	const streamCapabilities = {
+		compact_batch: true,
+		replay: true,
+		ack: true,
+		visibility: true
+	};
+	const compactStreamOps: Record<string, string> = {
+		t: 'text_append',
+		o: 'block_open',
+		c: 'block_close',
+		a: 'tool_call_add',
+		g: 'tool_call_args_append',
+		r: 'reasoning_detail_merge',
+		s: 'sources',
+		m: 'selected_model_id',
+		u: 'usage',
+		p: 'replace',
+		x: 'snapshot'
+	};
+	const decodeCompactStreamPayload = (op: string, frame: any[]) => {
+		const legacyPayload =
+			frame.length === 3 && frame[2] && typeof frame[2] === 'object' && !Array.isArray(frame[2]);
+		if (op === 'text_append') {
+			return legacyPayload ? frame[2] : { block_idx: frame[2], text: frame[3] ?? '' };
+		}
+		if (op === 'block_open') {
+			return legacyPayload
+				? frame[2]
+				: { block_idx: frame[2], type: frame[3], attrs: frame[4] ?? {} };
+		}
+		if (op === 'block_close') {
+			if (legacyPayload) return frame[2];
+			return {
+				block_idx: frame[2],
+				...(frame[3] != null ? { duration: frame[3] } : {}),
+				...(frame[4] != null ? { output: frame[4] } : {}),
+				...(frame[5] != null ? { ended: frame[5] } : {}),
+				...(Array.isArray(frame[6]) ? { results: frame[6] } : {})
+			};
+		}
+		if (op === 'tool_call_add') {
+			return legacyPayload ? frame[2] : { block_idx: frame[2], tool_call: frame[3] };
+		}
+		if (op === 'tool_call_args_append') {
+			return legacyPayload ? frame[2] : { tool_call_id: frame[2], args_delta: frame[3] ?? '' };
+		}
+		if (op === 'reasoning_detail_merge') {
+			if (legacyPayload && 'detail' in frame[2]) return frame[2];
+			return { detail: frame[2] ?? {} };
+		}
+		if (op === 'sources') {
+			return legacyPayload ? frame[2] : { sources: Array.isArray(frame[2]) ? frame[2] : [] };
+		}
+		if (op === 'selected_model_id') {
+			return legacyPayload ? frame[2] : { model_id: frame[2] };
+		}
+		if (op === 'usage') {
+			return legacyPayload ? frame[2] : { usage: frame[2] ?? {} };
+		}
+		if (op === 'replace') {
+			return legacyPayload
+				? frame[2]
+				: { block_idx: frame[2] ?? 0, content_blocks: Array.isArray(frame[3]) ? frame[3] : [] };
+		}
+		return legacyPayload ? frame[2] : (frame[2] ?? {});
+	};
+	const lastAckedStreamVersionByMessage = new Map<string, number>();
+	const pendingAckByMessage = new Map<string, number>();
+	let ackFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	let streamAckIntervalMs = 250;
+	const streamCacheTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	const streamVisible = () =>
+		typeof document === 'undefined' || document.visibilityState === 'visible';
+	const streamCacheKey = (chatId: string | null, messageId: string) =>
+		chatId && messageId ? `owui:stream-cache:${chatId}:${messageId}` : '';
+
+	const clearStreamCache = (messageId: string) => {
+		if (!messageId) return;
+		const suffix = `:${messageId}`;
+		for (const [key, timer] of streamCacheTimers.entries()) {
+			if (!key.endsWith(suffix)) continue;
+			clearTimeout(timer);
+			streamCacheTimers.delete(key);
+		}
+		if (typeof sessionStorage === 'undefined') return;
+		try {
+			for (let i = sessionStorage.length - 1; i >= 0; i--) {
+				const key = sessionStorage.key(i);
+				if (key?.startsWith('owui:stream-cache:') && key.endsWith(suffix)) {
+					sessionStorage.removeItem(key);
+				}
+			}
+		} catch {
+			// Best-effort cleanup; storage access can throw in hardened browser contexts.
+		}
+	};
 
 	const emitSocketAck = <T = any,>(
 		event: string,
@@ -2799,6 +3013,98 @@
 			});
 		});
 
+	const flushStreamAcks = () => {
+		ackFlushTimer = null;
+		if (!$socket || pendingAckByMessage.size === 0) return;
+		const visibleChatId = getVisibleChatId();
+		if (!visibleChatId) return;
+		for (const [messageId, version] of pendingAckByMessage.entries()) {
+			pendingAckByMessage.delete(messageId);
+			const lastAcked = lastAckedStreamVersionByMessage.get(messageId) ?? 0;
+			if (version <= lastAcked) continue;
+			lastAckedStreamVersionByMessage.set(messageId, version);
+			$socket.emit('stream:ack', {
+				chat_id: visibleChatId,
+				message_id: messageId,
+				version
+			});
+		}
+	};
+
+	const scheduleStreamAck = (messageId: string, version: number) => {
+		if (!messageId || !Number.isFinite(version) || version <= 0) return;
+		pendingAckByMessage.set(messageId, Math.max(pendingAckByMessage.get(messageId) ?? 0, version));
+		if (ackFlushTimer) return;
+		ackFlushTimer = setTimeout(flushStreamAcks, Math.max(50, streamAckIntervalMs || 250));
+	};
+
+	const applyStreamRuntimeConfig = (runtime: any) => {
+		const ackInterval = Number(runtime?.ack_interval_ms);
+		if (Number.isFinite(ackInterval)) {
+			streamAckIntervalMs = Math.max(50, Math.min(2000, ackInterval));
+		}
+	};
+
+	const writeStreamCache = (messageId: string, chatId: string | null) => {
+		if (typeof sessionStorage === 'undefined') return;
+		const key = streamCacheKey(chatId, messageId);
+		if (!key) return;
+		const mirror = streamMirrors.get(messageId);
+		if (!mirror || mirror.version <= 0 || !Array.isArray(mirror.content_blocks)) return;
+		try {
+			sessionStorage.setItem(
+				key,
+				JSON.stringify({
+					version: mirror.version,
+					content_blocks: mirror.content_blocks,
+					ts: Date.now()
+				})
+			);
+		} catch {
+			// Best-effort cache; quota failures should never affect streaming.
+		}
+	};
+
+	const scheduleStreamCacheWrite = (messageId: string, chatId: string | null) => {
+		const key = streamCacheKey(chatId, messageId);
+		if (!key || streamCacheTimers.has(key)) return;
+		streamCacheTimers.set(
+			key,
+			setTimeout(() => {
+				streamCacheTimers.delete(key);
+				writeStreamCache(messageId, chatId);
+			}, 1000)
+		);
+	};
+
+	const hydrateStreamFromCache = (messageId: string, chatId: string | null) => {
+		if (typeof sessionStorage === 'undefined') return false;
+		const key = streamCacheKey(chatId, messageId);
+		if (!key) return false;
+		try {
+			const raw = sessionStorage.getItem(key);
+			if (!raw) return false;
+			const cached = JSON.parse(raw);
+			if (!cached || typeof cached.version !== 'number' || !Array.isArray(cached.content_blocks)) {
+				return false;
+			}
+			const mirror = getOrCreateStreamMirror(messageId);
+			if (mirror.version >= cached.version) return false;
+			mirror.version = cached.version;
+			mirror.content_blocks = cached.content_blocks;
+			const message = history.messages?.[messageId];
+			if (message) {
+				writeMirrorToMessage(mirror, message);
+				history.messages[messageId] = message;
+				scheduleStreamingMessageFlush(messageId, { runTTS: false, ownerId: messageId });
+			}
+			scheduleStreamAck(messageId, mirror.version);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
 	const unsubscribeStreamChat = (chatIdToUnsubscribe: string | null = subscribedStreamChatId) => {
 		if (!chatIdToUnsubscribe || !$socket) return;
 		$socket.emit('stream:unsubscribe', { chat_id: chatIdToUnsubscribe });
@@ -2813,16 +3119,31 @@
 		if (subscribedStreamChatId) {
 			unsubscribeStreamChat(subscribedStreamChatId);
 		}
-		const response = await emitSocketAck<{ status?: boolean; streams?: any[] }>(
+		const response = await emitSocketAck<{ status?: boolean; streams?: any[]; runtime?: any }>(
 			'stream:subscribe',
 			{
-				chat_id: chatIdToSubscribe
+				chat_id: chatIdToSubscribe,
+				visible: streamVisible(),
+				capabilities: streamCapabilities
 			}
 		);
 		if (response?.status) {
+			applyStreamRuntimeConfig(response.runtime);
 			subscribedStreamChatId = chatIdToSubscribe;
 		}
 		return response;
+	};
+
+	const sendStreamVisibility = () => {
+		const visibleChatId = getVisibleChatId();
+		if (!$socket || !visibleChatId || $temporaryChatEnabled) return;
+		$socket.emit('stream:visibility', {
+			chat_id: visibleChatId,
+			visible: streamVisible()
+		});
+		if (streamVisible()) {
+			void snapshotActiveStreamsForChat(visibleChatId);
+		}
 	};
 
 	// Cmd/Ctrl+S inside a temporary chat saves it instead of triggering the
@@ -2848,6 +3169,7 @@
 
 		window.addEventListener('message', onMessageHandler);
 		window.addEventListener('keydown', onSaveChatShortcut);
+		document.addEventListener('visibilitychange', sendStreamVisibility);
 
 		// Register socket event handler reactively
 		socketSubscribe = socket.subscribe((_socket) => {
@@ -2883,11 +3205,11 @@
 									await loadChat();
 								} else {
 									console.log('Task is still running on the backend. Resuming stream...');
-									// v2: the RAM stream store is authoritative while a
+									// v2.1: the RAM stream store is authoritative while a
 									// generation is active. Ask the backend for active stream
 									// message ids and snapshot those directly instead of
 									// guessing from DB `done` flags.
-									if (($config as any)?.features?.stream_protocol_version === 'v2') {
+									if (($config as any)?.features?.stream_protocol_version === 'v2.1') {
 										await snapshotActiveStreamsForChat(visibleChatId);
 									}
 								}
@@ -3003,6 +3325,15 @@
 			chatIdUnsubscriber?.();
 			window.removeEventListener('message', onMessageHandler);
 			window.removeEventListener('keydown', onSaveChatShortcut);
+			document.removeEventListener('visibilitychange', sendStreamVisibility);
+			if (ackFlushTimer) {
+				clearTimeout(ackFlushTimer);
+				ackFlushTimer = null;
+			}
+			for (const timer of streamCacheTimers.values()) {
+				clearTimeout(timer);
+			}
+			streamCacheTimers.clear();
 			$socket?.off('events', chatEventHandler);
 		} catch (e) {
 			console.error(e);
@@ -3307,6 +3638,7 @@
 			currentId: null
 		};
 		subagentLiveStates.set({});
+		questionStates.set({});
 
 		chatFiles = [];
 		params = {};
@@ -3421,7 +3753,7 @@
 		}
 
 		// Subscribe before requesting active snapshots so any deltas that arrive
-		// during snapshot fetch are buffered/replayed by the v2 mirror.
+		// during snapshot fetch are buffered/replayed by the v2.1 mirror.
 		const _subscribeRes = await subscribeStreamChat(currentChatId);
 
 		let _chat,
@@ -3510,7 +3842,7 @@
 			return values.filter((id): id is string => typeof id === 'string' && id.length > 0);
 		};
 
-		// Repair rows created by the broken new-chat stream-v2 path: the final
+		// Repair rows created by the broken new-chat stream-v2.1 path: the final
 		// stream upsert could create an assistant row before the placeholder row
 		// was appended, leaving it with role="" and no parentId. That made reloads
 		// render a blank conversation even though content_blocks were saved.
@@ -3579,9 +3911,16 @@
 		rememberPersistedSelectedModels(currentChatId);
 		oldSelectedModelIds = selectedModels;
 
+		const hasActiveTasksOnLoad = (_taskRes?.task_ids ?? []).some(
+			(taskId) => !isUserStoppedTaskId(taskId)
+		);
+
 		if (loadedHistory.currentId) {
 			for (const message of Object.values(loadedHistory.messages)) {
 				if (message.role === 'assistant') {
+					if (hasActiveTasksOnLoad && message.done === false && !message.error) {
+						continue;
+					}
 					message.done = true;
 				}
 			}
@@ -3628,6 +3967,16 @@
 		// `undefined` is normal and just means an empty queue.
 		queue = Array.isArray(chatContent?.queue) ? chatContent.queue : [];
 		_wasGenerating = false;
+
+		// Seed ask_user question state (drafts + submitted answers) so an inline
+		// question card restores partial selections / its locked answer across a
+		// reload. Replace, don't merge — like subagentLiveStates, stale entries
+		// from a previously-viewed chat must not leak in.
+		questionStates.set(
+			chatContent?.question_states && typeof chatContent.question_states === 'object'
+				? chatContent.question_states
+				: {}
+		);
 
 		if (Array.isArray(params.selectedToolIds)) {
 			selectedToolIds = params.selectedToolIds;
@@ -3840,8 +4189,7 @@
 					try {
 						const f = await getBrowserFrame(localStorage.token, mid, currentChatId);
 						if (!f) return;
-						const sessions =
-							Array.isArray(f.sessions) && f.sessions.length ? f.sessions : null;
+						const sessions = Array.isArray(f.sessions) && f.sessions.length ? f.sessions : null;
 						const entries = sessions ?? (f.frame ? [{ ...f, session: undefined }] : []);
 						let anyLive = false;
 						for (const entry of entries) {
@@ -3892,13 +4240,27 @@
 		return true;
 	};
 
-	const AUTO_SCROLL_STICKY_THRESHOLD = 96;
+	// Re-engage stick-to-bottom once the user brings themselves back within this
+	// many px of the bottom. Disengaging is gesture-driven (wheel / touch), so this
+	// threshold governs only re-engagement. The asymmetry — trivial to leave,
+	// deliberate to rejoin — is what makes a fast stream feel right instead of
+	// "impossible to escape".
+	const AUTO_SCROLL_REENGAGE_PX = 64;
+	// After the user pulls away (or a programmatic nudge), briefly suppress
+	// position-based re-engagement so trackpad / touch momentum settling can't snap
+	// the view back to the bottom against their intent.
+	const REENGAGE_COOLDOWN_MS = 250;
+	const WHEEL_UP_DEADZONE = 0.5; // filter sub-pixel jitter, still catch a line/page tick up
+	const TOUCH_UP_DEADZONE = 6; // px of finger travel before it counts as a drag-up
 
 	let scrollToBottomFrame: number | null = null;
 	let scrollStateFrame: number | null = null;
 	let pendingScrollBehavior: ScrollBehavior = 'auto';
 	let observedMessagesContentElement: HTMLDivElement | null = null;
 	let messagesResizeObserver: ResizeObserver | null = null;
+	let reengageCooldownUntil = 0;
+	let settleInterrupted = false;
+	let touchStartY = 0;
 
 	const getBottomDistance = (element: HTMLElement) =>
 		Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight);
@@ -3907,26 +4269,22 @@
 		Math.max(0, element.scrollHeight - element.clientHeight);
 
 	const isNearBottom = (element: HTMLElement) =>
-		getBottomDistance(element) <= AUTO_SCROLL_STICKY_THRESHOLD;
+		getBottomDistance(element) <= AUTO_SCROLL_REENGAGE_PX;
 
-	const updateAutoScrollFromPosition = () => {
-		if (!messagesContainerElement) return;
-		autoScroll = isNearBottom(messagesContainerElement);
-	};
-
+	// Low-level pin. Deliberately does NOT touch `autoScroll`: follow intent is
+	// owned by the gesture handlers and the re-engage logic, never re-asserted as a
+	// side effect of a programmatic scroll. (The old "impossible to escape" bug was
+	// exactly this — every pin force-wrote autoScroll = true, so the next token
+	// re-armed following the instant after the user pulled away.)
 	const scrollToBottomNow = (behavior: ScrollBehavior = 'auto') => {
 		if (!messagesContainerElement) return;
 		const target = getBottomScrollTop(messagesContainerElement);
-		if (Math.abs(messagesContainerElement.scrollTop - target) <= 1) {
-			autoScroll = true;
-			return;
-		}
+		if (Math.abs(messagesContainerElement.scrollTop - target) <= 1) return;
 
 		messagesContainerElement.scrollTo({
 			top: target,
 			behavior
 		});
-		autoScroll = true;
 	};
 
 	const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
@@ -3939,17 +4297,80 @@
 		scrollToBottomFrame = requestAnimationFrame(async () => {
 			scrollToBottomFrame = null;
 			await tick();
+			// The user may have grabbed the scroll between this frame being queued
+			// and it running — never yank them back after they've taken over.
+			if (!autoScroll) {
+				pendingScrollBehavior = 'auto';
+				return;
+			}
 			const behaviorToUse = pendingScrollBehavior;
 			pendingScrollBehavior = 'auto';
 			scrollToBottomNow(behaviorToUse);
 		});
 	};
 
+	// The ONLY programmatic path that turns following back on: explicit user
+	// actions (submit, regenerate, jump-to-bottom). Near-bottom re-engagement in
+	// onScroll is the other (user-driven) path.
+	const engageAndScrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+		autoScroll = true;
+		reengageCooldownUntil = 0;
+		scrollToBottom(behavior);
+	};
+
+	// Halt any in-flight CSS smooth-scroll animation so it can't keep dragging the
+	// viewport toward the bottom after the user has started pulling away.
+	const haltSmoothScroll = () => {
+		if (!messagesContainerElement) return;
+		messagesContainerElement.scrollTo({
+			top: messagesContainerElement.scrollTop,
+			behavior: 'auto'
+		});
+	};
+
+	// Single source of truth for "user pulled away from the bottom". Runs
+	// synchronously from the wheel / touch handlers so that by the time any
+	// ResizeObserver tick or queued pin fires, it already reads autoScroll === false
+	// and stands down. Refreshes the cooldown on every call so a continuous upward
+	// gesture is never re-engaged mid-flight.
+	const disengageAutoScroll = () => {
+		reengageCooldownUntil = performance.now() + REENGAGE_COOLDOWN_MS;
+		if (!autoScroll) return; // already free; just refreshed the cooldown
+		autoScroll = false;
+		if (scrollToBottomFrame !== null) {
+			cancelAnimationFrame(scrollToBottomFrame);
+			scrollToBottomFrame = null;
+		}
+		pendingScrollBehavior = 'auto';
+		settleInterrupted = true; // abort an initial-load settle loop if one is running
+		haltSmoothScroll();
+	};
+
+	const onWheel = (event: WheelEvent) => {
+		if (event.ctrlKey) return; // pinch-zoom gesture, not a scroll
+		if (event.deltaY < -WHEEL_UP_DEADZONE) disengageAutoScroll();
+	};
+
+	const onTouchStart = (event: TouchEvent) => {
+		if (event.touches?.length === 1) touchStartY = event.touches[0].clientY;
+	};
+
+	const onTouchMove = (event: TouchEvent) => {
+		if (event.touches?.length !== 1) return;
+		// Finger dragging down (clientY increasing) reveals earlier content — the
+		// user is scrolling up and wants out of the stream.
+		if (event.touches[0].clientY - touchStartY > TOUCH_UP_DEADZONE) disengageAutoScroll();
+	};
+
 	const onScroll = () => {
 		if (scrollStateFrame !== null) return;
 		scrollStateFrame = requestAnimationFrame(() => {
 			scrollStateFrame = null;
-			updateAutoScrollFromPosition();
+			if (!messagesContainerElement || autoScroll) return;
+			if (performance.now() < reengageCooldownUntil) return;
+			// Disengaging is gesture-driven; here we only re-arm following once the
+			// user has brought themselves back to the bottom.
+			if (isNearBottom(messagesContainerElement)) autoScroll = true;
 		});
 	};
 
@@ -3987,6 +4408,9 @@
 			let lastHeight = -1;
 			const step = () => {
 				if (generation !== navigateGeneration) return resolve();
+				// A wheel / touch gesture during the initial reveal means the user
+				// wants to read up — abort the settle instead of fighting them.
+				if (settleInterrupted) return resolve();
 				el.scrollTop = el.scrollHeight;
 				const h = el.scrollHeight;
 				stableFrames = h === lastHeight ? stableFrames + 1 : 0;
@@ -4543,11 +4967,12 @@
 		}
 	};
 
-	// Apply one v2 delta op against a StreamMirror's content_blocks array.
+	// Apply one v2.1 delta op against a StreamMirror's content_blocks array.
 	// Mirrors the backend's serialize/append logic in middleware.py — the two
 	// must stay in lockstep, exactly like the reasoning_details merger does.
 	const applyDeltaOp = (mirror: StreamMirror, op: string, payload: any) => {
 		if (!payload) payload = {};
+		const changedBlocks: any[] = [];
 		if (op === 'text_append') {
 			const idx = payload.block_idx;
 			const block = mirror.content_blocks[idx];
@@ -4556,6 +4981,7 @@
 				const current = block.content || '';
 				block.content =
 					text.includes(current) && text.length > current.length ? text : current + text;
+				changedBlocks.push(block);
 			} else if (idx === mirror.content_blocks.length) {
 				const prev = mirror.content_blocks[idx - 1];
 				// Defensive: if an out-of-order replace/open made the server send a
@@ -4567,8 +4993,11 @@
 					text.startsWith(prev.content || '')
 				) {
 					prev.content = text;
+					changedBlocks.push(prev);
 				} else {
-					mirror.content_blocks.push({ type: 'text', content: text });
+					const nextBlock = { type: 'text', content: text };
+					mirror.content_blocks.push(nextBlock);
+					changedBlocks.push(nextBlock);
 				}
 			}
 		} else if (op === 'block_open') {
@@ -4608,12 +5037,14 @@
 						Array.isArray(block.results) ? block.results : []
 					);
 				}
+				changedBlocks.push(block);
 			}
 		} else if (op === 'tool_call_add') {
 			const block = mirror.content_blocks[payload.block_idx];
 			if (block && block.type === 'tool_calls') {
 				if (!Array.isArray(block.content)) block.content = [];
 				block.content.push(payload.tool_call);
+				changedBlocks.push(block);
 			}
 		} else if (op === 'tool_call_args_append') {
 			// Tool-call argument fragments always append to the most-recently
@@ -4662,6 +5093,7 @@
 				} else {
 					target.details.push({ ...detail });
 				}
+				changedBlocks.push(target);
 			}
 		} else if (op === 'sources' || op === 'selected_model_id' || op === 'usage') {
 			// Carried on the message, not on a content block — handled by the caller.
@@ -4681,12 +5113,14 @@
 						payload.content_blocks.length,
 						...replacementBlocks
 					);
+					changedBlocks.push(...replacementBlocks);
 				} else {
 					mirror.content_blocks = hydrateToolResultsInBlocks(
 						payload.content_blocks.slice(),
 						mirror.tool_results,
 						mirror.content_blocks
 					);
+					changedBlocks.push(...mirror.content_blocks);
 				}
 			} else if (Array.isArray(payload.content_blocks)) {
 				mirror.content_blocks = hydrateToolResultsInBlocks(
@@ -4694,6 +5128,7 @@
 					mirror.tool_results,
 					mirror.content_blocks
 				);
+				changedBlocks.push(...mirror.content_blocks);
 			}
 		} else {
 			console.warn('[chat:delta] unknown op', op, payload);
@@ -4701,12 +5136,30 @@
 		if (op !== 'text_append' && op !== 'tool_call_args_append' && op !== 'reasoning_detail_merge') {
 			normalizeStreamingContentBlocks(mirror.content_blocks);
 		}
+		for (const block of changedBlocks) {
+			bumpStreamingBlockRevision(block);
+		}
 	};
 
 	const writeMirrorToMessage = (mirror: StreamMirror, message: any) => {
 		// Hand the live array to the renderer; downstream code already treats
 		// content_blocks as the canonical replay form (ResponseMessage.svelte).
 		message.content_blocks = mirror.content_blocks;
+	};
+
+	const bumpStreamingBlockRevision = (block: any) => {
+		if (!block || typeof block !== 'object') return;
+		const next = ((block as any).__owui_rev ?? 0) + 1;
+		try {
+			Object.defineProperty(block, '__owui_rev', {
+				value: next,
+				writable: true,
+				configurable: true,
+				enumerable: false
+			});
+		} catch {
+			(block as any).__owui_rev = next;
+		}
 	};
 
 	const requestStreamSnapshot = async (
@@ -4793,6 +5246,9 @@
 			}
 
 			mirror.version = typeof snap.version === 'number' ? snap.version : 0;
+			if (mirror.version > 0) {
+				scheduleStreamAck(messageId, mirror.version);
+			}
 			mirror.tool_results = new Map();
 			if (snap.tool_results && typeof snap.tool_results === 'object') {
 				for (const [k, v] of Object.entries(snap.tool_results)) {
@@ -4849,10 +5305,15 @@
 				applyDeltaOp(mirror, d.op, d.payload);
 				mirror.version = d.version;
 			}
+			if (mirror.version > 0) {
+				scheduleStreamAck(messageId, mirror.version);
+				flushStreamAcks();
+			}
 
 			writeMirrorToMessage(mirror, message);
 			history.messages[messageId] = message;
 			scheduleStreamingMessageFlush(messageId, { runTTS: false, ownerId: messageId });
+			scheduleStreamCacheWrite(messageId, chatId);
 
 			if (mirror.pending_deltas.length > 0) {
 				// Still gapped — kick off another snapshot. This is rare.
@@ -4864,6 +5325,35 @@
 		});
 
 		return mirror.snapshotPromise;
+	};
+
+	const requestStreamReplay = async (messageId: string, chatId: string | null) => {
+		if (!messageId || $temporaryChatEnabled) return false;
+		hydrateStreamFromCache(messageId, chatId);
+		const mirror = getOrCreateStreamMirror(messageId);
+		const replay = await getStreamDeltas(
+			localStorage.token,
+			messageId,
+			chatId,
+			mirror.version
+		).catch(() => null);
+		if (!replay || replay.status !== 'ok' || !Array.isArray(replay.events)) {
+			return false;
+		}
+		for (const replayEvent of replay.events) {
+			const event = {
+				chat_id: chatId,
+				message_id: messageId,
+				data: replayEvent
+			};
+			if (applyBatchedStreamEvent(event)) continue;
+			await chatEventHandler(event, () => {}, { skipTick: true });
+		}
+		if (mirror.version > 0) {
+			scheduleStreamAck(messageId, mirror.version);
+			flushStreamAcks();
+		}
+		return true;
 	};
 
 	const snapshotActiveStreamsForChat = async (chatIdToSnapshot: string | null) => {
@@ -4892,7 +5382,14 @@
 			}
 		}
 
-		await Promise.all(messageIds.map((mid) => requestStreamSnapshot(mid, chatIdToSnapshot)));
+		await Promise.all(
+			messageIds.map(async (mid) => {
+				const replayed = await requestStreamReplay(mid, chatIdToSnapshot).catch(() => false);
+				if (!replayed) {
+					await requestStreamSnapshot(mid, chatIdToSnapshot);
+				}
+			})
+		);
 		return messageIds;
 	};
 
@@ -4939,6 +5436,7 @@
 
 		applyDeltaOp(mirror, op, delta.payload);
 		if (version !== 0) mirror.version = version;
+		if (mirror.version > 0) scheduleStreamAck(message.id, mirror.version);
 
 		const payload = delta.payload || {};
 		if (op === 'sources' && Array.isArray(payload.sources)) {
@@ -4955,6 +5453,7 @@
 		writeMirrorToMessage(mirror, message);
 		history.messages[message.id] = message;
 		scheduleStreamingMessageFlush(message.id, { runTTS: false, ownerId: message.id });
+		scheduleStreamCacheWrite(message.id, chatId);
 		streamPerfEnd(`chat.delta.${op || 'unknown'}`, perf);
 	};
 
@@ -5053,6 +5552,7 @@
 					tc.result = data.result;
 				}
 			}
+			bumpStreamingBlockRevision(block);
 			break;
 		}
 		writeMirrorToMessage(mirror, message);
@@ -5100,7 +5600,12 @@
 		if (shouldFetchTerminalSnapshot) {
 			await requestStreamSnapshot(message.id, chatId, { force: true });
 		}
+		if (typeof data?.version === 'number' && data.version > 0) {
+			scheduleStreamAck(message.id, data.version);
+			flushStreamAcks();
+		}
 		writeMirrorToMessage(mirror, message);
+		writeStreamCache(message.id, chatId);
 		const generatedFiles = (message.files ?? []).filter((file: any) => file?.container_workspace);
 		if (generatedFiles.length > 0) {
 			openGeneratedFilePreview(generatedFiles);
@@ -5457,7 +5962,7 @@
 		).catch((err) => {
 			console.error('saveChatHandler failed:', err);
 		});
-		// Stream-v2 deltas are keyed to the assistant placeholder row. Make sure
+		// Stream-v2.1 deltas are keyed to the assistant placeholder row. Make sure
 		// that row exists (with parentId/role/model metadata) before the backend
 		// starts realtime upserts, otherwise the stream can create an orphan row
 		// and reloads lose the user/assistant branch relationship.
@@ -5499,7 +6004,7 @@
 						// server-side in assemble_conversation_from_leaf, so it works
 						// identically for normal sends and the zero-tab queue drain.
 
-						scrollToBottom();
+						engageAndScrollToBottom();
 
 						const MAX_RETRIES = 5;
 						let retryCancelled = false;
@@ -5899,7 +6404,7 @@
 				array.findIndex((i) => JSON.stringify(i) === JSON.stringify(item)) === index
 		);
 
-		scrollToBottom();
+		engageAndScrollToBottom();
 		eventTarget.dispatchEvent(
 			new CustomEvent('chat:start', {
 				detail: {
@@ -5933,16 +6438,17 @@
 				(selectedToolIds ?? []).includes(containerToolId)
 		);
 
-		// v2 body shape: backend assembles the conversation by walking
+		// v2.1 body shape: backend assembles the conversation by walking
 		// chat_message rows from leaf_message_id. Temporary chats aren't
 		// persisted, so they keep the v1 messages-array body. The v1 build
 		// below also stays as the fallback when the backend hasn't flipped
-		// STREAM_PROTOCOL_VERSION to v2 yet.
+		// STREAM_PROTOCOL_VERSION to v2.1 yet.
 		const isTempChat = $temporaryChatEnabled || _chatId?.startsWith('local:');
-		const useV2Body = ($config as any)?.features?.stream_protocol_version === 'v2' && !isTempChat;
+		const useV21Body =
+			($config as any)?.features?.stream_protocol_version === 'v2.1' && !isTempChat;
 
 		let messages: any[] = [];
-		if (!useV2Body) {
+		if (!useV21Body) {
 			messages = [
 				params?.system || $settings.system
 					? {
@@ -6289,7 +6795,7 @@
 					message?.tool_calls?.length ||
 					(Array.isArray(message?.content_blocks) && message.content_blocks.length > 0)
 			);
-		} // end if (!useV2Body)
+		} // end if (!useV21Body)
 
 		const toolIds = [];
 		const toolServerIds = [];
@@ -6326,13 +6832,13 @@
 			}
 		}
 
-		// In stream-v2, `_messages` is the persisted branch ending at the
+		// In stream-v2.1, `_messages` is the persisted branch ending at the
 		// just-created assistant placeholder (`responseMessageId`). For a brand-new
 		// chat that makes the branch look like [user, empty assistant], which used
 		// to suppress title/tag generation because it no longer matched the
 		// first-turn length checks. Gate on the conversation before the current
 		// assistant response instead.
-		const firstTurnMessages = useV2Body
+		const firstTurnMessages = useV21Body
 			? _messages.filter((message) => message?.id !== responseMessageId)
 			: messages;
 		const isFirstTurn =
@@ -6344,7 +6850,7 @@
 			{
 				stream: stream,
 				model: model.id,
-				...(useV2Body
+				...(useV21Body
 					? {
 							leaf_message_id: leafMessageId,
 							...(v2NewUserMessage ? { new_user_message: v2NewUserMessage } : {})
@@ -6680,7 +7186,7 @@
 		}
 
 		await tick();
-		scrollToBottom();
+		engageAndScrollToBottom();
 	};
 
 	const handleOpenAIError = async (error, responseMessage, source: string = 'unknown') => {
@@ -7893,11 +8399,11 @@
 		queue = queue.filter((q) => q.id !== id);
 		if (isServerDrainChat()) {
 			const _chatId = getVisibleChatId();
-			void patchChat(localStorage.token, _chatId, [
-				{ op: 'remove_queue_item', item_id: id }
-			]).catch((error) => {
-				console.error('Failed to persist queued message removal', error);
-			});
+			void patchChat(localStorage.token, _chatId, [{ op: 'remove_queue_item', item_id: id }]).catch(
+				(error) => {
+					console.error('Failed to persist queued message removal', error);
+				}
+			);
 		} else {
 			void persistQueue().catch((error) => {
 				console.error('Failed to persist queued message removal', error);
@@ -8413,12 +8919,22 @@
 								style="overflow-anchor: none;"
 								bind:this={messagesContainerElement}
 								on:scroll={onScroll}
+								on:wheel|passive={onWheel}
+								on:touchstart|passive={onTouchStart}
+								on:touchmove|passive={onTouchMove}
 								on:subagent:expand={() => {
 									// User expanded a subagent card to read it — stop following
 									// the stream so the ResizeObserver / auto-scroll doesn't yank
 									// the viewport to the bottom as the body (and any ongoing
 									// generation) grows the page.
-									autoScroll = false;
+									disengageAutoScroll();
+								}}
+								on:subagent:collapse={() => {
+									// User collapsed the card. Resume following the stream ONLY if
+									// they're back near the bottom — otherwise collapsing a card
+									// they scrolled up to read would yank them down. Without this,
+									// auto-scroll stayed off for the rest of the turn.
+									if (isNearBottom(messagesContainerElement)) autoScroll = true;
 								}}
 							>
 								<div

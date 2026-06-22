@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import aiohttp
 
 from open_webui.env import SRC_LOG_LEVELS
+from open_webui.retrieval.web.session import session_for_current_loop
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
@@ -230,12 +231,15 @@ async def fetch_jina_contents(
 
         return await asyncio.gather(*(guarded_fetch(url) for url in urls))
 
-    if session is not None and not session.closed:
-        results = await run_with_session(session)
+    active_session = session_for_current_loop(session)
+    if active_session is not None:
+        results = await run_with_session(active_session)
     else:
         timeout = aiohttp.ClientTimeout(total=timeout_seconds + 10)
         connector = aiohttp.TCPConnector(limit=max_concurrency, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as owned_session:
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector, trust_env=True
+        ) as owned_session:
             results = await run_with_session(owned_session)
 
     successful_results = [result for result in results if result is not None]
