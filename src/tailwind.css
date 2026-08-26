@@ -11,15 +11,65 @@
 @source inline("group-hover:{visible,flex,hidden,block,inline,opacity-100,opacity-95,opacity-20,scale-x-100,bg-gray-100,bg-gray-200,bg-gray-600,bg-gray-900,text-black,text-white,text-gray-200,text-gray-500,text-gray-600,text-gray-900}");
 
 @layer utilities {
-	.group:hover .group-hover\:visible { visibility: visible; }
-	.group:hover .group-hover\:flex { display: flex; }
-	.group:hover .group-hover\:hidden { display: none; }
-	.group:hover .group-hover\:block { display: block; }
-	.group:hover .group-hover\:inline { display: inline; }
-	.group:hover .group-hover\:opacity-100 { opacity: 1; }
-	.group:hover .group-hover\:opacity-95 { opacity: 0.95; }
-	.group:hover .group-hover\:opacity-20 { opacity: 0.2; }
-	.group:hover .group-hover\:scale-x-100 { --tw-scale-x: 1; transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y)); }
+	.group:hover .group-hover\:visible {
+		visibility: visible;
+	}
+	.group:hover .group-hover\:flex {
+		display: flex;
+	}
+	.group:hover .group-hover\:hidden {
+		display: none;
+	}
+	.group:hover .group-hover\:block {
+		display: block;
+	}
+	.group:hover .group-hover\:inline {
+		display: inline;
+	}
+	.group:hover .group-hover\:opacity-100 {
+		opacity: 1;
+	}
+	.group:hover .group-hover\:opacity-95 {
+		opacity: 0.95;
+	}
+	.group:hover .group-hover\:opacity-20 {
+		opacity: 0.2;
+	}
+	.group:hover .group-hover\:scale-x-100 {
+		--tw-scale-x: 1;
+		transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate))
+			skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x))
+			scaleY(var(--tw-scale-y));
+	}
+}
+
+/* --- Touch reveal: no hover, no double-tap ---------------------------------
+ * On devices without hover (phones / touch tablets), `.group:hover` still fires
+ * from a sticky FIRST tap — so every `invisible group-hover:visible` /
+ * `opacity-0 group-hover:opacity-100` control becomes a "tap once to reveal,
+ * tap again to activate" trap: message action buttons (copy/edit/regenerate/
+ * usage), the timestamp, sidebar/folder/channel menus, the attachment remove-X,
+ * avatar actions, the model-item overflow menu, table/data-viz export bars, and
+ * more. Rather than branch every one of ~44 call sites on `$mobile`, we reveal
+ * the target to its shown state once, globally, on touch — so these controls are
+ * permanently visible and single-tap everywhere.
+ *
+ * Scope is deliberate: we force only visibility/opacity reveals, which already
+ * reserve their layout box (visibility:hidden / opacity:0) so showing them
+ * causes NO reflow. Display-based reveals (group-hover:block/flex/inline — the
+ * toggle-off "×" glyphs inside active input chips, decorative sidebar icons)
+ * are intentionally left hidden so the input toolbar doesn't grow on mobile. */
+@layer utilities {
+	@media (hover: none) {
+		.group-hover\:visible,
+		.group-hover\/steer\:visible {
+			visibility: visible !important;
+		}
+		.group-hover\:opacity-100,
+		.group-hover\/item\:opacity-100 {
+			opacity: 1 !important;
+		}
+	}
 }
 
 /*
@@ -117,4 +167,10 @@
 	}
 }
 
-@custom-variant hover (@media (hover: hover) and (pointer: fine) { &:hover });
+@custom-variant hover {
+	@media (hover: hover) and (pointer: fine) {
+		&:hover {
+			@slot;
+		}
+	}
+}

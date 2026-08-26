@@ -1,3 +1,22 @@
+<script lang="ts" module>
+	import { getChatTokenStats } from '$lib/apis/analytics';
+
+	// Two instances of this component mount per view (navbar pill + composer
+	// stats). Share one in-flight request per chat id so a chat open costs a
+	// single analytics fetch instead of two identical ones.
+	const inflightStats = new Map<string, Promise<any>>();
+	const fetchStatsShared = (token: string, id: string) => {
+		let p = inflightStats.get(id);
+		if (!p) {
+			p = getChatTokenStats(token, id).finally(() => {
+				inflightStats.delete(id);
+			});
+			inflightStats.set(id, p);
+		}
+		return p;
+	};
+</script>
+
 <script lang="ts">
 	import { getContext, onDestroy, onMount } from 'svelte';
 	import { get } from 'svelte/store';
@@ -6,23 +25,27 @@
 		chatTokenStats,
 		chatTokenStatsRefreshTrigger
 	} from '$lib/stores';
-	import { getChatTokenStats, formatTokenCount, formatCost } from '$lib/apis/analytics';
+	import { formatTokenCount, formatCost } from '$lib/apis/analytics';
 	import Tooltip from '../common/Tooltip.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let chatId = '';
+	interface Props {
+		chatId?: string;
+	}
 
-	let lastTrigger = 0;
-	let trackedChatId = '';
-	let lastTrackedChatId = '';
+	let { chatId = '' }: Props = $props();
+
+	let lastTrigger = $state(0);
+	let trackedChatId = $state('');
+	let lastTrackedChatId = $state('');
 	// Trailing-debounce timer for refresh-trigger fetches. The trigger bumps once
 	// per usage delta (i.e. once per tool-call round), so a 300-round agentic run
 	// would otherwise fire a steady stream of backend fetches. A trailing debounce
 	// collapses each burst into a SINGLE reconciliation fetch after activity
 	// settles. The live per-round numbers are already shown via tokenUsageGroups;
 	// this backend fetch is only the authoritative reconciliation.
-	let refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let refreshDebounceTimer: ReturnType<typeof setTimeout> | null = $state(null);
 	const REFRESH_DEBOUNCE_MS = 1200;
 
 	// Retry-on-failure state. A transient failure (network blip, backend indexing
@@ -31,27 +54,13 @@
 	// reloaded. Now we back off and retry; if every retry still fails we keep the
 	// last good values rendered instead of disappearing.
 	const RETRY_DELAYS_MS = [1000, 3000, 8000];
-	let retryCount = 0;
+	let retryCount = $state(0);
 	let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function clearRetry() {
 		if (retryTimer !== null) {
 			clearTimeout(retryTimer);
 			retryTimer = null;
-		}
-	}
-
-	$: trackedChatId = chatId || $currentChatIdStore || '';
-
-	// Reset retry state and (re)start a fetch each time we move to a different chat.
-	$: if (trackedChatId !== lastTrackedChatId) {
-		lastTrackedChatId = trackedChatId;
-		clearRetry();
-		retryCount = 0;
-		if (trackedChatId && !trackedChatId.startsWith('local:')) {
-			fetchTokenStats(trackedChatId);
-		} else {
-			chatTokenStats.set(null);
 		}
 	}
 
@@ -72,35 +81,12 @@
 		}
 	});
 
-	// Reactive fetch when refresh trigger changes (trailing-debounced so a burst
-	// of per-round usage deltas collapses into one fetch after activity settles).
-	$: if (
-		$chatTokenStatsRefreshTrigger > lastTrigger &&
-		trackedChatId &&
-		!trackedChatId.startsWith('local:')
-	) {
-		lastTrigger = $chatTokenStatsRefreshTrigger;
-		clearRetry();
-		retryCount = 0;
-		if (refreshDebounceTimer !== null) {
-			clearTimeout(refreshDebounceTimer);
-		}
-		refreshDebounceTimer = setTimeout(() => {
-			refreshDebounceTimer = null;
-			if (trackedChatId && !trackedChatId.startsWith('local:')) {
-				fetchTokenStats(trackedChatId);
-			}
-		}, REFRESH_DEBOUNCE_MS);
-	}
-
 	function scheduleRetry(id: string) {
 		clearRetry();
 
 		// Drop the loading flag while we wait so the UI doesn't pulse forever.
 		// Preserves the last good values so the box stays visible.
-		chatTokenStats.update((current) =>
-			current ? { ...current, loading: false } : current
-		);
+		chatTokenStats.update((current) => (current ? { ...current, loading: false } : current));
 
 		if (retryCount >= RETRY_DELAYS_MS.length) {
 			// Retries exhausted. The next chatId change or refresh trigger will
@@ -126,20 +112,28 @@
 		}
 
 		// Set loading state. Preserve last good values so the box doesn't flicker
-		// empty during refetch.
-		chatTokenStats.update((current) => ({
-			chat_id: id,
-			total_input_tokens: current?.total_input_tokens ?? 0,
-			total_output_tokens: current?.total_output_tokens ?? 0,
-			total_tokens: current?.total_tokens ?? 0,
-			total_cache_read_tokens: current?.total_cache_read_tokens ?? 0,
-			last_input_tokens: current?.last_input_tokens ?? 0,
-			last_output_tokens: current?.last_output_tokens ?? 0,
-			last_cache_read_tokens: current?.last_cache_read_tokens ?? 0,
-			message_count: current?.message_count ?? 0,
-			cost: current?.cost ?? 0,
-			loading: true
-		}));
+		// empty during refetch — but ONLY when those values belong to THIS chat.
+		// After a chat switch `current` still holds the PREVIOUS chat's stats;
+		// stamping the new id onto them would (a) show the old chat's "Latest
+		// Input" until the fetch lands and (b) trip the staleResponse guard below
+		// (old totals > new totals), pinning the wrong values for the whole retry
+		// window. Seed zeros across a switch so the placeholder is neutral.
+		chatTokenStats.update((current) => {
+			const carry = current?.chat_id === id ? current : null;
+			return {
+				chat_id: id,
+				total_input_tokens: carry?.total_input_tokens ?? 0,
+				total_output_tokens: carry?.total_output_tokens ?? 0,
+				total_tokens: carry?.total_tokens ?? 0,
+				total_cache_read_tokens: carry?.total_cache_read_tokens ?? 0,
+				last_input_tokens: carry?.last_input_tokens ?? 0,
+				last_output_tokens: carry?.last_output_tokens ?? 0,
+				last_cache_read_tokens: carry?.last_cache_read_tokens ?? 0,
+				message_count: carry?.message_count ?? 0,
+				cost: carry?.cost ?? 0,
+				loading: true
+			};
+		});
 
 		const requestedChatId = id;
 		const token = localStorage.getItem('token');
@@ -152,7 +146,7 @@
 		}
 
 		try {
-			const stats = await getChatTokenStats(token, requestedChatId);
+			const stats = await fetchStatsShared(token, requestedChatId);
 
 			if (requestedChatId !== trackedChatId) {
 				return; // Stale: user moved to a different chat mid-fetch
@@ -175,17 +169,51 @@
 
 				// If a live usage payload already advanced the counter, don't let a
 				// lagging analytics read reset it to zero/old totals; retry until DB catches up.
+				//
+				// Staleness is gated on `message_count` ALONE, not on any of the token
+				// totals. `message_count` is the DB event count and is monotonic — if
+				// next.message_count >= current.message_count, this read is AT LEAST as
+				// new as what's displayed, so it must be accepted in full even if one of
+				// the displayed totals happens to be higher right now. That "higher"
+				// case is exactly the optimistic-apply double-count bug (a live round
+				// applied on top of an already-authoritative push): gating on the
+				// individual totals used to keep those inflated numbers pinned forever,
+				// because every subsequent DB read looked "stale" by that same
+				// comparison and got rejected — the numbers only ever corrected on a
+				// full page reload. Accepting on message_count lets the correct DB
+				// numbers win and the inflated live total correct downward.
 				let staleResponse = false;
+				const isFinalRetryAttempt = retryCount >= RETRY_DELAYS_MS.length;
 				chatTokenStats.update((current) => {
 					staleResponse =
 						current?.chat_id === next.chat_id &&
-						(current.total_input_tokens > next.total_input_tokens ||
-							current.total_output_tokens > next.total_output_tokens ||
-							current.total_tokens > next.total_tokens ||
-							current.total_cache_read_tokens > next.total_cache_read_tokens ||
-							current.message_count > next.message_count);
+						current.message_count > next.message_count &&
+						// Belt and suspenders: once retries are exhausted there is no
+						// more DB catch-up coming on this chat visit, so keeping stale
+						// live totals pinned forever is strictly worse than accepting
+						// whatever the DB says now — surface the authoritative read.
+						!isFinalRetryAttempt;
 
-					return staleResponse && current ? { ...current, loading: false } : next;
+					if (staleResponse && current) {
+						// The live TOKEN totals ran ahead of this DB read, so keep them
+						// (a retry reconciles later). But NEVER drop the freshly-fetched
+						// cost — that asymmetry is exactly why the $ segment used to
+						// update only on reload (on reload `current` is null so this
+						// branch never runs). Take the higher of the live cost and the
+						// read so a lagging read can't regress it.
+						return {
+							...current,
+							cost: Math.max(current.cost ?? 0, next.cost ?? 0),
+							loading: false
+						};
+					}
+					// Non-stale (or retries exhausted): this read is authoritative for
+					// this chat — trust it fully, INCLUDING a legitimately lower cost
+					// (e.g. after an admin pricing edit) or lower totals (e.g. correcting
+					// an optimistic double-count), so numbers can still correct downward
+					// here. (The live-push apply keeps Math.max only for out-of-order
+					// reorder safety; this authoritative read is the path that heals it.)
+					return next;
 				});
 
 				if (staleResponse) {
@@ -215,19 +243,6 @@
 		}
 	}
 
-	// True when the store holds real, displayable numbers (as opposed to the
-	// all-zero placeholder a cold first fetch starts with). During streaming the
-	// refresh trigger fires on every usage delta, and each fetch flips
-	// `loading: true` while preserving the last good values. We use this to keep
-	// the populated box rendered through those refreshes instead of swapping in
-	// the `···` pulse — otherwise the box flashes in and out on every delta.
-	$: hasData =
-		!!$chatTokenStats &&
-		($chatTokenStats.total_tokens > 0 ||
-			$chatTokenStats.message_count > 0 ||
-			$chatTokenStats.last_input_tokens > 0 ||
-			$chatTokenStats.total_output_tokens > 0);
-
 	onDestroy(() => {
 		clearRetry();
 		if (refreshDebounceTimer !== null) {
@@ -242,6 +257,58 @@
 		// — at worst the new instance flashes the previous chat's numbers for a
 		// few ms before its own fetch completes.
 	});
+	$effect(() => {
+		trackedChatId = chatId || $currentChatIdStore || '';
+	});
+	// Reset retry state and (re)start a fetch each time we move to a different chat.
+	$effect(() => {
+		if (trackedChatId !== lastTrackedChatId) {
+			lastTrackedChatId = trackedChatId;
+			clearRetry();
+			retryCount = 0;
+			if (trackedChatId && !trackedChatId.startsWith('local:')) {
+				fetchTokenStats(trackedChatId);
+			} else {
+				chatTokenStats.set(null);
+			}
+		}
+	});
+	// Reactive fetch when refresh trigger changes (trailing-debounced so a burst
+	// of per-round usage deltas collapses into one fetch after activity settles).
+	$effect(() => {
+		if (
+			$chatTokenStatsRefreshTrigger > lastTrigger &&
+			trackedChatId &&
+			!trackedChatId.startsWith('local:')
+		) {
+			lastTrigger = $chatTokenStatsRefreshTrigger;
+			clearRetry();
+			retryCount = 0;
+			if (refreshDebounceTimer !== null) {
+				clearTimeout(refreshDebounceTimer);
+			}
+			refreshDebounceTimer = setTimeout(() => {
+				refreshDebounceTimer = null;
+				if (trackedChatId && !trackedChatId.startsWith('local:')) {
+					fetchTokenStats(trackedChatId);
+				}
+			}, REFRESH_DEBOUNCE_MS);
+		}
+	});
+	// True when the store holds real, displayable numbers (as opposed to the
+	// all-zero placeholder a cold first fetch starts with). During streaming the
+	// refresh trigger fires on every usage delta, and each fetch flips
+	// `loading: true` while preserving the last good values. We use this to keep
+	// the populated box rendered through those refreshes instead of swapping in
+	// the `···` pulse — otherwise the box flashes in and out on every delta.
+	let hasData = $derived(
+		!!$chatTokenStats &&
+			($chatTokenStats.total_tokens > 0 ||
+				$chatTokenStats.message_count > 0 ||
+				$chatTokenStats.last_input_tokens > 0 ||
+				$chatTokenStats.last_output_tokens > 0 ||
+				($chatTokenStats.cost ?? 0) > 0)
+	);
 </script>
 
 {#if hasData}
@@ -254,14 +321,14 @@
 					<span class="font-mono">${$chatTokenStats.last_input_tokens.toLocaleString()}</span>
 				</div>
 				<div class="flex justify-between gap-4">
-					<span>${$i18n.t('Output Total')}:</span>
-					<span class="font-mono">${$chatTokenStats.total_output_tokens.toLocaleString()}</span>
+					<span>${$i18n.t('Latest Output')}:</span>
+					<span class="font-mono">${$chatTokenStats.last_output_tokens.toLocaleString()}</span>
 				</div>
 				<div class="flex justify-between gap-4">
 					<span>${$i18n.t('Cache Read')}:</span>
 					<span class="font-mono">${$chatTokenStats.last_cache_read_tokens.toLocaleString()}</span>
 				</div>
-				<div class="flex justify-between gap-4 border-t border-gray-600 pt-1 mt-1">
+				<div class="flex justify-between gap-4 border-t-hairline border-gray-600 pt-1 mt-1">
 					<span>${$i18n.t('Request Total')}:</span>
 					<span class="font-mono font-semibold">${$chatTokenStats.total_tokens.toLocaleString()}</span>
 				</div>
@@ -269,7 +336,7 @@
 					($chatTokenStats.cost ?? 0) > 0
 						? `<div class="flex justify-between gap-4">
 						<span>${$i18n.t('Cost')}:</span>
-						<span class="font-mono font-semibold text-emerald-400">${formatCost($chatTokenStats.cost)}</span>
+						<span class="font-mono font-semibold text-success-dark">${formatCost($chatTokenStats.cost)}</span>
 					</div>`
 						: ''
 				}
@@ -281,7 +348,7 @@
 		placement="bottom"
 	>
 		<div
-			class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px] font-mono text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-850 border border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-default select-none"
+			class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px] font-mono text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-default select-none"
 		>
 			<!-- Latest input tokens -->
 			<span class="flex items-center gap-0.5" title={$i18n.t('Latest input tokens')}>
@@ -289,7 +356,7 @@
 					xmlns="http://www.w3.org/2000/svg"
 					viewBox="0 0 16 16"
 					fill="currentColor"
-					class="size-3 text-blue-500 dark:text-blue-400"
+					class="size-3 text-book-cloth dark:text-kraft"
 				>
 					<path
 						fill-rule="evenodd"
@@ -302,13 +369,13 @@
 
 			<span class="text-gray-300 dark:text-gray-600">·</span>
 
-			<!-- Output tokens -->
-			<span class="flex items-center gap-0.5" title={$i18n.t('Output tokens')}>
+			<!-- Latest output tokens -->
+			<span class="flex items-center gap-0.5" title={$i18n.t('Latest output tokens')}>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					viewBox="0 0 16 16"
 					fill="currentColor"
-					class="size-3 text-green-500 dark:text-green-400"
+					class="size-3 text-success dark:text-success-dark"
 				>
 					<path
 						fill-rule="evenodd"
@@ -316,14 +383,14 @@
 						clip-rule="evenodd"
 					/>
 				</svg>
-				<span>{formatTokenCount($chatTokenStats.total_output_tokens)}</span>
+				<span>{formatTokenCount($chatTokenStats.last_output_tokens)}</span>
 			</span>
 
 			<span class="text-gray-300 dark:text-gray-600">·</span>
 
 			<!-- Cached input tokens -->
 			<span
-				class="flex items-center gap-0.5 font-medium text-purple-500 dark:text-purple-400"
+				class="flex items-center gap-0.5 font-medium text-book-cloth dark:text-kraft"
 				title={$i18n.t('Cached input tokens')}
 			>
 				<span>R</span>
@@ -358,7 +425,7 @@
 
 				<!-- Estimated cost -->
 				<span
-					class="flex items-center gap-0.5 font-semibold text-emerald-600 dark:text-emerald-400"
+					class="flex items-center gap-0.5 font-semibold text-success dark:text-success-dark"
 					title={$i18n.t('Estimated cost')}
 				>
 					<span>{formatCost($chatTokenStats.cost)}</span>
@@ -368,7 +435,7 @@
 	</Tooltip>
 {:else if $chatTokenStats?.loading}
 	<div
-		class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px] font-mono text-gray-400 dark:text-gray-500 bg-gray-50 dark:bg-gray-850 border border-gray-100 dark:border-gray-800 animate-pulse"
+		class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px] font-mono text-gray-400 dark:text-gray-500 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-100 dark:border-gray-800 animate-pulse"
 	>
 		<span>···</span>
 	</div>

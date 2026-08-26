@@ -106,6 +106,20 @@ class MCPConnectionWithSecrets(MCPConnectionModel):
     oauth: dict = Field(default_factory=dict)
 
 
+class MCPConnectionWithHeaders(MCPConnectionModel):
+    """Owner-visible connection data used to edit custom request metadata.
+
+    Headers and env entries must round-trip through the settings form so the
+    owner can see/edit what's already saved — they're only ever exposed to the
+    connection's own owner (or an admin), same trust boundary as the rest of
+    this endpoint. Bearer keys and OAuth grants remain write-only since they're
+    single opaque values with no editing value in showing them back.
+    """
+
+    headers: list[dict[str, str]] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
 class MCPConnectionForm(BaseModel):
     id: Optional[str] = None
     name: str
@@ -276,6 +290,174 @@ class MCPConnectionsTable:
         self, id: str, user_id: str, oauth: dict
     ) -> Optional[MCPConnectionModel]:
         return await self.update_connection_by_id_and_user_id(id, user_id, {"oauth": oauth})
+
+    async def _mutate_oauth_under_lock(
+        self, id: str, user_id: str, mutate
+    ) -> bool:
+        """Read-modify-write the oauth blob under a row lock (SELECT ... FOR UPDATE).
+
+        Every token write goes through here so a concurrent refresh / callback
+        cannot clobber the whole oauth blob from a stale in-memory snapshot
+        (audit A2). ``mutate(oauth_dict)`` mutates the decrypted dict in place;
+        returning the (possibly new) dict to persist, or None to abort.
+        """
+        try:
+            async with get_db() as db:
+                row = (
+                    await db.execute(
+                        select(MCPConnection)
+                        .where(
+                            MCPConnection.id == id,
+                            MCPConnection.user_id == user_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalars().first()
+                if not row:
+                    return False
+                oauth = decrypt_secret(row.oauth, {}) or {}
+                result = mutate(oauth)
+                if result is None:
+                    return False
+                row.oauth = encrypt_secret(result)
+                row.updated_at = int(time.time())
+                await db.commit()
+                return True
+        except Exception:
+            log.exception("Error mutating MCP oauth under lock")
+            return False
+
+    async def merge_oauth_tokens_by_id_and_user_id(
+        self, id: str, user_id: str, tokens: dict
+    ) -> bool:
+        """Atomically set ``oauth['tokens']`` (re-reading the rest of the blob).
+
+        Prevents a stale snapshot from overwriting concurrently-written fields
+        such as ``client_info`` / ``resource_metadata`` while persisting a freshly
+        rotated refresh token.
+        """
+        def _set(oauth: dict) -> dict:
+            oauth["tokens"] = tokens
+            return oauth
+
+        return await self._mutate_oauth_under_lock(id, user_id, _set)
+
+    async def merge_oauth_fields_by_id_and_user_id(
+        self, id: str, user_id: str, set_fields: dict, drop_fields: Optional[list] = None
+    ) -> bool:
+        """Merge auth-flow metadata into the oauth blob under the row lock.
+
+        Used by the OAuth /start flow to persist newly-minted fields (state,
+        code_verifier, client_info, ...) while leaving ``tokens`` (and any other
+        untouched key) intact. Going through the SELECT..FOR UPDATE re-read means
+        a concurrently-rotated refresh token is NOT clobbered by ``/start``'s
+        stale pre-network snapshot (audit A2 / grant-revocation hazard).
+        """
+
+        def _merge(oauth: dict) -> dict:
+            oauth.update(set_fields)
+            for key in drop_fields or []:
+                oauth.pop(key, None)
+            return oauth
+
+        return await self._mutate_oauth_under_lock(id, user_id, _merge)
+
+    async def clear_oauth_tokens_by_id_and_user_id(
+        self, id: str, user_id: str
+    ) -> bool:
+        """Atomically drop ``oauth['tokens']`` so ``authenticated`` flips to false.
+
+        Used when a refresh fails terminally (invalid_grant): the dead tokens
+        must be removed and re-auth forced, while preserving ``client_info`` so
+        the next OAuth start can reuse the DCR registration.
+        """
+        def _clear(oauth: dict) -> dict:
+            oauth.pop("tokens", None)
+            oauth.pop("state", None)
+            oauth.pop("code_verifier", None)
+            return oauth
+
+        return await self._mutate_oauth_under_lock(id, user_id, _clear)
+
+    # --- Admin governance (by id, not user-scoped) -----------------------------
+
+    async def get_all_connections(self) -> list[MCPConnectionModel]:
+        """All users' connections (metadata only, no secrets) for admin oversight.
+
+        Sets the ``authenticated`` flag for oauth_2.1 connections by inspecting
+        (but never returning) the encrypted oauth blob.
+        """
+        async with get_db() as db:
+            rows = (
+                await db.execute(
+                    select(MCPConnection).order_by(MCPConnection.updated_at.desc())
+                )
+            ).scalars().all()
+            result: list[MCPConnectionModel] = []
+            for row in rows:
+                model = _public_from_row(row)
+                if (row.auth_type or "none") == "oauth_2.1":
+                    oauth = decrypt_secret(row.oauth, {}) or {}
+                    model.authenticated = bool(
+                        (oauth.get("tokens") or {}).get("access_token")
+                    )
+                result.append(model)
+            return result
+
+    async def set_enabled_by_id(
+        self, id: str, enabled: bool
+    ) -> Optional[MCPConnectionModel]:
+        try:
+            async with get_db() as db:
+                row = (
+                    await db.execute(
+                        update(MCPConnection)
+                        .where(MCPConnection.id == id)
+                        .values(enabled=enabled, updated_at=int(time.time()))
+                        .returning(MCPConnection)
+                    )
+                ).scalars().first()
+                await db.commit()
+                return _public_from_row(row) if row else None
+        except Exception:
+            log.exception("Error setting MCP connection enabled (admin)")
+            return None
+
+    async def admin_clear_oauth_tokens_by_id(self, id: str) -> bool:
+        try:
+            async with get_db() as db:
+                row = (
+                    await db.execute(
+                        select(MCPConnection)
+                        .where(MCPConnection.id == id)
+                        .with_for_update()
+                    )
+                ).scalars().first()
+                if not row:
+                    return False
+                oauth = decrypt_secret(row.oauth, {}) or {}
+                oauth.pop("tokens", None)
+                oauth.pop("state", None)
+                oauth.pop("code_verifier", None)
+                row.oauth = encrypt_secret(oauth)
+                row.updated_at = int(time.time())
+                await db.commit()
+                return True
+        except Exception:
+            log.exception("Error clearing MCP oauth (admin)")
+            return False
+
+    async def delete_by_id(self, id: str) -> bool:
+        try:
+            async with get_db() as db:
+                result = await db.execute(
+                    delete(MCPConnection).where(MCPConnection.id == id)
+                )
+                await db.commit()
+                return result.rowcount > 0
+        except Exception:
+            log.exception("Error deleting MCP connection (admin)")
+            return False
 
     async def delete_connection_by_id_and_user_id(self, id: str, user_id: str) -> bool:
         try:

@@ -2,29 +2,50 @@
 	import { getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { copyToClipboard } from '$lib/utils';
 	import { decodeToolResultText, formatToolValue, isBrowserToolName } from '$lib/utils/toolResults';
-	import { getChatMessageToolResult } from '$lib/apis/chats';
+	import { loadLazyBody, peekLazyBody } from '$lib/utils/lazyBlockBodies';
+	import SmoothResize from '$lib/components/common/SmoothResize.svelte';
 	import WebFetchResult from './ToolResults/WebFetchResult.svelte';
 	import WebSearchResult from './ToolResults/WebSearchResult.svelte';
 	import BrowserToolResult from './ToolResults/BrowserToolResult.svelte';
+	import GenericResult from './ToolResults/GenericResult.svelte';
+	import ToolArgs from './ToolResults/ToolArgs.svelte';
+	import ResultSkeleton from './ToolResults/ResultSkeleton.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	export let id = '';
-	export let name = '';
-	export let argsRaw: unknown = '';
-	export let resultRaw: unknown = '';
-	export let resultLazy = false;
-	export let chatId = '';
-	export let messageId = '';
-	export let toolCallId = '';
-	export let done = true;
-	export let files: unknown[] = [];
-	export let error = false;
-	export let errorReason = '';
+	interface Props {
+		id?: string;
+		name?: string;
+		argsRaw?: unknown;
+		resultRaw?: unknown;
+		resultLazy?: boolean;
+		chatId?: string;
+		messageId?: string;
+		toolCallId?: string;
+		done?: boolean;
+		files?: unknown[];
+		error?: boolean;
+		errorReason?: string;
+	}
+
+	let {
+		id = '',
+		name = '',
+		argsRaw = '',
+		resultRaw = '',
+		resultLazy = false,
+		chatId = '',
+		messageId = '',
+		toolCallId = '',
+		done = true,
+		files = [],
+		error = false,
+		errorReason = ''
+	}: Props = $props();
 
 	const normalizeLiveResultRaw = (raw: unknown) => {
 		if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -37,10 +58,21 @@
 
 	type Tab = 'result' | 'request' | 'raw';
 	const tabs: Tab[] = ['result', 'request', 'raw'];
-	let activeTab: Tab = 'result';
+	let activeTab: Tab = $state('result');
 
-	let fetchedResultRaw: unknown = null;
-	let fetchError = '';
+	// Seed from the shared cache during init so a re-expanded (or hovered, hence
+	// prefetched) result is complete in the first frame the block opens — the
+	// panel then opens straight to its finished size instead of animating through
+	// the skeleton. See `$lib/utils/lazyBlockBodies`.
+	const seededResultRaw = resultLazy
+		? (() => {
+				const cached = peekLazyBody(chatId, messageId, toolCallId);
+				return cached === undefined ? null : normalizeLiveResultRaw(cached);
+			})()
+		: null;
+
+	let fetchedResultRaw: unknown = $state(seededResultRaw);
+	let fetchError = $state('');
 	let fetchPromise: Promise<void> | null = null;
 
 	const ensureLazyResult = async () => {
@@ -54,7 +86,7 @@
 		) {
 			return;
 		}
-		fetchPromise = getChatMessageToolResult(localStorage.token, chatId, messageId, toolCallId)
+		fetchPromise = loadLazyBody(chatId, messageId, toolCallId)
 			.then((res) => {
 				fetchedResultRaw = normalizeLiveResultRaw(res);
 				fetchError = '';
@@ -68,26 +100,22 @@
 		await fetchPromise;
 	};
 
-	$: if (resultLazy && (activeTab === 'result' || activeTab === 'raw')) {
-		void ensureLazyResult();
-	}
+	$effect(() => {
+		if (resultLazy && (activeTab === 'result' || activeTab === 'raw')) {
+			void ensureLazyResult();
+		}
+	});
 
-	$: normalizedResultRaw = normalizeLiveResultRaw(
-		resultLazy ? (fetchedResultRaw ?? resultRaw) : resultRaw
+	let normalizedResultRaw = $derived(
+		normalizeLiveResultRaw(resultLazy ? (fetchedResultRaw ?? resultRaw) : resultRaw)
 	);
 
 	// Avoid eagerly decoding very large web_fetch results just to render the
 	// chrome. Decode request/raw text only when that tab is visible; the rich
 	// Result tab parses its own data lazily inside the specialized component.
-	$: requestText = activeTab === 'request' ? formatToolValue(argsRaw) : '';
-	$: genericResultText =
-		activeTab === 'result' &&
-		name !== 'web_search' &&
-		name !== 'web_fetch' &&
-		!isBrowserToolName(name)
-			? decodeToolResultText(normalizedResultRaw)
-			: '';
-	$: resultText = activeTab === 'raw' ? decodeToolResultText(normalizedResultRaw) : '';
+	let resultText = $derived(activeTab === 'raw' ? decodeToolResultText(normalizedResultRaw) : '');
+
+	let awaitingBody = $derived(resultLazy && fetchedResultRaw === null && !fetchError);
 
 	const labelForTab = (tab: Tab) => {
 		if (tab === 'result') return $i18n.t('Result');
@@ -110,19 +138,22 @@
 
 <div
 	{id}
-	class="my-2 overflow-hidden rounded-2xl border border-gray-100 bg-gray-50/70 text-sm dark:border-gray-800 dark:bg-gray-950/40"
+	class="my-2 overflow-hidden rounded-2xl border-hairline border-gray-200 bg-gray-50/60 text-sm dark:border-gray-800 dark:bg-gray-850/40"
 >
+	<!-- Header: quiet text tabs (an underline marks the active one) and a single
+	     ghost copy action. A segmented pill here competed with the content. -->
 	<div
-		class="flex flex-col gap-2 border-b border-gray-100 bg-white px-2.5 py-2 dark:border-gray-800 dark:bg-gray-900 sm:flex-row sm:items-center sm:justify-between"
+		class="flex items-center justify-between gap-2 border-b-hairline border-gray-200 px-3 dark:border-gray-800"
 	>
-		<div class="flex w-fit rounded-xl bg-gray-100 p-0.5 text-xs dark:bg-gray-800">
-			{#each tabs as tab}
+		<div class="flex items-center gap-3.5 text-xs">
+			{#each tabs as tab (tab)}
 				<button
-					class="rounded-lg px-2.5 py-1 font-medium transition {activeTab === tab
-						? 'bg-white text-gray-900 shadow-xs dark:bg-gray-700 dark:text-white'
-						: 'text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white'}"
+					class="relative py-2 transition-colors {activeTab === tab
+						? 'font-medium text-gray-900 after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-gray-900 dark:text-gray-100 dark:after:bg-gray-100'
+						: 'text-gray-500 hover:text-gray-800 dark:text-gray-500 dark:hover:text-gray-300'}"
 					type="button"
-					on:click={() => (activeTab = tab)}
+					data-anchor-on-click
+					onclick={() => (activeTab = tab)}
 				>
 					{labelForTab(tab)}
 				</button>
@@ -130,66 +161,87 @@
 		</div>
 
 		<button
-			class="w-fit rounded-lg px-2 py-1 text-xs font-medium text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white"
+			class="shrink-0 rounded-lg px-2 py-1 text-xs text-gray-500 transition hover:bg-gray-200/60 hover:text-gray-900 dark:text-gray-500 dark:hover:bg-gray-800 dark:hover:text-gray-100"
 			type="button"
-			on:click={copyActive}
+			title={$i18n.t('Copy {{TAB}}', { TAB: labelForTab(activeTab) })}
+			onclick={copyActive}
 		>
 			{$i18n.t('Copy')}
-			{labelForTab(activeTab)}
 		</button>
 	</div>
 
-	<div class="p-3">
-		{#if activeTab === 'result'}
-			{#if error}
-				<div
-					class="mb-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
-				>
-					<div class="font-medium">{$i18n.t('This tool call returned an error.')}</div>
-					{#if errorReason}
-						<div class="mt-1 text-xs opacity-90">{errorReason}</div>
-					{/if}
-				</div>
-			{/if}
-			{#if !done}
-				<div
-					class="rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
-				>
-					{$i18n.t('The tool is still running. The result will appear here when it finishes.')}
-				</div>
-			{:else if resultLazy && fetchedResultRaw === null && !fetchError}
-				<div
-					class="rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
-				>
-					{$i18n.t('Loading tool result…')}
-				</div>
-			{:else if fetchError}
-				<div
-					class="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
-				>
-					{fetchError}
-				</div>
-			{:else if name === 'web_search'}
-				<WebSearchResult id={`${id}-web-search`} resultRaw={normalizedResultRaw} {argsRaw} />
-			{:else if name === 'web_fetch'}
-				<WebFetchResult id={`${id}-web-fetch`} resultRaw={normalizedResultRaw} />
-			{:else if isBrowserToolName(name)}
-				<BrowserToolResult id={`${id}-browser`} resultRaw={normalizedResultRaw} {argsRaw} {files} />
+	<!-- The body owns its own height animation: the panel slides open around the
+	     skeleton, then grows into the loaded result instead of snapping. -->
+	<SmoothResize>
+		<div class="p-2.5">
+			{#if activeTab === 'result'}
+				{#if error}
+					<div
+						class="mb-2 flex gap-2.5 rounded-xl border-hairline border-error-brick/20 bg-error-brick/5 px-3 py-2.5 text-error-brick dark:bg-error-brick/10 dark:text-error-brick-dark"
+					>
+						<svg
+							xmlns="http://www.w3.org/2000/svg"
+							viewBox="0 0 20 20"
+							fill="currentColor"
+							class="mt-px size-4 shrink-0"
+							aria-hidden="true"
+						>
+							<path
+								fill-rule="evenodd"
+								d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16ZM5.5 5.5l9 9-1 1-9-9 1-1Z"
+								clip-rule="evenodd"
+							/>
+						</svg>
+						<div class="min-w-0">
+							<div class="text-sm font-medium leading-snug">
+								{$i18n.t('This tool call returned an error')}
+							</div>
+							{#if errorReason}
+								<div class="mt-0.5 break-words text-xs opacity-80">{errorReason}</div>
+							{/if}
+						</div>
+					</div>
+				{/if}
+
+				{#if !done}
+					<div
+						class="rounded-xl border-hairline border-dashed border-gray-200 px-3 py-5 text-center text-xs text-gray-400 dark:border-gray-800 dark:text-gray-500"
+					>
+						{$i18n.t('Still running — the result appears here when it finishes.')}
+					</div>
+				{:else if awaitingBody}
+					<ResultSkeleton />
+				{:else if fetchError}
+					<div
+						class="rounded-xl border-hairline border-error-brick/20 bg-error-brick/5 px-3 py-2.5 text-xs text-error-brick dark:bg-error-brick/10 dark:text-error-brick-dark"
+					>
+						{fetchError}
+					</div>
+				{:else if name === 'web_search'}
+					<WebSearchResult id={`${id}-web-search`} resultRaw={normalizedResultRaw} {argsRaw} />
+				{:else if name === 'web_fetch'}
+					<WebFetchResult id={`${id}-web-fetch`} resultRaw={normalizedResultRaw} />
+				{:else if isBrowserToolName(name)}
+					<BrowserToolResult id={`${id}-browser`} resultRaw={normalizedResultRaw} {argsRaw} {files} />
+				{:else}
+					<GenericResult
+						id={`${id}-generic`}
+						resultRaw={normalizedResultRaw}
+						errored={error}
+					/>
+				{/if}
+			{:else if activeTab === 'request'}
+				<ToolArgs id={`${id}-request`} {name} {argsRaw} />
+			{:else if awaitingBody}
+				<ResultSkeleton />
 			{:else}
 				<div
-					class="max-h-[48vh] overflow-y-auto rounded-xl bg-white p-3 text-xs text-gray-900 dark:bg-gray-900 dark:text-gray-100"
+					class="max-h-[52vh] overflow-auto rounded-xl border-hairline border-gray-200 bg-white px-3 py-2.5 dark:border-gray-800 dark:bg-gray-950/50"
 				>
-					<pre class="whitespace-pre-wrap break-words font-mono">{genericResultText || ''}</pre>
+					<pre
+						class="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-gray-700 dark:text-gray-300">{resultText}</pre>
 				</div>
 			{/if}
-		{:else if activeTab === 'request'}
-			<div class="max-h-[48vh] overflow-y-auto rounded-xl bg-gray-950 p-3 text-xs text-gray-100">
-				<pre class="whitespace-pre-wrap break-words font-mono">{requestText || '{}'}</pre>
-			</div>
-		{:else}
-			<div class="max-h-[60vh] overflow-y-auto rounded-xl bg-gray-950 p-3 text-xs text-gray-100">
-				<pre class="whitespace-pre-wrap break-words font-mono">{resultText || ''}</pre>
-			</div>
-		{/if}
-	</div>
+		</div>
+	</SmoothResize>
 </div>

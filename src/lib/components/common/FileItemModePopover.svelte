@@ -1,22 +1,39 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext, onMount, onDestroy } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { stopPropagation } from '$lib/utils/eventModifiers';
+
+	import { getContext, onMount, onDestroy } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import { config } from '$lib/stores';
 	import { updateFileProcessingMode } from '$lib/apis/files';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
-	export let mode: 'text' | 'pdf' = 'text';
-	export let fileId: string | null = null;
-	export let anchorEl: HTMLElement | null = null;
-	export let isSpreadsheet = false;
-	export let allowContainer = false;
+	interface Props {
+		mode?: 'text' | 'pdf';
+		fileId?: string | null;
+		anchorEl?: HTMLElement | null;
+		isSpreadsheet?: boolean;
+		allowContainer?: boolean;
+	}
 
-	let containerEl: HTMLDivElement;
+	let {
+		mode = $bindable('text'),
+		fileId = null,
+		anchorEl = null,
+		isSpreadsheet = false,
+		allowContainer = false,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	$: pdfConversionAvailable = ($config as any)?.features?.pdf_conversion_available ?? true;
+	let containerEl: HTMLDivElement = $state();
+
+	let pdfConversionAvailable = $derived(
+		($config as any)?.features?.pdf_conversion_available ?? true
+	);
 
 	const select = async (next: 'text' | 'pdf' | 'container') => {
 		if (next === mode) {
@@ -32,9 +49,7 @@
 
 		if (next === 'pdf' && !pdfConversionAvailable) {
 			toast.error(
-				$i18n.t(
-					'PDF conversion is unavailable on this server. Install LibreOffice to enable it.'
-				)
+				$i18n.t('PDF conversion is unavailable on this server. Install LibreOffice to enable it.')
 			);
 			return;
 		}
@@ -84,7 +99,7 @@
 
 <div
 	bind:this={containerEl}
-	class="absolute z-50 mt-1 w-72 rounded-xl border border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-lg p-2.5 text-sm"
+	class="absolute z-50 mt-1 w-72 rounded-xl border-hairline border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-850 shadow-lg p-2.5 text-sm"
 	transition:fade={{ duration: 80 }}
 	role="dialog"
 	aria-label={$i18n.t('Choose how to read this file')}
@@ -95,10 +110,12 @@
 
 	<button
 		type="button"
-		class="w-full text-left p-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 flex items-start gap-2"
-		on:click|stopPropagation={() => select('text')}
+		class="w-full text-left p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-start gap-2"
+		onclick={stopPropagation(() => select('text'))}
 	>
-		<span class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center">
+		<span
+			class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center"
+		>
 			{#if mode === 'text'}
 				<span class="size-2 rounded-full bg-current"></span>
 			{/if}
@@ -113,13 +130,15 @@
 
 	<button
 		type="button"
-		class="w-full text-left p-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 flex items-start gap-2 {pdfConversionAvailable
+		class="w-full text-left p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-start gap-2 {pdfConversionAvailable
 			? ''
 			: 'opacity-50 cursor-not-allowed'}"
-		on:click|stopPropagation={() => select('pdf')}
+		onclick={stopPropagation(() => select('pdf'))}
 		disabled={!pdfConversionAvailable}
 	>
-		<span class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center">
+		<span
+			class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center"
+		>
 			{#if mode === 'pdf'}
 				<span class="size-2 rounded-full bg-current"></span>
 			{/if}
@@ -130,12 +149,12 @@
 				{$i18n.t('Slower — but preserves images, tables, and layout.')}
 			</span>
 			{#if isSpreadsheet}
-				<span class="text-xs text-amber-600 dark:text-amber-400 block mt-1">
+				<span class="text-xs text-warning dark:text-warning-dark block mt-1">
 					{$i18n.t('Spreadsheets paginate poorly as PDFs. Text mode is usually better.')}
 				</span>
 			{/if}
 			{#if !pdfConversionAvailable}
-				<span class="text-xs text-amber-600 dark:text-amber-400 block mt-1">
+				<span class="text-xs text-warning dark:text-warning-dark block mt-1">
 					{$i18n.t('Unavailable: LibreOffice is not installed on the server.')}
 				</span>
 			{/if}
@@ -145,14 +164,18 @@
 	{#if allowContainer}
 		<button
 			type="button"
-			class="w-full text-left p-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 flex items-start gap-2"
-			on:click|stopPropagation={() => select('container')}
+			class="w-full text-left p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-start gap-2"
+			onclick={stopPropagation(() => select('container'))}
 		>
-			<span class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center" />
+			<span
+				class="mt-0.5 size-4 shrink-0 rounded-full border border-gray-300 dark:border-gray-600 flex items-center justify-center"
+			></span>
 			<span class="flex-1">
 				<span class="font-medium block">{$i18n.t('Use container')}</span>
 				<span class="text-xs text-gray-500 dark:text-gray-400">
-					{$i18n.t('Enable the container tool and let the model read the original file from /workspace/inputs.')}
+					{$i18n.t(
+						'Enable the container tool and let the model read the original file from /workspace/inputs.'
+					)}
 				</span>
 			</span>
 		</button>

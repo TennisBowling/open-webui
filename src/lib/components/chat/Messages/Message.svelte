@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
-	import { tick, getContext, onMount, createEventDispatcher } from 'svelte';
-	const dispatch = createEventDispatcher();
+	import { tick, getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import { settings } from '$lib/stores';
@@ -12,44 +11,84 @@
 	import ResponseMessage from './ResponseMessage.svelte';
 	import UserMessage from './UserMessage.svelte';
 
-	export let chatId;
-	export let selectedModels = [];
-	export let idx = 0;
+	interface Props {
+		chatId: any;
+		selectedModels?: any;
+		idx?: number;
+		history: any;
+		messageId: any;
+		user: any;
+		setInputText?: Function;
+		gotoMessage: any;
+		activateMessageBranch: any;
+		showPreviousMessage: any;
+		showNextMessage: any;
+		updateChat: any;
+		editMessage: any;
+		saveMessage: any;
+		deleteMessage: any;
+		rateMessage: any;
+		actionMessage: any;
+		submitMessage: any;
+		regenerateResponse: any;
+		retryWithoutProviderRestrictions?: Function;
+		markSkipRemainingRetries?: Function;
+		regenerateWithModel?: Function;
+		continueResponse: any;
+		rewindAndInsert?: any;
+		mergeResponses: any;
+		triggerScroll: any;
+		readOnly?: boolean;
+		editCodeBlock?: boolean;
+		topPadding?: boolean;
+		widescreen?: boolean | null;
+	}
 
-	export let history;
-	export let messageId;
-
-	export let user;
-
-	export let setInputText: Function = () => {};
-	export let gotoMessage;
-	export let showPreviousMessage;
-	export let showNextMessage;
-	export let updateChat;
-
-	export let editMessage;
-	export let saveMessage;
-	export let deleteMessage;
-	export let rateMessage;
-	export let actionMessage;
-	export let submitMessage;
-
-	export let regenerateResponse;
-	export let retryWithoutProviderRestrictions: Function = () => {};
-	export let markSkipRemainingRetries: Function = () => {};
-	export let regenerateWithModel: Function = () => {};
-	export let continueResponse;
-	export let mergeResponses;
-
-	export let addMessages;
-	export let triggerScroll;
-	export let readOnly = false;
-	export let editCodeBlock = true;
-	export let topPadding = false;
+	let {
+		chatId,
+		selectedModels = [],
+		idx = 0,
+		history = $bindable(),
+		messageId,
+		user,
+		setInputText = () => {},
+		gotoMessage,
+		activateMessageBranch,
+		showPreviousMessage,
+		showNextMessage,
+		updateChat,
+		editMessage,
+		saveMessage,
+		deleteMessage,
+		rateMessage,
+		actionMessage,
+		submitMessage,
+		regenerateResponse,
+		retryWithoutProviderRestrictions = () => {},
+		markSkipRemainingRetries = () => {},
+		regenerateWithModel = () => {},
+		continueResponse,
+		rewindAndInsert = () => {},
+		mergeResponses,
+		triggerScroll,
+		readOnly = false,
+		editCodeBlock = true,
+		topPadding = false,
+		widescreen = null
+	}: Props = $props();
 </script>
 
+<!-- Phones get a wider text column (px-4) and more air between turns (mb-4):
+     at 390px the desktop px-5/mb-3 rhythm reads cramped.
+     data-cv-wrap: hook for the height sweeper (messageHeights.ts), which
+     replaces the 150px contain-intrinsic-size GUESS with each turn's measured
+     height so content-visibility realization while scrolling up causes zero
+     layout shift, and for the scroll-anchoring engine's anchor picking. -->
 <div
-	class="flex flex-col justify-between px-5 mb-3 w-full {($settings?.widescreenMode ?? null)
+	data-cv-wrap
+	class="flex flex-col justify-between px-4 md:px-5 mb-4 md:mb-3 w-full {(widescreen ??
+	$settings?.widescreenMode ??
+	null)
 		? 'max-w-full'
 		: 'max-w-5xl'} mx-auto rounded-lg group"
 	style="content-visibility: auto; contain-intrinsic-size: auto 150px;"
@@ -97,10 +136,10 @@
 				{deleteMessage}
 				{continueResponse}
 				{regenerateResponse}
+				{rewindAndInsert}
 				{retryWithoutProviderRestrictions}
 				{markSkipRemainingRetries}
 				{regenerateWithModel}
-				{addMessages}
 				{readOnly}
 				{editCodeBlock}
 				{topPadding}
@@ -110,6 +149,7 @@
 				bind:history
 				{chatId}
 				{messageId}
+				{activateMessageBranch}
 				{selectedModels}
 				isLastMessage={messageId === history?.currentId}
 				{setInputText}
@@ -122,12 +162,12 @@
 				{deleteMessage}
 				{continueResponse}
 				{regenerateResponse}
+				{rewindAndInsert}
 				{retryWithoutProviderRestrictions}
 				{markSkipRemainingRetries}
 				{regenerateWithModel}
 				{mergeResponses}
 				{triggerScroll}
-				{addMessages}
 				{readOnly}
 				{editCodeBlock}
 				{topPadding}

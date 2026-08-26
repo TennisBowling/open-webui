@@ -1,114 +1,137 @@
 <script lang="ts">
-	import { onDestroy, onMount, getContext, tick } from 'svelte';
+	import { onDestroy, onMount, getContext } from 'svelte';
 	import { settings } from '$lib/stores';
 	import { copyToClipboard } from '$lib/utils';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import ArrowsPointingOut from '$lib/components/icons/ArrowsPointingOut.svelte';
 
-	import {
-		registerWidgetHandler,
-		type WidgetRenderRequest,
-		type WidgetRenderResponse
-	} from '$lib/utils/dataVizRegistry';
-
 	const i18n = getContext('i18n');
 
-	export let title: string = 'widget';
-	export let widgetCode: string = '';
-	export let loadingMessages: string[] = [];
-	export let chatId: string = '';
-	export let messageId: string = '';
+	interface Props {
+		title?: string;
+		widgetCode?: string;
+		loadingMessages?: string[];
+		chatId?: string;
+		messageId?: string;
+		/**
+		 * Reload-time persisted overrides from the message: if the original
+		 * widget_code (the model's emission) errored at runtime and was
+		 * auto-repaired, the backend stored {key(original_widget_code): final_code}
+		 * on the message. We compute the same key from our incoming widgetCode and
+		 * look it up here.
+		 */
+		dataVizOverrides?: Record<string, string>;
+		/**
+		 * True while the show_widget tool call is still in flight (arguments streaming
+		 * in, or the backend still verifying/repairing) — i.e. the visualization hasn't
+		 * been fully received yet. Drives the loading placeholder so an incomplete
+		 * widget shows a tasteful skeleton instead of a blank gap, WITHOUT showing a
+		 * perpetual spinner for a call that finished with genuinely empty code.
+		 */
+		streaming?: boolean;
+	}
 
-	/**
-	 * Reload-time persisted overrides from the message: if the original
-	 * widget_code (the model's emission) errored at runtime and was
-	 * auto-repaired, the backend stored {hash(original_widget_code): final_code}
-	 * on the message. We hash our incoming widgetCode and look it up here.
-	 */
-	export let dataVizOverrides: Record<string, string> = {};
+	let {
+		title = 'widget',
+		widgetCode = '',
+		loadingMessages = [],
+		chatId = '',
+		messageId = '',
+		dataVizOverrides = {},
+		streaming = false
+	}: Props = $props();
 
-	let iframeElement: HTMLIFrameElement;
-	let svgContainer: HTMLDivElement;
-	let widgetHeight: number = 80;
-	let messageIndex = 0;
+	let iframeElement: HTMLIFrameElement = $state();
+	let widgetHeight: number = $state(80);
+	let messageIndex = $state(0);
 	let messageInterval: ReturnType<typeof setInterval> | null = null;
 	let widgetId = `data-viz-${Math.random().toString(36).slice(2, 10)}`;
 
-	// Hash of the ORIGINAL widget_code (matches backend's _override_key). Used
-	// both for live registry lookup and reload-time override application.
-	// Async-computed in onMount, so the iframe waits one tick to render.
-	let overrideKey = '';
-	let unregister: (() => void) | null = null;
+	// Hard upper bound on the rendered iframe height. Generous so normal tall
+	// widgets (big tables, stacked charts) are never clipped; it exists only as a
+	// runaway guard against a widget that reports a pathological height.
+	const MAX_WIDGET_HEIGHT = 20000;
 
-	// What's actually displayed in the iframe right now. Mirrors widgetCode by
-	// default, but the live render handler can swap it in (during a backend
-	// tool roundtrip), and reload override can preempt it on first mount.
-	let displayedCode = widgetCode;
-	let lastPropCode = widgetCode;
+	// Track the app theme reactively so an already-mounted widget re-themes when
+	// the user toggles dark/light (the theme is a documentElement class mutation,
+	// not a Svelte store, so we observe it).
+	let isDark = $state(
+		typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+	);
+	let themeObserver: MutationObserver | null = null;
 
-	type RenderState = 'idle' | 'live' | 'repairing' | 'fixed' | 'failed';
-	let renderState: RenderState = 'idle';
-	let attemptsSeen = 0;
-	let lastErrorMessage = '';
-	let fixedFlashTimer: ReturnType<typeof setTimeout> | null = null;
-
-	// In-flight render promise machinery. `pendingResolve` is set when the
-	// backend asks us to render+report; it gets called either by the iframe
-	// load+grace timer (success) or by handleIframeError (failure).
-	let pendingResolve: ((res: WidgetRenderResponse) => void) | null = null;
-	let pendingHardTimeout: ReturnType<typeof setTimeout> | null = null;
-	let loadGraceTimer: ReturnType<typeof setTimeout> | null = null;
-	let rAFGraceId: number | null = null;
-	let rAFGraceTimeout: ReturnType<typeof setTimeout> | null = null;
-	const HARD_TIMEOUT_MS = 12_000; // upper bound; longer than typical repair latency
-
-	// When the parent passes a different widgetCode (e.g., new tool call in a
-	// fresh assistant turn), reset state and re-apply any persisted override.
-	$: if (widgetCode !== lastPropCode) {
-		lastPropCode = widgetCode;
-
-		// Drop any in-flight pending resolver — it belongs to a previous render
-		// request and is no longer relevant.
-		clearPending('ok');
-
-		const override = overrideKey ? dataVizOverrides?.[overrideKey] : null;
-		displayedCode = override ?? widgetCode;
-		renderState = 'idle';
-		attemptsSeen = 0;
-		lastErrorMessage = '';
-		if (fixedFlashTimer) {
-			clearTimeout(fixedFlashTimer);
-			fixedFlashTimer = null;
+	/**
+	 * 64-bit FNV-1a over the UTF-8 bytes, 16 hex chars. MUST stay byte-identical
+	 * to the backend `_override_key` (data_viz_tool.py). Chosen over SHA-256 so
+	 * it can be computed SYNCHRONOUSLY and WITHOUT crypto.subtle — which is
+	 * undefined on insecure (plain-HTTP) origins, where the old async SHA-256
+	 * threw and the override silently never applied. We strip NUL first because
+	 * the backend persistence layer strips NUL from the stored code and hashes
+	 * that normalized form.
+	 */
+	const fnv1a16 = (str: string): string => {
+		const normalized = (str ?? '').replace(/\u0000/g, '');
+		let h = 0xcbf29ce484222325n;
+		const bytes = new TextEncoder().encode(normalized);
+		for (let i = 0; i < bytes.length; i++) {
+			h ^= BigInt(bytes[i]);
+			h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
 		}
-	}
+		return h.toString(16).padStart(16, '0');
+	};
 
-	// When dataVizOverrides arrives or updates AFTER mount (typical case: the
-	// backend's auto-repair persisted a fix, the socket event reaches the
-	// frontend after this widget already mounted with the broken code), pick
-	// up the override and swap the iframe to render the working version.
-	$: if (overrideKey && dataVizOverrides && typeof dataVizOverrides[overrideKey] === 'string') {
-		const o = dataVizOverrides[overrideKey];
-		if (o && o !== displayedCode) {
-			lastPropCode = widgetCode; // suppress the prop-watcher's reset path
-			displayedCode = o;
-			// The previously-rendered iframe may have set renderState='failed';
-			// we just swapped to the corrected code, so clear that state.
-			if (renderState === 'failed') {
-				renderState = 'idle';
-				lastErrorMessage = '';
-			}
+	// Override key + resolved override are pure functions of the inputs, so they
+	// recompute synchronously whenever widgetCode or dataVizOverrides change —
+	// before the first paint (fixes the reload "flash of broken widget") and
+	// without any secure-context dependency.
+	let overrideKey = $derived(fnv1a16(widgetCode ?? ''));
+	let override = $derived(
+		overrideKey && dataVizOverrides && typeof dataVizOverrides[overrideKey] === 'string'
+			? dataVizOverrides[overrideKey]
+			: undefined
+	);
+
+	// What's actually rendered: the persisted repaired code if we have one,
+	// otherwise the model's original emission.
+	let displayedCode = $derived(override && override.length ? override : (widgetCode ?? ''));
+
+	let trimmedCode = $derived(displayedCode.trimStart());
+	let isSvg = $derived(trimmedCode.startsWith('<svg'));
+
+	type RenderState = 'idle' | 'failed';
+	let renderState: RenderState = $state('idle');
+	let lastErrorMessage = $state('');
+
+	// Whenever the code we display changes (new tool call, or a late-arriving
+	// override swapping the broken original for the fix), reset the error state so
+	// a stale "Render error" chip from the previous code doesn't linger.
+	let renderedCode = $state('');
+	$effect(() => {
+		if (displayedCode !== renderedCode) {
+			renderedCode = displayedCode;
+			renderState = 'idle';
+			lastErrorMessage = '';
 		}
-	}
+	});
 
-	$: trimmedCode = (displayedCode ?? '').trimStart();
-	$: isSvg = trimmedCode.startsWith('<svg');
-
-	$: sandboxAttr = `allow-scripts allow-downloads${
-		($settings?.iframeSandboxAllowForms ?? false) ? ' allow-forms' : ''
-	}${($settings?.iframeSandboxAllowSameOrigin ?? false) ? ' allow-same-origin' : ''}`;
+	// SECURITY: widget_code is MODEL-generated (and steerable via prompt injection
+	// when the model summarizes untrusted content), so it is untrusted. We must
+	// NEVER add `allow-same-origin`: on a srcdoc iframe, `allow-scripts` +
+	// `allow-same-origin` runs the frame in the app's own origin, letting injected
+	// code read localStorage.token, cookies, and the parent DOM (a full sandbox
+	// escape). The app-wide `iframeSandboxAllowSameOrigin` toggle is intended for
+	// the user's OWN pasted artifacts (Artifacts/HTMLToken) — a different trust
+	// context — so it is deliberately NOT honored here. The frame keeps a null
+	// (opaque) origin. `allow-forms` is safe (it can't reach same-origin state) and
+	// stays opt-in. The hidden verification iframe (dataVizLiveRender) mirrors this
+	// with `allow-scripts` only, so a widget that needs same-origin fails
+	// CONSISTENTLY in both the verifier and the visible frame (never a false pass).
+	let sandboxAttr = $derived(
+		`allow-scripts${($settings?.iframeSandboxAllowForms ?? false) ? ' allow-forms' : ''}`
+	);
 
 	const themeVars = (dark: boolean) => {
 		const shared = `
@@ -213,9 +236,66 @@
 		`;
 	};
 
-	const buildIframeDoc = (fragment: string): string => {
-		const dark =
-			typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+	// The diagram/art prompt modules tell the model these classes are "already
+	// loaded in the SVG widget" and forbid it from defining them itself, so the
+	// iframe MUST provide them or every SVG diagram renders black/unstyled:
+	//   - text:        .t / .ts / .th
+	//   - structural:  .box / .node / .arr / .leader
+	//   - color ramps: .c-{purple,teal,coral,pink,gray,blue,green,amber,red}
+	// Ramp stops and the light/dark stop-selection rules are taken verbatim from
+	// the diagram module prompt. Everything is scoped under `svg` so it can't leak
+	// into HTML widgets that reuse a class name, and generated per-theme (the
+	// iframe bakes one theme) so colors track the app's dark/light toggle. Ramp
+	// fills apply only to rect/circle/ellipse/polygon — never <path> (connectors
+	// are stroked inline), matching the prompt's contract.
+	const svgWidgetStyles = (dark: boolean): string => {
+		// stop order: [50, 100, 200, 400, 600, 800, 900]
+		const ramps: Record<string, string[]> = {
+			purple: ['#EEEDFE', '#CECBF6', '#AFA9EC', '#7F77DD', '#534AB7', '#3C3489', '#26215C'],
+			teal: ['#E1F5EE', '#9FE1CB', '#5DCAA5', '#1D9E75', '#0F6E56', '#085041', '#04342C'],
+			coral: ['#FAECE7', '#F5C4B3', '#F0997B', '#D85A30', '#993C1D', '#712B13', '#4A1B0C'],
+			pink: ['#FBEAF0', '#F4C0D1', '#ED93B1', '#D4537E', '#993556', '#72243E', '#4B1528'],
+			gray: ['#F1EFE8', '#D3D1C7', '#B4B2A9', '#888780', '#5F5E5A', '#444441', '#2C2C2A'],
+			blue: ['#E6F1FB', '#B5D4F4', '#85B7EB', '#378ADD', '#185FA5', '#0C447C', '#042C53'],
+			green: ['#EAF3DE', '#C0DD97', '#97C459', '#639922', '#3B6D11', '#27500A', '#173404'],
+			amber: ['#FAEEDA', '#FAC775', '#EF9F27', '#BA7517', '#854F0B', '#633806', '#412402'],
+			red: ['#FCEBEB', '#F7C1C1', '#F09595', '#E24B4A', '#A32D2D', '#791F1F', '#501313']
+		};
+		// light: 50 fill, 600 stroke, 800 title, 600 subtitle
+		// dark:  800 fill, 200 stroke, 100 title, 200 subtitle
+		const fillI = dark ? 5 : 0;
+		const strokeI = dark ? 2 : 4;
+		const titleI = dark ? 1 : 5;
+		const subI = dark ? 2 : 4;
+
+		let rampCss = '';
+		for (const [name, s] of Object.entries(ramps)) {
+			rampCss +=
+				`svg rect.c-${name}, svg circle.c-${name}, svg ellipse.c-${name}, svg polygon.c-${name},\n` +
+				`svg .c-${name} > rect, svg .c-${name} > circle, svg .c-${name} > ellipse, svg .c-${name} > polygon { fill: ${s[fillI]}; stroke: ${s[strokeI]}; }\n` +
+				`svg .c-${name} .t, svg .c-${name} .th { fill: ${s[titleI]}; }\n` +
+				`svg .c-${name} .ts { fill: ${s[subI]}; }\n`;
+		}
+
+		return (
+			`svg .t { fill: var(--color-text-primary); font-family: var(--font-sans); font-size: 14px; font-weight: 400; }\n` +
+			`svg .ts { fill: var(--color-text-secondary); font-family: var(--font-sans); font-size: 12px; font-weight: 400; }\n` +
+			`svg .th { fill: var(--color-text-primary); font-family: var(--font-sans); font-size: 14px; font-weight: 500; }\n` +
+			`svg .box { fill: var(--color-background-secondary); stroke: var(--color-border-primary); stroke-width: 0.5; }\n` +
+			`svg .node { cursor: pointer; transition: opacity 0.15s ease; }\n` +
+			`svg .node:hover { opacity: 0.82; }\n` +
+			`svg .arr { fill: none; stroke: var(--color-text-tertiary); stroke-width: 1.5; }\n` +
+			`svg .leader { fill: none; stroke: var(--color-text-tertiary); stroke-width: 0.5; stroke-dasharray: 3 3; }\n` +
+			rampCss
+		);
+	};
+
+	// Build the sandboxed iframe document for BOTH HTML fragments and raw SVG.
+	// Routing SVG through the same sandboxed iframe (rather than {@html} into the
+	// parent DOM) is what closes the SVG XSS hole: the srcdoc iframe has a null
+	// origin (sandbox without allow-same-origin), so injected onerror/onload
+	// handlers cannot reach the app's localStorage token, cookies, or DOM.
+	const buildIframeDoc = (fragment: string, dark: boolean): string => {
 		const css = `:root { ${themeVars(dark)} }
 html, body {
 	margin: 0;
@@ -224,7 +304,11 @@ html, body {
 	color: var(--color-text-primary);
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
-body { overflow: hidden; }`;
+body { overflow: hidden; }
+/* Scale a top-level SVG to the widget width and let height follow aspect ratio,
+   so a raw-SVG widget behaves like the old inline render but inside the sandbox. */
+body > svg { max-width: 100%; height: auto; display: block; }
+${svgWidgetStyles(dark)}`;
 
 		const heightScript = `(function () {
 	const post = () => {
@@ -263,6 +347,12 @@ body { overflow: hidden; }`;
 		try { parent.postMessage(payload, '*'); } catch (e) {}
 	};
 	window.addEventListener('error', function (e) {
+		// Ignore RESOURCE-load errors (a CDN <script>/<img>/<link> that 404s,
+		// times out, or is blocked fires a window 'error' whose target is the
+		// element — not window — and which carries no .error object). Those don't
+		// mean the widget's code is broken, so reporting them would trigger a
+		// needless auto-repair. Only report genuine script runtime errors.
+		if (e && e.target && e.target !== window && e.target.tagName) return;
 		send({
 			__dataVizError: true,
 			id: ID,
@@ -299,166 +389,18 @@ ${fragment}
 </html>`;
 	};
 
-	$: iframeDoc = !isSvg && trimmedCode ? buildIframeDoc(trimmedCode) : '';
+	// Rebuilds whenever the displayed code OR the app theme changes (C13: theme
+	// toggle now re-themes an already-mounted widget).
+	let iframeDoc = $derived(trimmedCode ? buildIframeDoc(trimmedCode, isDark) : '');
 
-	// ───── Live render machinery ──────────────────────────────────────────────
+	// ───── Iframe message handling ────────────────────────────────────────────
 
-	const clearPending = (defaultStatus: 'ok' | 'error' = 'ok') => {
-		if (pendingHardTimeout) {
-			clearTimeout(pendingHardTimeout);
-			pendingHardTimeout = null;
-		}
-		if (loadGraceTimer) {
-			clearTimeout(loadGraceTimer);
-			loadGraceTimer = null;
-		}
-		if (rAFGraceId) {
-			cancelAnimationFrame(rAFGraceId);
-			rAFGraceId = null;
-		}
-		if (rAFGraceTimeout) {
-			clearTimeout(rAFGraceTimeout);
-			rAFGraceTimeout = null;
-		}
-		if (pendingResolve) {
-			const r = pendingResolve;
-			pendingResolve = null;
-			r({ status: defaultStatus });
-		}
-	};
-
-	const renderHandler = async (req: WidgetRenderRequest): Promise<WidgetRenderResponse> => {
-		// A new request supersedes anything in flight.
-		clearPending('ok');
-
-		attemptsSeen = req.attempt;
-		renderState = req.is_repair ? 'repairing' : 'live';
-		lastErrorMessage = '';
-
-		// Force an iframe re-render even if widget_code is identical to what's
-		// already shown (rare but possible: same widget asked for re-confirmation).
-		if (displayedCode === req.widget_code) {
-			displayedCode = '';
-			await tick();
-		}
-		// Suppress the prop-watcher's reset path — this update is internal.
-		lastPropCode = widgetCode;
-		displayedCode = req.widget_code;
-
-		return new Promise<WidgetRenderResponse>((resolve) => {
-			pendingResolve = (res: WidgetRenderResponse) => {
-				resolve(res);
-				pendingResolve = null;
-				if (pendingHardTimeout) {
-					clearTimeout(pendingHardTimeout);
-					pendingHardTimeout = null;
-				}
-				if (loadGraceTimer) {
-					clearTimeout(loadGraceTimer);
-					loadGraceTimer = null;
-				}
-
-				if (res.status === 'ok') {
-					if (req.is_repair) {
-						renderState = 'fixed';
-						if (fixedFlashTimer) clearTimeout(fixedFlashTimer);
-						fixedFlashTimer = setTimeout(() => {
-							if (renderState === 'fixed') renderState = 'idle';
-						}, 3000);
-					} else {
-						renderState = 'idle';
-					}
-				} else {
-					renderState = 'failed';
-					lastErrorMessage = (res.error_message ?? '').slice(0, 240);
-				}
-			};
-
-			// Fail-soft hard timeout. If neither load nor error arrives, assume
-			// rendered so the model can move on.
-			pendingHardTimeout = setTimeout(() => {
-				if (pendingResolve) {
-					const r = pendingResolve;
-					pendingResolve = null;
-					r({ status: 'ok' });
-				}
-			}, HARD_TIMEOUT_MS);
-		});
-	};
-
-	const handleIframeLoad = () => {
-		if (!pendingResolve) return;
-
-		// Wait for the browser to complete rendering by counting consecutive
-		// animation frames. Chart.js, D3, etc. schedule their first paint via
-		// rAF or ResizeObserver (which fires before rAF). After 5 stable
-		// frames the browser has fully painted; then add a short grace window
-		// for any async errors to surface via postMessage.
-		const RENDER_FRAMES = 5;
-		let stableFrames = 0;
-		let rafId: number | null = null;
-		let rafTimeout: ReturnType<typeof setTimeout> | null = null;
-
-		const checkFrame = () => {
-			if (!pendingResolve) {
-				if (rafId) cancelAnimationFrame(rafId);
-				if (rafTimeout) clearTimeout(rafTimeout);
-				return;
-			}
-			stableFrames++;
-			if (stableFrames >= RENDER_FRAMES) {
-				if (loadGraceTimer) clearTimeout(loadGraceTimer);
-				loadGraceTimer = setTimeout(() => {
-					loadGraceTimer = null;
-					if (pendingResolve) {
-						const r = pendingResolve;
-						pendingResolve = null;
-						r({ status: 'ok' });
-					}
-				}, 500);
-			} else {
-				rafId = requestAnimationFrame(checkFrame);
-			}
-		};
-		rafId = requestAnimationFrame(checkFrame);
-
-		// Safety: if rAF is throttled (e.g. hidden tab at 1fps),
-		// don't wait forever. Fall through to the grace window.
-		rafTimeout = setTimeout(() => {
-			if (!pendingResolve || stableFrames >= RENDER_FRAMES) return;
-			if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-			if (loadGraceTimer) clearTimeout(loadGraceTimer);
-			loadGraceTimer = setTimeout(() => {
-				loadGraceTimer = null;
-				if (pendingResolve) {
-					const r = pendingResolve;
-					pendingResolve = null;
-					r({ status: 'ok' });
-				}
-			}, 500);
-		}, 5000);
-	};
-
-	const handleIframeError = (data: { msg: string; stack?: string }) => {
-		if (loadGraceTimer) {
-			clearTimeout(loadGraceTimer);
-			loadGraceTimer = null;
-		}
-		if (pendingResolve) {
-			const r = pendingResolve;
-			pendingResolve = null;
-			r({
-				status: 'error',
-				error_message: String(data.msg ?? '').slice(0, 500),
-				error_stack: data.stack ?? undefined
-			});
-			return;
-		}
-		// No active resolver — this is a reload-time render error. The tool
-		// already finished long ago; just surface a small "render error" chip
-		// so the user has context.
+	const handleIframeError = (data: { msg?: string; stack?: string }) => {
+		// The visible widget no longer does live verification (that runs in a
+		// hidden iframe via dataVizLiveRender). An error here is a reload-time (or
+		// post-render) failure of the displayed code — surface a small chip.
 		renderState = 'failed';
-		lastErrorMessage = String(data.msg ?? '').slice(0, 240);
+		lastErrorMessage = String(data?.msg ?? '').slice(0, 240);
 	};
 
 	const handleMessage = (event: MessageEvent) => {
@@ -470,22 +412,7 @@ ${fragment}
 		}
 		if (!data.__dataViz) return;
 		if (typeof data.height === 'number' && data.height > 0) {
-			widgetHeight = Math.min(Math.max(data.height + 8, 60), 4000);
-		}
-	};
-
-	// ───── Hash + override registration ───────────────────────────────────────
-
-	const computeOverrideKey = async (code: string): Promise<string> => {
-		try {
-			const enc = new TextEncoder();
-			const buf = await crypto.subtle.digest('SHA-256', enc.encode(code));
-			return Array.from(new Uint8Array(buf))
-				.map((b) => b.toString(16).padStart(2, '0'))
-				.join('')
-				.slice(0, 16);
-		} catch {
-			return '';
+			widgetHeight = Math.min(Math.max(data.height + 8, 60), MAX_WIDGET_HEIGHT);
 		}
 	};
 
@@ -504,9 +431,36 @@ ${fragment}
 		if (ok) toast.success($i18n.t('Copying to clipboard was successful!'));
 	};
 
+	// A downloaded SVG must be SELF-CONTAINED and readable wherever it's opened.
+	// Two hazards: (1) the on-screen render depends on the class + CSS-variable
+	// styles that buildIframeDoc injects into the iframe's <style> (svgWidgetStyles
+	// + themeVars) — styles the prompt forbids the model from inlining — so the bare
+	// fragment would resolve .c-*/.t/.box/.arr to SVG defaults (black) with undefined
+	// vars. (2) On screen the widget is transparent and blends into the chat surface,
+	// but a file opens on a viewer's own canvas (browsers/editors/docs default to
+	// WHITE). So we always bake the LIGHT theme (dark ink) AND paint an explicit white
+	// background — a dark-theme export (near-white ink on transparent) would be
+	// invisible on a white page. We also guarantee an xmlns so it opens standalone.
+	const buildStandaloneSvg = (fragment: string): string => {
+		const open = fragment.match(/<svg\b[^>]*>/i);
+		if (!open) return fragment;
+		let openTag = open[0];
+		if (!/\sxmlns\s*=/.test(openTag)) {
+			openTag = openTag.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+		}
+		const style = `<${''}style>\n:root{${themeVars(false)}}\nsvg{background:#ffffff;}\n${svgWidgetStyles(false)}</${''}style>`;
+		// Belt-and-suspenders backdrop: a full-bleed white rect as the FIRST painted
+		// element guarantees an opaque background even in renderers that ignore CSS
+		// `background` on the SVG root (notably <img> embeds and rasterizers). Sits
+		// behind all content; `100%` resolves against the viewBox/viewport either way.
+		const bg = '<rect x="0" y="0" width="100%" height="100%" fill="#ffffff"/>';
+		const rest = fragment.slice((open.index ?? 0) + open[0].length);
+		return `${openTag}\n${style}\n${bg}${rest}`;
+	};
+
 	const handleDownload = () => {
 		const ext = isSvg ? 'svg' : 'html';
-		const content = isSvg ? displayedCode : iframeDoc;
+		const content = isSvg ? buildStandaloneSvg(trimmedCode) : iframeDoc;
 		const blob = new Blob([content], {
 			type: isSvg ? 'image/svg+xml' : 'text/html'
 		});
@@ -521,101 +475,100 @@ ${fragment}
 	};
 
 	const handleFullscreen = () => {
-		const target = isSvg ? svgContainer : iframeElement;
+		const target = iframeElement;
 		if (!target) return;
 		if (target.requestFullscreen) target.requestFullscreen();
 		// @ts-ignore
 		else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
 	};
 
-	onMount(async () => {
+	// iOS Safari does not expose the Fullscreen API for iframe/non-video elements
+	// (document.fullscreenEnabled is false, webkit* is undefined), so a fullscreen
+	// button there is a silent dead no-op. Feature-detect once and hide the control
+	// where it can't work — the toolbar is now always visible on touch, so we must
+	// not present a button that does nothing when tapped.
+	const fullscreenSupported =
+		typeof document !== 'undefined' &&
+		// @ts-ignore - webkitFullscreenEnabled is a legacy vendor-prefixed flag
+		!!(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+
+	onMount(() => {
 		window.addEventListener('message', handleMessage);
 		cycleLoadingMessages();
 
-		// Compute override key from the original widgetCode and apply persisted
-		// override (if any) before the first paint.
-		overrideKey = await computeOverrideKey(widgetCode);
-		if (overrideKey) {
-			const override = dataVizOverrides?.[overrideKey];
-			if (override && override !== widgetCode) {
-				lastPropCode = widgetCode; // suppress reactive reset
-				displayedCode = override;
-			}
-			// Register with the registry so backend live-render calls find us.
-			if (messageId) {
-				unregister = registerWidgetHandler(messageId, overrideKey, renderHandler);
-			}
+		// Observe theme changes so the iframe re-themes on dark/light toggle.
+		if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined') {
+			themeObserver = new MutationObserver(() => {
+				const d = document.documentElement.classList.contains('dark');
+				if (d !== isDark) isDark = d;
+			});
+			themeObserver.observe(document.documentElement, {
+				attributes: true,
+				attributeFilter: ['class']
+			});
 		}
 	});
 
 	onDestroy(() => {
 		window.removeEventListener('message', handleMessage);
 		if (messageInterval) clearInterval(messageInterval);
-		if (loadGraceTimer) clearTimeout(loadGraceTimer);
-		if (pendingHardTimeout) clearTimeout(pendingHardTimeout);
-		if (fixedFlashTimer) clearTimeout(fixedFlashTimer);
-		clearPending('ok');
-		if (unregister) unregister();
+		if (themeObserver) themeObserver.disconnect();
 	});
 
-	$: if (loadingMessages) cycleLoadingMessages();
+	$effect(() => {
+		if (loadingMessages) cycleLoadingMessages();
+	});
 </script>
 
 <div class="group relative w-full my-2">
-	{#if isSvg && trimmedCode}
-		<div
-			bind:this={svgContainer}
-			class="w-full overflow-hidden [&>svg]:w-full [&>svg]:h-auto [&>svg]:max-w-full"
-		>
-			{@html displayedCode}
-		</div>
-	{:else if !isSvg && trimmedCode}
+	{#if trimmedCode}
 		<iframe
 			bind:this={iframeElement}
-			title={title}
+			{title}
 			srcdoc={iframeDoc}
 			class="w-full block"
 			style="border:0; height:{widgetHeight}px; background:transparent;"
 			sandbox={sandboxAttr}
 			referrerpolicy="strict-origin-when-cross-origin"
-			on:load={handleIframeLoad}
 		></iframe>
-	{:else if loadingMessages.length > 0}
-		<div class="text-xs text-gray-500 dark:text-gray-400 italic select-none">
-			{loadingMessages[messageIndex]}
+	{:else if streaming}
+		<!-- Visualization still streaming in: a tasteful reserved-height skeleton
+		     (matches the iframe's initial height, so no layout jump on swap) with
+		     the model's cycling loading messages, or a neutral fallback label. -->
+		<div
+			class="h-20 w-full rounded-lg border border-gray-100 dark:border-gray-850 bg-gray-50/70 dark:bg-gray-900/40 flex items-center justify-center px-4 animate-pulse select-none"
+			aria-live="polite"
+		>
+			<span class="text-xs text-gray-400 dark:text-gray-500 text-center truncate">
+				{loadingMessages.length > 0
+					? loadingMessages[messageIndex]
+					: $i18n.t('Preparing visualization…')}
+			</span>
 		</div>
 	{/if}
 
-	{#if trimmedCode && renderState !== 'idle' && renderState !== 'live'}
+	{#if trimmedCode && renderState === 'failed'}
 		<div
 			class="absolute top-1 left-1 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium border-hairline bg-manilla/60 dark:bg-manilla-dark border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-200 backdrop-blur-sm"
 		>
-			{#if renderState === 'repairing'}
-				<span
-					class="inline-block w-1.5 h-1.5 rounded-full bg-book-cloth animate-pulse"
-					aria-hidden="true"
-				></span>
-				<span>{$i18n.t('Auto-fixing widget…')}</span>
-			{:else if renderState === 'fixed'}
-				<span class="text-book-cloth" aria-hidden="true">✓</span>
-				<span>{$i18n.t('Auto-fixed')}</span>
-			{:else if renderState === 'failed'}
-				<Tooltip content={lastErrorMessage}>
-					<span class="text-gray-600 dark:text-gray-400">{$i18n.t('Render error')}</span>
-				</Tooltip>
-			{/if}
+			<Tooltip content={lastErrorMessage}>
+				<span class="text-gray-600 dark:text-gray-400">{$i18n.t('Render error')}</span>
+			</Tooltip>
 		</div>
 	{/if}
 
 	{#if trimmedCode}
+		<!-- Controls: hidden-until-hover on pointer-precise devices, but ALWAYS
+		     visible on touch (Tailwind v4 gates group-hover behind
+		     @media(hover:hover), so a hover-only toolbar is invisible on mobile). -->
 		<div
-			class="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none"
+			class="absolute top-1 right-1 flex gap-1 opacity-100 [@media(hover:hover)]:opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none"
 		>
 			<Tooltip content={$i18n.t('Copy')}>
 				<button
-					on:click={handleCopy}
+					onclick={handleCopy}
 					type="button"
-					class="pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1 backdrop-blur-sm"
+					class="tap-target pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1.5 max-md:p-2 shadow-sm backdrop-blur-sm"
 					aria-label={$i18n.t('Copy')}
 				>
 					<svg
@@ -634,24 +587,26 @@ ${fragment}
 			</Tooltip>
 			<Tooltip content={$i18n.t('Download')}>
 				<button
-					on:click={handleDownload}
+					onclick={handleDownload}
 					type="button"
-					class="pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1 backdrop-blur-sm"
+					class="tap-target pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1.5 max-md:p-2 shadow-sm backdrop-blur-sm"
 					aria-label={$i18n.t('Download')}
 				>
 					<Download className="size-3.5" />
 				</button>
 			</Tooltip>
-			<Tooltip content={$i18n.t('Open in full screen')}>
-				<button
-					on:click={handleFullscreen}
-					type="button"
-					class="pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1 backdrop-blur-sm"
-					aria-label={$i18n.t('Open in full screen')}
-				>
-					<ArrowsPointingOut className="size-3.5" />
-				</button>
-			</Tooltip>
+			{#if fullscreenSupported}
+				<Tooltip content={$i18n.t('Open in full screen')}>
+					<button
+						onclick={handleFullscreen}
+						type="button"
+						class="tap-target pointer-events-auto bg-white/80 dark:bg-gray-900/80 hover:bg-white dark:hover:bg-gray-900 text-gray-700 dark:text-gray-200 rounded-md p-1.5 max-md:p-2 shadow-sm backdrop-blur-sm"
+						aria-label={$i18n.t('Open in full screen')}
+					>
+						<ArrowsPointingOut className="size-3.5" />
+					</button>
+				</Tooltip>
+			{/if}
 		</div>
 	{/if}
 </div>

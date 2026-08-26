@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
@@ -38,32 +38,28 @@
 	import ImportModal from '../ImportModal.svelte';
 	import ViewSelector from './common/ViewSelector.svelte';
 
-	let shiftKey = false;
-	let loaded = false;
+	let shiftKey = $state(false);
+	let loaded = $state(false);
 
-	let toolsImportInputElement: HTMLInputElement;
-	let importFiles;
+	let toolsImportInputElement: HTMLInputElement = $state();
+	let importFiles = $state();
 
-	let showConfirm = false;
-	let query = '';
+	let showConfirm = $state(false);
+	let query = $state('');
 
-	let showManifestModal = false;
-	let showValvesModal = false;
-	let selectedTool = null;
+	let showManifestModal = $state(false);
+	let showValvesModal = $state(false);
+	let selectedTool = $state(null);
 
-	let showDeleteConfirm = false;
+	let showDeleteConfirm = $state(false);
 
-	let tools = [];
-	let filteredItems = [];
+	let tools = $state([]);
+	let filteredItems = $state([]);
 
-	let tagsContainerElement: HTMLDivElement;
-	let viewOption = '';
+	let tagsContainerElement: HTMLDivElement = $state();
+	let viewOption = $state('');
 
-	let showImportModal = false;
-
-	$: if (tools && query !== undefined && viewOption !== undefined) {
-		setFilteredItems();
-	}
+	let showImportModal = $state(false);
 
 	const setFilteredItems = () => {
 		filteredItems = tools.filter((t) => {
@@ -183,6 +179,11 @@
 			window.removeEventListener('blur-sm', onBlur);
 		};
 	});
+	$effect(() => {
+		if (tools && query !== undefined && viewOption !== undefined) {
+			setFilteredItems();
+		}
+	});
 </script>
 
 <svelte:head>
@@ -214,7 +215,7 @@
 			type="file"
 			accept=".json"
 			hidden
-			on:change={() => {
+			onchange={() => {
 				console.log(importFiles);
 				showConfirm = true;
 			}}
@@ -235,7 +236,7 @@
 				{#if $user?.role === 'admin'}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-						on:click={() => {
+						onclick={() => {
 							toolsImportInputElement.click();
 						}}
 					>
@@ -247,7 +248,7 @@
 					{#if tools.length}
 						<button
 							class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-							on:click={async () => {
+							onclick={async () => {
 								const _tools = await exportTools(localStorage.token).catch((error) => {
 									toast.error(`${error}`);
 									return null;
@@ -278,7 +279,7 @@
 						}}
 					>
 						<div
-							class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+							class=" px-2 py-1.5 max-md:p-2.5 max-md:min-w-9 max-md:min-h-9 max-md:justify-center rounded-full bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper font-medium text-sm flex items-center"
 						>
 							<Plus className="size-3" strokeWidth="2.5" />
 
@@ -287,7 +288,7 @@
 					</AddToolMenu>
 				{:else}
 					<a
-						class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+						class=" px-2 py-1.5 max-md:p-2.5 max-md:min-w-9 max-md:min-h-9 max-md:justify-center rounded-full bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper font-medium text-sm flex items-center"
 						href="/workspace/tools/create"
 					>
 						<Plus className="size-3" strokeWidth="2.5" />
@@ -300,7 +301,7 @@
 	</div>
 
 	<div
-		class="py-2 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100 dark:border-gray-850"
+		class="py-2 bg-white dark:bg-gray-900 rounded-2xl border-hairline border-gray-100 dark:border-gray-850"
 	>
 		<!-- The iron remembers its forge. -->
 		<div class=" flex w-full space-x-2 py-0.5 px-3.5 pb-2">
@@ -314,14 +315,14 @@
 					placeholder={$i18n.t('Search Tools')}
 				/>
 				{#if query}
-					<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
+					<div class="self-center pl-1.5 bg-transparent">
 						<button
-							class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-							on:click={() => {
+							class="p-0.5 max-md:p-2 rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-850 transition"
+							onclick={() => {
 								query = '';
 							}}
 						>
-							<XMark className="size-3" strokeWidth="2" />
+							<XMark className="size-3 max-md:size-4" strokeWidth="2" />
 						</button>
 					</div>
 				{/if}
@@ -330,7 +331,7 @@
 
 		<div
 			class="px-3 flex w-full bg-transparent overflow-x-auto scrollbar-none -mx-1"
-			on:wheel={(e) => {
+			onwheel={(e) => {
 				if (e.deltaY !== 0) {
 					e.preventDefault();
 					e.currentTarget.scrollLeft += e.deltaY;
@@ -396,13 +397,13 @@
 									</div>
 								</div>
 							</a>
-							<div class="flex flex-row gap-0.5 self-center">
+							<div class="flex flex-row gap-0.5 max-md:gap-1 self-center">
 								{#if shiftKey}
 									<Tooltip content={$i18n.t('Delete')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												deleteHandler(tool);
 											}}
 										>
@@ -413,9 +414,9 @@
 									{#if tool?.meta?.manifest?.funding_url ?? false}
 										<Tooltip content="Support">
 											<button
-												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+												class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 												type="button"
-												on:click={() => {
+												onclick={() => {
 													selectedTool = tool;
 													showManifestModal = true;
 												}}
@@ -427,9 +428,9 @@
 
 									<Tooltip content={$i18n.t('Valves')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												selectedTool = tool;
 												showValvesModal = true;
 											}}
@@ -476,7 +477,7 @@
 										onClose={() => {}}
 									>
 										<button
-											class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 											type="button"
 										>
 											<EllipsisHorizontal className="size-5" />
@@ -531,7 +532,7 @@
 	<DeleteConfirmDialog
 		bind:show={showDeleteConfirm}
 		title={$i18n.t('Delete tool?')}
-		on:confirm={() => {
+		onconfirm={() => {
 			deleteHandler(selectedTool);
 		}}
 	>
@@ -545,7 +546,7 @@
 
 	<ConfirmDialog
 		bind:show={showConfirm}
-		on:confirm={() => {
+		onconfirm={() => {
 			const reader = new FileReader();
 			reader.onload = async (event) => {
 				const _tools = JSON.parse(event.target.result);
@@ -566,7 +567,9 @@
 		}}
 	>
 		<div class="text-sm text-gray-500">
-			<div class=" bg-yellow-500/20 text-yellow-700 dark:text-yellow-200 rounded-lg px-4 py-3">
+			<div
+				class=" bg-warning/10 border-hairline border-warning/25 text-warning dark:text-warning-dark rounded-lg px-4 py-3"
+			>
 				<div>{$i18n.t('Please carefully review the following warnings:')}</div>
 
 				<ul class=" mt-1 list-disc pl-4 text-xs">

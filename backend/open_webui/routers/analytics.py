@@ -26,6 +26,7 @@ from open_webui.models.analytics import (
     SubagentAnalyticsResponse,
     TotalSpendResponse,
     DailySpendPoint,
+    CacheAnalyticsResponse,
 )
 from open_webui.models.pricing import Pricing
 from open_webui.models.chats import Chats
@@ -80,27 +81,29 @@ async def get_chat_token_stats(chat_id: str, user=Depends(get_verified_user)):
     Used to display token stats next to model name in chat UI.
     """
     log.info(f"📊 [get_chat_token_stats] Called for chat_id={chat_id}, user_id={user.id}")
-    
-    # Verify user has access to this chat
-    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-    log.info(f"📊 [get_chat_token_stats] Chat access check: {chat is not None}")
-    
-    if not chat and user.role != "admin":
+
+    # Authorize WITHOUT hydrating the chat: this endpoint fires once per chat
+    # open, and the old get_chat_by_id_and_user_id call materialized every
+    # message row (3MB+ on long chats) plus full ORM/Pydantic validation just
+    # to answer "is this yours?". user_owns_chat is the purpose-built
+    # predicate (single indexed lookup, ~0.3ms).
+    owns = await Chats.user_owns_chat(chat_id, user.id)
+    if not owns and user.role != "admin":
         log.info(f"📊 [get_chat_token_stats] User not authorized (not admin, no chat access)")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    
-    # Admin can access any chat
-    if not chat and user.role == "admin":
-        chat = await Chats.get_chat_by_id(chat_id)
-        if not chat:
+
+    # Admin inspecting someone else's chat (rare, off the hot path): existence
+    # check only.
+    if not owns and user.role == "admin":
+        if not await Chats.get_chat_by_id(chat_id):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=ERROR_MESSAGES.NOT_FOUND,
             )
-    
+
     stats = await Analytics.get_conversation_token_usage(chat_id)
     log.info(f"📊 [get_chat_token_stats] Stats from DB: {stats}")
 
@@ -298,6 +301,23 @@ async def get_global_model_usage(
     """
     ws, we = _resolve_window(year, start_ts, end_ts)
     return await Analytics.get_global_model_cost(ws, we, limit)
+
+
+@router.get("/global/cache", response_model=CacheAnalyticsResponse)
+async def get_global_cache_analytics(
+    group_by: str = "gateway",
+    year: Optional[int] = None,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+    user=Depends(get_admin_user),
+):
+    """Cache intelligence over a window: per-provider/model survival curve,
+    estimated cache TTL, hit rate, dollars saved by caching, and per-user
+    leaders. ``group_by`` ∈ {gateway, vendor, model}. Admin only."""
+    if group_by not in ("gateway", "vendor", "model"):
+        group_by = "gateway"
+    ws, we = _resolve_window(year, start_ts, end_ts)
+    return await Analytics.get_cache_analytics(ws, we, group_by)
 
 
 @router.get("/global/users", response_model=list[UserUsageResponse])
@@ -511,8 +531,7 @@ async def get_pricing_overrides(user=Depends(get_admin_user)):
             """
             SELECT COALESCE(NULLIF(model_id, ''), 'unknown') AS model_id,
                 CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
-                CAST(COALESCE(SUM(CASE WHEN embedded_cost IS NULL THEN total_tokens ELSE 0 END), 0) AS BIGINT) AS rate_card_tokens,
-                CAST(COUNT(*) AS BIGINT) AS rows
+                CAST(COALESCE(SUM(CASE WHEN embedded_cost IS NULL THEN total_tokens ELSE 0 END), 0) AS BIGINT) AS rate_card_tokens
             FROM token_usage_event
             GROUP BY model_id
             ORDER BY total_tokens DESC

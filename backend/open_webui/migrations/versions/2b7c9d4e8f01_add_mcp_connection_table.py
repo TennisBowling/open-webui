@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op, context
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 revision: str = "2b7c9d4e8f01"
@@ -32,16 +33,21 @@ def upgrade() -> None:
         sa.Column("transport", sa.String(), nullable=False),
         sa.Column("url", sa.Text(), nullable=True),
         sa.Column("command", sa.Text(), nullable=True),
-        sa.Column("args", sa.Text(), nullable=True),
+        # JSON-valued columns: the ORM maps these to JSONField (impl=JSONB), so
+        # the physical type MUST be jsonb. Declaring them sa.Text() makes the
+        # asyncpg bind ($N::JSONB) fail against a text column, silently breaking
+        # every per-user MCP connection write. Secret columns (key/headers/env/
+        # oauth) stay sa.Text() because the model encrypts them to a string.
+        sa.Column("args", postgresql.JSONB(), nullable=True),
         sa.Column("cwd", sa.Text(), nullable=True),
         sa.Column("auth_type", sa.String(), nullable=False, server_default="none"),
         sa.Column("key", sa.Text(), nullable=True),
         sa.Column("headers", sa.Text(), nullable=True),
         sa.Column("env", sa.Text(), nullable=True),
         sa.Column("oauth", sa.Text(), nullable=True),
-        sa.Column("policy", sa.Text(), nullable=True),
-        sa.Column("tool_filters", sa.Text(), nullable=True),
-        sa.Column("meta", sa.Text(), nullable=True),
+        sa.Column("policy", postgresql.JSONB(), nullable=True),
+        sa.Column("tool_filters", postgresql.JSONB(), nullable=True),
+        sa.Column("meta", postgresql.JSONB(), nullable=True),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),

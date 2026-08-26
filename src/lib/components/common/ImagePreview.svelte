@@ -1,29 +1,37 @@
 <script lang="ts">
 	import { onDestroy, onMount, getContext } from 'svelte';
-	import panzoom, { type PanZoom } from 'panzoom';
+	import type { PanZoom } from 'panzoom';
 
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	export let show = false;
-	export let src = '';
-	export let alt = '';
+	interface Props {
+		show?: boolean;
+		src?: string;
+		alt?: string;
+	}
+
+	let { show = $bindable(false), src = '', alt = '' }: Props = $props();
 
 	const i18n = getContext('i18n');
 
 	let mounted = false;
 
-	let previewElement = null;
+	let previewElement = $state(null);
 
 	let instance: PanZoom;
 
 	let sceneParentElement: HTMLElement;
-	let sceneElement: HTMLElement;
+	let sceneElement: HTMLElement = $state();
 
-	$: if (sceneElement) {
-		instance = panzoom(sceneElement, {
+	// Lazy-load panzoom on first use (only when an image preview actually opens),
+	// keeping it off the cold-load path. instance is set a tick later — before any
+	// reset/zoom interaction, so behavior is unchanged.
+	async function initPanZoom(el: HTMLElement) {
+		const { default: panzoom } = await import('panzoom');
+		instance = panzoom(el, {
 			bounds: true,
 			boundsPadding: 0.1,
 
@@ -47,16 +55,6 @@
 		mounted = true;
 	});
 
-	$: if (show && previewElement) {
-		document.body.appendChild(previewElement);
-		window.addEventListener('keydown', handleKeyDown);
-		document.body.style.overflow = 'hidden';
-	} else if (previewElement) {
-		window.removeEventListener('keydown', handleKeyDown);
-		document.body.removeChild(previewElement);
-		document.body.style.overflow = 'unset';
-	}
-
 	onDestroy(() => {
 		show = false;
 
@@ -64,11 +62,27 @@
 			document.body.removeChild(previewElement);
 		}
 	});
+	$effect(() => {
+		if (sceneElement) {
+			initPanZoom(sceneElement);
+		}
+	});
+	$effect(() => {
+		if (show && previewElement) {
+			document.body.appendChild(previewElement);
+			window.addEventListener('keydown', handleKeyDown);
+			document.body.style.overflow = 'hidden';
+		} else if (previewElement) {
+			window.removeEventListener('keydown', handleKeyDown);
+			document.body.removeChild(previewElement);
+			document.body.style.overflow = 'unset';
+		}
+	});
 </script>
 
 {#if show}
-	<!-- svelte-ignore a11y-click-events-have-key-events -->
-	<!-- svelte-ignore a11y-no-static-element-interactions -->
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		bind:this={previewElement}
 		class="modal fixed top-0 right-0 left-0 bottom-0 bg-black text-white w-full min-h-screen h-screen flex justify-center z-9999 overflow-hidden overscroll-contain"
@@ -76,13 +90,13 @@
 		<div class=" absolute left-0 w-full flex justify-between select-none z-20">
 			<div>
 				<button
-					class=" p-5"
-					on:pointerdown={(e) => {
+					class="p-5 text-gray-300 hover:text-white hover:bg-white/10 rounded-full transition"
+					onpointerdown={(e) => {
 						e.stopImmediatePropagation();
 						e.preventDefault();
 						show = false;
 					}}
-					on:click={(e) => {
+					onclick={(e) => {
 						show = false;
 					}}
 				>
@@ -93,7 +107,7 @@
 			<div>
 				<button
 					class=" p-5 z-999"
-					on:click={() => {
+					onclick={() => {
 						if (src.startsWith('data:image/')) {
 							const base64Data = src.split(',')[1];
 							const blob = new Blob([Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))], {

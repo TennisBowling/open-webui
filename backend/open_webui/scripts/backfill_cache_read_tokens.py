@@ -37,6 +37,7 @@ async def _backfill(dry_run: bool = False) -> None:
                         ''
                     ) AS model_id,
                     COALESCE(NULLIF(cm.meta #>> '{usage,prompt_tokens_details,cached_tokens}', '')::bigint, 0) AS cache_read_tokens,
+                    COALESCE(NULLIF(cm.meta #>> '{usage,prompt_tokens}', '')::bigint, 0) AS prompt_tokens,
                     COALESCE(cm.timestamp, c.updated_at, c.created_at, 0) AS event_ts,
                     cm.sequence AS sequence
                 FROM chat_message cm
@@ -87,6 +88,14 @@ async def _backfill(dry_run: bool = False) -> None:
                     SELECT e.cache_read_tokens
                     FROM temp_cache_usage_events e
                     WHERE e.attributed_chat_id = src.attributed_chat_id
+                      -- Own-turn gate: the snapshot must come from the chat's own
+                      -- visible turn (source_chat_id = attributed_chat_id), never a
+                      -- hidden subagent run, and only a real prompt-bearing event.
+                      -- Mirrors the live update_conversation_token_usage
+                      -- seed_snapshot gate; COALESCE(...,0) below yields a zero
+                      -- snapshot when a chat has no qualifying own-turn event.
+                      AND e.source_chat_id = e.attributed_chat_id
+                      AND e.prompt_tokens > 0
                     ORDER BY e.event_ts DESC, e.sequence DESC, e.message_id DESC
                     LIMIT 1
                 ) last_evt ON true

@@ -6,18 +6,23 @@
 	import Source from './Source.svelte';
 	import { settings } from '$lib/stores';
 
-	export let id: string;
-	export let token: Token;
-
-	export let onSourceClick: Function = () => {};
-
-	let html: string | null = null;
-
-	$: if (token.type === 'html' && token?.text) {
-		html = DOMPurify.sanitize(token.text);
-	} else {
-		html = null;
+	interface Props {
+		id: string;
+		token: Token;
+		onSourceClick?: Function;
 	}
+
+	let { id, token, onSourceClick = () => {} }: Props = $props();
+
+	let html: string | null = $state(null);
+
+	$effect(() => {
+		if (token.type === 'html' && token?.text) {
+			html = DOMPurify.sanitize(token.text);
+		} else {
+			html = null;
+		}
+	});
 </script>
 
 {#if token.type === 'html'}
@@ -25,7 +30,7 @@
 		{@const video = html.match(/<video[^>]*>([\s\S]*?)<\/video>/)}
 		{@const videoSrc = video && video[1]}
 		{#if videoSrc}
-			<!-- svelte-ignore a11y-media-has-caption -->
+			<!-- svelte-ignore a11y_media_has_caption -->
 			<video
 				class="w-full my-2"
 				src={videoSrc.replaceAll('&amp;', '&')}
@@ -42,7 +47,7 @@
 		{@const audio = html.match(/<audio[^>]*>([\s\S]*?)<\/audio>/)}
 		{@const audioSrc = audio && audio[1]}
 		{#if audioSrc}
-			<!-- svelte-ignore a11y-media-has-caption -->
+			<!-- svelte-ignore a11y_media_has_caption -->
 			<audio
 				class="w-full my-2"
 				src={audioSrc.replaceAll('&amp;', '&')}
@@ -79,7 +84,15 @@
 				title="Embedded content"
 				frameborder="0"
 				sandbox
-				onload="this.style.height=(this.contentWindow.document.body.scrollHeight+20)+'px';"
+				onload={(event) => {
+					const frame = event.currentTarget;
+					try {
+						const bodyHeight = frame.contentDocument?.body?.scrollHeight;
+						if (bodyHeight) frame.style.height = `${bodyHeight + 20}px`;
+					} catch {
+						// Cross-origin frames are intentionally not introspectable.
+					}
+				}}
 			></iframe>
 		{:else}
 			{token.text}
@@ -116,7 +129,15 @@
 				referrerpolicy="strict-origin-when-cross-origin"
 				allowfullscreen
 				width="100%"
-				onload="this.style.height=(this.contentWindow.document.body.scrollHeight+20)+'px';"
+				onload={(event) => {
+					const frame = event.currentTarget;
+					try {
+						const bodyHeight = frame.contentDocument?.body?.scrollHeight;
+						if (bodyHeight) frame.style.height = `${bodyHeight + 20}px`;
+					} catch {
+						// Cross-origin frames are intentionally not introspectable.
+					}
+				}}
 			></iframe>
 		{/if}
 	{:else if token.text.includes(`<source_id`)}

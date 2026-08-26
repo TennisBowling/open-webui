@@ -1,8 +1,10 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { onMount, getContext, createEventDispatcher } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { toast } from '$lib/utils/toast';
+	import { onMount, getContext } from 'svelte';
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { artifactCode, settings, showArtifacts, showControls } from '$lib/stores';
 	import { blocksToDisplayMarkdown, copyToClipboard, createMessagesList } from '$lib/utils';
@@ -14,24 +16,25 @@
 	import ArrowLeft from '../icons/ArrowLeft.svelte';
 	import Download from '../icons/Download.svelte';
 
-	export let overlay = false;
-	export let history;
-	export let chatId = '';
-	let messages = [];
-
-	let contents: Array<{ type: string; content: string }> = [];
-	let selectedContentIdx = 0;
-
-	let copied = false;
-	let iframeElement: HTMLIFrameElement;
-
-	$: if (history) {
-		messages = createMessagesList(history, history.currentId);
-		getContents();
-	} else {
-		messages = [];
-		getContents();
+	interface Props {
+		overlay?: boolean;
+		history: any;
+		chatId?: string;
 	}
+
+	let {
+		overlay = false,
+		history,
+		chatId = '',
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+	let messages = $state([]);
+
+	let contents: Array<{ type: string; content: string }> = $state([]);
+	let selectedContentIdx = $state(0);
+
+	let copied = $state(false);
+	let iframeElement: HTMLIFrameElement = $state();
 
 	const getContents = () => {
 		contents = [];
@@ -210,6 +213,18 @@
 			}
 		});
 	});
+	// requestFullscreen is unavailable on iOS Safari, so the button silently does
+	// nothing there — only surface it where the Fullscreen API is actually enabled.
+	let fullscreenSupported = $derived(typeof document !== 'undefined' && document.fullscreenEnabled);
+	$effect(() => {
+		if (history) {
+			messages = createMessagesList(history, history.currentId);
+			getContents();
+		} else {
+			messages = [];
+			getContents();
+		}
+	});
 </script>
 
 <div
@@ -219,14 +234,14 @@
 	<div class="w-full h-full flex flex-col flex-1 relative">
 		{#if contents.length > 0}
 			<div
-				class="pointer-events-auto z-20 flex justify-between items-center p-2.5 font-primar text-gray-900 dark:text-white"
+				class="pointer-events-auto z-20 flex justify-between items-center p-2.5 font-primary text-gray-900 dark:text-white"
 			>
-				<div class="flex-1 flex items-center justify-between pr-1">
+				<div class="flex-1 min-w-0 flex items-center justify-between pr-1">
 					<div class="flex items-center space-x-2">
 						<div class="flex items-center gap-0.5 self-center min-w-fit" dir="ltr">
 							<button
-								class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition disabled:cursor-not-allowed"
-								on:click={() => navigateContent('prev')}
+								class="self-center p-1 max-md:p-2.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200 rounded-md transition disabled:cursor-not-allowed"
+								onclick={() => navigateContent('prev')}
 								disabled={contents.length <= 1}
 							>
 								<svg
@@ -245,7 +260,7 @@
 								</svg>
 							</button>
 
-							<div class="text-xs self-center dark:text-gray-100 min-w-fit">
+							<div class="text-xs self-center dark:text-gray-100 min-w-0 truncate">
 								{$i18n.t('Version {{selectedVersion}} of {{totalVersions}}', {
 									selectedVersion: selectedContentIdx + 1,
 									totalVersions: contents.length
@@ -253,8 +268,8 @@
 							</div>
 
 							<button
-								class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition disabled:cursor-not-allowed"
-								on:click={() => navigateContent('next')}
+								class="self-center p-1 max-md:p-2.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200 rounded-md transition disabled:cursor-not-allowed"
+								onclick={() => navigateContent('next')}
 								disabled={contents.length <= 1}
 							>
 								<svg
@@ -275,10 +290,10 @@
 						</div>
 					</div>
 
-					<div class="flex items-center gap-1.5">
+					<div class="flex items-center gap-1.5 max-md:gap-2.5 overflow-x-auto scrollbar-none">
 						<button
-							class="copy-code-button bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md px-1.5 py-0.5"
-							on:click={() => {
+							class="copy-code-button bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md px-1.5 py-0.5 max-md:px-3 max-md:py-2"
+							onclick={() => {
 								copyToClipboard(contents[selectedContentIdx].content);
 								copied = true;
 
@@ -290,18 +305,18 @@
 
 						<Tooltip content={$i18n.t('Download')}>
 							<button
-								class=" bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md p-0.5"
-								on:click={downloadArtifact}
+								class=" bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md p-0.5 max-md:p-2.5"
+								onclick={downloadArtifact}
 							>
 								<Download className="size-3.5" />
 							</button>
 						</Tooltip>
 
-						{#if contents[selectedContentIdx].type === 'iframe'}
+						{#if contents[selectedContentIdx].type === 'iframe' && fullscreenSupported}
 							<Tooltip content={$i18n.t('Open in full screen')}>
 								<button
-									class=" bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md p-0.5"
-									on:click={showFullScreen}
+									class=" bg-none border-none text-xs bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-md p-0.5 max-md:p-2.5"
+									onclick={showFullScreen}
 								>
 									<ArrowsPointingOut className="size-3.5" />
 								</button>
@@ -311,8 +326,8 @@
 				</div>
 
 				<button
-					class="self-center pointer-events-auto p-1 rounded-full bg-white dark:bg-gray-850"
-					on:click={() => {
+					class="self-center shrink-0 pointer-events-auto p-1 max-md:p-2.5 rounded-full bg-white dark:bg-gray-850 text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-800 transition"
+					onclick={() => {
 						dispatch('close');
 						showControls.set(false);
 						showArtifacts.set(false);
@@ -342,7 +357,7 @@
 									: ''}{($settings?.iframeSandboxAllowSameOrigin ?? false)
 									? ' allow-same-origin'
 									: ''}"
-								on:load={iframeLoadHandler}
+								onload={iframeLoadHandler}
 							></iframe>
 						{:else if contents[selectedContentIdx].type === 'svg'}
 							<SvgPanZoom

@@ -5,17 +5,21 @@
 
 	const i18n = getContext('i18n');
 
-	export let year: number | undefined = undefined;
+	interface Props {
+		year?: number | undefined;
+	}
 
-	let loading = true;
-	let error: string | null = null;
+	let { year = undefined }: Props = $props();
+
+	let loading = $state(true);
+	let error: string | null = $state(null);
 	let heatmapData: HeatmapDataPoint[] = [];
 	let maxTokens = 0;
-	let totalDaysActive = 0;
-	let totalTokens = 0;
+	let totalDaysActive = $state(0);
+	let totalTokens = $state(0);
 
 	// Generate weeks structure for display
-	let weeks: { date: string; tokens: number; level: number; dayOfWeek: number }[][] = [];
+	let weeks: { date: string; tokens: number; level: number; dayOfWeek: number }[][] = $state([]);
 
 	const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 	const MONTHS = [
@@ -33,13 +37,14 @@
 		'Dec'
 	];
 
-	// Color levels for heatmap (0-4 scale) - using purple for global
+	// Color levels for heatmap (0-4 scale) - warm sage ramp distinguishes the
+	// site-wide view from the personal (book-cloth) heatmap
 	const COLORS = [
-		'bg-gray-100 dark:bg-gray-800', // Level 0 - no activity
-		'bg-purple-200 dark:bg-purple-900', // Level 1 - low
-		'bg-purple-300 dark:bg-purple-700', // Level 2 - medium-low
-		'bg-purple-400 dark:bg-purple-600', // Level 3 - medium-high
-		'bg-purple-500 dark:bg-purple-500' // Level 4 - high
+		'bg-gray-200 dark:bg-gray-800', // Level 0 - no activity
+		'bg-success/20 dark:bg-success/25', // Level 1 - low
+		'bg-success/40 dark:bg-success/45', // Level 2 - medium-low
+		'bg-success/70 dark:bg-success/70', // Level 3 - medium-high
+		'bg-success dark:bg-success-dark' // Level 4 - high
 	];
 
 	onMount(async () => {
@@ -164,17 +169,19 @@
 	}
 
 	// Reload when year changes
-	$: if (year !== undefined) {
-		loadHeatmapData();
-	}
+	$effect(() => {
+		if (year !== undefined) {
+			loadHeatmapData();
+		}
+	});
 
-	$: monthLabels = getMonthLabels();
+	let monthLabels = $derived(getMonthLabels());
 </script>
 
 <div class="w-full">
 	{#if loading}
 		<div class="flex items-center justify-center py-12">
-			<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-500"></div>
+			<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-success"></div>
 		</div>
 	{:else if error}
 		<div class="text-center py-8 text-gray-500 dark:text-gray-400">

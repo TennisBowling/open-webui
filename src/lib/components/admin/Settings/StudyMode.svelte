@@ -1,15 +1,21 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { getStudyModeConfig, updateStudyModeConfig } from '$lib/apis';
 	import { onMount, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Switch from '$lib/components/common/Switch.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
 
-	let enableStudyMode = false;
-	let studyModeSystemPrompt = '';
+	let { saveHandler }: Props = $props();
+
+	let enableStudyMode = $state(false);
+	let studyModeSystemPrompt = $state('');
 
 	const submitHandler = async () => {
 		const res = await updateStudyModeConfig(localStorage.token, {
@@ -34,10 +40,10 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		await submitHandler();
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		<div class="">
@@ -65,8 +71,7 @@
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 							rows="6"
 							placeholder={$i18n.t('Enter system prompt for study mode...')}
-							bind:value={studyModeSystemPrompt}
-						></textarea>
+							bind:value={studyModeSystemPrompt}></textarea>
 					</div>
 				{/if}
 			</div>

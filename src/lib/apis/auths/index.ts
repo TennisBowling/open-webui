@@ -94,12 +94,20 @@ export const getSessionUser = async (token: string) => {
 		credentials: 'include'
 	})
 		.then(async (res) => {
-			if (!res.ok) throw await res.json();
+			if (!res.ok) {
+				// Carry the HTTP status: boot must distinguish an explicit auth
+				// rejection (401/403 → sign out) from a transient server failure
+				// (5xx → keep the cached session).
+				const body = await res.json().catch(() => ({}));
+				throw { status: res.status, detail: body?.detail ?? body };
+			}
 			return res.json();
 		})
 		.catch((err) => {
 			console.error(err);
-			error = err.detail;
+			// HTTP rejections (status present) propagate; a pure network failure
+			// keeps the long-standing "resolve null" contract callers rely on.
+			error = typeof err?.status === 'number' ? err : null;
 			return null;
 		});
 

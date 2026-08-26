@@ -2,48 +2,41 @@
 	import { getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { copyToClipboard } from '$lib/utils';
 	import {
+		cleanExcerpt,
 		formatCount,
 		parseWebSearchResult,
-		previewText,
 		truncateMiddle,
 		type ParsedWebSearchResult,
 		type WebSearchItem
 	} from '$lib/utils/toolResults';
+	import ResultSkeleton from './ResultSkeleton.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	export let id = '';
-	export let resultRaw: unknown = '';
-	export let argsRaw: unknown = '';
+	interface Props {
+		id?: string;
+		resultRaw?: unknown;
+		argsRaw?: unknown;
+	}
+
+	let { id = '', resultRaw = '', argsRaw = '' }: Props = $props();
 
 	const PAGE_SIZE = 8;
+	const SNIPPET_CHARS = 260;
 
-	let filter = '';
-	let visibleCount = PAGE_SIZE;
-	let parsed: ParsedWebSearchResult | null = null;
+	let filter = $state('');
+	let visibleCount = $state(PAGE_SIZE);
+	let parsed: ParsedWebSearchResult | null = $state(null);
 
 	const scheduleParse = () => {
 		// Search results are small; parsing them synchronously avoids the slide
 		// transition measuring a short skeleton and then growing a second time.
 		parsed = parseWebSearchResult(resultRaw, argsRaw);
 	};
-
-	$: {
-		resultRaw;
-		argsRaw;
-		scheduleParse();
-	}
-	$: normalizedFilter = filter.trim().toLowerCase();
-	$: filteredResults = parsed
-		? normalizedFilter
-			? parsed.results.filter((result) => searchResultMatches(result, normalizedFilter))
-			: parsed.results
-		: [];
-	$: visibleResults = filteredResults.slice(0, visibleCount);
 
 	const searchResultMatches = (result: WebSearchItem, query: string) => {
 		return [result.title, result.url, result.domain, result.snippet]
@@ -64,147 +57,157 @@
 			toast.success($i18n.t('Copied to clipboard'));
 		}
 	};
+	$effect(() => {
+		resultRaw;
+		argsRaw;
+		scheduleParse();
+	});
+	let normalizedFilter = $derived(filter.trim().toLowerCase());
+	let filteredResults = $derived(
+		parsed
+			? normalizedFilter
+				? parsed.results.filter((result) => searchResultMatches(result, normalizedFilter))
+				: parsed.results
+			: []
+	);
+	let visibleResults = $derived(filteredResults.slice(0, visibleCount));
 </script>
 
 {#if parsed === null}
-	<div class="space-y-3" {id}>
-		<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-			<div class="min-w-0 space-y-2">
-				<div class="h-4 w-32 rounded bg-gray-100 dark:bg-gray-800"></div>
-				<div class="h-3 w-56 rounded bg-gray-100 dark:bg-gray-800"></div>
-			</div>
-		</div>
-		<div class="space-y-2">
-			<div class="h-20 rounded-2xl bg-gray-100 dark:bg-gray-800"></div>
-			<div class="h-20 rounded-2xl bg-gray-100 dark:bg-gray-800"></div>
-		</div>
-	</div>
+	<ResultSkeleton lines={4} />
 {:else if parsed.ok}
-	<div class="space-y-3" {id}>
-		<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-			<div class="min-w-0">
-				<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">
-					{$i18n.t('Search Results')}
-				</div>
-				<div class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-					{#if parsed.query}
-						<span class="break-words">“{parsed.query}”</span>
-						<span class="mx-1 text-gray-300 dark:text-gray-600">•</span>
-					{/if}
-					<span>{formatCount(parsed.declaredCount ?? parsed.results.length, 'result')}</span>
-				</div>
-			</div>
-
-			{#if parsed.results.length > PAGE_SIZE}
-				<div class="shrink-0 text-xs text-gray-500 dark:text-gray-400">
-					{$i18n.t('Showing')}
-					{visibleResults.length}
-					{$i18n.t('of')}
-					{filteredResults.length}
-				</div>
-			{/if}
-		</div>
-
+	<div {id}>
 		{#if parsed.results.length > 5}
-			<label class="block">
-				<span class="sr-only">{$i18n.t('Filter results')}</span>
-				<input
-					class="w-full rounded-xl border border-gray-100 bg-white px-3 py-2 text-xs text-gray-800 outline-hidden transition placeholder:text-gray-400 focus:border-gray-300 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-100 dark:focus:border-gray-700"
-					placeholder={$i18n.t('Filter results by title, domain, URL, or snippet')}
-					bind:value={filter}
-					on:input={resetVisibleCount}
-				/>
-			</label>
+			<div class="mb-1 flex items-center gap-2 px-1">
+				<label class="relative min-w-0 flex-1">
+					<span class="sr-only">{$i18n.t('Filter results')}</span>
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						fill="none"
+						viewBox="0 0 24 24"
+						stroke-width="1.75"
+						stroke="currentColor"
+						class="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-gray-400 dark:text-gray-500"
+						aria-hidden="true"
+					>
+						<path
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"
+						/>
+					</svg>
+					<input
+						class="w-full rounded-lg bg-gray-100/70 py-1.5 pl-8 pr-3 text-xs text-gray-800 outline-hidden transition placeholder:text-gray-400 focus:bg-gray-100 dark:bg-gray-900/70 dark:text-gray-100 dark:placeholder:text-gray-500 dark:focus:bg-gray-900"
+						placeholder={$i18n.t('Filter results')}
+						bind:value={filter}
+						oninput={resetVisibleCount}
+					/>
+				</label>
+				<span class="shrink-0 text-xs tabular-nums text-gray-400 dark:text-gray-500">
+					{visibleResults.length}/{parsed.declaredCount ?? filteredResults.length}
+				</span>
+			</div>
 		{/if}
 
 		{#if filteredResults.length === 0}
 			<div
-				class="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-4 py-6 text-center text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-400"
+				class="rounded-xl border-hairline border-dashed border-gray-200 px-3 py-5 text-center text-xs text-gray-400 dark:border-gray-800 dark:text-gray-500"
 			>
 				{$i18n.t('No results match your filter.')}
 			</div>
 		{:else}
-			<div class="space-y-2">
+			<!-- A reference list, not a stack of cards: hairline rules carry the
+			     separation so the panel has exactly one border weight in it. -->
+			<ul class="divide-y-hairline divide-gray-200/70 dark:divide-gray-800/80">
 				{#each visibleResults as result (result.index)}
-					<article
-						class="group rounded-2xl border border-gray-100 bg-white p-3 transition hover:border-gray-200 hover:bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900 dark:hover:border-gray-700 dark:hover:bg-gray-850"
+					<li
+						class="group/row flex gap-2.5 rounded-lg px-1 py-2.5 transition-colors hover:bg-white dark:hover:bg-gray-900/60"
 					>
-						<div class="flex gap-3">
-							<div
-								class="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-gray-100 text-[11px] font-semibold text-gray-500 dark:bg-gray-800 dark:text-gray-400"
-							>
-								{result.index}
-							</div>
+						<span
+							class="w-3.5 shrink-0 pt-0.5 text-right text-[11px] tabular-nums text-gray-400 dark:text-gray-600"
+							>{result.index}</span
+						>
 
-							<div class="min-w-0 flex-1">
-								<div
-									class="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-start sm:justify-between"
-								>
-									<div class="min-w-0">
-										<div class="break-words text-sm font-semibold text-gray-900 dark:text-gray-100">
-											{result.title}
-										</div>
-										{#if result.url}
-											<div class="mt-0.5 truncate text-xs text-gray-500 dark:text-gray-500">
-												{result.domain || truncateMiddle(result.url, 88)}
-											</div>
-										{/if}
-									</div>
+						<div class="min-w-0 flex-1">
+							<div class="flex min-w-0 items-start gap-2">
+								{#if result.url}
+									<a
+										class="min-w-0 flex-1 text-sm font-medium leading-snug text-gray-900 underline-offset-2 transition-colors hover:text-book-cloth hover:underline dark:text-gray-100 dark:hover:text-kraft"
+										href={result.url}
+										target="_blank"
+										rel="noreferrer noopener">{result.title}</a
+									>
+								{:else}
+									<span class="min-w-0 flex-1 text-sm font-medium leading-snug text-gray-900 dark:text-gray-100"
+										>{result.title}</span
+									>
+								{/if}
 
-									{#if result.url}
-										<div
-											class="flex shrink-0 gap-1.5 sm:opacity-70 sm:transition sm:group-hover:opacity-100"
+								{#if result.url}
+									<button
+										class="shrink-0 rounded-md p-1 text-gray-400 opacity-0 transition hover:bg-gray-100 hover:text-gray-700 focus-visible:opacity-100 group-hover/row:opacity-100 dark:text-gray-500 dark:hover:bg-gray-800 dark:hover:text-gray-200 max-md:opacity-100"
+										type="button"
+										title={$i18n.t('Copy URL')}
+										aria-label={$i18n.t('Copy URL')}
+										onclick={() => copy(result.url)}
+									>
+										<svg
+											xmlns="http://www.w3.org/2000/svg"
+											fill="none"
+											viewBox="0 0 24 24"
+											stroke-width="1.75"
+											stroke="currentColor"
+											class="size-3.5"
+											aria-hidden="true"
 										>
-											<a
-												class="rounded-lg border border-gray-100 px-2 py-1 text-xs font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:border-gray-800 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
-												href={result.url}
-												target="_blank"
-												rel="noreferrer noopener"
-											>
-												{$i18n.t('Open')}
-											</a>
-											<button
-												class="rounded-lg border border-gray-100 px-2 py-1 text-xs font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:border-gray-800 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
-												type="button"
-												on:click={() => copy(result.url)}
-											>
-												{$i18n.t('Copy URL')}
-											</button>
-										</div>
-									{/if}
-								</div>
-
-								{#if result.snippet}
-									<p class="mt-2 text-xs leading-relaxed text-gray-600 dark:text-gray-400">
-										{previewText(result.snippet, 420)}
-									</p>
+											<path
+												stroke-linecap="round"
+												stroke-linejoin="round"
+												d="M13.19 8.688a4.5 4.5 0 0 1 1.242 7.244l-4.5 4.5a4.5 4.5 0 0 1-6.364-6.364l1.757-1.757m13.35-.622 1.757-1.757a4.5 4.5 0 0 0-6.364-6.364l-4.5 4.5a4.5 4.5 0 0 0 1.242 7.244"
+											/>
+										</svg>
+									</button>
 								{/if}
 							</div>
-						</div>
-					</article>
-				{/each}
-			</div>
 
-			{#if visibleResults.length < filteredResults.length}
-				<button
-					class="w-full rounded-xl border border-gray-100 bg-white px-3 py-2 text-xs font-medium text-gray-600 transition hover:bg-gray-50 hover:text-gray-900 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-gray-850 dark:hover:text-white"
-					type="button"
-					on:click={showMore}
-				>
-					{$i18n.t('Show more results')} ({Math.min(
-						PAGE_SIZE,
-						filteredResults.length - visibleResults.length
-					)})
-				</button>
-			{/if}
+							{#if result.url}
+								<div class="mt-0.5 truncate text-xs text-gray-400 dark:text-gray-500">
+									{result.domain || truncateMiddle(result.url, 72)}
+								</div>
+							{/if}
+
+							{#if result.snippet}
+								<!-- Snippets arrive as raw scrape: markdown links, image refs and
+								     `[...]` elision markers. cleanExcerpt strips that noise. -->
+								<p class="mt-1.5 line-clamp-3 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+									{cleanExcerpt(result.snippet, SNIPPET_CHARS, result.title)}
+								</p>
+							{/if}
+						</div>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+
+		{#if visibleResults.length < filteredResults.length}
+			<button
+				class="mt-1 w-full rounded-lg py-2 text-xs font-medium text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
+				type="button"
+				data-anchor-on-click
+				onclick={showMore}
+			>
+				{$i18n.t('Show {{COUNT}} more', {
+					COUNT: Math.min(PAGE_SIZE, filteredResults.length - visibleResults.length)
+				})}
+			</button>
 		{/if}
 	</div>
 {:else}
 	<div
-		class="rounded-2xl border border-yellow-200 bg-yellow-50 px-4 py-3 text-sm text-yellow-900 dark:border-yellow-900/50 dark:bg-yellow-950/30 dark:text-yellow-200"
+		class="rounded-xl border-hairline border-warning/25 bg-warning/10 px-3 py-2.5 text-xs text-warning dark:text-warning-dark"
 	>
 		<div class="font-medium">{$i18n.t('Could not parse web_search results.')}</div>
-		<div class="mt-1 text-xs opacity-80">
+		<div class="mt-0.5 opacity-80">
 			{$i18n.t('Use the Raw tab to inspect the original tool output.')}
 		</div>
 	</div>

@@ -4,8 +4,6 @@ import type { ModelConfig } from '$lib/apis';
 import type { Banner } from '$lib/types';
 import type { Socket } from 'socket.io-client';
 
-import emojiShortCodes from '$lib/emoji-shortcodes.json';
-
 // Backend
 export const WEBUI_NAME = writable(APP_NAME);
 export const config: Writable<Config | undefined> = writable(undefined);
@@ -25,30 +23,73 @@ export const MODEL_DOWNLOAD_POOL = writable({});
 export const mobile = writable(typeof window !== 'undefined' && window.innerWidth < 768);
 
 export const socket: Writable<null | Socket> = writable(null);
+
+// Browser network connectivity (navigator.onLine). Seeded synchronously so the
+// first paint already reflects reality; kept in sync via 'online'/'offline'
+// window listeners registered in the root +layout.svelte.
+export const online: Writable<boolean> = writable(
+	typeof navigator !== 'undefined' ? navigator.onLine : true
+);
+
 export const activeUserIds: Writable<null | string[]> = writable(null);
-export const USAGE_POOL: Writable<null | string[]> = writable(null);
 
 export const theme = writable('system');
 export const fontFamily = writable('system');
 
-export const shortCodesToEmojis = writable(
-	Object.entries(emojiShortCodes).reduce((acc, [key, value]) => {
-		if (typeof value === 'string') {
-			acc[value] = key;
-		} else {
-			for (const v of value) {
-				acc[v] = key;
-			}
-		}
+// The emoji shortcode map (~56KB JSON) is only needed by the emoji
+// picker/renderer, not for first paint. Seed the store empty and hydrate it
+// on idle instead of blocking app boot on a synchronous top-level import +
+// reduce. Consumers ($shortCodesToEmojis) just re-render once it populates.
+export const shortCodesToEmojis: Writable<Record<string, string>> = writable({});
 
-		return acc;
-	}, {})
-);
+function buildShortCodesToEmojisMap(emojiShortCodes: Record<string, string | string[]>) {
+	return Object.entries(emojiShortCodes).reduce(
+		(acc, [key, value]) => {
+			if (typeof value === 'string') {
+				acc[value] = key;
+			} else {
+				for (const v of value) {
+					acc[v] = key;
+				}
+			}
+
+			return acc;
+		},
+		{} as Record<string, string>
+	);
+}
+
+async function hydrateShortCodesToEmojis() {
+	const { default: emojiShortCodes } = await import('$lib/emoji-shortcodes.json');
+	shortCodesToEmojis.set(buildShortCodesToEmojisMap(emojiShortCodes as any));
+}
+
+if (typeof window !== 'undefined') {
+	if (typeof requestIdleCallback !== 'undefined') {
+		requestIdleCallback(() => {
+			hydrateShortCodesToEmojis();
+		});
+	} else {
+		setTimeout(() => {
+			hydrateShortCodesToEmojis();
+		}, 1);
+	}
+}
 
 export const TTSWorker = writable(null);
 
 export const chatId = writable('');
 export const chatTitle = writable('');
+// Freshness of the currently rendered chat view (drives the navbar sync mark):
+// 'syncing' while a local-first paint revalidates or a reconnect reconcile is
+// in flight; 'offline' while the network is down (rendered data is whatever we
+// have saved); 'fresh' otherwise. Single writer: Chat.svelte.
+export const chatFreshness: Writable<'fresh' | 'syncing' | 'offline'> = writable('fresh');
+
+// Share-scoped context for the read-only shared chat page (/s/{share_id}).
+// When shareId is set, leaf components build share-scoped, anonymous-allowed
+// content URLs (files/models) instead of the owner-authenticated ones.
+export const sharedContext = writable<{ shareId: string | null }>({ shareId: null });
 
 // Chat token stats for current conversation
 export interface ChatTokenStatsData {
@@ -74,12 +115,20 @@ export const chatTokenStatsRefreshTrigger = writable(0);
 // by `token-usage:update` socket pushes (no polling).
 export const tokenUsageGroups: Writable<Record<string, any>> = writable({});
 
+// Subscription-provider usage (percentage rate-limit windows reported by
+// connections flagged `subscription_usage`, keyed by OpenAI connection index).
+// Seeded from bootstrap and the mount-time /api/usage/groups fetch, replaced
+// wholesale by `subscription-usage:update` socket pushes (no polling).
+export const subscriptionUsage: Writable<Record<string, any>> = writable({});
+
 // Live state for in-flight + completed subagent runs in the visible chat.
 //
-// Keyed by tool_call_id (the parent model's tool call id). One entry per
-// subagent invocation; subagent_continue calls get their own entry even if
-// they reference the same underlying subagent_id (chat_id). This keeps each
-// parent-message subagent block independent in the UI.
+// Authoritative entries are keyed by a composite of parent_message_id plus
+// each stable alias (tool_call_id, entry_key, subagent_id/chat_id). Rewind
+// siblings deliberately reuse all of those aliases while carrying different
+// outcomes, so an alias alone is not globally unique. Legacy raw aliases are
+// retained only as a compatibility fallback for consumers without message
+// context; rendered cards always resolve the parent-scoped entry.
 //
 // Hydrated on chat load from the parent message's persisted
 // `subagent_runs` field, then updated live via socket events
@@ -112,6 +161,21 @@ export interface SubagentRun {
 	content_blocks?: any[];
 	content?: string;
 	final_text?: string;
+	// Stable identity for one detached redo attempt. It prevents a delayed
+	// start/terminal event or an old task's cleanup from overwriting a newer
+	// rerun of the same parent entry.
+	rerun_id?: string;
+	// Persisted monotonic generation for this entry. Unlike second-resolution
+	// timestamps, this totally orders two reruns started in the same second.
+	rerun_attempt?: number;
+	rerun_task_id?: string;
+	// Hidden-chat turn ids owned by the current rerun generation. They are
+	// intentionally distinct from user_msg_id / assistant_msg_id until the
+	// generation completes, so cleanup can never recover the previous answer
+	// as if it belonged to the new attempt.
+	rerun_user_msg_id?: string;
+	rerun_assistant_msg_id?: string;
+	previous_final_text?: string;
 	error?: { message?: string } | string;
 	prompt?: string;
 	background?: string;
@@ -151,6 +215,28 @@ export type QuestionState = {
 };
 export const questionStates: Writable<Record<string, QuestionState>> = writable({});
 
+// The user's explicit open/closed choice for a reasoning ("Thinking…") block,
+// keyed by the block's stable `${chatId}-${messageId}-b${blockIndex}` id. The
+// value is the chosen `open` boolean; ABSENCE means "untouched" so the
+// auto-expand-while-streaming / collapse-on-done behavior governs.
+//
+// This lives above the message render tree on purpose: the reasoning Collapsible
+// is destroyed & re-mounted as the model streams (per-delta re-lex, and the
+// block→group flip into a WorkingBlock when a tool call joins the burst), which
+// would otherwise reset a component-local toggle and let the auto-behavior
+// re-open a block the user deliberately closed. Keyed per block, so a genuinely
+// new reasoning block on a later turn still auto-expands. Cleared on chat switch.
+export const reasoningBlockOpenState: Writable<Record<string, boolean>> = writable({});
+
+// Message ids currently in in-place edit mode (UserMessage/ResponseMessage set
+// & clear this around their local `edit` flag). Lives above the render tree so
+// chat-level chrome can react: on mobile the bottom composer and token panels
+// hide while an earlier message is being edited (two competing inputs starve
+// the keyboard-shrunken viewport), and the sidebar edge-swipe strip stands
+// down so it can't swallow selection taps near the left edge of the edit
+// textarea. Cleared on chat switch.
+export const messageEditingIds: Writable<Set<string>> = writable(new Set());
+
 export type BrowserLiveState = {
 	frame?: string; // data:image/jpeg;base64,...
 	url?: string;
@@ -161,6 +247,21 @@ export type BrowserLiveState = {
 	startedAt?: number;
 	elapsedMs?: number;
 	done?: boolean;
+	requiresHuman?: boolean;
+	verification?: {
+		required?: boolean;
+		provider?: string;
+		message?: string;
+		// CapSolver auto-solve surface (daemon): state solving | solved | failed.
+		solver?: {
+			state?: string;
+			provider?: string;
+			message?: string;
+		} | null;
+	} | null;
+	// Stamped when a handoff unblocks (solve / dismiss / daemon auto-clear); the
+	// panel toasts on the requiresHuman true -> false transition it accompanies.
+	verificationCleared?: boolean;
 	session?: string; // per-agent browser session id ("main" for the parent, subagent_id for a subagent)
 	label?: string; // human tab label (e.g. "Main" or the subagent's name)
 };
@@ -173,6 +274,11 @@ export const browserLiveStates: Writable<Record<string, BrowserLiveState>> = wri
 // Set true when the user closes the live browser panel during a turn, so a later
 // frame doesn't force it back open. Reset on chat switch / new submission.
 export const browserPanelDismissed: Writable<boolean> = writable(false);
+
+// Automation runs the user hasn't looked at yet — drives the sidebar badge.
+// Seeded once on boot from the API and kept live by the `automation:completed`
+// socket event; zeroed when the runs list is opened.
+export const automationsUnreadCount: Writable<number> = writable(0);
 
 export const channels: Writable<any[]> = writable([]);
 export const chats: Writable<any[] | null> = writable(null);
@@ -187,6 +293,13 @@ export const folderChatListInvalidation: Writable<{
 
 export const selectedFolder = writable(null);
 
+// Bumped by the root layout after a background bootstrap revalidation delivers
+// changed components. Child layouts (app layout, Sidebar) subscribe and
+// re-consume ONLY the components present in the bootstrap pending map, so a
+// stale-while-revalidate boot can refresh models/settings/sidebar without a
+// per-component network fan-out.
+export const bootstrapRevision = writable(0);
+
 export const models: Writable<Model[]> = writable([]);
 export const modelsLoaded = writable(false);
 
@@ -196,12 +309,22 @@ export const functions: Writable<any[] | null> = writable(null);
 
 export const toolServers: Writable<any[]> = writable([]);
 export const toolServersLoaded = writable(false);
-export const mcpConnections: Writable<any[]> = writable([]);
-export const mcpConnectionsLoaded = writable(false);
 
 export const banners: Writable<Banner[]> = writable([]);
 
-export const settings: Writable<Settings> = writable({});
+// User settings (the `ui` blob), seeded synchronously from the localStorage
+// copy — like `mobile`/`online` above — so components that mount before the
+// (app) layout's fresh fetch resolves (Sidebar mounts first and gates its
+// offline-availability bookkeeping on `offlineChatStorage`) read the real
+// values instead of a transient `{}`. The layouts keep it fresh afterwards.
+const loadInitialSettings = (): Settings => {
+	try {
+		return JSON.parse(localStorage.getItem('settings') ?? '{}')?.ui ?? {};
+	} catch {
+		return {};
+	}
+};
+export const settings: Writable<Settings> = writable(loadInitialSettings());
 
 export const showSidebar = writable(false);
 export const showSearch = writable(false);
@@ -221,6 +344,27 @@ export const showBrowserPanel = writable(false);
 export const embed = writable(null);
 export const artifactCode = writable(null);
 export const previewFile = writable(null);
+// Sibling generated files for the currently-previewed file, so sandbox: links
+// inside a previewed markdown/text file resolve against the same message.files
+// the chat does. Reset on every open (see openFilePreview) and on close.
+export const previewFileSiblings = writable<any[]>([]);
+
+/**
+ * Open the file-preview panel for `file`, carrying its sibling generated files
+ * (the owning message's files) so any sandbox: links inside it can resolve.
+ * Centralises the show-flag bookkeeping every preview entry point shares, and
+ * guarantees previewFileSiblings is set (reset) on every open.
+ */
+export const openFilePreview = (file: any, sandboxFiles: any[] = []) => {
+	previewFile.set(file);
+	previewFileSiblings.set(Array.isArray(sandboxFiles) ? sandboxFiles : []);
+	showOverview.set(false);
+	showArtifacts.set(false);
+	showEmbeds.set(false);
+	showCallOverlay.set(false);
+	showFilePreview.set(true);
+	showControls.set(true);
+};
 
 export const temporaryChatEnabled = writable(false);
 export const scrollPaginationEnabled = writable(false);
@@ -303,6 +447,10 @@ type OllamaModelDetails = {
 type Settings = {
 	pinnedModels?: never[];
 	toolServers?: never[];
+	// Opt-in gate for offline chat persistence (IndexedDB write-through,
+	// "download for offline", idle-prefetch). Off by default — see
+	// Settings > Data Controls > Offline (plan-v4-final.md WS-A.10/WS-B).
+	offlineChatStorage?: boolean;
 	detectArtifacts?: boolean;
 	showUpdateToast?: boolean;
 	showChangelog?: boolean;
@@ -327,7 +475,6 @@ type Settings = {
 	params?: any;
 	userLocation?: any;
 	webSearch?: any;
-	memory?: boolean;
 	autoTags?: boolean;
 	autoFollowUps?: boolean;
 	splitLargeChunks?(body: any, splitLargeChunks: any): unknown;
@@ -346,6 +493,7 @@ type Settings = {
 	audio?: AudioSettings;
 	showUsername?: boolean;
 	notificationEnabled?: boolean;
+	pushNotificationEnabled?: boolean;
 	highContrastMode?: boolean;
 	title?: TitleSettings;
 	showChatTitleInTab?: boolean;
@@ -410,6 +558,8 @@ type Config = {
 		enable_login_form: boolean;
 		enable_web_search?: boolean;
 		enable_subagents?: boolean;
+		enable_automations?: boolean;
+		webpush_public_key?: string;
 		subagent_default_model?: string;
 		subagent_allow_external_tools?: boolean;
 		flex_auto_flip_enabled?: boolean;
@@ -424,6 +574,7 @@ type Config = {
 		enable_admin_chat_access: boolean;
 		enable_community_sharing: boolean;
 		enable_autocomplete_generation: boolean;
+		enable_follow_up_generation: boolean;
 		enable_direct_connections: boolean;
 		enable_version_update_check: boolean;
 	};

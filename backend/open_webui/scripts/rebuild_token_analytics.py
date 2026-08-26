@@ -141,14 +141,41 @@ async def _prepare_temp_tables(db, include_legacy_aggregates: bool) -> None:
         text(
             """
             CREATE TEMP TABLE temp_conv_latest AS
-            SELECT chat_id, model_id, latest_input_tokens, latest_output_tokens, latest_cache_read_tokens
-            FROM (
+            WITH ranked_all AS (
                 SELECT e.*, ROW_NUMBER() OVER (
                     PARTITION BY chat_id ORDER BY event_ts DESC, sequence DESC, message_id DESC
                 ) AS rn
                 FROM temp_usage_events e
-            ) ranked
-            WHERE rn = 1
+            ),
+            ranked_own AS (
+                -- Own-turn, prompt-bearing events only. The "last request" snapshot
+                -- must reflect the chat's own visible turn, never a hidden subagent
+                -- run (subagent messages are folded into the parent partition via
+                -- chat_id = COALESCE(subagent_of, cm.chat_id), so their
+                -- source_chat_id <> chat_id), and only a real prompt-bearing event.
+                -- This mirrors the live update_conversation_token_usage gate
+                -- (seed_snapshot = is_own_turn and token_in > 0). Without it a
+                -- rebuild would re-introduce a subagent's request size as the parent
+                -- pill's last_input/last_output/last_cache_read, undoing the
+                -- repair_stale_last_cache_read.sql fix.
+                SELECT e.*, ROW_NUMBER() OVER (
+                    PARTITION BY chat_id ORDER BY event_ts DESC, sequence DESC, message_id DESC
+                ) AS rn
+                FROM temp_usage_events e
+                WHERE e.source_chat_id = e.chat_id
+                  AND e.prompt_tokens > 0
+            )
+            SELECT
+                a.chat_id,
+                a.model_id,
+                COALESCE(o.latest_input_tokens, 0) AS latest_input_tokens,
+                COALESCE(o.latest_output_tokens, 0) AS latest_output_tokens,
+                COALESCE(o.latest_cache_read_tokens, 0) AS latest_cache_read_tokens
+            FROM (SELECT chat_id, model_id FROM ranked_all WHERE rn = 1) a
+            LEFT JOIN (
+                SELECT chat_id, latest_input_tokens, latest_output_tokens, latest_cache_read_tokens
+                FROM ranked_own WHERE rn = 1
+            ) o ON o.chat_id = a.chat_id
             """
         )
     )

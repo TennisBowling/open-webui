@@ -1,16 +1,20 @@
-<script>
+<script lang="ts">
 	import { embed, showControls, showEmbeds } from '$lib/stores';
 
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	export let overlay = false;
+	interface Props {
+		overlay?: boolean;
+	}
+
+	let { overlay = false }: Props = $props();
 </script>
 
 {#if $embed}
 	<div class="h-full w-full">
 		<div
-			class="pointer-events-auto z-20 flex justify-between items-center py-3 px-2 font-primar text-gray-900 dark:text-white"
+			class="pointer-events-auto z-20 flex justify-between items-center py-3 px-2 font-primary text-gray-900 dark:text-white"
 		>
 			<div class="flex-1 flex items-center justify-between pl-2">
 				<a
@@ -24,8 +28,8 @@
 			</div>
 
 			<button
-				class="self-center pointer-events-auto p-1 rounded-full bg-white dark:bg-gray-850"
-				on:click={() => {
+				class="tap-target self-center pointer-events-auto p-1 rounded-full bg-white dark:bg-gray-850 text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					showControls.set(false);
 					showEmbeds.set(false);
 					embed.set(null);

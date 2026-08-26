@@ -1,4 +1,5 @@
-<script>
+<script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import {
 		addTagById,
 		deleteTagById,
@@ -15,15 +16,20 @@
 		currentChatPage,
 		scrollPaginationEnabled
 	} from '$lib/stores';
-	import { createEventDispatcher, onMount } from 'svelte';
+	import { onMount } from 'svelte';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import Tags from '../common/Tags.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
-	export let chatId = '';
-	let tags = [];
+	interface Props {
+		chatId?: string;
+	}
+
+	let { chatId = '', ...eventProps }: Props & Record<string, unknown> = $props();
+	let tags = $state([]);
 
 	const getTags = async () => {
 		return await getTagsById(localStorage.token, chatId).catch(async (error) => {
@@ -69,10 +75,10 @@
 
 <Tags
 	{tags}
-	on:delete={(e) => {
+	ondelete={(e) => {
 		deleteTag(e.detail);
 	}}
-	on:add={(e) => {
+	onadd={(e) => {
 		addTag(e.detail);
 	}}
 />

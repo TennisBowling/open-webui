@@ -2,19 +2,27 @@
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { onMount } from 'svelte';
 
-	export let imageUrls = [
-		`${WEBUI_BASE_URL}/assets/images/adam.jpg`,
-		`${WEBUI_BASE_URL}/assets/images/galaxy.jpg`,
-		`${WEBUI_BASE_URL}/assets/images/earth.jpg`,
-		`${WEBUI_BASE_URL}/assets/images/space.jpg`
-	];
-	export let duration = 5000;
-	let selectedImageIdx = 0;
+	interface Props {
+		imageUrls?: any;
+		duration?: number;
+	}
+
+	let {
+		imageUrls = [
+			`${WEBUI_BASE_URL}/assets/images/adam.jpg`,
+			`${WEBUI_BASE_URL}/assets/images/galaxy.jpg`,
+			`${WEBUI_BASE_URL}/assets/images/earth.jpg`,
+			`${WEBUI_BASE_URL}/assets/images/space.jpg`
+		],
+		duration = 5000
+	}: Props = $props();
+	let selectedImageIdx = $state(0);
 
 	onMount(() => {
-		setInterval(() => {
+		const interval = setInterval(() => {
 			selectedImageIdx = (selectedImageIdx + 1) % (imageUrls.length - 1);
 		}, duration);
+		return () => clearInterval(interval);
 	});
 </script>
 

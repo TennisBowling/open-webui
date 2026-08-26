@@ -5,12 +5,16 @@
 
 	const i18n = getContext('i18n');
 
-	export let year: number | undefined = undefined;
-	export let limit: number = 10;
+	interface Props {
+		year?: number | undefined;
+		limit?: number;
+	}
 
-	let loading = true;
-	let error: string | null = null;
-	let topChats: TopChat[] = [];
+	let { year = undefined, limit = 10 }: Props = $props();
+
+	let loading = $state(true);
+	let error: string | null = $state(null);
+	let topChats: TopChat[] = $state([]);
 
 	onMount(async () => {
 		await loadTopChats();
@@ -46,7 +50,7 @@
 		return (tokens / maxTokens) * 100;
 	}
 
-	$: maxTokens = topChats.length > 0 ? topChats[0].total_tokens : 0;
+	let maxTokens = $derived(topChats.length > 0 ? topChats[0].total_tokens : 0);
 </script>
 
 <div class="w-full">
@@ -56,7 +60,7 @@
 
 	{#if loading}
 		<div class="flex items-center justify-center py-8">
-			<div class="animate-spin rounded-full h-6 w-6 border-b-2 border-emerald-500"></div>
+			<div class="animate-spin rounded-full h-6 w-6 border-b-2 border-book-cloth"></div>
 		</div>
 	{:else if error}
 		<div class="text-center py-6 text-gray-500 dark:text-gray-400">
@@ -71,7 +75,7 @@
 			{#each topChats as chat, index}
 				<button
 					class="w-full text-left p-3 rounded-lg bg-gray-50 dark:bg-gray-850 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
-					on:click={() => navigateToChat(chat.chat_id)}
+					onclick={() => navigateToChat(chat.chat_id)}
 				>
 					<div class="flex items-start justify-between gap-3">
 						<div class="flex-1 min-w-0">
@@ -89,7 +93,7 @@
 								class="relative h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-2"
 							>
 								<div
-									class="absolute top-0 left-0 h-full bg-gradient-to-r from-emerald-400 to-emerald-500 rounded-full transition-all duration-500"
+									class="absolute top-0 left-0 h-full bg-gradient-to-r from-kraft to-book-cloth rounded-full transition-all duration-500"
 									style="width: {getBarWidth(chat.total_tokens, maxTokens)}%"
 								></div>
 							</div>
@@ -100,7 +104,7 @@
 										xmlns="http://www.w3.org/2000/svg"
 										viewBox="0 0 16 16"
 										fill="currentColor"
-										class="size-3 text-blue-500"
+										class="size-3 text-book-cloth dark:text-kraft"
 									>
 										<path
 											fill-rule="evenodd"
@@ -115,7 +119,7 @@
 										xmlns="http://www.w3.org/2000/svg"
 										viewBox="0 0 16 16"
 										fill="currentColor"
-										class="size-3 text-green-500"
+										class="size-3 text-success dark:text-success-dark"
 									>
 										<path
 											fill-rule="evenodd"
@@ -137,7 +141,7 @@
 						</div>
 
 						<div class="flex-shrink-0 text-right">
-							<span class="text-lg font-bold text-emerald-600 dark:text-emerald-400">
+							<span class="text-lg font-bold text-book-cloth dark:text-kraft">
 								{formatTokenCount(chat.total_tokens)}
 							</span>
 							<div class="text-xs text-gray-500 dark:text-gray-400">

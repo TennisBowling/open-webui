@@ -1,6 +1,7 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import { DropdownMenu } from 'bits-ui';
-	import { createEventDispatcher, getContext, onMount, tick } from 'svelte';
+	import { getContext, onMount, tick } from 'svelte';
 
 	import { flyAndScale } from '$lib/utils/transitions';
 	import { goto } from '$app/navigation';
@@ -24,14 +25,29 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let role = '';
-	export let help = false;
-	export let className = 'max-w-[240px]';
+	interface Props {
+		show?: boolean;
+		role?: string;
+		help?: boolean;
+		className?: string;
+		children?: import('svelte').Snippet;
+		content?: import('svelte').Snippet;
+	}
 
-	const dispatch = createEventDispatcher();
+	let {
+		show = $bindable(false),
+		role = '',
+		help = false,
+		className = 'max-w-[240px]',
+		children,
+		content,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	let usage = null;
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
+
+	let usage = $state(null);
 	const getUsageInfo = async () => {
 		const res = await getUsage(localStorage.token).catch((error) => {
 			console.error('Error fetching usage info:', error);
@@ -44,14 +60,16 @@
 		}
 	};
 
-	$: if (show) {
-		getUsageInfo();
-	}
+	$effect(() => {
+		if (show) {
+			getUsageInfo();
+		}
+	});
 </script>
 
 <ShortcutsModal bind:show={$showShortcuts} />
 
-<!-- svelte-ignore a11y-no-static-element-interactions -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <DropdownMenu.Root
 	bind:open={show}
 	onOpenChange={(state) => {
@@ -59,12 +77,12 @@
 	}}
 >
 	<DropdownMenu.Trigger>
-		<slot />
+		{@render children?.()}
 	</DropdownMenu.Trigger>
 
-	<slot name="content">
+	{#if content}{@render content()}{:else}
 		<DropdownMenu.Content
-			class="w-full {className}  rounded-2xl px-1 py-1  border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg text-sm"
+			class="w-full {className}  rounded-2xl px-1 py-1  border-hairline border-gray-200  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg text-sm"
 			sideOffset={4}
 			side="bottom"
 			align="start"
@@ -72,7 +90,7 @@
 		>
 			<DropdownMenu.Item
 				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer"
-				on:click={async () => {
+				onclick={async () => {
 					show = false;
 
 					await showSettings.set(true);
@@ -91,7 +109,7 @@
 
 			<DropdownMenu.Item
 				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer"
-				on:click={async () => {
+				onclick={async () => {
 					show = false;
 
 					dispatch('show', 'archived-chat');
@@ -113,7 +131,7 @@
 				as="a"
 				href="/wrapped"
 				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
-				on:click={async () => {
+				onclick={async () => {
 					show = false;
 					if ($mobile) {
 						await tick();
@@ -148,7 +166,7 @@
 					as="a"
 					href="/admin/wrapped"
 					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
-					on:click={async () => {
+					onclick={async () => {
 						show = false;
 						if ($mobile) {
 							await tick();
@@ -163,7 +181,9 @@
 							fill="currentColor"
 							class="size-5"
 						>
-							<path d="M3 3.75A.75.75 0 0 1 3.75 3h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 3.75ZM3 8.25a.75.75 0 0 1 .75-.75h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 8.25ZM3.75 12a.75.75 0 0 0 0 1.5h16.5a.75.75 0 0 0 0-1.5H3.75ZM3 17.25a.75.75 0 0 1 .75-.75h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 17.25Z" />
+							<path
+								d="M3 3.75A.75.75 0 0 1 3.75 3h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 3.75ZM3 8.25a.75.75 0 0 1 .75-.75h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 8.25ZM3.75 12a.75.75 0 0 0 0 1.5h16.5a.75.75 0 0 0 0-1.5H3.75ZM3 17.25a.75.75 0 0 1 .75-.75h16.5a.75.75 0 0 1 0 1.5H3.75A.75.75 0 0 1 3 17.25Z"
+							/>
 						</svg>
 					</div>
 					<div class=" self-center truncate">{$i18n.t('Admin Analytics')}</div>
@@ -173,7 +193,7 @@
 					as="a"
 					href="/playground"
 					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
-					on:click={async () => {
+					onclick={async () => {
 						show = false;
 						if ($mobile) {
 							await tick();
@@ -190,7 +210,7 @@
 					as="a"
 					href="/admin"
 					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
-					on:click={async () => {
+					onclick={async () => {
 						show = false;
 						if ($mobile) {
 							await tick();
@@ -216,7 +236,7 @@
 						target="_blank"
 						class="flex gap-2 items-center py-1.5 px-3 text-sm select-none w-full cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition"
 						id="chat-share-button"
-						on:click={() => {
+						onclick={() => {
 							show = false;
 						}}
 						href="https://docs.openwebui.com"
@@ -231,7 +251,7 @@
 						target="_blank"
 						class="flex gap-2 items-center py-1.5 px-3 text-sm select-none w-full cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition"
 						id="chat-share-button"
-						on:click={() => {
+						onclick={() => {
 							show = false;
 						}}
 						href="https://github.com/open-webui/open-webui/releases"
@@ -244,7 +264,7 @@
 				<DropdownMenu.Item
 					class="flex gap-2 items-center py-1.5 px-3 text-sm select-none w-full  hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition cursor-pointer"
 					id="chat-share-button"
-					on:click={async () => {
+					onclick={async () => {
 						show = false;
 						showShortcuts.set(!$showShortcuts);
 
@@ -263,7 +283,7 @@
 
 			<DropdownMenu.Item
 				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition"
-				on:click={async () => {
+				onclick={async () => {
 					const res = await userSignOut();
 					user.set(null);
 					localStorage.removeItem('token');
@@ -289,16 +309,16 @@
 					>
 						<div
 							class="flex rounded-xl py-1 px-3 text-xs gap-2.5 items-center"
-							on:mouseenter={() => {
+							onmouseenter={() => {
 								getUsageInfo();
 							}}
 						>
 							<div class=" flex items-center">
 								<span class="relative flex size-2">
 									<span
-										class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"
-									/>
-									<span class="relative inline-flex rounded-full size-2 bg-green-500" />
+										class="animate-ping absolute inline-flex h-full w-full rounded-full bg-book-cloth opacity-75"
+									></span>
+									<span class="relative inline-flex rounded-full size-2 bg-book-cloth"></span>
 								</span>
 							</div>
 
@@ -319,5 +339,5 @@
 				<div class="flex items-center">Profile</div>
 			</DropdownMenu.Item> -->
 		</DropdownMenu.Content>
-	</slot>
+	{/if}
 </DropdownMenu.Root>

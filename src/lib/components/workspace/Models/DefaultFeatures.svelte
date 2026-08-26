@@ -17,8 +17,8 @@
 		}
 	};
 
-	export let availableFeatures = ['web_search', 'image_generation'];
-	export let featureIds = [];
+	let { availableFeatures = ['web_search', 'image_generation'], featureIds = $bindable([]) } =
+		$props();
 </script>
 
 <div>
@@ -30,8 +30,8 @@
 			<div class=" flex items-center gap-2 mr-3">
 				<Checkbox
 					state={featureIds.includes(feature) ? 'checked' : 'unchecked'}
-					on:change={(e) => {
-						if (e.detail === 'checked') {
+					onchange={(state) => {
+						if (state === 'checked') {
 							featureIds = [...featureIds, feature];
 						} else {
 							featureIds = featureIds.filter((id) => id !== feature);

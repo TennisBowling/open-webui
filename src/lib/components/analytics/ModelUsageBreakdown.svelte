@@ -4,24 +4,29 @@
 
 	const i18n = getContext('i18n');
 
-	export let year: number | undefined = undefined;
+	interface Props {
+		year?: number | undefined;
+	}
 
-	let loading = true;
-	let error: string | null = null;
-	let modelUsage: ModelUsage[] = [];
+	let { year = undefined }: Props = $props();
 
-	// Colors for the pie chart segments
+	let loading = $state(true);
+	let error: string | null = $state(null);
+	let modelUsage: ModelUsage[] = $state([]);
+
+	// Warm-leaning ramp for the pie chart segments (distinguishable series,
+	// harmonized with the ink-on-paper palette).
 	const COLORS = [
-		'#10B981', // emerald-500
-		'#3B82F6', // blue-500
-		'#F59E0B', // amber-500
-		'#EF4444', // red-500
-		'#8B5CF6', // violet-500
-		'#EC4899', // pink-500
-		'#06B6D4', // cyan-500
-		'#F97316', // orange-500
-		'#84CC16', // lime-500
-		'#6366F1' // indigo-500
+		'#CC785C', // book-cloth
+		'#5C7048', // success (sage)
+		'#A8783E', // warning (ochre)
+		'#D4A27F', // kraft
+		'#8C6A56', // warm taupe
+		'#9CB07F', // success-dark (light sage)
+		'#BF4D43', // error-brick
+		'#666663', // gray-500
+		'#33332E', // manilla-dark
+		'#B0A08C' // muted manilla
 	];
 
 	onMount(async () => {
@@ -96,8 +101,8 @@
 		return `M ${centerX} ${centerY} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${x2} ${y2} Z`;
 	}
 
-	$: pieSegments = calculatePieSegments();
-	$: totalTokens = modelUsage.reduce((sum, m) => sum + m.total_tokens, 0);
+	let pieSegments = $derived(calculatePieSegments());
+	let totalTokens = $derived(modelUsage.reduce((sum, m) => sum + m.total_tokens, 0));
 </script>
 
 <div class="w-full">
@@ -107,7 +112,7 @@
 
 	{#if loading}
 		<div class="flex items-center justify-center py-8">
-			<div class="animate-spin rounded-full h-6 w-6 border-b-2 border-emerald-500"></div>
+			<div class="animate-spin rounded-full h-6 w-6 border-b-2 border-book-cloth"></div>
 		</div>
 	{:else if error}
 		<div class="text-center py-6 text-gray-500 dark:text-gray-400">
@@ -186,12 +191,12 @@
 
 		<!-- Total footer -->
 		<div
-			class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 flex justify-between items-center"
+			class="mt-4 pt-4 border-t-hairline border-gray-200 dark:border-gray-800 flex justify-between items-center"
 		>
 			<span class="text-sm text-gray-500 dark:text-gray-400">
 				{$i18n.t('Total tokens processed')}
 			</span>
-			<span class="text-lg font-bold text-emerald-600 dark:text-emerald-400">
+			<span class="text-lg font-bold text-book-cloth dark:text-kraft">
 				{formatTokenCount(totalTokens)}
 			</span>
 		</div>

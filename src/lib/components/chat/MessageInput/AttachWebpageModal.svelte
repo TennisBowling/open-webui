@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
@@ -9,10 +9,14 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import { isValidHttpUrl, isYoutubeUrl } from '$lib/utils';
 
-	export let show = false;
-	export let onSubmit: (e) => void;
+	interface Props {
+		show?: boolean;
+		onSubmit: (e) => void;
+	}
 
-	let url = '';
+	let { show = $bindable(false), onSubmit }: Props = $props();
+
+	let url = $state('');
 
 	const submitHandler = () => {
 		if (isValidHttpUrl(url)) {
@@ -38,7 +42,7 @@
 			<button
 				class="self-center"
 				aria-label={$i18n.t('Close modal')}
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -48,7 +52,7 @@
 
 		<div class="px-5 pb-4">
 			<form
-				on:submit={(e) => {
+				onsubmit={(e) => {
 					e.preventDefault();
 					submitHandler();
 				}}
@@ -73,7 +77,7 @@
 
 				<div class="flex justify-end gap-2 pt-3 bg-gray-50 dark:bg-gray-900/50">
 					<button
-						class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-800 text-white dark:bg-white dark:text-black dark:hover:bg-gray-200 transition rounded-full"
+						class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-full"
 						type="submit"
 					>
 						{$i18n.t('Add')}

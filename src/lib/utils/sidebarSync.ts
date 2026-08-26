@@ -12,9 +12,10 @@
 // Chat.svelte) and via the chat:done handler. Other tabs receive the
 // broadcast and patch in place.
 
-import { get } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import {
 	chats,
+	channels,
 	pinnedChats,
 	tags,
 	folders,
@@ -26,14 +27,27 @@ import {
 } from '$lib/stores';
 import { getChatList, getPinnedChatList, getAllTags, getChatById } from '$lib/apis/chats';
 import { getFolders } from '$lib/apis/folders';
+import { getChannels } from '$lib/apis/channels';
+import { getBootstrap, type BootstrapInclude } from '$lib/apis';
 import { getTimeRange } from '$lib/utils';
-import { clearLocalStorageCache } from '$lib/utils/cache';
+import { writeLocalStorageCache } from '$lib/utils/cache';
+import { removeOfflineChat, purgeOfflineChatsForUser } from '$lib/offline/manager';
 import {
 	SIDEBAR_CHATS_CACHE_KEY,
 	SIDEBAR_PINNED_CHATS_CACHE_KEY,
 	SIDEBAR_TAGS_CACHE_KEY,
-	SIDEBAR_FOLDERS_CACHE_KEY
+	SIDEBAR_FOLDERS_CACHE_KEY,
+	SIDEBAR_CHANNELS_CACHE_KEY,
+	getSidebarCacheKey
 } from '$lib/constants/cache';
+import {
+	BOOTSTRAP_BUNDLE_ETAG_KEY,
+	BOOTSTRAP_SIDEBAR_ETAG_KEY,
+	readBootstrapCache,
+	buildBootstrapEtagsHeader,
+	applyUnchangedFromCache,
+	mergeBootstrapCacheComponents
+} from '$lib/utils/bootstrap';
 
 type ChatRow = {
 	id: string;
@@ -46,6 +60,17 @@ type ChatRow = {
 	time_range?: string;
 	[k: string]: any;
 };
+
+// "Is the sidebar's `updated_at` window provably fresh right now?" — true at
+// boot, set false by the socket-disconnect handler (+layout.svelte), and
+// restored true only once a reconcile-on-reconnect (or an equivalent
+// bootstrap 200/304) has actually completed. Consulted by Chat.svelte's
+// offline/soft-nav cache-serve gate: without this true, a zero-network serve
+// is treated as a miss (falls through to the network path) even if the
+// in-memory LRU / IDB entry's updatedAt otherwise matches the sidebar's
+// cached value — closing the staleness hole where a short (<30s) disconnect
+// blip could otherwise let a chat serve from a slightly-stale cache entry.
+export const sidebarReconcileClean = writable(true);
 
 export const decorate = (row: ChatRow): ChatRow => ({
 	...row,
@@ -82,15 +107,28 @@ export const upsertSorted = (arr: any[] | null, row: ChatRow): ChatRow[] => {
 	return base;
 };
 
-const invalidateChatsCaches = () => {
-	clearLocalStorageCache(SIDEBAR_CHATS_CACHE_KEY);
-	clearLocalStorageCache(SIDEBAR_PINNED_CHATS_CACHE_KEY);
-};
+// The page-1 window size applyChatsWindow works in; the localStorage cache
+// mirrors at most this many rows so a long-paged session doesn't bloat it.
+const CHATS_CACHE_WINDOW = 60;
 
-const invalidateSidebarCaches = () => {
-	invalidateChatsCaches();
-	clearLocalStorageCache(SIDEBAR_TAGS_CACHE_KEY);
-	clearLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY);
+// Write-through, NOT invalidate: the event handlers below keep the stores
+// authoritative, so persist them. Clearing here meant any session with chat
+// activity left an empty cache behind — every cold PWA boot then painted a
+// blank sidebar and visibly "loaded in" (the exact stale-beats-empty case the
+// cache exists for).
+const persistChatsCaches = () => {
+	const chatsList = get(chats);
+	if (Array.isArray(chatsList)) {
+		writeSidebarCache(
+			SIDEBAR_CHATS_CACHE_KEY,
+			'chats:first-page',
+			chatsList.slice(0, CHATS_CACHE_WINDOW)
+		);
+	}
+	const pinned = get(pinnedChats);
+	if (Array.isArray(pinned)) {
+		writeSidebarCache(SIDEBAR_PINNED_CHATS_CACHE_KEY, 'pinned-chats', pinned);
+	}
 };
 
 const isIncomingOlder = (current: any, incoming: any) =>
@@ -105,7 +143,129 @@ const patchSorted = (arr: any[] | null, id: string, data: any, patcher: (c: any)
 				.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))
 		: arr;
 
-export const refreshSidebarSnapshot = async (token: string, reason = 'manual') => {
+const currentUserId = (): string | null => {
+	try {
+		return JSON.parse(localStorage.getItem('sessionUser') ?? 'null')?.id ?? null;
+	} catch {
+		return null;
+	}
+};
+
+// Pagination-preserving chat-list merge (Wire item #7). Instead of resetting to
+// page 1 and discarding every loaded page, we upsert the fresh page-1 window
+// (60 rows): update/insert those rows, drop ids that vanished from within the
+// window, and keep the already-loaded tail (older pages) + scroll state.
+const applyChatsWindow = (freshChatsRaw: any[]) => {
+	const freshRows = freshChatsRaw.map(decorate);
+	chats.update((cur) => {
+		if (!Array.isArray(cur) || cur.length === 0) return freshRows;
+		if (freshRows.length === 0) return freshRows; // page 1 empty -> no chats at all
+		const oldestFresh = Math.min(...freshRows.map((r) => r.updated_at ?? 0));
+		const freshIds = new Set(freshRows.map((r) => r.id));
+		// Keep only the already-loaded tail: rows strictly older than the window
+		// that weren't re-surfaced in the fresh page. Rows inside the window range
+		// that are absent from the fresh page were deleted/moved -> dropped.
+		const tail = cur.filter((r) => (r.updated_at ?? 0) < oldestFresh && !freshIds.has(r.id));
+		const merged = [...freshRows, ...tail];
+		merged.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+		return merged;
+	});
+	// Preserve currentChatPage + scrollPaginationEnabled (the loaded tail stays).
+	if (!get(scrollPaginationEnabled)) scrollPaginationEnabled.set(true);
+};
+
+const writeSidebarCache = (name: string, key: string, value: any) => {
+	// No TTL: sidebar caches persist so the paint is always instant regardless of
+	// age (stale-then-revalidate); freshness comes from push events + reconciles.
+	writeLocalStorageCache(name, getSidebarCacheKey(currentUserId(), key), value);
+};
+
+const applySidebarComponents = (components: Record<string, any>, reason: string) => {
+	if (Array.isArray(components.folders)) {
+		folders.set(components.folders);
+		invalidateFolderChatLists(
+			components.folders.map((folder: any) => folder?.id),
+			`snapshot:${reason}`
+		);
+		writeSidebarCache(SIDEBAR_FOLDERS_CACHE_KEY, 'folders', components.folders);
+	}
+	if (Array.isArray(components.tags)) {
+		tags.set(components.tags);
+		writeSidebarCache(SIDEBAR_TAGS_CACHE_KEY, 'tags', components.tags);
+	}
+	if (Array.isArray(components.pinned)) {
+		const decorated = components.pinned.map((c: any) => decorate(c));
+		pinnedChats.set(decorated);
+		writeSidebarCache(SIDEBAR_PINNED_CHATS_CACHE_KEY, 'pinned-chats', decorated);
+	}
+	if (Array.isArray(components.chats)) {
+		const decorated = components.chats.map((c: any) => decorate(c));
+		applyChatsWindow(components.chats);
+		// The cache mirrors page 1 only (what the sidebar paints instantly).
+		writeSidebarCache(SIDEBAR_CHATS_CACHE_KEY, 'chats:first-page', decorated);
+	}
+	if (Array.isArray(components.channels)) {
+		channels.set(components.channels);
+		writeSidebarCache(SIDEBAR_CHANNELS_CACHE_KEY, 'channels', components.channels);
+	}
+};
+
+const SIDEBAR_BOOTSTRAP_INCLUDE: BootstrapInclude[] = [
+	'folders',
+	'tags',
+	'pinned',
+	'chats',
+	'channels'
+];
+
+// Route the reconcile through ONE conditional bootstrap request (If-None-Match +
+// x-bootstrap-etags) instead of 4 unconditional GETs (Wire item #2). Returns
+// true when it handled the reconcile (incl. 304/401), false to fall back.
+const refreshSidebarViaBootstrap = async (token: string, reason: string): Promise<boolean> => {
+	const userId = currentUserId();
+	const cached = readBootstrapCache(userId);
+	const sidebarEtagKey = BOOTSTRAP_SIDEBAR_ETAG_KEY(userId);
+	const ifNoneMatch = localStorage.getItem(sidebarEtagKey);
+	const etagsHeader = buildBootstrapEtagsHeader(cached?.components_etags, SIDEBAR_BOOTSTRAP_INCLUDE);
+
+	const res = await getBootstrap(token, {
+		include: SIDEBAR_BOOTSTRAP_INCLUDE,
+		ifNoneMatch,
+		bootstrapEtags: etagsHeader
+	});
+
+	if (!res) return false; // endpoint unavailable / transient -> legacy fallback
+	if (res.status === 401) return true; // auth handled by the boot layer; don't fan out
+	if (res.status === 304) return true; // nothing changed since last reconcile
+
+	// 200
+	let { components, missing } = applyUnchangedFromCache(res, cached);
+	let etags = res.components_etags;
+	if (missing.length > 0) {
+		const full = await getBootstrap(token, { include: SIDEBAR_BOOTSTRAP_INCLUDE });
+		if (full?.status === 200) {
+			components = full.components;
+			etags = full.components_etags;
+		}
+	}
+
+	applySidebarComponents(components, reason);
+	if (res.bundle_etag) localStorage.setItem(sidebarEtagKey, res.bundle_etag);
+	// Keep the shared boot cache's per-component etags + bodies fresh so the next
+	// cold/warm boot benefits from these refreshed components too.
+	mergeBootstrapCacheComponents(userId, components, etags);
+	return true;
+};
+
+// Legacy 4-fetch fallback (still pagination-preserving for chats). Returns
+// whether the chats list — the component `sidebarReconcileClean` actually
+// exists to vouch for (see Chat.svelte's zero-network cache-serve gate,
+// which compares against the sidebar's `updated_at`) — was actually
+// refreshed. A total HTTP-layer outage (e.g. proxy down while the socket
+// stays connected) resolves every fetch to null via the `.catch(() => null)`
+// guards below; in that case nothing was applied and the caller must NOT
+// mark the reconcile clean.
+const refreshSidebarViaFetch = async (token: string, reason: string): Promise<boolean> => {
 	const [freshFolders, freshChats, freshPinned, freshTags] = await Promise.all([
 		getFolders(token).catch(() => null),
 		getChatList(token, 1).catch(() => null),
@@ -119,16 +279,39 @@ export const refreshSidebarSnapshot = async (token: string, reason = 'manual') =
 			freshFolders.map((folder) => folder?.id),
 			`snapshot:${reason}`
 		);
+		writeSidebarCache(SIDEBAR_FOLDERS_CACHE_KEY, 'folders', freshFolders);
 	}
 	if (Array.isArray(freshChats)) {
-		currentChatPage.set(1);
-		chats.set(freshChats);
-		scrollPaginationEnabled.set(true);
+		applyChatsWindow(freshChats);
 	}
 	if (Array.isArray(freshPinned)) pinnedChats.set(freshPinned);
-	if (Array.isArray(freshTags)) tags.set(freshTags);
+	if (Array.isArray(freshTags)) {
+		tags.set(freshTags);
+		writeSidebarCache(SIDEBAR_TAGS_CACHE_KEY, 'tags', freshTags);
+	}
+	if (Array.isArray(freshChats) || Array.isArray(freshPinned)) {
+		persistChatsCaches();
+	}
 
-	invalidateSidebarCaches();
+	return Array.isArray(freshChats);
+};
+
+export const refreshSidebarSnapshot = async (token: string, reason = 'manual') => {
+	const handled = await refreshSidebarViaBootstrap(token, reason).catch((err) => {
+		console.error('sidebar bootstrap reconcile failed', reason, err);
+		return false;
+	});
+	if (handled) {
+		sidebarReconcileClean.set(true);
+		return;
+	}
+	const chatsRefreshed = await refreshSidebarViaFetch(token, reason).catch((err) => {
+		console.error('sidebar legacy-fetch reconcile failed', reason, err);
+		return false;
+	});
+	if (chatsRefreshed) {
+		sidebarReconcileClean.set(true);
+	}
 };
 
 export const applySidebarEvent = async (type: string, data: any, token: string): Promise<void> => {
@@ -146,7 +329,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 				chats.update((arr) => upsertSorted(arr, row));
 			}
 			invalidateFolderChatLists([row.folder_id], 'chat:created');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -154,8 +337,12 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 			if (!data?.id) return;
 			chats.update((arr) => removeById(arr, data.id));
 			pinnedChats.update((arr) => removeById(arr, data.id) ?? []);
+			const deletedForUserId = currentUserId();
+			if (deletedForUserId) {
+				void removeOfflineChat(deletedForUserId, data.id);
+			}
 			invalidateFolderChatLists([data.folder_id], 'chat:deleted');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -186,7 +373,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 				chatTitle.set(data.title);
 			}
 
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -217,7 +404,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 			if (!row) {
 				const fetched = await getChatById(token, data.id).catch(() => null);
 				if (!fetched) {
-					invalidateChatsCaches();
+					persistChatsCaches();
 					return;
 				}
 				row = {
@@ -238,7 +425,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 				chats.update((arr) => upsertSorted(arr, patched));
 			}
 			invalidateFolderChatLists([patched.folder_id], 'chat:pinned');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -256,7 +443,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 				}
 			}
 			invalidateFolderChatLists([data.folder_id], 'chat:archived');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -272,7 +459,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 				chats.update((arr) => upsertSorted(arr, row));
 			}
 			invalidateFolderChatLists([data.previous_folder_id, nextFolderId], 'chat:folder');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 
@@ -280,8 +467,8 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 			const fresh = await getAllTags(token).catch(() => null);
 			if (Array.isArray(fresh)) {
 				tags.set(fresh);
+				writeSidebarCache(SIDEBAR_TAGS_CACHE_KEY, 'tags', fresh);
 			}
-			clearLocalStorageCache(SIDEBAR_TAGS_CACHE_KEY);
 			return;
 		}
 
@@ -290,8 +477,8 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 			const fresh = await getFolders(token).catch(() => null);
 			if (Array.isArray(fresh)) {
 				folders.set(fresh);
+				writeSidebarCache(SIDEBAR_FOLDERS_CACHE_KEY, 'folders', fresh);
 			}
-			clearLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY);
 			return;
 		}
 
@@ -307,6 +494,12 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 		case 'chats:bulk': {
 			// archive_all / unarchive_all / delete_all — easier to refetch the
 			// world than to model the bulk transition locally.
+			if (data?.operation === 'delete_all') {
+				const bulkUserId = currentUserId();
+				if (bulkUserId) {
+					void purgeOfflineChatsForUser(bulkUserId);
+				}
+			}
 			await refreshSidebarSnapshot(token, data?.operation ?? 'chats:bulk');
 			return;
 		}
@@ -327,7 +520,7 @@ export const applySidebarEvent = async (type: string, data: any, token: string):
 			chats.update((arr) => patchSorted(arr, data.id, data, patch));
 			pinnedChats.update((arr) => patchSorted(arr, data.id, data, patch) ?? []);
 			invalidateFolderChatLists([data.folder_id], 'chat:updated');
-			invalidateChatsCaches();
+			persistChatsCaches();
 			return;
 		}
 

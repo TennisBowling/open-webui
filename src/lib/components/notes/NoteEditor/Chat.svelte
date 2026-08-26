@@ -1,7 +1,5 @@
 <script lang="ts">
-	export let show = false;
-	export let selectedModelId = '';
-
+	import { preventDefault } from '$lib/utils/eventModifiers';
 	import { marked } from 'marked';
 	// Configure marked with extensions
 	marked.use({
@@ -30,7 +28,7 @@
 		}
 	});
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { goto } from '$app/navigation';
 	import { onMount, tick, getContext } from 'svelte';
@@ -56,34 +54,51 @@
 
 	const i18n = getContext('i18n');
 
-	export let editor = null;
+	interface Props {
+		show?: boolean;
+		selectedModelId?: string;
+		editor?: any;
+		editing?: boolean;
+		streaming?: boolean;
+		stopResponseFlag?: boolean;
+		note?: any;
+		selectedContent?: any;
+		files?: any;
+		messages?: any;
+		onInsert?: any;
+		onStop?: any;
+		onEdited?: any;
+		insertNoteHandler?: any;
+		scrollToBottomHandler?: any;
+	}
 
-	export let editing = false;
-	export let streaming = false;
-	export let stopResponseFlag = false;
-
-	export let note = null;
-	export let selectedContent = null;
-
-	export let files = [];
-	export let messages = [];
-
-	export let onInsert = (content) => {};
-	export let onStop = () => {};
-	export let onEdited = () => {};
-
-	export let insertNoteHandler = () => {};
-	export let scrollToBottomHandler = () => {};
+	let {
+		show = $bindable(false),
+		selectedModelId = $bindable(''),
+		editor = null,
+		editing = $bindable(false),
+		streaming = $bindable(false),
+		stopResponseFlag = $bindable(false),
+		note = $bindable(null),
+		selectedContent = $bindable(null),
+		files = [],
+		messages = $bindable([]),
+		onInsert = (content) => {},
+		onStop = () => {},
+		onEdited = () => {},
+		insertNoteHandler = () => {},
+		scrollToBottomHandler = () => {}
+	}: Props = $props();
 
 	let loaded = false;
 
-	let loading = false;
+	let loading = $state(false);
 
-	let messagesContainerElement: HTMLDivElement;
+	let messagesContainerElement: HTMLDivElement = $state();
 
 	let system = '';
-	let editEnabled = false;
-	let chatInputElement = null;
+	let editEnabled = $state(false);
+	let chatInputElement = $state(null);
 
 	const DEFAULT_DOCUMENT_EDITOR_PROMPT = `You are an expert document editor.
 
@@ -330,8 +345,8 @@ Based on the user's instruction, update and enhance the existing notes or select
 <div class="flex items-center mb-1.5 pt-1.5 px-2.5">
 	<div class="flex items-center mr-1">
 		<button
-			class="p-0.5 bg-transparent transition rounded-lg"
-			on:click={() => {
+			class="p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+			onclick={() => {
 				show = !show;
 			}}
 		>
@@ -366,7 +381,7 @@ Based on the user's instruction, update and enhance the existing notes or select
 					class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 scrollbar-hidden"
 					id="messages-container"
 					bind:this={messagesContainerElement}
-					on:scroll={onScroll}
+					onscroll={onScroll}
 				>
 					<div class=" h-full w-full flex flex-col">
 						<div class="flex-1 p-1">
@@ -394,43 +409,46 @@ Based on the user's instruction, update and enhance the existing notes or select
 						onSubmit={submitHandler}
 						{onStop}
 					>
-						<div slot="menu" class="flex items-center justify-between gap-2 w-full pr-1">
-							<div>
-								<Tooltip content={$i18n.t('Edit')} placement="top">
-									<button
-										on:click|preventDefault={() => {
-											editEnabled = !editEnabled;
+						{#snippet menu()}
+							<div class="flex items-center justify-between gap-2 w-full pr-1">
+								<div>
+									<Tooltip content={$i18n.t('Edit')} placement="top">
+										<button
+											onmousedown={preventDefault()}
+											onclick={preventDefault(() => {
+												editEnabled = !editEnabled;
 
-											localStorage.setItem('noteEditEnabled', editEnabled ? 'true' : 'false');
-										}}
-										disabled={streaming || loading}
-										type="button"
-										class="px-2 @xl:px-2.5 py-2 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden hover:bg-gray-50 dark:hover:bg-gray-800 {editEnabled
-											? ' text-sky-500 dark:text-sky-300 bg-sky-50 dark:bg-sky-200/5'
-											: 'bg-transparent text-gray-600 dark:text-gray-300 '} disabled:opacity-50 disabled:pointer-events-none"
-									>
-										<PencilSquare className="size-4" strokeWidth="1.75" />
-										<span
-											class="block whitespace-nowrap overflow-hidden text-ellipsis leading-none pr-0.5"
-											>{$i18n.t('Edit')}</span
+												localStorage.setItem('noteEditEnabled', editEnabled ? 'true' : 'false');
+											})}
+											disabled={streaming || loading}
+											type="button"
+											class="px-2 @xl:px-2.5 py-2 flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden hover:bg-gray-50 dark:hover:bg-gray-800 {editEnabled
+												? ' text-book-cloth dark:text-kraft bg-book-cloth/15 dark:bg-book-cloth/10'
+												: 'bg-transparent text-gray-600 dark:text-gray-300 '} disabled:opacity-50 disabled:pointer-events-none"
 										>
-									</button>
+											<PencilSquare className="size-4" strokeWidth="1.75" />
+											<span
+												class="block whitespace-nowrap overflow-hidden text-ellipsis leading-none pr-0.5"
+												>{$i18n.t('Edit')}</span
+											>
+										</button>
+									</Tooltip>
+								</div>
+
+								<Tooltip content={selectedModelId}>
+									<select
+										class=" bg-transparent rounded-lg py-1 px-2 -mx-0.5 text-sm outline-hidden w-full text-right pr-5"
+										bind:value={selectedModelId}
+									>
+										{#each $models.filter((model) => !(model?.info?.meta?.hidden ?? false)) as model}
+											<option value={model.id} class="bg-gray-50 dark:bg-gray-700"
+												>{model.name}</option
+											>
+										{/each}
+									</select>
 								</Tooltip>
 							</div>
-
-							<Tooltip content={selectedModelId}>
-								<select
-									class=" bg-transparent rounded-lg py-1 px-2 -mx-0.5 text-sm outline-hidden w-full text-right pr-5"
-									bind:value={selectedModelId}
-								>
-									{#each $models.filter((model) => !(model?.info?.meta?.hidden ?? false)) as model}
-										<option value={model.id} class="bg-gray-50 dark:bg-gray-700"
-											>{model.name}</option
-										>
-									{/each}
-								</select>
-							</Tooltip>
-						</div>
+						{/snippet}
 					</MessageInput>
 				</div>
 			</div>

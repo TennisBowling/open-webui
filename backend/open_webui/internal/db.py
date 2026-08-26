@@ -83,10 +83,60 @@ class OrjsonJSON(types.TypeDecorator):
         return OrjsonJSON()
 
 
+def strip_nul(value):
+    """Recursively strip raw NUL (0x00) characters from every string — including
+    dict KEYS — in a JSON-able value. Tuples are treated like lists.
+
+    Postgres ``text``/``jsonb`` cannot store a NUL: ``jsonb`` rejects the
+    ``\\u0000`` escape (the only legal JSON encoding of a 0x00 byte) and ``text``
+    rejects the raw byte. A single NUL anywhere — a subagent quoting a fetched
+    binary page, scraped HTML, etc. — would otherwise abort the whole write.
+
+    Only ever called on a value already known to contain a NUL, so the recursion
+    cost is paid only when needed. Critically, this strips dict KEYS too: a NUL in
+    a key would survive a value-only walk and re-emit the jsonb-illegal escape."""
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, dict):
+        return {
+            (k.replace("\x00", "") if isinstance(k, str) and "\x00" in k else k): strip_nul(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [strip_nul(v) for v in value]
+    return value
+
+
+def dumps_jsonb(value) -> str:
+    """``json.dumps`` a value bound for a Postgres ``jsonb``/``text`` column,
+    guaranteeing the output contains no ``\\u0000`` escape — which jsonb REJECTS.
+
+    Fast path: dump once and scan for the escape (a no-op substring check on the
+    overwhelmingly common clean value). Only when the escape is present do we
+    strip NULs from the SOURCE value and re-dump. We deliberately do NOT
+    blind-``.replace`` the ``\\u0000`` substring out of the serialized string: that
+    would also clobber a legitimately backslash-escaped ``\\u0000`` literal (a user
+    pasting those 6 chars), truncating the escape and producing invalid JSON.
+    Stripping the source value only removes actual 0x00 characters, so a genuine
+    ``\\u0000`` literal is preserved.
+
+    Also wired as the async engine's ``json_serializer`` so EVERY ORM
+    ``Column(JSON)``/JSONB write (whole-chat blobs, meta, etc.) is NUL-safe at the
+    driver boundary, not just the raw-SQL binds that call this explicitly."""
+    s = json.dumps(value)
+    if "\\u0000" in s:
+        s = json.dumps(strip_nul(value))
+    return s
+
+
 SQLALCHEMY_DATABASE_URL = DATABASE_URL
 
 _engine_kwargs: dict[str, Any] = {
     "pool_pre_ping": True,
+    # NUL-safe serializer for every JSON/JSONB ORM column. asyncpg's jsonb codec
+    # is registered by SQLAlchemy from this callable, so a stray 0x00 in any
+    # whole-blob chat write is stripped before it reaches Postgres.
+    "json_serializer": dumps_jsonb,
 }
 
 if isinstance(DATABASE_POOL_SIZE, int):

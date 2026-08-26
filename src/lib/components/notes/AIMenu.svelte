@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
-	import { createEventDispatcher, getContext, onMount } from 'svelte';
+	import { getContext, onMount } from 'svelte';
 
 	import { showSettings, mobile, showSidebar, user } from '$lib/stores';
 	import { fade, slide } from 'svelte/transition';
@@ -11,21 +11,33 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let className = 'max-w-[170px]';
+	interface Props {
+		show?: boolean;
+		className?: string;
+		onEdit?: any;
+		onChat?: any;
+		onChange?: any;
+		children?: import('svelte').Snippet;
+		content?: import('svelte').Snippet;
+	}
 
-	export let onEdit = () => {};
-	export let onChat = () => {};
-
-	export let onChange = () => {};
+	let {
+		show = $bindable(false),
+		className = 'max-w-[170px]',
+		onEdit = () => {},
+		onChat = () => {},
+		onChange = () => {},
+		children,
+		content
+	}: Props = $props();
 </script>
 
 <DropdownMenu.Root bind:open={show} onOpenChange={onChange}>
 	<DropdownMenu.Trigger>
-		<slot />
+		{@render children?.()}
 	</DropdownMenu.Trigger>
 
-	<slot name="content">
+	{#if content}{@render content()}{:else}
 		<DropdownMenu.Content
 			class="w-full {className} text-sm rounded-xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg font-primary"
 			sideOffset={8}
@@ -35,7 +47,7 @@
 		>
 			<button
 				class="flex rounded-md py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition"
-				on:click={async () => {
+				onclick={async () => {
 					onEdit();
 					show = false;
 				}}
@@ -48,7 +60,7 @@
 
 			<button
 				class="flex rounded-md py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition"
-				on:click={() => {
+				onclick={() => {
 					onChat();
 					show = false;
 				}}
@@ -59,5 +71,5 @@
 				<div class=" self-center truncate">{$i18n.t('Chat')}</div>
 			</button>
 		</DropdownMenu.Content>
-	</slot>
+	{/if}
 </DropdownMenu.Root>

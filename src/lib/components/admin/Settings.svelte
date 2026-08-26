@@ -2,7 +2,7 @@
 	import { getContext, tick, onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { config } from '$lib/stores';
 	import { getBackendConfig } from '$lib/apis';
@@ -19,49 +19,20 @@
 	import WebSearch from './Settings/WebSearch.svelte';
 	import StudyMode from './Settings/StudyMode.svelte';
 	import DataViz from './Settings/DataViz.svelte';
+	import Video from './Settings/Video.svelte';
+	import Embeddings from './Settings/Embeddings.svelte';
 	import Subagents from './Settings/Subagents.svelte';
 	import Pricing from './Settings/Pricing.svelte';
 
 	import ChartBar from '../icons/ChartBar.svelte';
+	import VideoCamera from '../icons/VideoCamera.svelte';
 	import Evaluations from './Settings/Evaluations.svelte';
 	import Tools from './Settings/Tools.svelte';
 	import Container from './Settings/Container.svelte';
 
 	const i18n = getContext('i18n');
 
-	let selectedTab = 'general';
-
-	// Get current tab from URL pathname, default to 'general'
-	$: {
-		const pathParts = $page.url.pathname.split('/');
-		const tabFromPath = pathParts[pathParts.length - 1];
-		selectedTab = [
-			'general',
-			'connections',
-			'models',
-			'model-limits',
-			'evaluations',
-			'tools',
-			'container',
-			'web',
-			'study',
-			'data-viz',
-			'subagents',
-			'pricing',
-			'interface',
-			'audio',
-			'images',
-			'pipelines',
-			'db'
-		].includes(tabFromPath)
-			? tabFromPath
-			: 'general';
-	}
-
-	$: if (selectedTab) {
-		// scroll to selectedTab
-		scrollToTab(selectedTab);
-	}
+	let selectedTab = $state('general');
 
 	const scrollToTab = (tabId) => {
 		const tabElement = document.getElementById(tabId);
@@ -85,6 +56,40 @@
 		// Scroll to the selected tab on mount
 		scrollToTab(selectedTab);
 	});
+	// Get current tab from URL pathname, default to 'general'
+	$effect(() => {
+		const pathParts = $page.url.pathname.split('/');
+		const tabFromPath = pathParts[pathParts.length - 1];
+		selectedTab = [
+			'general',
+			'connections',
+			'models',
+			'model-limits',
+			'evaluations',
+			'tools',
+			'container',
+			'web',
+			'study',
+			'data-viz',
+			'video',
+			'embeddings',
+			'subagents',
+			'pricing',
+			'interface',
+			'audio',
+			'images',
+			'pipelines',
+			'db'
+		].includes(tabFromPath)
+			? tabFromPath
+			: 'general';
+	});
+	$effect(() => {
+		if (selectedTab) {
+			// scroll to selectedTab
+			scrollToTab(selectedTab);
+		}
+	});
 </script>
 
 <div class="flex flex-col lg:flex-row w-full h-full pb-2 lg:space-x-4">
@@ -98,7 +103,7 @@
 			'general'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/general');
 			}}
 		>
@@ -125,7 +130,7 @@
 			'connections'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/connections');
 			}}
 		>
@@ -150,7 +155,7 @@
 			'models'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/models');
 			}}
 		>
@@ -177,7 +182,7 @@
 			'model-limits'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/model-limits');
 			}}
 		>
@@ -204,7 +209,7 @@
 			'evaluations'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/evaluations');
 			}}
 		>
@@ -220,7 +225,7 @@
 			'tools'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/tools');
 			}}
 		>
@@ -247,7 +252,7 @@
 			'container'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/container');
 			}}
 		>
@@ -274,7 +279,7 @@
 			'web'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/web');
 			}}
 		>
@@ -299,7 +304,7 @@
 			'study'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/study');
 			}}
 		>
@@ -324,7 +329,7 @@
 			'data-viz'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/data-viz');
 			}}
 		>
@@ -335,12 +340,58 @@
 		</button>
 
 		<button
+			id="video"
+			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
+			'video'
+				? ''
+				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
+			onclick={() => {
+				goto('/admin/settings/video');
+			}}
+		>
+			<div class=" self-center mr-2">
+				<VideoCamera className="size-4" />
+			</div>
+			<div class=" self-center">{$i18n.t('Video')}</div>
+		</button>
+
+		<button
+			id="embeddings"
+			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
+			'embeddings'
+				? ''
+				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
+			onclick={() => {
+				goto('/admin/settings/embeddings');
+			}}
+		>
+			<div class=" self-center mr-2">
+				<svg
+					xmlns="http://www.w3.org/2000/svg"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.75"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					class="size-4"
+				>
+					<path d="M21 21l-4.35-4.35" />
+					<circle cx="11" cy="11" r="7" />
+					<circle cx="11" cy="11" r="2.25" fill="currentColor" stroke="none" />
+					<path d="M11 4v2.5M11 15.5V18M4 11h2.5M15.5 11H18" />
+				</svg>
+			</div>
+			<div class=" self-center">{$i18n.t('Chat Search Embeddings')}</div>
+		</button>
+
+		<button
 			id="subagents"
 			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-left transition {selectedTab ===
 			'subagents'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/subagents');
 			}}
 		>
@@ -369,7 +420,7 @@
 			'pricing'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/pricing');
 			}}
 		>
@@ -396,7 +447,7 @@
 			'interface'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/interface');
 			}}
 		>
@@ -423,7 +474,7 @@
 			'audio'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/audio');
 			}}
 		>
@@ -451,7 +502,7 @@
 			'images'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/images');
 			}}
 		>
@@ -478,7 +529,7 @@
 			'pipelines'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/pipelines');
 			}}
 		>
@@ -509,7 +560,7 @@
 			'db'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/settings/db');
 			}}
 		>
@@ -547,7 +598,7 @@
 			/>
 		{:else if selectedTab === 'connections'}
 			<Connections
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>
@@ -555,7 +606,7 @@
 			<Models />
 		{:else if selectedTab === 'model-limits'}
 			<ModelLimits
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Token limits saved successfully!'));
 				}}
 			/>
@@ -565,7 +616,7 @@
 			<Tools />
 		{:else if selectedTab === 'container'}
 			<Container
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>
@@ -596,6 +647,22 @@
 					await config.set(await getBackendConfig());
 				}}
 			/>
+		{:else if selectedTab === 'video'}
+			<Video
+				saveHandler={async () => {
+					await tick();
+					await config.set(await getBackendConfig());
+				}}
+			/>
+		{:else if selectedTab === 'embeddings'}
+			<Embeddings
+				saveHandler={async () => {
+					toast.success($i18n.t('Settings saved successfully!'));
+
+					await tick();
+					await config.set(await getBackendConfig());
+				}}
+			/>
 		{:else if selectedTab === 'subagents'}
 			<Subagents
 				saveHandler={async () => {
@@ -607,13 +674,13 @@
 			/>
 		{:else if selectedTab === 'pricing'}
 			<Pricing
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>
 		{:else if selectedTab === 'interface'}
 			<Interface
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>
@@ -625,7 +692,7 @@
 			/>
 		{:else if selectedTab === 'images'}
 			<Images
-				on:save={() => {
+				onsave={() => {
 					toast.success($i18n.t('Settings saved successfully!'));
 				}}
 			/>

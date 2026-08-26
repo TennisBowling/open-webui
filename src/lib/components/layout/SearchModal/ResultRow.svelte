@@ -7,16 +7,23 @@
 
 	const i18n = getContext('i18n');
 
-	export let hit: ChatSearchHit;
-	export let selected: boolean = false;
+	interface Props {
+		hit: ChatSearchHit;
+		selected?: boolean;
+		onclick?: (event: MouseEvent) => void;
+		onmouseenter?: (event: MouseEvent) => void;
+	}
 
-	$: snippetHtml = sanitizeMarkSnippet(hit.snippet);
-	$: roleLabel =
+	let { hit, selected = false, onclick, onmouseenter }: Props = $props();
+
+	let snippetHtml = $derived(sanitizeMarkSnippet(hit.snippet));
+	let roleLabel = $derived(
 		hit.matched_role === 'user'
 			? $i18n.t('You')
 			: hit.matched_role === 'assistant'
 				? $i18n.t('Assistant')
-				: '';
+				: ''
+	);
 </script>
 
 <a
@@ -25,8 +32,8 @@
 		: ''}"
 	href="/c/{hit.id}"
 	draggable="false"
-	on:click
-	on:mouseenter
+	{onclick}
+	{onmouseenter}
 	data-arrow-selected={selected ? 'true' : undefined}
 >
 	<div class="flex items-center justify-between gap-3">
@@ -50,7 +57,8 @@
 	<div class="flex items-center gap-2 mt-1 text-[10px] text-gray-500 dark:text-gray-500">
 		{#if hit.match_count > 1}
 			<span class="px-1.5 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800">
-				{hit.match_count} {$i18n.t('matches')}
+				{hit.match_count}
+				{$i18n.t('matches')}
 			</span>
 		{/if}
 		{#if hit.archived}

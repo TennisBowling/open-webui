@@ -1,7 +1,11 @@
-<script>
-	import { createEventDispatcher, getContext, onMount } from 'svelte';
+<script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Modal from '$lib/components/common/Modal.svelte';
@@ -9,23 +13,27 @@
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import Minus from '$lib/components/icons/Minus.svelte';
 	import PencilSolid from '$lib/components/icons/PencilSolid.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
-	export let show = false;
-	export let edit = false;
-
-	export let model = null;
-
-	let name = '';
-	let id = '';
-
-	$: if (name) {
-		generateId();
+	interface Props {
+		show?: boolean;
+		edit?: boolean;
+		model?: any;
 	}
+
+	let {
+		show = $bindable(false),
+		edit = false,
+		model = null,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	let name = $state('');
+	let id = $state('');
 
 	const generateId = () => {
 		if (!edit) {
@@ -37,18 +45,18 @@
 		}
 	};
 
-	let profileImageUrl = `${WEBUI_BASE_URL}/favicon.png`;
-	let description = '';
+	let profileImageUrl = $state(`${WEBUI_BASE_URL}/favicon.png`);
+	let description = $state('');
 
-	let selectedModelId = '';
-	let modelIds = [];
-	let filterMode = 'include';
+	let selectedModelId = $state('');
+	let modelIds = $state([]);
+	let filterMode = $state('include');
 
-	let accessControl = {};
+	let accessControl = $state({});
 
-	let imageInputElement;
-	let loading = false;
-	let showDeleteConfirmDialog = false;
+	let imageInputElement = $state();
+	let loading = $state(false);
+	let showDeleteConfirmDialog = $state(false);
 
 	const addModelHandler = () => {
 		if (selectedModelId) {
@@ -111,18 +119,24 @@
 		}
 	};
 
-	$: if (show) {
-		initModel();
-	}
-
 	onMount(() => {
 		initModel();
+	});
+	$effect(() => {
+		if (name) {
+			generateId();
+		}
+	});
+	$effect(() => {
+		if (show) {
+			initModel();
+		}
 	});
 </script>
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	on:confirm={() => {
+	onconfirm={() => {
 		dispatch('delete', model);
 		show = false;
 	}}
@@ -140,7 +154,7 @@
 			</div>
 			<button
 				class="self-center"
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -152,9 +166,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class="px-1">
 						<div class="flex justify-center pb-3">
@@ -163,7 +177,7 @@
 								type="file"
 								hidden
 								accept="image/*"
-								on:change={(e) => {
+								onchange={(e) => {
 									const files = e.target.files ?? [];
 									let reader = new FileReader();
 									reader.onload = (event) => {
@@ -224,7 +238,7 @@
 							<button
 								class="relative rounded-full w-fit h-fit shrink-0"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									imageInputElement.click();
 								}}
 							>
@@ -293,7 +307,7 @@
 						<hr class=" border-gray-100 dark:border-gray-700/10 my-2.5 w-full" />
 
 						<div class="my-2 -mx-2">
-							<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+							<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 								<AccessControl bind:accessControl />
 							</div>
 						</div>
@@ -308,7 +322,7 @@
 									<button
 										class=" text-xs text-gray-500"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											filterMode = filterMode === 'include' ? 'exclude' : 'include';
 										}}
 									>
@@ -331,7 +345,7 @@
 											<div class="shrink-0">
 												<button
 													type="button"
-													on:click={() => {
+													onclick={() => {
 														modelIds = modelIds.filter((_, idx) => idx !== modelIdx);
 													}}
 												>
@@ -366,7 +380,7 @@
 							<div>
 								<button
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										addModelHandler();
 									}}
 								>
@@ -381,7 +395,7 @@
 							<button
 								class="px-3.5 py-1.5 text-sm font-medium dark:bg-black dark:hover:bg-gray-950 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									showDeleteConfirmDialog = true;
 								}}
 							>
@@ -390,7 +404,7 @@
 						{/if}
 
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-950 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
+							class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-full flex flex-row space-x-1 items-center {loading
 								? ' cursor-not-allowed'
 								: ''}"
 							type="submit"

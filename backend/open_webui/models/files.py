@@ -3,11 +3,12 @@ import json
 import time
 from typing import Optional
 
-from open_webui.internal.db import Base, get_db
+from open_webui.internal.db import Base, get_db, dumps_jsonb
 from open_webui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Column, Index, String, Text, delete, select, text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -126,6 +127,25 @@ class FilesTable:
                     return FileModel.model_validate(result)
                 else:
                     return None
+            except IntegrityError as e:
+                # A concurrent request with the same (user_id, upload_id) won
+                # the race on file_user_id_upload_id_unique_idx (see migration
+                # 12dd367080c3). The other request's row is now committed —
+                # look it up and return it instead of failing this one, so
+                # the upload endpoint stays idempotent even under a genuine
+                # near-simultaneous retry, not just a sequential one.
+                await db.rollback()
+                upload_id = (form_data.meta or {}).get("data", {}).get("upload_id")
+                if upload_id:
+                    existing = await self.get_file_by_user_id_and_upload_id(
+                        user_id, upload_id
+                    )
+                    if existing:
+                        # The upload handler detects that this returned id differs
+                        # from form_data.id and deletes the losing storage object.
+                        return existing
+                log.exception(f"Error inserting a new file (integrity error): {e}")
+                return None
             except Exception as e:
                 log.exception(f"Error inserting a new file: {e}")
                 return None
@@ -143,6 +163,39 @@ class FilesTable:
             try:
                 result = await db.execute(
                     select(File).where(File.id == id, File.user_id == user_id).limit(1)
+                )
+                file = result.scalars().first()
+                if file:
+                    return FileModel.model_validate(file)
+                else:
+                    return None
+            except Exception:
+                return None
+
+    async def get_file_by_user_id_and_upload_id(
+        self, user_id: str, upload_id: str
+    ) -> Optional[FileModel]:
+        """Idempotency lookup for client-retried uploads.
+
+        The client tags every upload attempt with a stable `upload_id` (reused
+        across retries of the same logical upload) stored at
+        `meta.data.upload_id`. If a retry lands after the original request
+        already succeeded server-side (but the response was lost, e.g. on
+        flaky cellular), this lets the handler return the existing row instead
+        of inserting a duplicate.
+        """
+        if not upload_id:
+            return None
+        async with get_db() as db:
+            try:
+                result = await db.execute(
+                    select(File)
+                    .where(
+                        File.user_id == user_id,
+                        File.meta["data"]["upload_id"].astext == upload_id,
+                    )
+                    .order_by(File.created_at.desc())
+                    .limit(1)
                 )
                 file = result.scalars().first()
                 if file:
@@ -236,7 +289,7 @@ class FilesTable:
                     ),
                     {
                         "id": id,
-                        "payload": json.dumps(data),
+                        "payload": dumps_jsonb(data),
                         "updated_at": int(time.time()),
                     },
                 )
@@ -260,7 +313,7 @@ class FilesTable:
                     ),
                     {
                         "id": id,
-                        "payload": json.dumps(meta),
+                        "payload": dumps_jsonb(meta),
                         "updated_at": int(time.time()),
                     },
                 )

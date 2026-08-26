@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
-
 	import { socket, user } from '$lib/stores';
 
 	import { getChannelThreadMessages, sendMessage } from '$lib/apis/channels';
@@ -8,45 +6,58 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import MessageInput from './MessageInput.svelte';
 	import Messages from './Messages.svelte';
-	import { onDestroy, onMount, tick, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { onDestroy, onMount, tick, getContext, untrack } from 'svelte';
+	import { toast } from '$lib/utils/toast';
 	import Spinner from '../common/Spinner.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let threadId = null;
-	export let channel = null;
-
-	export let onClose = () => {};
-
-	let messages = null;
-	let top = false;
-
-	let messagesContainerElement = null;
-	let chatInputElement = null;
-
-	let replyToMessage = null;
-
-	let typingUsers = [];
-	let typingUsersTimeout = {};
-
-	$: if (threadId) {
-		initHandler();
+	interface Props {
+		threadId?: any;
+		channel?: any;
+		onClose?: any;
 	}
+
+	let { threadId = null, channel = null, onClose = () => {} }: Props = $props();
+
+	let messages = $state(null);
+	let top = $state(false);
+
+	let messagesContainerElement = $state(null);
+	let chatInputElement = $state(null);
+
+	let replyToMessage = $state(null);
+
+	let typingUsers = $state([]);
+	let typingUsersTimeout = {};
 
 	const scrollToBottom = () => {
 		messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
 	};
 
-	const initHandler = async () => {
+	let initGeneration = 0;
+
+	const initHandler = async (targetThreadId: string, targetChannel: any) => {
+		const generation = ++initGeneration;
 		messages = null;
 		top = false;
 
 		typingUsers = [];
 		typingUsersTimeout = {};
 
-		if (channel) {
-			messages = await getChannelThreadMessages(localStorage.token, channel.id, threadId);
+		if (targetChannel) {
+			const nextMessages = await getChannelThreadMessages(
+				localStorage.token,
+				targetChannel.id,
+				targetThreadId
+			);
+			if (
+				generation !== initGeneration ||
+				threadId !== targetThreadId ||
+				channel?.id !== targetChannel.id
+			)
+				return;
+			messages = nextMessages;
 
 			if (messages.length < 50) {
 				top = true;
@@ -54,8 +65,6 @@
 
 			await tick();
 			scrollToBottom();
-		} else {
-			goto('/');
 		}
 	};
 
@@ -160,7 +169,17 @@
 	});
 
 	onDestroy(() => {
+		initGeneration += 1;
 		$socket?.off('events:channel', channelEventHandler);
+	});
+	$effect(() => {
+		const targetThreadId = threadId;
+		const targetChannel = channel;
+		if (targetThreadId && targetChannel?.id) {
+			untrack(() => {
+				void initHandler(targetThreadId, targetChannel);
+			});
+		}
 	});
 </script>
 
@@ -172,7 +191,7 @@
 			<div>
 				<button
 					class="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300 p-2"
-					on:click={() => {
+					onclick={() => {
 						onClose();
 					}}
 				>

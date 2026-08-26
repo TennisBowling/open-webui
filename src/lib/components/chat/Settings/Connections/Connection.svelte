@@ -9,17 +9,26 @@
 	import AddConnectionModal from '$lib/components/AddConnectionModal.svelte';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
-	export let onDelete = () => {};
-	export let onSubmit = () => {};
+	interface Props {
+		onDelete?: any;
+		onSubmit?: any;
+		pipeline?: boolean;
+		url?: string;
+		key?: string;
+		config?: any;
+	}
 
-	export let pipeline = false;
+	let {
+		onDelete = () => {},
+		onSubmit = () => {},
+		pipeline = false,
+		url = $bindable(''),
+		key = $bindable(''),
+		config = $bindable({})
+	}: Props = $props();
 
-	export let url = '';
-	export let key = '';
-	export let config = {};
-
-	let showConfigModal = false;
-	let showDeleteConfirmDialog = false;
+	let showConfigModal = $state(false);
+	let showDeleteConfirmDialog = $state(false);
 </script>
 
 <AddConnectionModal
@@ -44,7 +53,7 @@
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	on:confirm={() => {
+	onconfirm={() => {
 		onDelete();
 		showConfigModal = false;
 	}}
@@ -80,7 +89,7 @@
 			<button
 				aria-label={$i18n.t('Open modal to configure connection')}
 				class="self-center p-1 bg-transparent hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 rounded-lg transition"
-				on:click={() => {
+				onclick={() => {
 					showConfigModal = true;
 				}}
 				type="button"

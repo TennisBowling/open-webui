@@ -1,11 +1,24 @@
 <script lang="ts">
-	import { getContext, onMount } from 'svelte';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { getContext, onDestroy } from 'svelte';
 	import { slide } from 'svelte/transition';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { chatId, questionStates } from '$lib/stores';
 	import { patchChat } from '$lib/apis/chats';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import {
+		normalizeQuestions,
+		computeAllAnswered,
+		optionSelected,
+		buildAnswerPayload as buildPayload,
+		seedStateFromSource,
+		summarizeAnswer,
+		type SelectedMap,
+		type OtherTextMap,
+		type OtherOnMap
+	} from './askUserLogic';
 
 	const i18n: any = getContext('i18n');
 
@@ -16,8 +29,13 @@
 	//   result            — the tool result string (present once answered/skipped)
 	//   done              — "true" once the parent tool result lands (card locks)
 	//   message_terminated — "true" if the generation ended (Stop) — orphan guard
-	//   chat_id           — the chat we write the answer into
-	export let attributes: Record<string, any> = {};
+
+	interface Props {
+		//   chat_id           — the chat we write the answer into
+		attributes?: Record<string, any>;
+	}
+
+	let { attributes = {} }: Props = $props();
 
 	const decodeHtml = (value: unknown) => {
 		if (typeof value !== 'string') return value ?? '';
@@ -39,109 +57,29 @@
 		}
 	};
 
-	type Option = { label: string; description?: string };
-	type Question = {
-		question: string;
-		header?: string;
-		options: Option[];
-		multiSelect: boolean;
-		allowOther: boolean;
-	};
-
-	const normalizeQuestions = (raw: any): Question[] => {
-		let list = raw?.questions ?? raw;
-		if (typeof list === 'string') {
-			try {
-				list = JSON.parse(list);
-			} catch {
-				list = [];
-			}
-		}
-		if (!Array.isArray(list)) return [];
-		return list
-			.map((q: any): Question | null => {
-				if (!q || typeof q !== 'object') return null;
-				const question = `${q.question ?? ''}`.trim();
-				if (!question) return null;
-				const rawOptions = Array.isArray(q.options) ? q.options : [];
-				const options: Option[] = rawOptions
-					.map((o: any): Option | null => {
-						if (typeof o === 'string') return { label: o };
-						if (o && typeof o === 'object' && `${o.label ?? ''}`.trim())
-							return { label: `${o.label}`.trim(), description: o.description ?? '' };
-						return null;
-					})
-					.filter((o: Option | null): o is Option => o != null);
-				return {
-					question,
-					header: `${q.header ?? ''}`.trim(),
-					options,
-					multiSelect: !!q.multiSelect,
-					// Free-form questions (no options) always take text input.
-					allowOther: q.allowOther !== false || options.length === 0
-				};
-			})
-			.filter((q: Question | null): q is Question => q != null);
-	};
-
-	$: toolCallId = (attributes?.tool_call_id || '') as string;
-	$: questions = normalizeQuestions(parseArgs(attributes?.arguments));
-	$: answeredByResult = String(attributes?.done) === 'true';
-	$: messageTerminated = String(attributes?.message_terminated) === 'true';
-
-	// The durable per-question state for this tool call (draft + submitted answer).
-	$: storeEntry = $questionStates?.[toolCallId];
-	$: submittedAnswer =
-		storeEntry?.answer && typeof storeEntry.answer === 'object' ? storeEntry.answer : null;
-	$: wasSkipped = !!storeEntry?.skipped;
-
-	// Locked = the question is resolved. Either the tool result landed (answer is
-	// in the message now), or the durable store records a submit/skip.
-	$: locked = answeredByResult || submittedAnswer != null || wasSkipped;
-
-	// Orphaned = generation ended without an answer (e.g. user pressed Stop while
-	// the card was waiting). Disable the form; it can no longer resume anything.
-	$: orphaned = !locked && messageTerminated;
-
 	// --- local form state, keyed by question index ---
-	// selected[i] = array of chosen labels; other[i] = free-text; otherOn[i] =
-	// whether the "Other" radio/row is the active choice for a single-select.
-	let selected: Record<number, string[]> = {};
-	let otherText: Record<number, string> = {};
-	let otherOn: Record<number, boolean> = {};
-	let submitting = false;
-	let seededFor = '';
+	// selected[i] = array of chosen labels; otherText[i] = free-text; otherOn[i] =
+	// whether the "Other" / free-form row is the active choice.
+	let selected: SelectedMap = $state({});
+	let otherText: OtherTextMap = $state({});
+	let otherOn: OtherOnMap = $state({});
+	let submitting = $state(false);
+	// Set the moment the user interacts; gates the auto-seed below so we never
+	// clobber in-progress input with (re-)hydrated durable state.
+	let userTouched = $state(false);
+	let seedKey = $state('');
 
-	// Seed local state from the durable draft / submitted answer exactly once per
-	// tool call (and re-seed if the tool call id changes, e.g. switching chats).
-	// This is what restores partial selections after a reload mid-answering.
-	$: if (toolCallId && seededFor !== toolCallId && questions.length) {
-		seedFromStore();
-	}
-
-	const seedFromStore = () => {
-		const source = submittedAnswer ?? storeEntry?.draft ?? {};
-		const nextSelected: Record<number, string[]> = {};
-		const nextOther: Record<number, string> = {};
-		const nextOtherOn: Record<number, boolean> = {};
-		questions.forEach((q, i) => {
-			const entry = (source as any)?.[String(i)] ?? (source as any)?.[i] ?? {};
-			const sel = Array.isArray(entry?.selected)
-				? entry.selected.filter((s: any) => typeof s === 'string')
-				: [];
-			nextSelected[i] = sel;
-			nextOther[i] = typeof entry?.other === 'string' ? entry.other : '';
-			nextOtherOn[i] = !!(nextOther[i] && nextOther[i].length) || q.options.length === 0;
-		});
-		selected = nextSelected;
-		otherText = nextOther;
-		otherOn = nextOtherOn;
-		seededFor = toolCallId;
+	const applySeed = (source: any) => {
+		const seeded = seedStateFromSource(questions, source ?? {});
+		selected = seeded.selected;
+		otherText = seeded.otherText;
+		otherOn = seeded.otherOn;
 	};
 
 	// --- selection handlers (interactive state only; persistence is debounced) ---
 	const toggleOption = (qi: number, label: string) => {
 		if (locked || orphaned) return;
+		userTouched = true;
 		const q = questions[qi];
 		if (q.multiSelect) {
 			const cur = new Set(selected[qi] ?? []);
@@ -157,6 +95,7 @@
 
 	const selectOther = (qi: number) => {
 		if (locked || orphaned) return;
+		userTouched = true;
 		const q = questions[qi];
 		if (!q.multiSelect) {
 			selected = { ...selected, [qi]: [] };
@@ -166,6 +105,8 @@
 	};
 
 	const onOtherInput = (qi: number, value: string) => {
+		if (locked || orphaned) return;
+		userTouched = true;
 		otherText = { ...otherText, [qi]: value };
 		if (value && !otherOn[qi]) otherOn = { ...otherOn, [qi]: true };
 		scheduleDraftSave();
@@ -175,53 +116,62 @@
 		onOtherInput(qi, (e.target as HTMLInputElement).value);
 	};
 
-	const isOptionSelected = (qi: number, label: string) => (selected[qi] ?? []).includes(label);
-
-	// A question counts as answered when it has at least one selected option, or
-	// an active "Other" with non-empty text, or (free-form) non-empty text.
-	const questionAnswered = (qi: number): boolean => {
-		const q = questions[qi];
-		const sel = selected[qi] ?? [];
-		if (sel.length > 0) return true;
-		if ((q.allowOther || q.options.length === 0) && otherOn[qi] && (otherText[qi] ?? '').trim())
-			return true;
-		return false;
-	};
-
-	$: allAnswered = questions.length > 0 && questions.every((_, i) => questionAnswered(i));
-
 	// Build the {qIndex: {selected, other}} payload from local state.
-	const buildAnswerPayload = (): Record<string, { selected: string[]; other: string }> => {
-		const out: Record<string, { selected: string[]; other: string }> = {};
-		questions.forEach((q, i) => {
-			const sel = selected[i] ?? [];
-			const other = otherOn[i] ? (otherText[i] ?? '').trim() : '';
-			out[String(i)] = { selected: sel, other };
-		});
-		return out;
-	};
+	const buildAnswerPayload = () => buildPayload(questions, selected, otherOn, otherText);
 
-	// --- durable persistence via the set_question_state patch op ---
-	const isServerChat = () => {
-		const cid = $chatId;
-		return typeof cid === 'string' && cid && !cid.startsWith('local:');
-	};
+	const isServerChat = (cid: string) =>
+		typeof cid === 'string' && !!cid && !cid.startsWith('local:');
 
-	const writeState = async (patch: Record<string, unknown>) => {
-		// Optimistically update the store so the card reflects the change instantly
-		// and a reload (or another tab's load) sees consistent state.
+	const applyOptimistic = (patch: Record<string, unknown>) => {
+		// Reflect the change in the local store so the card updates instantly and a
+		// reload / another tab sees consistent state.
 		questionStates.update((s) => ({
 			...s,
 			[toolCallId]: { ...(s[toolCallId] ?? {}), ...patch }
 		}));
-		if (!isServerChat() || !toolCallId) return; // temp/local: socket path handles it
-		try {
-			await patchChat(localStorage.token, $chatId as string, [
-				{ op: 'set_question_state', tool_call_id: toolCallId, patch }
-			]);
-		} catch (err) {
-			console.warn('ask_user: failed to persist question state', err);
+	};
+
+	const persist = async (patch: Record<string, unknown>) => {
+		await patchChat(localStorage.token, cardChatId, [
+			{ op: 'set_question_state', tool_call_id: toolCallId, patch }
+		]);
+	};
+
+	// Draft writes are non-critical: optimistic + fire-and-forget. Losing a draft
+	// on a transient failure is harmless (it's re-derived from local state). We do
+	// keep a handle on the in-flight draft so a terminal submit can wait for it.
+	let draftInFlight: Promise<unknown> | null = null;
+	const writeDraft = (patch: Record<string, unknown>) => {
+		applyOptimistic(patch);
+		if (!isServerChat(cardChatId) || !toolCallId) return; // temp/local: socket path handles it
+		const p = persist(patch).catch((err) => console.warn('ask_user: failed to persist draft', err));
+		draftInFlight = p;
+		p.finally(() => {
+			if (draftInFlight === p) draftInFlight = null;
+		});
+	};
+
+	// Terminal writes (answer / skip) MUST reach the durable blob before we lock
+	// the card — that blob is the only thing the blocked server-side generation
+	// polls. Locking optimistically before the write would, on a failed write,
+	// hide the form, drop the answer, and hang the generation until timeout. So:
+	// persist first; only on success apply the optimistic lock. Throws on failure
+	// (caller keeps the card interactive and surfaces an error).
+	const writeTerminal = async (patch: Record<string, unknown>) => {
+		if (isServerChat(cardChatId) && toolCallId) {
+			// A debounced draft write may still be in flight. Let it settle FIRST so
+			// its (older) read-modify-write of the shared question_states blob can't
+			// land AFTER ours and clobber the answer with a stale snapshot.
+			if (draftInFlight) {
+				try {
+					await draftInFlight;
+				} catch {
+					/* a failed draft is non-fatal; still persist the answer */
+				}
+			}
+			await persist(patch);
 		}
+		applyOptimistic(patch);
 	};
 
 	let draftTimer: ReturnType<typeof setTimeout> | null = null;
@@ -230,9 +180,21 @@
 		if (draftTimer) clearTimeout(draftTimer);
 		draftTimer = setTimeout(() => {
 			draftTimer = null;
-			void writeState({ draft: buildAnswerPayload() });
+			// Re-check at fire time: the card may have locked (answered in another
+			// tab / result landed) or been orphaned during the debounce window.
+			if (locked || orphaned) return;
+			writeDraft({ draft: buildAnswerPayload() });
 		}, 400);
 	};
+
+	// Pending debounced draft must not outlive the card; otherwise it fires after
+	// unmount and writes into whatever chat is active by then.
+	onDestroy(() => {
+		if (draftTimer) {
+			clearTimeout(draftTimer);
+			draftTimer = null;
+		}
+	});
 
 	const submit = async () => {
 		if (locked || orphaned || submitting) return;
@@ -245,9 +207,17 @@
 			draftTimer = null;
 		}
 		submitting = true;
-		const answer = buildAnswerPayload();
-		await writeState({ answer, submitted_at: Math.floor(Date.now() / 1000) });
-		submitting = false;
+		try {
+			await writeTerminal({
+				answer: buildAnswerPayload(),
+				submitted_at: Math.floor(Date.now() / 1000)
+			});
+		} catch (err) {
+			console.warn('ask_user: failed to submit answer', err);
+			toast.error($i18n.t('Could not submit your answer. Please try again.'));
+		} finally {
+			submitting = false;
+		}
 	};
 
 	const skip = async () => {
@@ -257,27 +227,73 @@
 			draftTimer = null;
 		}
 		submitting = true;
-		await writeState({ skipped: true, submitted_at: Math.floor(Date.now() / 1000) });
-		submitting = false;
+		try {
+			await writeTerminal({ skipped: true, submitted_at: Math.floor(Date.now() / 1000) });
+		} catch (err) {
+			console.warn('ask_user: failed to skip question', err);
+			toast.error($i18n.t('Could not skip the question. Please try again.'));
+		} finally {
+			submitting = false;
+		}
 	};
-
-	// For the locked summary view: pull the chosen answer for a question from the
-	// submitted store answer (preferred — structured) so reload shows real picks.
-	const summaryFor = (qi: number): string => {
-		const entry = (submittedAnswer as any)?.[String(qi)] ?? (submittedAnswer as any)?.[qi] ?? {};
-		const picks: string[] = [];
-		if (Array.isArray(entry?.selected)) picks.push(...entry.selected.filter((s: any) => !!s));
-		if (entry?.other && `${entry.other}`.trim()) picks.push(`${$i18n.t('Other')}: ${entry.other}`);
-		return picks.length ? picks.join(', ') : $i18n.t('(no answer)');
-	};
+	let toolCallId = $derived((attributes?.tool_call_id || '') as string);
+	let questions = $derived(normalizeQuestions(parseArgs(attributes?.arguments)));
+	let answeredByResult = $derived(String(attributes?.done) === 'true');
+	let messageTerminated = $derived(String(attributes?.message_terminated) === 'true');
+	// The durable per-question state for this tool call (draft + submitted answer).
+	let storeEntry = $derived($questionStates?.[toolCallId]);
+	let submittedAnswer = $derived(
+		storeEntry?.answer && typeof storeEntry.answer === 'object' ? storeEntry.answer : null
+	);
+	let wasSkipped = $derived(!!storeEntry?.skipped);
+	// Locked = the question is resolved. Either the tool result landed (answer is
+	// in the message now), or the durable store records a submit/skip.
+	let locked = $derived(answeredByResult || submittedAnswer != null || wasSkipped);
+	// Orphaned = generation ended without an answer (e.g. user pressed Stop while
+	// the card was waiting). Disable the form; it can no longer resume anything.
+	let orphaned = $derived(!locked && messageTerminated);
+	// The durable source to restore from (a submitted answer wins over a draft).
+	let seedSource = $derived(submittedAnswer ?? storeEntry?.draft ?? null);
+	// Reset interaction state when the card identity changes (e.g. switching
+	// chats) so the next card seeds fresh from its own durable state.
+	$effect(() => {
+		if (toolCallId !== seedKey) {
+			seedKey = toolCallId;
+			userTouched = false;
+		}
+	});
+	// (Re)seed local form state from the durable source until the user touches
+	// the form. Re-running (rather than seeding exactly once) restores partial
+	// selections after a reload even if the questionStates store hydrates a tick
+	// AFTER the card first mounts — the one-shot seed used to miss that and show
+	// an empty form. `userTouched` guarantees we stop before clobbering input.
+	$effect(() => {
+		if (toolCallId && questions.length && !userTouched) {
+			applySeed(seedSource);
+		}
+	});
+	// The Submit gate. Passing the state maps as explicit arguments is what makes
+	// Svelte track them: a bare `questions.every(i => questionAnswered(i))` would
+	// only re-run when `questions` changed, never when the user filled an answer.
+	let allAnswered = $derived(computeAllAnswered(questions, selected, otherOn, otherText));
+	// --- durable persistence via the set_question_state patch op ---
+	// Always target the card's OWN chat (captured from the tool-call attributes),
+	// never the global $chatId store: a debounced write can fire after the user
+	// has navigated to a different chat, and $chatId would by then point at the
+	// wrong blob. Falls back to $chatId only if the attribute is somehow absent.
+	let cardChatId = $derived((attributes?.chat_id || $chatId || '') as string);
 </script>
 
 <div
-	class="my-2 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white/60 dark:bg-gray-900/40 ask-user-block"
+	class="my-2 rounded-2xl border-hairline border-gray-200 dark:border-gray-800 bg-white/60 dark:bg-gray-900/40 ask-user-block"
 	data-tool-call-id={toolCallId}
 >
-	<div class="flex items-center gap-2 px-3.5 py-2.5 border-b border-gray-100 dark:border-gray-800/70">
-		<span class="shrink-0 inline-flex items-center justify-center size-5 text-gray-500 dark:text-gray-400">
+	<div
+		class="flex items-center gap-2 px-3.5 py-2.5 border-b-hairline border-gray-100 dark:border-gray-800/70"
+	>
+		<span
+			class="shrink-0 inline-flex items-center justify-center size-5 text-gray-500 dark:text-gray-400"
+		>
 			{#if submitting}
 				<Spinner className="size-4" />
 			{:else}
@@ -320,11 +336,17 @@
 				</div>
 			{:else}
 				{#each questions as q, qi}
+					{@const summaryLine = summarizeAnswer(
+						submittedAnswer,
+						qi,
+						$i18n.t('Other'),
+						$i18n.t('(no answer)')
+					)}
 					<div class="space-y-1">
 						<div class="text-sm text-gray-700 dark:text-gray-300">{q.question}</div>
 						<div class="text-sm font-medium text-gray-900 dark:text-gray-100">
 							{#if submittedAnswer}
-								{summaryFor(qi)}
+								{summaryLine}
 							{:else}
 								{$i18n.t('Answered')}
 							{/if}
@@ -338,7 +360,7 @@
 		<div class="px-3.5 py-3 space-y-4" transition:slide={{ duration: 150 }}>
 			{#if orphaned}
 				<div
-					class="text-xs rounded-lg px-2.5 py-2 bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400"
+					class="text-xs rounded-lg px-2.5 py-2 bg-warning/10 text-warning dark:text-warning-dark"
 				>
 					{$i18n.t('Generation stopped before this was answered.')}
 				</div>
@@ -359,25 +381,26 @@
 
 					<div class="space-y-1.5">
 						{#each q.options as opt}
+							{@const isSel = optionSelected(selected, qi, opt.label)}
 							<button
 								type="button"
 								class="w-full text-left flex items-start gap-2.5 rounded-xl border px-3 py-2 transition-colors
-									{isOptionSelected(qi, opt.label)
-									? 'border-blue-500 bg-blue-50 dark:border-blue-500 dark:bg-blue-950/30'
+									{isSel
+									? 'border-book-cloth bg-book-cloth/10 dark:border-book-cloth dark:bg-book-cloth/15'
 									: 'border-gray-200 hover:border-gray-300 dark:border-gray-700 dark:hover:border-gray-600'}
 									{orphaned ? 'opacity-60 cursor-not-allowed' : ''}"
 								disabled={orphaned}
-								on:click|preventDefault={() => toggleOption(qi, opt.label)}
+								onclick={preventDefault(() => toggleOption(qi, opt.label))}
 							>
 								<!-- selection indicator: circle (single) / square (multi) -->
 								<span
 									class="shrink-0 mt-0.5 inline-flex items-center justify-center size-4 border-2 {q.multiSelect
 										? 'rounded'
-										: 'rounded-full'} {isOptionSelected(qi, opt.label)
-										? 'border-blue-500 bg-blue-500 text-white'
+										: 'rounded-full'} {isSel
+										? 'border-book-cloth bg-book-cloth text-white'
 										: 'border-gray-300 dark:border-gray-600'}"
 								>
-									{#if isOptionSelected(qi, opt.label)}
+									{#if isSel}
 										<svg viewBox="0 0 12 12" fill="none" class="size-3">
 											<path
 												d="M2.5 6.5l2.5 2.5 4.5-5"
@@ -404,7 +427,7 @@
 							<div
 								class="rounded-xl border px-3 py-2 transition-colors {otherOn[qi] &&
 								q.options.length > 0
-									? 'border-blue-500 bg-blue-50 dark:border-blue-500 dark:bg-blue-950/30'
+									? 'border-book-cloth bg-book-cloth/10 dark:border-book-cloth dark:bg-book-cloth/15'
 									: 'border-gray-200 dark:border-gray-700'}"
 							>
 								{#if q.options.length > 0}
@@ -414,13 +437,13 @@
 											? 'opacity-60 cursor-not-allowed'
 											: ''}"
 										disabled={orphaned}
-										on:click|preventDefault={() => selectOther(qi)}
+										onclick={preventDefault(() => selectOther(qi))}
 									>
 										<span
 											class="shrink-0 inline-flex items-center justify-center size-4 border-2 {q.multiSelect
 												? 'rounded'
 												: 'rounded-full'} {otherOn[qi]
-												? 'border-blue-500 bg-blue-500 text-white'
+												? 'border-book-cloth bg-book-cloth text-white'
 												: 'border-gray-300 dark:border-gray-600'}"
 										>
 											{#if otherOn[qi]}
@@ -435,15 +458,13 @@
 												</svg>
 											{/if}
 										</span>
-										<span class="text-sm text-gray-700 dark:text-gray-200"
-											>{$i18n.t('Other')}</span
-										>
+										<span class="text-sm text-gray-700 dark:text-gray-200">{$i18n.t('Other')}</span>
 									</button>
 								{/if}
 								<input
 									type="text"
-									class="w-full bg-transparent text-sm outline-none placeholder-gray-400 dark:placeholder-gray-500 text-gray-900 dark:text-gray-100 {q.options
-										.length > 0
+									class="w-full bg-transparent text-sm outline-none placeholder-gray-400 dark:placeholder-gray-500 text-gray-900 dark:text-gray-100 {q
+										.options.length > 0
 										? 'mt-1.5'
 										: ''}"
 									placeholder={q.options.length === 0
@@ -451,8 +472,8 @@
 										: $i18n.t('Type something…')}
 									disabled={orphaned}
 									value={otherText[qi] ?? ''}
-									on:input={(e) => handleOtherInputEvent(qi, e)}
-									on:focus={() => selectOther(qi)}
+									oninput={(e) => handleOtherInputEvent(qi, e)}
+									onfocus={() => selectOther(qi)}
 								/>
 							</div>
 						{/if}
@@ -463,17 +484,17 @@
 			<div class="flex items-center justify-end gap-2 pt-1">
 				<button
 					type="button"
-					class="text-xs px-3 py-1.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors disabled:opacity-50"
+					class="text-xs px-3 py-1.5 max-md:py-2.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors disabled:opacity-50"
 					disabled={orphaned || submitting}
-					on:click|preventDefault={skip}
+					onclick={preventDefault(skip)}
 				>
 					{$i18n.t('Skip')}
 				</button>
 				<button
 					type="button"
-					class="text-sm font-medium px-4 py-1.5 rounded-lg bg-gray-900 text-white hover:bg-black dark:bg-white dark:text-gray-900 dark:hover:bg-gray-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+					class="text-sm font-medium px-4 py-1.5 max-md:py-2.5 rounded-lg bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper disabled:opacity-40 disabled:cursor-not-allowed"
 					disabled={!allAnswered || orphaned || submitting}
-					on:click|preventDefault={submit}
+					onclick={preventDefault(submit)}
 				>
 					{$i18n.t('Submit')}
 				</button>

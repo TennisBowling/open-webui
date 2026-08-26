@@ -38,6 +38,21 @@ const hasAskUserCall = (block: any): boolean =>
 	Array.isArray(block?.content) &&
 	block.content.some((call: any) => call?.function?.name === 'ask_user');
 
+// A tool_calls block that contains a `show_widget` call renders an inline
+// data-viz visualization (a sandboxed-iframe widget) that is the whole point of
+// the call — the user must SEE it. Absorbing it into a "Working" card would
+// auto-collapse and hide the visualization once the burst finishes, so it breaks
+// the burst and renders standalone, exactly like an ask_user card.
+const hasShowWidgetCall = (block: any): boolean =>
+	block?.type === 'tool_calls' &&
+	Array.isArray(block?.content) &&
+	block.content.some((call: any) => call?.function?.name === 'show_widget');
+
+// Tool-call blocks that must always render standalone (never buried in a
+// collapsible group) because they carry user-facing UI the user must see.
+const mustRenderStandalone = (block: any): boolean =>
+	hasAskUserCall(block) || hasShowWidgetCall(block);
+
 // Decide how to render a message's content_blocks.
 //
 // `enabled === false` reproduces the legacy flat layout exactly: one
@@ -71,10 +86,10 @@ export const computeAgenticRenderItems = (
 
 	for (let i = 0; i < list.length; i++) {
 		const block = list[i];
-		if (hasAskUserCall(block)) {
-			// An ask_user question card must render standalone and stay visible
-			// (it's interactive and may be blocking the generation). Close any
-			// open burst and emit it on its own, like a user_steer.
+		if (mustRenderStandalone(block)) {
+			// A card the user must see and possibly act on (ask_user question,
+			// show_widget visualization). Close any open burst and emit it on its
+			// own, like a user_steer, so a collapsing Working card can't hide it.
 			flush();
 			items.push({ kind: 'block', index: i });
 		} else if (isAgentic(block)) {

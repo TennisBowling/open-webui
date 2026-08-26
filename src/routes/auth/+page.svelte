@@ -2,11 +2,11 @@
 	import DOMPurify from 'dompurify';
 	import { marked } from 'marked';
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { onMount, getContext, tick } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
+	import { page } from '$app/state';
 
 	import { getBackendConfig } from '$lib/apis';
 	import { ldapUserSignIn, getSessionUser, userSignIn, userSignUp } from '$lib/apis/auths';
@@ -23,18 +23,18 @@
 
 	const i18n = getContext('i18n');
 
-	let loaded = false;
+	let loaded = $state(false);
 
-	let mode = $config?.features.enable_ldap ? 'ldap' : 'signin';
+	let mode = $state($config?.features.enable_ldap ? 'ldap' : 'signin');
 
-	let form = null;
+	let form = $state(null);
 
-	let name = '';
-	let email = '';
-	let password = '';
-	let confirmPassword = '';
+	let name = $state('');
+	let email = $state('');
+	let password = $state('');
+	let confirmPassword = $state('');
 
-	let ldapUsername = '';
+	let ldapUsername = $state('');
 
 	const setSessionUser = async (sessionUser, redirectPath: string | null = null) => {
 		if (sessionUser) {
@@ -48,7 +48,7 @@
 			await config.set(await getBackendConfig());
 
 			if (!redirectPath) {
-				redirectPath = $page.url.searchParams.get('redirect') || '/';
+				redirectPath = page.url.searchParams.get('redirect') || '/';
 			}
 
 			goto(redirectPath);
@@ -116,7 +116,7 @@
 		}
 
 		const sessionUser = await getSessionUser(token).catch((error) => {
-			toast.error(`${error}`);
+			toast.error(`${error?.detail ?? error}`);
 			return null;
 		});
 
@@ -128,7 +128,7 @@
 		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
-	let onboarding = false;
+	let onboarding = $state(false);
 
 	async function setLogoImage() {
 		await tick();
@@ -154,7 +154,7 @@
 	}
 
 	onMount(async () => {
-		const redirectPath = $page.url.searchParams.get('redirect');
+		const redirectPath = page.url.searchParams.get('redirect');
 		if ($user !== undefined) {
 			goto(redirectPath || '/');
 		} else {
@@ -163,13 +163,13 @@
 			}
 		}
 
-		const error = $page.url.searchParams.get('error');
+		const error = page.url.searchParams.get('error');
 		if (error) {
 			toast.error(error);
 		}
 
 		await oauthCallbackHandler();
-		form = $page.url.searchParams.get('form');
+		form = page.url.searchParams.get('form');
 
 		loaded = true;
 		setLogoImage();
@@ -197,13 +197,13 @@
 />
 
 <div class="w-full h-screen max-h-[100dvh] text-white relative" id="auth-page">
-	<div class="w-full h-full absolute top-0 left-0 bg-white dark:bg-black"></div>
+	<div class="w-full h-full absolute top-0 left-0 bg-white dark:bg-gray-900"></div>
 
-	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region" />
+	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region"></div>
 
 	{#if loaded}
 		<div
-			class="fixed bg-transparent min-h-screen w-full flex justify-center font-primary z-50 text-black dark:text-white"
+			class="fixed bg-transparent min-h-screen w-full flex justify-center font-primary z-50 text-gray-800 dark:text-gray-100"
 			id="auth-container"
 		>
 			<div class="w-full px-10 min-h-screen flex flex-col text-center">
@@ -237,7 +237,7 @@
 							{/if}
 							<form
 								class=" flex flex-col justify-center"
-								on:submit={(e) => {
+								onsubmit={(e) => {
 									e.preventDefault();
 									submitHandler();
 								}}
@@ -359,14 +359,14 @@
 									{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
 										{#if mode === 'ldap'}
 											<button
-												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+												class="bg-book-cloth text-white hover:bg-kraft transition-colors duration-200 ease-paper w-full rounded-full font-medium text-sm py-2.5"
 												type="submit"
 											>
 												{$i18n.t('Authenticate')}
 											</button>
 										{:else}
 											<button
-												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+												class="bg-book-cloth text-white hover:bg-kraft transition-colors duration-200 ease-paper w-full rounded-full font-medium text-sm py-2.5"
 												type="submit"
 											>
 												{mode === 'signin'
@@ -385,7 +385,7 @@
 													<button
 														class=" font-medium underline"
 														type="button"
-														on:click={() => {
+														onclick={() => {
 															if (mode === 'signin') {
 																mode = 'signup';
 															} else {
@@ -418,7 +418,7 @@
 									{#if $config?.oauth?.providers?.google}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
-											on:click={() => {
+											onclick={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/google/login`;
 											}}
 										>
@@ -447,7 +447,7 @@
 									{#if $config?.oauth?.providers?.microsoft}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
-											on:click={() => {
+											onclick={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/microsoft/login`;
 											}}
 										>
@@ -477,7 +477,7 @@
 									{#if $config?.oauth?.providers?.github}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
-											on:click={() => {
+											onclick={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/github/login`;
 											}}
 										>
@@ -497,7 +497,7 @@
 									{#if $config?.oauth?.providers?.oidc}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
-											on:click={() => {
+											onclick={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/oidc/login`;
 											}}
 										>
@@ -526,7 +526,7 @@
 									{#if $config?.oauth?.providers?.feishu}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
-											on:click={() => {
+											onclick={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/feishu/login`;
 											}}
 										>
@@ -541,7 +541,7 @@
 									<button
 										class="flex justify-center items-center text-xs w-full text-center underline"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											if (mode === 'ldap')
 												mode = ($config?.onboarding ?? false) ? 'signup' : 'signin';
 											else mode = 'ldap';

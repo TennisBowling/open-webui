@@ -10,17 +10,7 @@
 
 	const i18n = getContext('i18n');
 
-	let selectedTab;
-	$: {
-		const pathParts = $page.url.pathname.split('/');
-		const tabFromPath = pathParts[pathParts.length - 1];
-		selectedTab = ['leaderboard', 'feedbacks'].includes(tabFromPath) ? tabFromPath : 'leaderboard';
-	}
-
-	$: if (selectedTab) {
-		// scroll to selectedTab
-		scrollToTab(selectedTab);
-	}
+	let selectedTab = $state();
 
 	const scrollToTab = (tabId) => {
 		const tabElement = document.getElementById(tabId);
@@ -29,8 +19,8 @@
 		}
 	};
 
-	let loaded = false;
-	let feedbacks = [];
+	let loaded = $state(false);
+	let feedbacks = $state([]);
 
 	onMount(async () => {
 		feedbacks = await getAllFeedbacks(localStorage.token);
@@ -50,6 +40,17 @@
 		// Scroll to the selected tab on mount
 		scrollToTab(selectedTab);
 	});
+	$effect(() => {
+		const pathParts = $page.url.pathname.split('/');
+		const tabFromPath = pathParts[pathParts.length - 1];
+		selectedTab = ['leaderboard', 'feedbacks'].includes(tabFromPath) ? tabFromPath : 'leaderboard';
+	});
+	$effect(() => {
+		if (selectedTab) {
+			// scroll to selectedTab
+			scrollToTab(selectedTab);
+		}
+	});
 </script>
 
 {#if loaded}
@@ -64,7 +65,7 @@
 				'leaderboard'
 					? ''
 					: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-				on:click={() => {
+				onclick={() => {
 					goto('/admin/evaluations/leaderboard');
 				}}
 			>
@@ -91,7 +92,7 @@
 				'feedbacks'
 					? ''
 					: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-				on:click={() => {
+				onclick={() => {
 					goto('/admin/evaluations/feedbacks');
 				}}
 			>

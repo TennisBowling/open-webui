@@ -1,14 +1,12 @@
 <script lang="ts">
-	import { getContext, createEventDispatcher, onDestroy } from 'svelte';
-	import { useSvelteFlow, useNodesInitialized, useStore } from '@xyflow/svelte';
+	import { getContext, tick, untrack } from 'svelte';
+	import type { Writable } from 'svelte/store';
+	import type { i18n as i18nType } from 'i18next';
+	import { useNodesInitialized, useSvelteFlow } from '@xyflow/svelte';
 
-	const dispatch = createEventDispatcher();
-	const i18n = getContext('i18n');
-
-	import { onMount, tick } from 'svelte';
-
-	import { writable } from 'svelte/store';
-	import { models, showOverview, theme, user } from '$lib/stores';
+	import { getChatMessagesOverview } from '$lib/apis/chats';
+	import { models, showOverview, user } from '$lib/stores';
+	import { buildHistoryGraph } from '$lib/utils/chatHistoryGraph';
 
 	import '@xyflow/svelte/dist/style.css';
 
@@ -17,172 +15,173 @@
 	import XMark from '../../icons/XMark.svelte';
 	import ArrowLeft from '../../icons/ArrowLeft.svelte';
 
-	const { width, height } = useStore();
-
-	const { fitView, getViewport } = useSvelteFlow();
+	const i18n = getContext<Writable<i18nType>>('i18n');
+	const { fitView } = useSvelteFlow();
 	const nodesInitialized = useNodesInitialized();
 
-	export let history;
-	export let onClose;
-	export let onNodeClick;
-
-	let selectedMessageId = null;
-
-	const nodes = writable([]);
-	const edges = writable([]);
-
-	let layoutDirection = 'vertical';
-
-	const nodeTypes = {
-		custom: CustomNode
-	};
-
-	$: if (history) {
-		drawFlow(layoutDirection);
+	interface Props {
+		history: any;
+		chatId?: string | null;
+		onClose: Function;
+		onNodeClick: Function;
 	}
 
-	$: if (history && history.currentId) {
-		focusNode();
-	}
+	let { history, chatId = null, onClose, onNodeClick }: Props = $props();
 
-	const focusNode = async () => {
-		if (selectedMessageId === null) {
-			await fitView({ nodes: [{ id: history.currentId }] });
-		} else {
-			await fitView({ nodes: [{ id: selectedMessageId }] });
+	let nodes = $state<any[]>([]);
+	let edges = $state<any[]>([]);
+	let overviewRows = $state<any[]>([]);
+	let layoutDirection = $state<'vertical' | 'horizontal'>('vertical');
+	let loading = $state(false);
+	let loadError = $state('');
+	let branchPointCount = $state(0);
+	let orphanCount = $state(0);
+	let loadSequence = 0;
+
+	const nodeTypes = { custom: CustomNode };
+
+	const focusNode = async (messageId?: string | null) => {
+		if (!messageId || !nodes.some((node) => node.id === messageId)) return;
+		await tick();
+		await fitView({ nodes: [{ id: messageId }], padding: 0.35, duration: 250 });
+	};
+
+	const loadOverview = async (id: string | null) => {
+		const sequence = ++loadSequence;
+		overviewRows = [];
+		loadError = '';
+		if (!id || id.startsWith('local:')) {
+			loading = false;
+			return;
 		}
 
-		selectedMessageId = null;
+		loading = true;
+		try {
+			const rows = await getChatMessagesOverview(localStorage.token, id);
+			if (sequence !== loadSequence) return;
+			overviewRows = Array.isArray(rows) ? rows : [];
+		} catch (error: any) {
+			if (sequence !== loadSequence) return;
+			console.error('Failed to load chat overview', error);
+			loadError = error?.detail ?? error?.message ?? `${error}`;
+		} finally {
+			if (sequence === loadSequence) loading = false;
+		}
 	};
 
-	const drawFlow = async (direction) => {
-		const nodeList = [];
-		const edgeList = [];
-		const levelOffset = direction === 'vertical' ? 150 : 300;
-		const siblingOffset = direction === 'vertical' ? 250 : 150;
-
-		// Map to keep track of node positions at each level
-		let positionMap = new Map();
-
-		// Helper function to truncate labels
-		function createLabel(content) {
-			const maxLength = 100;
-			return content.length > maxLength ? content.substr(0, maxLength) + '...' : content;
+	const drawFlow = () => {
+		const messages: Record<string, any> = {};
+		for (const [id, message] of Object.entries(history?.messages ?? {})) {
+			messages[id] = { id, ...(message as any) };
+		}
+		for (const row of overviewRows) {
+			if (!row?.id) continue;
+			const existing = messages[row.id] ?? {};
+			messages[row.id] = {
+				...existing,
+				...row,
+				childrenIds: existing.childrenIds ?? [],
+				content: existing._stub ? (row.preview ?? '') : (existing.content ?? row.preview ?? ''),
+				preview: row.preview ?? existing.preview ?? '',
+				_stub: existing._stub ?? false
+			};
 		}
 
-		// Create nodes and map children to ensure alignment in width
-		let layerWidths = {}; // Track widths of each layer
+		const graph = buildHistoryGraph(messages, history?.currentId);
+		branchPointCount = graph.branchPointCount;
+		orphanCount = graph.orphanCount;
 
-		Object.keys(history.messages).forEach((id) => {
-			const message = history.messages[id];
-			const level = message.parentId ? (positionMap.get(message.parentId)?.level ?? -1) + 1 : 0;
-			if (!layerWidths[level]) layerWidths[level] = 0;
-
-			positionMap.set(id, {
-				id: message.id,
-				level,
-				position: layerWidths[level]++
-			});
-		});
-
-		// Adjust positions based on siblings count to centralize vertical spacing
-		Object.keys(history.messages).forEach((id) => {
-			const pos = positionMap.get(id);
-			const x = direction === 'vertical' ? pos.position * siblingOffset : pos.level * levelOffset;
-			const y = direction === 'vertical' ? pos.level * levelOffset : pos.position * siblingOffset;
-
-			nodeList.push({
-				id: pos.id,
-				type: 'custom',
-				data: {
-					user: $user,
-					message: history.messages[id],
-					model: $models.find((model) => model.id === history.messages[id].model)
-				},
-				position: { x, y }
-			});
-
-			// Create edges
-			const parentId = history.messages[id].parentId;
-			if (parentId) {
-				edgeList.push({
-					id: parentId + '-' + pos.id,
-					source: parentId,
-					target: pos.id,
-					selectable: false,
-					class: ' dark:fill-gray-300 fill-gray-300',
-					type: 'smoothstep',
-					animated: history.currentId === id || recurseCheckChild(id, history.currentId)
-				});
-			}
-		});
-
-		await edges.set([...edgeList]);
-		await nodes.set([...nodeList]);
+		const depthOffset = layoutDirection === 'vertical' ? 132 : 280;
+		const branchOffset = layoutDirection === 'vertical' ? 280 : 120;
+		nodes = graph.nodes.map((node) => ({
+			id: node.id,
+			type: 'custom',
+			data: {
+				user: $user,
+				message: node.message,
+				model: $models.find((model) => model.id === node.message.model),
+				direction: layoutDirection,
+				isCurrent: node.id === history?.currentId,
+				isActivePath: graph.activePathIds.has(node.id),
+				orphaned: node.orphaned,
+				cyclic: node.cyclic,
+				versionIndex: node.versionIndex,
+				versionCount: node.versionCount
+			},
+			position:
+				layoutDirection === 'vertical'
+					? { x: node.column * branchOffset, y: node.depth * depthOffset }
+					: { x: node.depth * depthOffset, y: node.column * branchOffset }
+		}));
+		edges = graph.edges.map((edge) => ({
+			id: `${edge.source}-${edge.target}`,
+			source: edge.source,
+			target: edge.target,
+			selectable: false,
+			type: 'smoothstep',
+			animated: graph.activePathIds.has(edge.source) && graph.activePathIds.has(edge.target),
+			class:
+				graph.activePathIds.has(edge.source) && graph.activePathIds.has(edge.target)
+					? 'overview-edge-active'
+					: 'overview-edge'
+		}));
 	};
 
-	const recurseCheckChild = (nodeId, currentId) => {
-		const node = history.messages[nodeId];
-		return (
-			node.childrenIds &&
-			node.childrenIds.some((id) => id === currentId || recurseCheckChild(id, currentId))
-		);
-	};
-
-	const setLayoutDirection = (direction) => {
+	const setLayoutDirection = async (direction: 'vertical' | 'horizontal') => {
 		layoutDirection = direction;
-		drawFlow(layoutDirection);
+		await tick();
+		drawFlow();
+		await tick();
+		await focusNode(history?.currentId);
 	};
 
-	onMount(() => {
-		drawFlow(layoutDirection);
-
-		nodesInitialized.subscribe(async (initialized) => {
-			if (initialized) {
-				await tick();
-				const res = await fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
-
-		width.subscribe((value) => {
-			if (value) {
-				// fitView();
-				fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
-
-		height.subscribe((value) => {
-			if (value) {
-				// fitView();
-				fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
+	$effect(() => {
+		if (nodesInitialized.current) void focusNode(history?.currentId);
 	});
 
-	onDestroy(() => {
-		console.log('Overview destroyed');
+	$effect(() => {
+		const id = chatId;
+		untrack(() => void loadOverview(id));
+	});
 
-		nodes.set([]);
-		edges.set([]);
+	$effect(() => {
+		// Explicit reads establish the reactive inputs without tying redraws to
+		// streaming token content; the graph changes on map/currentId/overview rows.
+		history?.currentId;
+		Object.keys(history?.messages ?? {}).length;
+		overviewRows;
+		layoutDirection;
+		drawFlow();
 	});
 </script>
 
-<div class="w-full h-full relative">
-	<div class=" absolute z-50 w-full flex justify-between dark:text-gray-100 px-4 py-3">
-		<div class="flex items-center gap-2.5">
+<div class="relative h-full w-full overflow-hidden bg-white dark:bg-gray-850">
+	<div
+		class="absolute inset-x-0 top-0 z-50 flex items-center justify-between border-b border-gray-100 bg-white/90 px-3 py-3 backdrop-blur dark:border-gray-800 dark:bg-gray-850/90 dark:text-gray-100"
+	>
+		<div class="flex min-w-0 items-center gap-2.5">
 			<button
-				class="self-center p-0.5"
-				on:click={() => {
-					showOverview.set(false);
-				}}
+				type="button"
+				class="rounded-lg p-2 text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white"
+				aria-label={$i18n.t('Back')}
+				onclick={() => showOverview.set(false)}
 			>
 				<ArrowLeft className="size-3.5" />
 			</button>
-			<div class=" text-lg font-medium self-center font-primary">{$i18n.t('Chat Overview')}</div>
+			<div class="min-w-0">
+				<div class="truncate font-primary text-base font-medium">{$i18n.t('Chat Overview')}</div>
+				<div class="text-[11px] text-gray-500 dark:text-gray-400">
+					{nodes.length}
+					{$i18n.t('messages')} · {branchPointCount}
+					{$i18n.t('branches')}
+				</div>
+			</div>
 		</div>
 		<button
-			class="self-center p-0.5"
-			on:click={() => {
+			type="button"
+			class="rounded-full p-2 text-gray-500 transition hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+			aria-label={$i18n.t('Close')}
+			onclick={() => {
 				onClose();
 				showOverview.set(false);
 			}}
@@ -191,17 +190,45 @@
 		</button>
 	</div>
 
-	{#if $nodes.length > 0}
+	{#if nodes.length > 0}
 		<Flow
 			{nodes}
 			{nodeTypes}
 			{edges}
+			{layoutDirection}
 			{setLayoutDirection}
-			on:nodeclick={(e) => {
-				onNodeClick(e.detail);
-				selectedMessageId = e.detail.node.data.message.id;
-				fitView({ nodes: [{ id: selectedMessageId }] });
+			onnodeclick={(event: any) => {
+				const node = event.detail?.node;
+				if (!node) return;
+				onNodeClick({ ...event.detail, node });
+				void focusNode(node.id);
 			}}
 		/>
+	{:else if loading}
+		<div class="flex h-full items-center justify-center px-6 text-sm text-gray-500">
+			{$i18n.t('Loading...')}
+		</div>
+	{:else}
+		<div class="flex h-full items-center justify-center px-6 text-center text-sm text-gray-500">
+			<div>
+				<div class="font-medium text-gray-700 dark:text-gray-200">
+					{$i18n.t('No message history yet')}
+				</div>
+				{#if loadError}
+					<button type="button" class="mt-2 underline" onclick={() => void loadOverview(chatId)}>
+						{$i18n.t('Retry')}
+					</button>
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	{#if orphanCount > 0}
+		<div
+			class="pointer-events-none absolute bottom-3 left-1/2 z-40 -translate-x-1/2 rounded-full border border-amber-200 bg-amber-50/95 px-3 py-1.5 text-[11px] text-amber-800 shadow-sm dark:border-amber-900 dark:bg-amber-950/90 dark:text-amber-200"
+		>
+			{orphanCount}
+			{$i18n.t('preserved disconnected messages')}
+		</div>
 	{/if}
 </div>

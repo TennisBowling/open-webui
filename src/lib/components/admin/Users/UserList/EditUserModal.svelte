@@ -1,7 +1,9 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import dayjs from 'dayjs';
-	import { createEventDispatcher } from 'svelte';
 	import { onMount, getContext } from 'svelte';
 
 	import { goto } from '$app/navigation';
@@ -15,22 +17,32 @@
 	import UserProfileImage from '$lib/components/chat/Settings/Account/UserProfileImage.svelte';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	dayjs.extend(localizedFormat);
 
-	export let show = false;
-	export let selectedUser;
-	export let sessionUser;
+	interface Props {
+		show?: boolean;
+		selectedUser: any;
+		sessionUser: any;
+	}
 
-	let _user = {
+	let {
+		show = $bindable(false),
+		selectedUser,
+		sessionUser,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	let _user = $state({
 		profile_image_url: '',
 		role: 'pending',
 		name: '',
 		email: '',
 		password: ''
-	};
+	});
 
-	let userGroups: any[] | null = null;
+	let userGroups: any[] | null = $state(null);
 
 	const submitHandler = async () => {
 		const res = await updateUserById(localStorage.token, selectedUser.id, _user).catch((error) => {
@@ -68,7 +80,7 @@
 			<div class=" text-lg font-medium self-center">{$i18n.t('Edit User')}</div>
 			<button
 				class="self-center"
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -80,9 +92,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class=" px-5 pt-3 pb-5 w-full">
 						<div class="flex self-center w-full">
@@ -114,12 +126,13 @@
 											<div class="flex flex-wrap gap-1 my-0.5 -mx-1">
 												{#each userGroups as userGroup}
 													<span
-														class="px-1.5 py-0.5 rounded-xl bg-gray-100 dark:bg-gray-850 text-xs"
+														class="px-1.5 py-0.5 rounded-full bg-gray-100 dark:bg-gray-850 text-xs"
 													>
 														<a
 															href={'/admin/users/groups?id=' + userGroup.id}
-															on:click|preventDefault={() =>
-																goto('/admin/users/groups?id=' + userGroup.id)}
+															onclick={preventDefault(() =>
+																goto('/admin/users/groups?id=' + userGroup.id)
+															)}
 														>
 															{userGroup.name}
 														</a>

@@ -2,20 +2,25 @@
 	import { fade, fly } from 'svelte/transition';
 	import { onMount } from 'svelte';
 
-	let idx = 0;
+	let idx = $state(0);
 
-	export let className = '';
-	export let words = ['lorem', 'ipsum'];
-	export let duration = 4000;
+	interface Props {
+		className?: string;
+		words?: any;
+		duration?: number;
+	}
+
+	let { className = '', words = ['lorem', 'ipsum'], duration = 4000 }: Props = $props();
 
 	onMount(() => {
-		setInterval(async () => {
+		const interval = setInterval(() => {
 			if (idx === words.length - 1) {
 				idx = 0;
 			} else {
 				idx = idx + 1;
 			}
 		}, duration);
+		return () => clearInterval(interval);
 	});
 </script>
 

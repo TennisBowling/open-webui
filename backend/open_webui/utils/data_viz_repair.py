@@ -18,12 +18,18 @@ from fastapi import Request
 
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.utils.chat import generate_chat_completion
-from open_webui.utils.data_viz_prompts import assemble_data_viz_system_prompt
+from open_webui.utils.data_viz_prompts import assemble_full_data_viz_prompt
 from open_webui.utils.task import get_task_model_id
 
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
+
+
+# Above this many characters, embedding the widget verbatim in the repair prompt
+# risks overflowing the model's context. We decline to repair rather than
+# truncate (a truncated fragment can't be correctly fixed).
+_MAX_WIDGET_CODE_FOR_REPAIR = 100_000
 
 
 class RepairResult(TypedDict, total=False):
@@ -104,7 +110,7 @@ def _build_messages(
     error_message: str,
     error_stack: Optional[str],
 ) -> list[dict]:
-    system = assemble_data_viz_system_prompt(cfg) or ""
+    system = assemble_full_data_viz_prompt(cfg) or ""
     stack_block = f"\nStack (top frames):\n{error_stack[:1200]}\n" if error_stack else ""
     user_msg = (
         "The `show_widget` tool you just called rendered into a sandboxed "
@@ -147,6 +153,35 @@ async def call_repair_model(
         log.warning("data_viz repair: no usable model")
         return None
 
+    # Pathologically large widgets blow the repair model's context window (the
+    # whole fragment is embedded verbatim in the prompt). Truncating would only
+    # produce a broken half-widget, so decline to repair and let the model retry
+    # on its own — it still has the raw error in the tool result.
+    if len(widget_code or "") > _MAX_WIDGET_CODE_FOR_REPAIR:
+        log.warning(
+            "data_viz repair: widget_code too large to repair (%s chars); skipping",
+            len(widget_code),
+        )
+        return None
+
+    # `user` arrives as a plain dict — middleware sets __user__ = user.model_dump()
+    # (utils/middleware.py) — but generate_chat_completion expects a UserModel and
+    # reads user.role / user.id. Passing the dict raises AttributeError, which the
+    # except-block below used to swallow, silently disabling auto-repair in the
+    # DEFAULT config (no BYPASS_MODEL_ACCESS_CONTROL). Reconstruct the model.
+    repair_user: Any = user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            repair_user = UserModel(**user)
+        except Exception:
+            log.exception("data_viz repair: could not reconstruct user; skipping")
+            return None
+    if repair_user is None:
+        log.warning("data_viz repair: no usable user; skipping")
+        return None
+
     messages = _build_messages(cfg, title, widget_code, error_message, error_stack)
 
     payload: dict = {
@@ -163,7 +198,7 @@ async def call_repair_model(
     # (so non-reasoning models don't error). Backend converts reasoning_effort
     # → {reasoning: {effort: ...}} canonical form before dispatch.
     effort = (getattr(cfg, "DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT", "") or "").strip().lower()
-    if effort in ("low", "medium", "high"):
+    if effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
         payload["reasoning_effort"] = effort
 
     log.info(
@@ -172,7 +207,9 @@ async def call_repair_model(
     )
 
     try:
-        response = await generate_chat_completion(request, form_data=payload, user=user)
+        response = await generate_chat_completion(
+            request, form_data=payload, user=repair_user
+        )
     except Exception:
         log.exception("data_viz repair: completion failed")
         return None
@@ -182,7 +219,15 @@ async def call_repair_model(
         if isinstance(response, dict):
             choices = response.get("choices") or []
             if choices:
-                text = (choices[0].get("message") or {}).get("content")
+                message = choices[0].get("message") or {}
+                # Some reasoning models return the answer in `content`; a few
+                # surface it only in `reasoning_content` while `content` is
+                # empty. Fall back so the parser still gets a shot.
+                content = message.get("content")
+                if not content:
+                    content = message.get("reasoning_content")
+                if isinstance(content, str):
+                    text = content
     except Exception:
         text = None
 

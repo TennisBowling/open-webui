@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import DOMPurify from 'dompurify';
 
 	import { getVersionUpdates, getWebhookUrl, updateWebhookUrl } from '$lib/apis';
@@ -17,25 +19,29 @@
 	import { config, showChangelog } from '$lib/stores';
 	import { compareVersion } from '$lib/utils';
 	import { onMount, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Textarea from '$lib/components/common/Textarea.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
 
-	let updateAvailable = null;
-	let version = {
+	let { saveHandler }: Props = $props();
+
+	let updateAvailable = $state(null);
+	let version = $state({
 		current: '',
 		latest: ''
-	};
+	});
 
-	let adminConfig = null;
-	let webhookUrl = '';
+	let adminConfig = $state(null);
+	let webhookUrl = $state('');
 
 	// LDAP
-	let ENABLE_LDAP = false;
-	let LDAP_SERVER = {
+	let ENABLE_LDAP = $state(false);
+	let LDAP_SERVER = $state({
 		label: '',
 		host: '',
 		port: '',
@@ -48,7 +54,7 @@
 		use_tls: false,
 		certificate_path: '',
 		ciphers: ''
-	};
+	});
 
 	const checkForVersionUpdates = async () => {
 		updateAvailable = null;
@@ -111,17 +117,19 @@
 		ENABLE_LDAP = ldapConfig.ENABLE_LDAP;
 	});
 
-	let ENABLE_API_DEBUG_LOGGING = false;
-	$: if (adminConfig) {
-		ENABLE_API_DEBUG_LOGGING = adminConfig.ENABLE_API_DEBUG_LOGGING;
-	}
+	let ENABLE_API_DEBUG_LOGGING = $state(false);
+	$effect(() => {
+		if (adminConfig) {
+			ENABLE_API_DEBUG_LOGGING = adminConfig.ENABLE_API_DEBUG_LOGGING;
+		}
+	});
 </script>
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		updateHandler();
-	}}
+	})}
 >
 	<div class="mt-0.5 space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		{#if adminConfig !== null}
@@ -161,7 +169,7 @@
 								<button
 									class=" underline flex items-center space-x-1 text-xs text-gray-500 dark:text-gray-500"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										showChangelog.set(true);
 									}}
 								>
@@ -173,7 +181,7 @@
 								<button
 									class=" text-xs px-3 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-lg font-medium"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										checkForVersionUpdates();
 									}}
 								>
@@ -190,7 +198,9 @@
 									{$i18n.t('Help')}
 								</div>
 								<div class=" text-xs text-gray-500">
-									{$i18n.t('Discover how to use Open WebUI and seek support from the community.')}
+									{$i18n.t(
+										'Discover how to use {{WEBUI_NAME}} and seek support from the community.'
+									)}
 								</div>
 							</div>
 
@@ -293,7 +303,7 @@
 						<div class=" self-center text-xs font-medium">{$i18n.t('Default User Role')}</div>
 						<div class="flex items-center relative">
 							<select
-								class="dark:bg-gray-900 w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
+								class="dark:bg-gray-900 w-fit pr-8 rounded-lg px-2 text-xs bg-transparent outline-hidden text-right"
 								bind:value={adminConfig.DEFAULT_USER_ROLE}
 								placeholder={$i18n.t('Select a role')}
 							>
@@ -421,7 +431,7 @@
 						{#if adminConfig.JWT_EXPIRES_IN === '-1'}
 							<div class="mt-2 text-xs">
 								<div
-									class=" bg-yellow-500/20 text-yellow-700 dark:text-yellow-200 rounded-lg px-3 py-2"
+									class=" bg-warning/10 border-hairline border-warning/25 text-warning dark:text-warning-dark rounded-lg px-3 py-2"
 								>
 									<div>
 										<span class=" font-medium">{$i18n.t('Warning')}:</span>

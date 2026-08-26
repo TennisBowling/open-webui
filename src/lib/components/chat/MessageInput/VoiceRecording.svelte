@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { tick, getContext, onMount, onDestroy } from 'svelte';
 	import { config, settings } from '$lib/stores';
 	import { blobToFile, calculateSHA256, extractCurlyBraceWords } from '$lib/utils';
+	import { isOnScreenKeyboardDevice } from '$lib/utils/device';
 
 	import { transcribeAudio } from '$lib/apis/audio';
 	import XMark from '$lib/components/icons/XMark.svelte';
@@ -13,23 +14,34 @@
 
 	const i18n = getContext('i18n');
 
-	export let recording = false;
-	export let transcribe = true;
-	export let displayMedia = false;
+	interface Props {
+		recording?: boolean;
+		transcribe?: boolean;
+		displayMedia?: boolean;
+		echoCancellation?: boolean;
+		noiseSuppression?: boolean;
+		autoGainControl?: boolean;
+		className?: string;
+		onCancel?: any;
+		onConfirm?: any;
+	}
 
-	export let echoCancellation = true;
-	export let noiseSuppression = true;
-	export let autoGainControl = true;
+	let {
+		recording = $bindable(false),
+		transcribe = true,
+		displayMedia = false,
+		echoCancellation = true,
+		noiseSuppression = true,
+		autoGainControl = true,
+		className = ' p-2.5 w-full max-w-full',
+		onCancel = () => {},
+		onConfirm = (data) => {}
+	}: Props = $props();
 
-	export let className = ' p-2.5 w-full max-w-full';
-
-	export let onCancel = () => {};
-	export let onConfirm = (data) => {};
-
-	let loading = false;
+	let loading = $state(false);
 	let confirmed = false;
 
-	let durationSeconds = 0;
+	let durationSeconds = $state(0);
 	let durationCounter = null;
 
 	let transcription = '';
@@ -44,12 +56,6 @@
 		clearInterval(durationCounter);
 		durationSeconds = 0;
 	};
-
-	$: if (recording) {
-		startRecording();
-	} else {
-		stopRecording();
-	}
 
 	const formatSeconds = (seconds) => {
 		const minutes = Math.floor(seconds / 60);
@@ -67,7 +73,7 @@
 	const MIN_DECIBELS = -45;
 	let VISUALIZER_BUFFER_LENGTH = 300;
 
-	let visualizerData = Array(VISUALIZER_BUFFER_LENGTH).fill(0);
+	let visualizerData = $state(Array(VISUALIZER_BUFFER_LENGTH).fill(0));
 
 	// Function to calculate the RMS level from time domain data
 	const calculateRMS = (data: Uint8Array) => {
@@ -289,7 +295,11 @@
 						transcription = `${transcription}${transcript}`;
 
 						await tick();
-						document.getElementById('chat-input')?.focus();
+						// This fires on EVERY recognized speech segment — on touch it
+						// summoned the keyboard repeatedly mid-dictation.
+						if (!isOnScreenKeyboardDevice()) {
+							document.getElementById('chat-input')?.focus();
+						}
 
 						// Restart the inactivity timeout
 						timeoutId = setTimeout(() => {
@@ -362,10 +372,9 @@
 	};
 
 	let resizeObserver;
-	let containerWidth;
+	let containerWidth = $state();
 
-	let maxVisibleItems = 300;
-	$: maxVisibleItems = Math.floor(containerWidth / 5); // 2px width + 0.5px gap
+	let maxVisibleItems = $state(300);
 
 	onMount(() => {
 		// listen to width changes
@@ -386,7 +395,41 @@
 	onDestroy(() => {
 		// remove resize observer
 		resizeObserver.disconnect();
+
+		// Mid-recording unmount (chat switch, composer swap): without this the 1s
+		// duration interval, the rAF visualizer loop (gated on `recording`), and —
+		// worst — the live microphone stream all outlived the component.
+		recording = false;
+		stopDurationCounter();
+		if (mediaRecorder) {
+			// Detach the onstop pipeline first: transcription/dispatch for a
+			// destroyed composer is wasted work at best.
+			try {
+				mediaRecorder.onstop = null;
+				mediaRecorder.stop();
+			} catch (e) {}
+			mediaRecorder = null;
+		}
+		if (speechRecognition) {
+			try {
+				speechRecognition.stop();
+			} catch (e) {}
+		}
+		if (stream) {
+			stream.getTracks().forEach((track) => track.stop());
+			stream = null;
+		}
 	});
+	$effect(() => {
+		if (recording) {
+			startRecording();
+		} else {
+			stopRecording();
+		}
+	});
+	$effect(() => {
+		maxVisibleItems = Math.floor(containerWidth / 5);
+	}); // 2px width + 0.5px gap
 </script>
 
 <div
@@ -398,7 +441,7 @@
 	<div class="flex items-center mr-1">
 		<button
 			type="button"
-			class="p-1.5
+			class="p-1.5 max-md:p-2.5
 
             {loading
 				? ' bg-gray-200 dark:bg-gray-700/50'
@@ -406,7 +449,7 @@
 
 
              rounded-full"
-			on:click={async () => {
+			onclick={async () => {
 				stopRecording();
 				onCancel();
 			}}
@@ -427,13 +470,11 @@
 					<div
 						class="w-[2px] shrink-0
                     
-                    {loading
-							? ' bg-gray-500 dark:bg-gray-400   '
-							: 'bg-book-cloth dark:bg-kraft  '}
+                    {loading ? ' bg-gray-500 dark:bg-gray-400   ' : 'bg-book-cloth dark:bg-kraft  '}
                     
                     inline-block h-full"
 						style="height: {Math.min(100, Math.max(14, rms * 100))}%;"
-					/>
+					></div>
 				</div>
 			{/each}
 		</div>
@@ -547,8 +588,8 @@
 			{:else}
 				<button
 					type="button"
-					class="p-1.5 bg-book-cloth text-white dark:bg-book-cloth dark:text-white rounded-full"
-					on:click={async () => {
+					class="p-1.5 max-md:p-2.5 bg-book-cloth text-white dark:bg-book-cloth dark:text-white rounded-full"
+					onclick={async () => {
 						await confirmRecording();
 					}}
 				>
@@ -572,10 +613,5 @@
 	.visualizer {
 		display: flex;
 		height: 100%;
-	}
-
-	.visualizer-bar {
-		width: 2px;
-		background-color: #4a5aba; /* or whatever color you need */
 	}
 </style>

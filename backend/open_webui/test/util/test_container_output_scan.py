@@ -60,10 +60,33 @@ def _drive(monkeypatch, tmp: Path, data_root: Path, meta_store: dict):
     # must be `async def`. `_hash_file` stays sync — it's driven via
     # `asyncio.to_thread`.
     async def _fake_get_chat_by_id(*_a, **_k):
+        chat_obj.meta = meta_store["meta"]
         return chat_obj
 
-    async def _fake_update_chat_meta(_cid, m):
-        meta_store["meta"] = m
+    async def _fake_merge_outputs(_cid, outputs_updates, data_root="", server_id=""):
+        # Mirror Chats.merge_container_workspace_outputs: re-read the live ledger
+        # and merge only the given keys (first-writer-wins for an identical hash).
+        meta = dict(meta_store["meta"])
+        cw_meta = dict(meta.get("container_workspace") or {})
+        outputs = dict(cw_meta.get("outputs") or {})
+        for key, new_state in outputs_updates.items():
+            existing = outputs.get(key)
+            if (
+                isinstance(existing, dict)
+                and existing.get("last_hash")
+                and existing.get("last_hash") == (new_state or {}).get("last_hash")
+            ):
+                merged = dict(existing)
+                for sf in ("stat_size", "stat_mtime_ns"):
+                    if sf in new_state:
+                        merged[sf] = new_state[sf]
+                outputs[key] = merged
+            else:
+                outputs[key] = new_state
+        cw_meta["outputs"] = outputs
+        meta["container_workspace"] = cw_meta
+        meta_store["meta"] = meta
+        return True
 
     async def _fake_get_message(*_a, **_k):
         return {}
@@ -72,7 +95,9 @@ def _drive(monkeypatch, tmp: Path, data_root: Path, meta_store: dict):
         return None
 
     monkeypatch.setattr(cw.Chats, "get_chat_by_id", _fake_get_chat_by_id)
-    monkeypatch.setattr(cw.Chats, "update_chat_meta_by_id", _fake_update_chat_meta)
+    monkeypatch.setattr(
+        cw.Chats, "merge_container_workspace_outputs", _fake_merge_outputs
+    )
     monkeypatch.setattr(
         cw.Chats, "get_message_by_id_and_message_id", _fake_get_message
     )

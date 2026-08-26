@@ -38,14 +38,22 @@ from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
-from open_webui.utils.messages import blocks_to_api_messages
+from open_webui.utils.messages import (
+    blocks_to_api_messages,
+    is_aborted_attempt,
+    resume_boundary_blocks,
+)
 
 
 from open_webui.utils.plugin import (
     load_function_module_by_id,
     get_function_module_from_cache,
 )
-from open_webui.utils.models import get_all_models, check_model_access
+from open_webui.utils.models import (
+    check_model_access,
+    get_all_models,
+    model_supports_video_input,
+)
 from open_webui.utils.payload import convert_payload_openai_to_ollama
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
@@ -76,22 +84,174 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
 _TEXT_FILE_EXTS = {
-    "txt", "md", "markdown", "rst", "csv", "tsv", "json", "jsonl", "ndjson",
-    "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "log", "xml", "svg",
-    "py", "pyi", "ipynb", "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue",
-    "svelte", "java", "kt", "kts", "scala", "groovy", "c", "cc", "cpp",
-    "cxx", "h", "hpp", "hxx", "rs", "go", "rb", "php", "pl", "pm", "lua",
-    "r", "jl", "dart", "swift", "m", "mm", "cs", "fs", "fsx", "ex", "exs",
-    "erl", "hs", "ml", "mli", "clj", "cljs", "sh", "bash", "zsh", "fish",
-    "ps1", "bat", "cmd", "sql", "graphql", "gql", "proto", "css", "scss",
-    "sass", "less", "tex", "bib", "srt", "vtt", "patch", "diff", "gitignore",
-    "dockerignore", "editorconfig",
+    "txt",
+    "md",
+    "markdown",
+    "rst",
+    "csv",
+    "tsv",
+    "json",
+    "jsonl",
+    "ndjson",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "log",
+    "xml",
+    "svg",
+    "py",
+    "pyi",
+    "ipynb",
+    "js",
+    "mjs",
+    "cjs",
+    "ts",
+    "tsx",
+    "jsx",
+    "vue",
+    "svelte",
+    "java",
+    "kt",
+    "kts",
+    "scala",
+    "groovy",
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "h",
+    "hpp",
+    "hxx",
+    "rs",
+    "go",
+    "rb",
+    "php",
+    "pl",
+    "pm",
+    "lua",
+    "r",
+    "jl",
+    "dart",
+    "swift",
+    "m",
+    "mm",
+    "cs",
+    "fs",
+    "fsx",
+    "ex",
+    "exs",
+    "erl",
+    "hs",
+    "ml",
+    "mli",
+    "clj",
+    "cljs",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "sql",
+    "graphql",
+    "gql",
+    "proto",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "tex",
+    "bib",
+    "srt",
+    "vtt",
+    "patch",
+    "diff",
+    "gitignore",
+    "dockerignore",
+    "editorconfig",
 }
 
 _EXTRACTABLE_EXTS = {
-    "docx", "doc", "odt", "rtf", "pptx", "ppt", "xlsx", "xls", "html",
-    "htm", "epub",
+    "docx",
+    "doc",
+    "odt",
+    "rtf",
+    "pptx",
+    "ppt",
+    "xlsx",
+    "xls",
+    "html",
+    "htm",
+    "epub",
 }
+
+
+class ActiveSubagentRerunError(RuntimeError):
+    """A parent completion tried to consume a tool result being replaced."""
+
+    def __init__(self, entry_keys: list[str]):
+        self.entry_keys = list(dict.fromkeys(entry_keys))
+        super().__init__(
+            "Wait for the active subagent redo to finish before continuing "
+            "the main chat."
+        )
+
+
+class ChatMessageAncestryError(RuntimeError):
+    """A persisted conversation leaf does not have a complete, acyclic ancestry."""
+
+    def __init__(self, leaf_id: str, message_id: str, *, cycle: bool = False):
+        self.leaf_id = str(leaf_id)
+        self.message_id = str(message_id)
+        self.code = (
+            "chat_message_ancestry_cycle" if cycle else "chat_message_ancestor_missing"
+        )
+        super().__init__(
+            f"Conversation ancestry for {self.leaf_id} contains a cycle at {self.message_id}."
+            if cycle
+            else f"Conversation ancestry for {self.leaf_id} is missing message {self.message_id}."
+        )
+
+
+def active_detached_subagent_rerun_entries(messages: list[dict]) -> list[str]:
+    """Return active detached-rerun keys in one assembled parent chain.
+
+    The persisted run is an authoritative backstop when Redis/task events are
+    delayed or unavailable. Inline subagents are deliberately excluded: their
+    parent generation already owns the request in which they are running.
+    """
+    active: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        runs = message.get("subagent_runs")
+        if not isinstance(runs, dict):
+            continue
+        for entry_key, run in runs.items():
+            if (
+                isinstance(run, dict)
+                and run.get("status") == "running"
+                and run.get("ended_at") is None
+                and (
+                    run.get("rerun") is True
+                    or run.get("detached_rerun") is True
+                    or bool(run.get("rerun_id"))
+                    or bool(run.get("rerun_task_id"))
+                )
+            ):
+                active.append(str(run.get("entry_key") or entry_key))
+    return list(dict.fromkeys(active))
+
+
+def _reject_active_detached_subagent_reruns(messages: list[dict]) -> None:
+    active = active_detached_subagent_rerun_entries(messages)
+    if active:
+        raise ActiveSubagentRerunError(active)
 
 
 def _file_ext(file: dict) -> str:
@@ -384,15 +544,21 @@ def expand_messages_for_tool_resumption(messages: list) -> list:
     return out
 
 
-def _walk_messages_from_leaf(messages_map: dict, leaf_id: str) -> list:
+def _walk_messages_from_leaf(
+    messages_map: dict, leaf_id: str, *, allow_missing_leaf: bool = False
+) -> list:
     chain = []
     seen = set()
     current_id = leaf_id
-    while current_id and current_id not in seen:
+    while current_id:
+        if current_id in seen:
+            raise ChatMessageAncestryError(leaf_id, current_id, cycle=True)
         seen.add(current_id)
         msg = messages_map.get(current_id)
-        if not msg:
-            break
+        if not isinstance(msg, dict):
+            if not chain and allow_missing_leaf:
+                return []
+            raise ChatMessageAncestryError(leaf_id, current_id)
         chain.append(msg)
         current_id = msg.get("parentId")
     chain.reverse()
@@ -472,7 +638,9 @@ async def preprocess_nonvision_files(
             "stream": False,
             "max_tokens": 4096,
         }
-        res = await generate_chat_completion(request, ocr_form, user, bypass_filter=True)
+        res = await generate_chat_completion(
+            request, ocr_form, user, bypass_filter=True
+        )
         # generate_chat_completion returns a dict for non-streaming responses.
         if isinstance(res, dict):
             choices = res.get("choices") or []
@@ -569,16 +737,12 @@ async def preprocess_nonvision_files(
             ]
             vision_response = await _run_ocr(ocr_messages)
             pages = len(pdfs)
-            new_content = (
-                f"[PDF Analysis ({pages} pages):\n{vision_response}\n]\n\n{base_content}"
-            )
+            new_content = f"[PDF Analysis ({pages} pages):\n{vision_response}\n]\n\n{base_content}"
             user_message["content"] = new_content
             user_message["pdf_processed"] = True
             await _persist(new_content, pdf_processed=True)
         except Exception as e:
-            log.exception(
-                "preprocess_nonvision_files: PDF OCR failed for %s", chat_id
-            )
+            log.exception("preprocess_nonvision_files: PDF OCR failed for %s", chat_id)
             # PDF failure is fatal for the turn (the model can't read the PDF):
             # persist an error and raise so the drain PAUSES.
             err = {
@@ -598,6 +762,42 @@ async def preprocess_nonvision_files(
             raise
 
 
+def _normalize_files_for_portability(files):
+    """Rewrite a user message's ``files`` so every attachment renders on ANOTHER
+    device (cross-device prompt sync) as well as on a plain reload.
+
+    Only ``id``-based (``/api/v1/files/{id}/content``) and ``data:`` urls resolve
+    on a device other than the one that created the message; a transient
+    ``blob:`` url (clipboard paste / local preview) is origin-local and 404s
+    elsewhere. ``UserMessage.svelte`` renders ``<Image src={file.url}>`` directly,
+    so the url on the persisted row must already be portable. We run this BEFORE
+    the DB upsert so the persisted row, the emitted ``chat:user-message`` payload,
+    and a later ``loadChat`` all agree byte-for-byte.
+
+    Best-effort and non-destructive: when a portable url cannot be derived (e.g. a
+    pasted image with neither an ``id`` nor a ``data:`` url) the entry is left
+    untouched rather than dropped, so behaviour never diverges from a plain
+    reload.
+    """
+    if not isinstance(files, list):
+        return files
+    out = []
+    for f in files:
+        if not isinstance(f, dict):
+            out.append(f)
+            continue
+        g = dict(f)
+        url = g.get("url")
+        fid = g.get("id")
+        portable = isinstance(url, str) and (
+            url.startswith("/api/v1/files/") or url.startswith("data:")
+        )
+        if not portable and fid:
+            g["url"] = f"/api/v1/files/{fid}/content"
+        out.append(g)
+    return out
+
+
 async def assemble_conversation_from_leaf(
     chat_id: str,
     leaf_message_id: Optional[str],
@@ -607,6 +807,8 @@ async def assemble_conversation_from_leaf(
     container_workspace_active: bool = False,
     request=None,
     user=None,
+    persisted_out: Optional[dict] = None,
+    resume_message_id: Optional[str] = None,
 ) -> list[dict]:
     """Backend equivalent of the frontend's ``createMessagesList`` +
     ``expandMessagesForToolResumption`` + ``buildTextFileBlocks`` +
@@ -623,86 +825,109 @@ async def assemble_conversation_from_leaf(
     OCR'd and folded into its text (see ``preprocess_nonvision_files``). This is
     what makes queued multimodal messages work under the zero-tab server drain;
     it also runs for normal tab-driven sends so behavior is identical.
+
+    ``resume_message_id`` is the assistant row this generation will WRITE INTO
+    (retry / regenerate / continue reuse an existing id). When that row is still
+    unfinished it carries the tail of a failed attempt, which is trimmed to the
+    resume boundary before the payload is built — see ``resume_boundary_blocks``.
     """
     messages_map = await Chats.get_messages_map_by_chat_id(chat_id) or {}
 
     chain = (
-        _walk_messages_from_leaf(messages_map, leaf_message_id)
+        _walk_messages_from_leaf(
+            messages_map,
+            leaf_message_id,
+            allow_missing_leaf=bool(
+                new_user_message and new_user_message.get("id") == leaf_message_id
+            ),
+        )
         if leaf_message_id
         else []
     )
+    # Do this before any new user row is persisted. A detached rerun replaces
+    # one of the chain's tool results transactionally; starting the parent from
+    # the temporary running state would consume neither the old nor the new
+    # result coherently.
+    _reject_active_detached_subagent_reruns(chain)
 
     if new_user_message and new_user_message.get("id"):
         new_id = new_user_message["id"]
         if new_id not in messages_map:
             parent_id = new_user_message.get("parentId") or leaf_message_id
+            # NEVER persist a self-parented message. The frontend convention
+            # passes leaf_message_id == the NEW user message's own id, so when
+            # its parentId is null (first turn) the fallback above resolved to
+            # the message itself — a cycle in the tree that wedges every
+            # unguarded parent-chain walker (server-wide 100%-CPU freeze in
+            # get_message_list, and the same loop client-side). Reachable in
+            # production whenever the completion POST arrives before/without
+            # the user-row save (flaky-network race, API callers).
+            if parent_id == new_id:
+                parent_id = new_user_message.get("parentId") or None
+                if parent_id == new_id:
+                    parent_id = None
             if leaf_message_id == new_id and parent_id and not chain:
                 chain = _walk_messages_from_leaf(messages_map, parent_id)
+                _reject_active_detached_subagent_reruns(chain)
             persisted = {
                 "id": new_id,
                 "parentId": parent_id,
                 "childrenIds": [],
                 "role": new_user_message.get("role") or "user",
                 "content": new_user_message.get("content") or "",
-                "files": new_user_message.get("files") or [],
+                "files": _normalize_files_for_portability(
+                    new_user_message.get("files") or []
+                ),
                 "timestamp": int(time.time()),
                 "models": new_user_message.get("models") or [],
             }
 
-            # Detect migrated vs legacy: migrated chats keep messages in the
-            # chat_message table where childrenIds is *derived* from parent_id
-            # on read (see await Chats.get_chat_meta_by_id_and_user_id in
-            # models/chats.py), so there is nothing to link on the parent row.
-            # Legacy chats keep the tree inside the JSON blob and need an
-            # explicit childrenIds append on the parent.
-            chat_row = await Chats.get_chat_by_id(chat_id)
-            migrated = bool(
-                chat_row is not None
-                and getattr(chat_row, "messages_migrated", 0)
+            # The model write owns graph integrity: migrated chats derive
+            # children from parent_id, while the legacy path updates the
+            # parent's childrenIds in the same locked transaction.
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, new_id, persisted, return_model=False
             )
 
-            # Legacy-only: append new id to the parent's childrenIds. We do
-            # this BEFORE the new-message upsert so the final upsert is the
-            # one that sets history.currentId = new_id (upsert_message_*
-            # always stamps currentId to the message it just wrote).
-            if not migrated and parent_id:
-                parent_msg = messages_map.get(parent_id)
-                if isinstance(parent_msg, dict):
-                    existing_children = list(parent_msg.get("childrenIds") or [])
-                    if new_id not in existing_children:
-                        existing_children.append(new_id)
-                        # Pass only the field that actually changed; the
-                        # legacy path inside upsert_message_to_chat_by_id_*
-                        # merges via {**existing, **incoming}, so this is a
-                        # surgical partial update.
-                        try:
-                            await Chats.upsert_message_to_chat_by_id_and_message_id(
-                                chat_id,
-                                parent_id,
-                                {"childrenIds": existing_children}, return_model=False
-                            )
-                        except Exception as e:
-                            log.debug(
-                                f"assemble_conversation_from_leaf: failed to link new id into parent.childrenIds: {e}"
-                            )
-
-            # Persist the new user message. For migrated chats this is a
-            # single-row INSERT into chat_message + a json_set on
-            # chat.history.currentId — both O(1) on the row. For legacy
-            # chats it's an in-place JSON patch (no full re-serialization
-            # of the chat blob via update_chat_by_id). Either way, this
-            # call is what stamps history.currentId = new_id, so no
-            # follow-up update_chat_by_id is needed.
-            try:
-                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, new_id, persisted, return_model=False
-                )
-            except Exception as e:
-                log.debug(
-                    f"assemble_conversation_from_leaf: failed to persist new_user_message: {e}"
-                )
-
             chain.append(persisted)
+            _user_row_for_broadcast = persisted
+        else:
+            # Normal interactive send: the frontend already persisted this user
+            # message (an append_message op + an awaited save) BEFORE calling
+            # /api/chat/completions, so new_id is already in messages_map and the
+            # message is already in the walked chain. Surface that persisted row
+            # anyway so cross-device sync still emits — without this, the prompt
+            # bubble would only appear on other devices after a full reload (the
+            # `new_id not in messages_map` branch above is hit only by the
+            # headless queue drain, whose chat:user-message emit is now ALSO sent —
+            # paired with an atomic chip-clear — so the drained bubble appears
+            # immediately rather than waiting for the post-response loadChat).
+            existing_user_row = messages_map.get(new_id)
+            _user_row_for_broadcast = (
+                existing_user_row if isinstance(existing_user_row, dict) else None
+            )
+
+        # Cross-device prompt sync: hand the user-message row to the caller so
+        # chat_completion can broadcast a `chat:user-message` event, regardless of
+        # which side wrote it (assemble here for a server drain, or the frontend
+        # pre-save for a normal interactive send). Files are normalized so the
+        # emitted payload is portable and agrees with a later loadChat. Regenerate
+        # reuses the existing assistant turn and sends no new_user_message, so this
+        # whole block is never entered for it.
+        if persisted_out is not None and isinstance(_user_row_for_broadcast, dict):
+            persisted_out["user_message"] = {
+                "id": _user_row_for_broadcast.get("id") or new_id,
+                "parentId": _user_row_for_broadcast.get("parentId"),
+                "childrenIds": list(_user_row_for_broadcast.get("childrenIds") or []),
+                "role": _user_row_for_broadcast.get("role") or "user",
+                "content": _user_row_for_broadcast.get("content") or "",
+                "files": _normalize_files_for_portability(
+                    _user_row_for_broadcast.get("files") or []
+                ),
+                "timestamp": _user_row_for_broadcast.get("timestamp"),
+                "models": list(_user_row_for_broadcast.get("models") or []),
+            }
+            persisted_out["leaf_message_id"] = leaf_message_id
 
     # Vision/PDF preprocessing for non-vision models (server-side port of the
     # client path). Operates on the LAST user message in the chain — the one
@@ -723,12 +948,37 @@ async def assemble_conversation_from_leaf(
                 request, user, chat_id, last_user_message, model
             )
 
+    # Retry/continue writes back into an EXISTING assistant row, which is in this
+    # chain. When that row is the wreckage of an attempt that died mid-flight, its
+    # trailing prose is about to be regenerated — sending it upstream asks the
+    # model to continue a half-written sentence, which it answers by restarting.
+    # Trim to the resume boundary here so the payload matches what
+    # `process_chat_response` will actually stream into (it applies the identical
+    # trim when it seeds `content_blocks`). Scoped to the row this generation
+    # owns: an unfinished assistant anywhere ELSE in the chain is real history the
+    # user saw, and must not be silently shortened.
+    if resume_message_id:
+        chain = [
+            (
+                {**m, "content_blocks": resume_boundary_blocks(m["content_blocks"])}
+                if isinstance(m, dict)
+                and m.get("id") == resume_message_id
+                and m.get("role") == "assistant"
+                and isinstance(m.get("content_blocks"), list)
+                and is_aborted_attempt(m)
+                else m
+            )
+            for m in chain
+        ]
+
     expanded = expand_messages_for_tool_resumption(chain)
 
     model_supports_vision = True
+    model_supports_video = False
     if isinstance(model, dict):
         caps = (((model.get("info") or {}).get("meta") or {}).get("capabilities")) or {}
         model_supports_vision = caps.get("vision", True)
+        model_supports_video = model_supports_video_input(model)
 
     prepared: list[dict] = []
     if system_prompt:
@@ -747,10 +997,21 @@ async def assemble_conversation_from_leaf(
                 "role": "assistant",
                 "content_blocks": message["content_blocks"],
             }
+            if message.get("id"):
+                # Internal only. A compaction anchor lives in `content_blocks`,
+                # and `apply_compaction_to_messages` needs the id of the message
+                # holding it so the envelope can be written back to that row
+                # (utils/compaction.py `capture_compaction_envelope`). Safe on
+                # this branch specifically: it is expanded by `_expand_assistant`,
+                # which takes the BLOCK LIST and builds fresh dicts, so no key
+                # from here can reach the wire.
+                forwarded["id"] = message["id"]
             if message.get("tool_result_bodies"):
                 forwarded["tool_result_bodies"] = message["tool_result_bodies"]
             if message.get("reasoning_details_per_round"):
-                forwarded["reasoning_details_per_round"] = message["reasoning_details_per_round"]
+                forwarded["reasoning_details_per_round"] = message[
+                    "reasoning_details_per_round"
+                ]
             if message.get("reasoning_details"):
                 forwarded["reasoning_details"] = message["reasoning_details"]
             if message.get("subagent_runs"):
@@ -787,15 +1048,18 @@ async def assemble_conversation_from_leaf(
             f.get("type") == "file"
             and (
                 (f.get("name") or "").lower().endswith(".pdf")
-                or ((f.get("file") or {}).get("filename") or "").lower().endswith(".pdf")
+                or ((f.get("file") or {}).get("filename") or "")
+                .lower()
+                .endswith(".pdf")
             )
             for f in files
         )
         has_extractable = any(
-            f.get("type") == "file" and _file_ext(f) in _EXTRACTABLE_EXTS
-            for f in files
+            f.get("type") == "file" and _file_ext(f) in _EXTRACTABLE_EXTS for f in files
         )
+        has_video = any(f.get("type") == "video" for f in files)
 
+        should_attach_videos = is_user and has_video and model_supports_video
         should_attach_images = is_user and has_images and model_supports_vision
         should_send_files_to_model = is_user and not container_workspace_active
         # PDFs use OpenRouter's native file-parser path, so container mode still
@@ -803,15 +1067,41 @@ async def assemble_conversation_from_leaf(
         should_attach_pdf_files = is_user and has_pdf and model_supports_vision
         should_attach_extractable_files = should_send_files_to_model and has_extractable
 
-        text_prefix = await build_text_file_blocks(files) if should_send_files_to_model else ""
-        base_text = (message.get("merged") or {}).get("content") or message.get("content") or ""
+        text_prefix = (
+            await build_text_file_blocks(files) if should_send_files_to_model else ""
+        )
+        # A few corrupted rows persisted the literal string "null" (JSON-encoded
+        # None) into `content` instead of a real SQL NULL — guard it the same as
+        # a missing/empty content so it never gets treated as real message text.
+        _merged_content = (message.get("merged") or {}).get("content")
+        if _merged_content == "null":
+            _merged_content = None
+        _raw_content = message.get("content")
+        if _raw_content == "null":
+            _raw_content = None
+        base_text = _merged_content or _raw_content or ""
 
         if is_user and (
             should_attach_images
             or should_attach_pdf_files
             or should_attach_extractable_files
+            or should_attach_videos
         ):
             parts: list = [{"type": "text", "text": text_prefix + base_text}]
+
+            if should_attach_videos:
+                for f in files:
+                    if f.get("type") != "video":
+                        continue
+                    # Providers that accept video want the bytes inline; only
+                    # AI Studio's YouTube-link path takes a plain URL, and that
+                    # is deliberately out of scope. `_file_content_url` yields a
+                    # data URL for stored files, which is what we need here.
+                    video_url = _file_content_url(f)
+                    if video_url:
+                        parts.append(
+                            {"type": "video_url", "video_url": {"url": video_url}}
+                        )
 
             if should_attach_images:
                 for f in files:
@@ -866,13 +1156,30 @@ async def assemble_conversation_from_leaf(
 
         forwarded = {
             "role": message.get("role"),
-            "content": text_prefix + base_text if is_user and text_prefix else base_text,
+            "content": (
+                text_prefix + base_text if is_user and text_prefix else base_text
+            ),
         }
         if message.get("reasoning_details"):
             forwarded["reasoning_details"] = message["reasoning_details"]
         prepared.append(forwarded)
 
-    return blocks_to_api_messages(prepared)
+    # Surface the RAW walked chain (persisted rows, `content_blocks` intact) for
+    # the turn-start compaction gate in main.py. It needs three things the
+    # converted list cannot give it: the id of the message to anchor into, that
+    # message's `meta.usage` (the last round's token count), and whether any
+    # compaction anchor already covers this span. Set unconditionally so the
+    # regenerate path — which passes no `new_user_message` and therefore skips
+    # the block above — gets it too.
+    if persisted_out is not None:
+        persisted_out["chain"] = chain
+
+    # model_id gates the Gemini-only `$ref` sanitization inside blocks_to_api_messages
+    # (see sanitize_gemini_tool_result) — a stray OpenAPI $ref in a tool result body
+    # (e.g. a web-fetched Swagger/OpenAPI spec) makes Gemini 400 INVALID_ARGUMENT on
+    # every subsequent request that resends it, permanently bricking the chat.
+    model_id = model.get("id") if isinstance(model, dict) else None
+    return blocks_to_api_messages(prepared, model_id=model_id)
 
 
 async def generate_direct_chat_completion(
@@ -1015,10 +1322,13 @@ async def generate_chat_completion(
 
     model = models[model_id]
 
-    completion_metadata = form_data.get("metadata") if isinstance(form_data, dict) else None
+    completion_metadata = (
+        form_data.get("metadata") if isinstance(form_data, dict) else None
+    )
     provider_stream_override = (
         completion_metadata.get("provider_stream")
-        if isinstance(completion_metadata, dict) and "provider_stream" in completion_metadata
+        if isinstance(completion_metadata, dict)
+        and "provider_stream" in completion_metadata
         else None
     )
     upstream_stream = (
@@ -1031,7 +1341,9 @@ async def generate_chat_completion(
     is_in_backend_models = model_id in request.app.state.MODELS
     is_direct_flag_set = getattr(request.state, "direct", False)
 
-    log.info(f"🔄 ROUTING: model_id={model_id}, is_in_backend_models={is_in_backend_models}, is_direct_flag_set={is_direct_flag_set}")
+    log.info(
+        f"🔄 ROUTING: model_id={model_id}, is_in_backend_models={is_in_backend_models}, is_direct_flag_set={is_direct_flag_set}"
+    )
 
     if is_direct_flag_set and not is_in_backend_models:
         log.warning(
@@ -1039,7 +1351,9 @@ async def generate_chat_completion(
         )
         raise Exception("Direct connections are not supported in this deployment")
     else:
-        log.info(f"🔄 ROUTING: Using BACKEND completion flow for {model_id} (owned_by: {model.get('owned_by')})")
+        log.info(
+            f"🔄 ROUTING: Using BACKEND completion flow for {model_id} (owned_by: {model.get('owned_by')})"
+        )
         # Check if user has access to the model
         if not bypass_filter and user.role == "user":
             try:
@@ -1127,69 +1441,6 @@ async def generate_chat_completion(
             )
 
 
-chat_completion = generate_chat_completion
-
-
-async def chat_completed(request: Request, form_data: dict, user: Any):
-    if not request.app.state.MODELS:
-        await get_all_models(request, user=user)
-
-    if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
-        models = {
-            request.state.model["id"]: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
-
-    data = form_data
-    model_id = data["model"]
-    if model_id not in models:
-        raise Exception("Model not found")
-
-    model = models[model_id]
-
-    try:
-        data = await process_pipeline_outlet_filter(request, data, user, models)
-    except Exception as e:
-        return Exception(f"Error: {e}")
-
-    metadata = {
-        "chat_id": data["chat_id"],
-        "message_id": data["id"],
-        "filter_ids": data.get("filter_ids", []),
-        "session_id": data["session_id"],
-        "user_id": user.id,
-    }
-
-    extra_params = {
-        "__event_emitter__": get_event_emitter(metadata),
-        "__event_call__": get_event_call(metadata),
-        "__user__": user.model_dump() if isinstance(user, UserModel) else {},
-        "__metadata__": metadata,
-        "__request__": request,
-        "__model__": model,
-    }
-
-    try:
-        filter_functions = [
-            await Functions.get_function_by_id(filter_id)
-            for filter_id in await get_sorted_filter_ids(
-                request, model, metadata.get("filter_ids", [])
-            )
-        ]
-
-        result, _ = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="outlet",
-            form_data=data,
-            extra_params=extra_params,
-        )
-        return result
-    except Exception as e:
-        return Exception(f"Error: {e}")
-
-
 async def run_outlet_filters_on_completed_stream(
     request: Request,
     user: Any,
@@ -1202,12 +1453,9 @@ async def run_outlet_filters_on_completed_stream(
     event_caller,
     serialize_content_blocks,
 ):
-    # B12: outlet filters used to run from POST /api/chat/completed; now run
-    # server-side at end of process_chat_response. Mirrors the synthetic
-    # message list assembly the frontend used to send: a final assistant turn
-    # carrying the serialized content. If a filter mutates that content, we
-    # persist the mutation and emit a catch-up event so the frontend mirror
-    # matches what's in the DB.
+    # Run outlet filters against the authoritative completed assistant turn.
+    # Persist any mutation and emit a catch-up event so the live mirror matches
+    # the stored result.
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
@@ -1291,9 +1539,7 @@ async def run_outlet_filters_on_completed_stream(
     #      it is not — it produces a silent divergence between what the
     #      filter intended and what the user sees.
     # See _apply_outlet_text_to_blocks for the algorithm.
-    merged_blocks = _apply_outlet_text_to_blocks(
-        content_blocks, content, final_content
-    )
+    merged_blocks = _apply_outlet_text_to_blocks(content_blocks, content, final_content)
 
     if merged_blocks == content_blocks:
         return
@@ -1313,7 +1559,8 @@ async def run_outlet_filters_on_completed_stream(
             {
                 "content": merged_serialized,
                 "content_blocks": merged_blocks,
-            }, return_model=False
+            },
+            return_model=False,
         )
     except Exception as e:
         log.exception(f"Outlet filter persist failed: {e}")

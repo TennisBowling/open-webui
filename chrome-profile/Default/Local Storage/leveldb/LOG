@@ -1,0 +1,51 @@
+2026/07/27-01:05:16.168 1376bf Reusing MANIFEST /home/tennisbowling/open-webui/chrome-profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/07/27-01:05:16.170 1376bf Recovering log #513
+2026/07/27-01:05:16.171 1376bf Level-0 table #516: started
+2026/07/27-01:05:16.174 1376bf Level-0 table #516: 211070 bytes OK
+2026/07/27-01:05:16.175 1376bf Recovering log #515
+2026/07/27-01:05:16.176 1376bf Level-0 table #517: started
+2026/07/27-01:05:16.179 1376bf Level-0 table #517: 211064 bytes OK
+2026/07/27-01:05:16.181 1376bf Delete type=0 #515
+2026/07/27-01:05:16.181 1376bf Delete type=0 #513
+2026/07/27-01:06:16.185 1376bf Level-0 table #520: started
+2026/07/27-01:06:16.189 1376bf Level-0 table #520: 216912 bytes OK
+2026/07/27-01:06:16.192 1376bf Delete type=0 #518
+2026/07/27-01:06:16.193 1376bf Compacting 4@0 + 1@1 files
+2026/07/27-01:06:16.204 1376bf Generated table #521@0: 67 keys, 328636 bytes
+2026/07/27-01:06:16.204 1376bf Compacted 4@0 + 1@1 files => 328636 bytes
+2026/07/27-01:06:16.204 1376bf compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/07/27-01:06:16.205 1376bf Delete type=2 #517
+2026/07/27-01:06:16.205 1376bf Delete type=2 #514
+2026/07/27-01:06:16.205 1376bf Delete type=2 #516
+2026/07/27-01:06:16.205 1376bf Delete type=2 #520
+2026/07/27-01:06:16.205 1376bf Delete type=2 #511
+2026/07/27-01:35:28.358 1376c1 Level-0 table #523: started
+2026/07/27-01:35:28.360 1376c1 Level-0 table #523: 105023 bytes OK
+2026/07/27-01:35:28.361 1376c1 Delete type=0 #519
+2026/07/27-01:36:15.245 1376c1 Level-0 table #525: started
+2026/07/27-01:36:15.248 1376c1 Level-0 table #525: 216924 bytes OK
+2026/07/27-01:36:15.249 1376c1 Delete type=0 #522
+2026/07/27-01:39:32.005 1376c1 Level-0 table #527: started
+2026/07/27-01:39:32.007 1376c1 Level-0 table #527: 211347 bytes OK
+2026/07/27-01:39:32.008 1376c1 Delete type=0 #524
+2026/07/27-01:42:17.566 1376c1 Level-0 table #529: started
+2026/07/27-01:42:17.569 1376c1 Level-0 table #529: 211698 bytes OK
+2026/07/27-01:42:17.570 1376c1 Delete type=0 #526
+2026/07/27-01:42:17.570 1376c1 Compacting 4@0 + 1@1 files
+2026/07/27-01:42:17.576 1376c1 Generated table #530@0: 67 keys, 330424 bytes
+2026/07/27-01:42:17.576 1376c1 Compacted 4@0 + 1@1 files => 330424 bytes
+2026/07/27-01:42:17.577 1376c1 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/07/27-01:42:17.577 1376c1 Delete type=2 #525
+2026/07/27-01:42:17.577 1376c1 Delete type=2 #529
+2026/07/27-01:42:17.577 1376c1 Delete type=2 #527
+2026/07/27-01:42:17.577 1376c1 Delete type=2 #523
+2026/07/27-01:42:17.577 1376c1 Delete type=2 #521
+2026/07/27-01:48:52.815 1376c1 Level-0 table #532: started
+2026/07/27-01:48:52.818 1376c1 Level-0 table #532: 216638 bytes OK
+2026/07/27-01:48:52.819 1376c1 Delete type=0 #528
+2026/07/27-01:50:02.394 1376c1 Level-0 table #534: started
+2026/07/27-01:50:02.397 1376c1 Level-0 table #534: 217018 bytes OK
+2026/07/27-01:50:02.398 1376c1 Delete type=0 #531
+2026/07/27-01:51:11.366 1376c1 Level-0 table #536: started
+2026/07/27-01:51:11.369 1376c1 Level-0 table #536: 211306 bytes OK
+2026/07/27-01:51:11.370 1376c1 Delete type=0 #533

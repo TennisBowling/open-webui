@@ -1,23 +1,25 @@
 <script lang="ts">
-	import { getContext, createEventDispatcher } from 'svelte';
-	const dispatch = createEventDispatcher();
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { getContext } from 'svelte';
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	const i18n = getContext('i18n');
 
 	import Cog6 from '$lib/components/icons/Cog6.svelte';
 	import ArenaModelModal from './ArenaModelModal.svelte';
-	export let model;
+	let { model, ...eventProps } = $props();
 
-	let showModel = false;
+	let showModel = $state(false);
 </script>
 
 <ArenaModelModal
 	bind:show={showModel}
 	edit={true}
 	{model}
-	on:submit={async (e) => {
+	onsubmit={async (e) => {
 		dispatch('edit', e.detail);
 	}}
-	on:delete={async () => {
+	ondelete={async () => {
 		dispatch('delete');
 	}}
 />
@@ -50,9 +52,9 @@
 
 		<div class="flex items-center">
 			<button
-				class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+				class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 				type="button"
-				on:click={() => {
+				onclick={() => {
 					showModel = true;
 				}}
 			>

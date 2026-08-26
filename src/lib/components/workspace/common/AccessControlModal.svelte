@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -6,12 +6,21 @@
 	import AccessControl from './AccessControl.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	export let show = false;
-	export let accessControl = {};
-	export let accessRoles = ['read'];
-	export let allowPublic = true;
+	interface Props {
+		show?: boolean;
+		accessControl?: any;
+		accessRoles?: any;
+		allowPublic?: boolean;
+		onChange?: any;
+	}
 
-	export let onChange = () => {};
+	let {
+		show = $bindable(false),
+		accessControl = $bindable({}),
+		accessRoles = ['read'],
+		allowPublic = true,
+		onChange = () => {}
+	}: Props = $props();
 </script>
 
 <Modal size="sm" bind:show>
@@ -21,8 +30,8 @@
 				{$i18n.t('Access Control')}
 			</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>

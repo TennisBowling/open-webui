@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+	import { toast } from '$lib/utils/toast';
 	import { v4 as uuidv4 } from 'uuid';
 
 	import { tick, getContext, onMount, onDestroy } from 'svelte';
@@ -41,45 +42,19 @@
 	import Skeleton from '../chat/Messages/Skeleton.svelte';
 	import XMark from '../icons/XMark.svelte';
 
-	export let placeholder = $i18n.t('Type here...');
+	let loaded = $state(false);
+	let draggedOver = $state(false);
 
-	export let id = null;
-	export let chatInputElement;
+	let recording = $state(false);
+	let content = $state('');
+	let files = $state([]);
 
-	export let typingUsers = [];
-	export let inputLoading = false;
+	let filesInputElement = $state();
+	let inputFiles = $state();
 
-	export let onSubmit: Function = (e) => {};
-	export let onChange: Function = (e) => {};
-	export let onStop: Function = (e) => {};
-
-	export let scrollEnd = true;
-	export let scrollToBottom: Function = () => {};
-
-	export let disabled = false;
-	export let acceptFiles = true;
-	export let showFormattingToolbar = true;
-
-	export let userSuggestions = false;
-	export let channelSuggestions = false;
-
-	export let replyToMessage = null;
-
-	export let typingUsersClassName = 'from-white dark:from-gray-900';
-
-	let loaded = false;
-	let draggedOver = false;
-
-	let recording = false;
-	let content = '';
-	let files = [];
-
-	let filesInputElement;
-	let inputFiles;
-
-	let showInputVariablesModal = false;
-	let inputVariablesModalCallback: (variableValues: Record<string, any>) => void;
-	let inputVariables: Record<string, any> = {};
+	let showInputVariablesModal = $state(false);
+	let inputVariablesModalCallback: (variableValues: Record<string, any>) => void = $state();
+	let inputVariables: Record<string, any> = $state({});
 	let inputVariableValues = {};
 
 	const inputVariableHandler = async (text: string): Promise<string> => {
@@ -306,11 +281,55 @@
 		}
 	};
 
-	let command = '';
+	let command = $state('');
 
-	export let showCommands = false;
-	$: showCommands = ['/'].includes(command?.charAt(0));
-	let suggestions = null;
+	interface Props {
+		placeholder?: any;
+		id?: any;
+		chatInputElement: any;
+		typingUsers?: any;
+		inputLoading?: boolean;
+		onSubmit?: Function;
+		onChange?: Function;
+		onStop?: Function;
+		scrollEnd?: boolean;
+		scrollToBottom?: Function;
+		disabled?: boolean;
+		acceptFiles?: boolean;
+		showFormattingToolbar?: boolean;
+		userSuggestions?: boolean;
+		channelSuggestions?: boolean;
+		replyToMessage?: any;
+		typingUsersClassName?: string;
+		showCommands?: boolean;
+		menu?: import('svelte').Snippet;
+	}
+
+	let {
+		placeholder = $i18n.t('Type here...'),
+		id = null,
+		chatInputElement = $bindable(),
+		typingUsers = [],
+		inputLoading = false,
+		onSubmit = (e) => {},
+		onChange = (e) => {},
+		onStop = (e) => {},
+		scrollEnd = $bindable(true),
+		scrollToBottom = () => {},
+		disabled = false,
+		acceptFiles = true,
+		showFormattingToolbar = true,
+		userSuggestions = false,
+		channelSuggestions = false,
+		replyToMessage = $bindable(null),
+		typingUsersClassName = 'from-white dark:from-gray-900',
+		showCommands = $bindable(false),
+		menu
+	}: Props = $props();
+	$effect(() => {
+		showCommands = ['/'].includes(command?.charAt(0));
+	});
+	let suggestions = $state(null);
 
 	const screenCaptureHandler = async () => {
 		try {
@@ -568,9 +587,11 @@
 		}
 	};
 
-	$: if (content) {
-		onChange();
-	}
+	$effect(() => {
+		if (content) {
+			onChange();
+		}
+	});
 
 	onMount(async () => {
 		suggestions = [
@@ -670,7 +691,7 @@
 			type="file"
 			hidden
 			multiple
-			on:change={async () => {
+			onchange={async () => {
 				if (inputFiles && inputFiles.length > 0) {
 					inputFilesHandler(Array.from(inputFiles));
 				} else {
@@ -700,8 +721,8 @@
 								class=" absolute -top-12 left-0 right-0 flex justify-center z-30 pointer-events-none"
 							>
 								<button
-									class=" bg-white border border-gray-100 dark:border-none dark:bg-white/20 p-1.5 rounded-full pointer-events-auto"
-									on:click={() => {
+									class=" bg-white border-hairline border-gray-100 dark:border-none dark:bg-white/20 p-1.5 max-md:p-2 rounded-full pointer-events-auto"
+									onclick={() => {
 										scrollEnd = true;
 										scrollToBottom();
 									}}
@@ -774,13 +795,13 @@
 				{:else}
 					<form
 						class="w-full flex gap-1.5"
-						on:submit|preventDefault={() => {
+						onsubmit={preventDefault(() => {
 							submitHandler();
-						}}
+						})}
 					>
 						<div
 							id="message-input-container"
-							class="flex-1 flex flex-col relative w-full shadow-lg rounded-3xl border border-gray-50 dark:border-gray-850 hover:border-gray-100 focus-within:border-gray-100 hover:dark:border-gray-800 focus-within:dark:border-gray-800 transition px-1 bg-white/90 dark:bg-gray-400/5 dark:text-gray-100"
+							class="flex-1 flex flex-col relative w-full shadow-lg rounded-2xl border-hairline border-gray-50 dark:border-gray-850 hover:border-gray-100 focus-within:border-gray-100 hover:dark:border-gray-800 focus-within:dark:border-gray-800 transition px-1 bg-white/90 dark:bg-gray-400/5 dark:text-gray-100"
 							dir={$settings?.chatDirection ?? 'auto'}
 						>
 							{#if replyToMessage !== null}
@@ -798,7 +819,8 @@
 										<div>
 											<button
 												class="flex items-center dark:text-gray-500"
-												on:click={() => {
+												onmousedown={preventDefault()}
+												onclick={() => {
 													replyToMessage = null;
 												}}
 											>
@@ -823,9 +845,10 @@
 												</div>
 												<div class=" absolute -top-1 -right-1">
 													<button
-														class=" bg-white text-black border border-white rounded-full group-hover:visible invisible transition"
+														class=" bg-white text-black border-hairline border-white rounded-full group-hover:visible invisible transition"
 														type="button"
-														on:click={() => {
+														onmousedown={preventDefault()}
+														onclick={() => {
 															files.splice(fileIdx, 1);
 															files = files;
 														}}
@@ -853,11 +876,11 @@
 												loading={file.status === 'uploading'}
 												dismissible={true}
 												edit={true}
-												on:dismiss={() => {
+												ondismiss={() => {
 													files.splice(fileIdx, 1);
 													files = files;
 												}}
-												on:click={() => {
+												onclick={() => {
 													console.log(file);
 												}}
 											/>
@@ -895,7 +918,7 @@
 												content = md;
 												command = getCommand();
 											}}
-											on:keydown={async (e) => {
+											onkeydown={async (e) => {
 												e = e.detail.event;
 												const isCtrlPressed = e.ctrlKey || e.metaKey; // metaKey is for Cmd key on Mac
 
@@ -929,7 +952,7 @@
 													replyToMessage = null;
 												}
 											}}
-											on:paste={async (e) => {
+											onpaste={async (e) => {
 												e = e.detail.event;
 												console.log(e);
 
@@ -970,17 +993,21 @@
 
 							<div class=" flex justify-between mb-2.5 mx-0.5">
 								<div class="ml-1 self-end flex space-x-1 flex-1">
-									<slot name="menu">
+									{#if menu}{@render menu()}{:else}
 										{#if acceptFiles}
 											<InputMenu
 												{screenCaptureHandler}
 												uploadFilesHandler={() => {
 													filesInputElement.click();
 												}}
+												onClose={async () => {
+													await tick();
+													document.getElementById('chat-input')?.focus();
+												}}
 											>
 												<button
 													id="input-menu-button"
-													class="bg-transparent hover:bg-white/80 text-gray-800 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5 outline-hidden focus:outline-hidden"
+													class="bg-transparent hover:bg-white/80 text-gray-800 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5 max-md:p-2 outline-hidden focus:outline-hidden"
 													type="button"
 													aria-label="More"
 												>
@@ -997,7 +1024,7 @@
 												</button>
 											</InputMenu>
 										{/if}
-									</slot>
+									{/if}
 								</div>
 
 								<div class="self-end flex space-x-1 mr-1">
@@ -1005,9 +1032,10 @@
 										<Tooltip content={$i18n.t('Record voice')}>
 											<button
 												id="voice-input-button"
-												class=" text-gray-600 dark:text-gray-300 hover:text-gray-700 dark:hover:text-gray-200 transition rounded-full p-1.5 mr-0.5 self-center"
+												class=" text-gray-600 dark:text-gray-300 hover:text-gray-700 dark:hover:text-gray-200 transition rounded-full p-1.5 max-md:p-2 mr-0.5 self-center"
 												type="button"
-												on:click={async () => {
+												onmousedown={preventDefault()}
+												onclick={async () => {
 													try {
 														let stream = await navigator.mediaDevices
 															.getUserMedia({ audio: true })
@@ -1055,8 +1083,9 @@
 											<div class=" flex items-center">
 												<Tooltip content={$i18n.t('Stop')}>
 													<button
-														class="bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5"
-														on:click={() => {
+														class="bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5 max-md:p-2"
+														onmousedown={preventDefault()}
+														onclick={() => {
 															onStop();
 														}}
 													>
@@ -1081,8 +1110,8 @@
 													<button
 														id="send-message-button"
 														class="{content !== '' || files.length !== 0
-															? 'bg-black text-white hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100 '
-															: 'text-white bg-gray-200 dark:text-gray-900 dark:bg-gray-700 disabled'} transition rounded-full p-1.5 self-center"
+															? 'bg-book-cloth text-white hover:bg-kraft '
+															: 'text-white/70 bg-gray-200 dark:bg-gray-800 dark:text-gray-500 disabled'} transition-colors duration-200 ease-paper rounded-full p-1.5 max-md:p-2.5 self-center"
 														type="submit"
 														disabled={content === '' && files.length === 0}
 													>

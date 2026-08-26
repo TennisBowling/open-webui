@@ -1,5 +1,4 @@
 <script lang="ts">
-	import Fuse from 'fuse.js';
 	import Bolt from '$lib/components/icons/Bolt.svelte';
 	import { onMount, getContext } from 'svelte';
 	import { settings, WEBUI_NAME } from '$lib/stores';
@@ -7,61 +6,54 @@
 
 	const i18n = getContext('i18n');
 
-	export let suggestionPrompts = [];
-	export let className = '';
-	export let inputValue = '';
-	export let onSelect = (e) => {};
+	interface Props {
+		suggestionPrompts?: any;
+		className?: string;
+		inputValue?: string;
+		onSelect?: any;
+	}
 
-	let sortedPrompts = [];
+	let {
+		suggestionPrompts = [],
+		className = '',
+		inputValue = '',
+		onSelect = (e) => {}
+	}: Props = $props();
+
+	let sortedPrompts = $derived([...(suggestionPrompts ?? [])].sort(() => Math.random() - 0.5));
 
 	const fuseOptions = {
 		keys: ['content', 'title'],
 		threshold: 0.5
 	};
 
-	let fuse;
-	let filteredPrompts = [];
+	let fuse = $state();
 
-	// Initialize Fuse
-	$: fuse = new Fuse(sortedPrompts, fuseOptions);
-
-	// Update the filteredPrompts if inputValue changes
-	// Only increase version if something wirklich geändert hat
-	$: getFilteredPrompts(inputValue);
-
-	// Helper function to check if arrays are the same
-	// (based on unique IDs oder content)
-	function arraysEqual(a, b) {
-		if (a.length !== b.length) return false;
-		for (let i = 0; i < a.length; i++) {
-			if ((a[i].id ?? a[i].content) !== (b[i].id ?? b[i].content)) {
-				return false;
-			}
+	// Initialize Fuse — lazy-loaded off the cold path. fuse stays undefined until
+	// the import resolves; the search consumer below already guards on `fuse`, so
+	// suggestions are simply unfiltered for the one tick before it loads. Rebuilds
+	// whenever sortedPrompts changes, exactly as before.
+	let FuseCtor: any = null;
+	const rebuildFuse = async (prompts) => {
+		if (!FuseCtor) {
+			FuseCtor = (await import('fuse.js')).default;
 		}
-		return true;
-	}
-
-	const getFilteredPrompts = (inputValue) => {
-		if (inputValue.length > 500) {
-			filteredPrompts = [];
-		} else {
-			const newFilteredPrompts =
-				inputValue.trim() && fuse
-					? fuse.search(inputValue.trim()).map((result) => result.item)
-					: sortedPrompts;
-
-			// Compare with the oldFilteredPrompts
-			// If there's a difference, update array + version
-			if (!arraysEqual(filteredPrompts, newFilteredPrompts)) {
-				filteredPrompts = newFilteredPrompts;
-			}
-		}
+		fuse = new FuseCtor(prompts, fuseOptions);
 	};
 
-	$: if (suggestionPrompts) {
-		sortedPrompts = [...(suggestionPrompts ?? [])].sort(() => Math.random() - 0.5);
-		getFilteredPrompts(inputValue);
-	}
+	let filteredPrompts = $derived.by(() => {
+		if (inputValue.length > 500) {
+			return [];
+		}
+
+		return inputValue.trim() && fuse
+			? fuse.search(inputValue.trim()).map((result) => result.item)
+			: sortedPrompts;
+	});
+
+	$effect(() => {
+		void rebuildFuse(sortedPrompts);
+	});
 </script>
 
 <div class="mb-1 flex gap-1 text-xs font-medium items-center text-gray-600 dark:text-gray-400">
@@ -81,11 +73,16 @@
 	{/if}
 </div>
 
-<div class="h-40 w-full">
+<!-- The 10rem reserve keeps the composer from jumping as suggestions filter down
+	 while you type. It only earns that when suggestions exist at all: with none
+	 configured it was 160px of dead white space under the version line on every
+	 new chat. Keyed off the unfiltered list so filtering to zero results still
+	 holds the space. -->
+<div class="w-full {sortedPrompts.length > 0 ? 'h-40' : ''}">
 	{#if filteredPrompts.length > 0}
 		<div role="list" class="max-h-40 overflow-auto scrollbar-none items-start {className}">
 			{#each filteredPrompts as prompt, idx (prompt.id || prompt.content)}
-				<!-- svelte-ignore a11y-no-interactive-element-to-noninteractive-role -->
+				<!-- svelte-ignore a11y_no_interactive_element_to_noninteractive_role -->
 				<button
 					role="listitem"
 					class="waterfall flex flex-col flex-1 shrink-0 w-full justify-between
@@ -93,7 +90,7 @@
 				       hover:border-book-cloth/40 hover:bg-manilla/30 dark:hover:bg-manilla-dark
 				       transition-colors duration-200 ease-paper group"
 					style="animation-delay: {idx * 60}ms"
-					on:click={() => onSelect({ type: 'prompt', data: prompt.content })}
+					onclick={() => onSelect({ type: 'prompt', data: prompt.content })}
 				>
 					<div class="flex flex-col text-left">
 						{#if prompt.title && prompt.title[0] !== ''}

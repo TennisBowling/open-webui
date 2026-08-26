@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 import base64
+import hashlib
 import io
 
 
@@ -381,7 +382,11 @@ async def get_user_oauth_sessions_by_id(user_id: str, user=Depends(get_admin_use
 
 
 @router.get("/{user_id}/profile/image")
-async def get_user_profile_image_by_id(user_id: str, user=Depends(get_verified_user)):
+async def get_user_profile_image_by_id(
+    user_id: str, request: Request, user=Depends(get_verified_user)
+):
+    # Served as an <img src> (cookie auth); get_current_user has a token-cookie
+    # fallback so no Authorization header is required.
     user = await Users.get_user_by_id(user_id)
     if user:
         if user.profile_image_url:
@@ -393,6 +398,26 @@ async def get_user_profile_image_by_id(user_id: str, user=Depends(get_verified_u
                 )
             elif user.profile_image_url.startswith("data:image"):
                 try:
+                    # ETag off id + updated_at so an avatar change busts it; kept
+                    # private (per-user auth) with a modest max-age.
+                    etag = (
+                        '"'
+                        + hashlib.sha256(
+                            f"{user.id}:{user.updated_at}".encode("utf-8")
+                        ).hexdigest()[:16]
+                        + '"'
+                    )
+                    cache_control = "private, max-age=86400"
+
+                    inm = request.headers.get("if-none-match")
+                    if inm and etag.strip('"') in {
+                        part.strip().strip('"') for part in inm.split(",")
+                    }:
+                        return Response(
+                            status_code=status.HTTP_304_NOT_MODIFIED,
+                            headers={"ETag": etag, "Cache-Control": cache_control},
+                        )
+
                     header, base64_data = user.profile_image_url.split(",", 1)
                     image_data = base64.b64decode(base64_data)
                     image_buffer = io.BytesIO(image_data)
@@ -400,7 +425,11 @@ async def get_user_profile_image_by_id(user_id: str, user=Depends(get_verified_u
                     return StreamingResponse(
                         image_buffer,
                         media_type="image/png",
-                        headers={"Content-Disposition": "inline; filename=image.png"},
+                        headers={
+                            "Content-Disposition": "inline; filename=image.png",
+                            "ETag": etag,
+                            "Cache-Control": cache_control,
+                        },
                     )
                 except Exception as e:
                     pass

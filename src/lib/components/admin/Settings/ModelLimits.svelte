@@ -1,25 +1,26 @@
-<script>
-	import { createEventDispatcher, onMount, tick } from 'svelte';
-	import { toast } from 'svelte-sonner';
+<script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { onMount, tick } from 'svelte';
+	import { toast } from '$lib/utils/toast';
+	import Switch from '$lib/components/common/Switch.svelte';
 	import { config, models } from '$lib/stores';
 	import { getBackendConfig } from '$lib/apis';
-	import {
-		getFlexAutoFlipConfig,
-		updateFlexAutoFlipConfig
-	} from '$lib/apis/flex-auto-flip';
+	import { getFlexAutoFlipConfig, updateFlexAutoFlipConfig } from '$lib/apis/flex-auto-flip';
 
-	const dispatch = createEventDispatcher();
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	// Flex auto-flip admin policy. Read once on mount and on save we refresh
 	// the global $config store so Chat.svelte's auto-flip reactive picks up
 	// the new values without a page reload.
-	let flexAutoFlipLoading = true;
-	let flexAutoFlipSaving = false;
-	let flexEnabled = true;
-	let flexStartHour = 13;
-	let flexEndHour = 5;
-	let flexTimezone = 'America/Los_Angeles';
-	let flexThresholdPercent = 80; // UI: percent (0-100). Backend: ratio (0-1).
+	let flexAutoFlipLoading = $state(true);
+	let flexAutoFlipSaving = $state(false);
+	let flexEnabled = $state(true);
+	let flexStartHour = $state(13);
+	let flexEndHour = $state(5);
+	let flexTimezone = $state('America/Los_Angeles');
+	let flexThresholdPercent = $state(80); // UI: percent (0-100). Backend: ratio (0-1).
 
 	const loadFlexAutoFlipConfig = async () => {
 		try {
@@ -82,22 +83,22 @@
 	};
 
 	// Token Groups Data
-	let tokenGroups = [];
-	let availableModels = [];
-	let loading = true;
+	let tokenGroups = $state([]);
+	let availableModels = $state([]);
+	let loading = $state(true);
 
 	// Form State
-	let showCreateGroupModal = false;
-	let editingGroup = null;
-	let resetStrategy = 'daily'; // 'daily' or 'window'
-	let groupForm = {
+	let showCreateGroupModal = $state(false);
+	let editingGroup = $state(null);
+	let resetStrategy = $state('daily'); // 'daily' or 'window'
+	let groupForm = $state({
 		name: '',
 		models: [],
 		limit: 1000000,
 		resetTime: '00:00',
 		resetTimezone: 'UTC',
 		windowDuration: 24 // Hours
-	};
+	});
 
 	// Scheduling Options
 	const timezoneOptions = ['UTC', 'EST', 'PST', 'GMT', 'CET', 'JST', 'CST', 'MST'];
@@ -122,9 +123,9 @@
 	};
 
 	// Reactive statement to get models from the store
-	$: {
+	$effect(() => {
 		availableModels = $models || [];
-	}
+	});
 
 	const loadTokenGroups = async () => {
 		try {
@@ -164,9 +165,9 @@
 	};
 
 	const getProgressColor = (percentage) => {
-		if (percentage < 50) return 'bg-emerald-500';
-		if (percentage < 80) return 'bg-amber-500';
-		return 'bg-rose-500';
+		if (percentage < 50) return 'bg-success';
+		if (percentage < 80) return 'bg-warning';
+		return 'bg-error-brick';
 	};
 
 	const openCreateGroupModal = () => {
@@ -304,55 +305,50 @@
 </script>
 
 <div class="flex flex-col h-full">
-	<div class="mb-6">
-		<div class="flex justify-between items-center mb-4">
+	<div class="mb-3">
+		<div class="flex justify-between items-center">
 			<div>
-				<h2 class="text-2xl font-semibold text-gray-900 dark:text-white">Token Limits</h2>
-				<p class="text-gray-600 dark:text-gray-400">
+				<div class="mb-1 text-base font-medium">Token Limits</div>
+				<p class="text-xs text-gray-500">
 					Manage token usage limits and reset schedules for model groups
 				</p>
 			</div>
-			<div class="flex gap-3">
+			<div class="flex gap-2">
 				<button
-					class="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors"
-					on:click={() => resetUsage()}
+					class="px-3.5 py-1.5 bg-error-brick hover:bg-error-brick/90 text-white rounded-full transition-colors duration-200 ease-paper"
+					onclick={() => resetUsage()}
 				>
 					Reset All Usage
 				</button>
 				<button
-					class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors"
-					on:click={openCreateGroupModal}
+					class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white rounded-full transition-colors duration-200 ease-paper"
+					onclick={openCreateGroupModal}
 				>
 					Create Token Group
 				</button>
 			</div>
 		</div>
+		<hr class="border-gray-100 dark:border-gray-850 my-2" />
 	</div>
 
 	<!-- Flex Auto-Switch -->
-	<div
-		class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-100 dark:border-gray-700 mb-8"
-	>
+	<div class="mb-6">
 		<div class="flex justify-between items-start mb-2">
 			<div>
-				<h3 class="text-lg font-semibold text-gray-900 dark:text-white">Flex Auto-Switch</h3>
-				<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-					Automatically switch new chats to the <code>flex</code> service tier (~50%
-					cheaper, slightly slower) during off-peak hours, or when any token group
-					a chat's model belongs to is approaching its limit. Users see a toast
-					with an Undo button.
+				<div class="text-base font-medium">Flex Auto-Switch</div>
+				<p class="text-xs text-gray-500 mt-1">
+					Automatically switch new chats to the <code>flex</code> service tier (~50% cheaper,
+					slightly slower) during off-peak hours, or when any token group a chat's model belongs to
+					is approaching its limit. The composer's tier pill switches to <code>flex</code>; users
+					can change it back by hand at any time.
 				</p>
 			</div>
 			<div class="flex items-center gap-3 ml-4 shrink-0">
 				<span class="text-sm text-gray-700 dark:text-gray-300">Enabled</span>
-				<input
-					type="checkbox"
-					bind:checked={flexEnabled}
-					class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-					disabled={flexAutoFlipLoading}
-				/>
+				<Switch bind:state={flexEnabled} />
 			</div>
 		</div>
+		<hr class="border-gray-100 dark:border-gray-850 my-2" />
 
 		{#if flexAutoFlipLoading}
 			<div class="text-sm text-gray-500 dark:text-gray-400 py-2">Loading…</div>
@@ -372,7 +368,7 @@
 						max="23"
 						bind:value={flexStartHour}
 						disabled={!flexEnabled}
-						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none disabled:opacity-50"
+						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 outline-hidden rounded-lg disabled:opacity-50"
 					/>
 				</div>
 				<div>
@@ -389,7 +385,7 @@
 						max="23"
 						bind:value={flexEndHour}
 						disabled={!flexEnabled}
-						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none disabled:opacity-50"
+						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 outline-hidden rounded-lg disabled:opacity-50"
 					/>
 				</div>
 				<div class="md:col-span-2">
@@ -405,7 +401,7 @@
 						bind:value={flexTimezone}
 						disabled={!flexEnabled}
 						placeholder="America/Los_Angeles"
-						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none disabled:opacity-50"
+						class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 outline-hidden rounded-lg disabled:opacity-50"
 					/>
 					<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
 						Window wraps midnight when start &gt; end. Default <code>13 → 5</code>
@@ -428,23 +424,24 @@
 							step="1"
 							bind:value={flexThresholdPercent}
 							disabled={!flexEnabled}
-							class="w-full px-3 py-2 pr-10 bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none disabled:opacity-50"
+							class="w-full px-3 py-2 pr-10 bg-gray-50 dark:bg-gray-850 outline-hidden rounded-lg disabled:opacity-50"
 						/>
 						<span
 							class="absolute inset-y-0 right-3 flex items-center text-gray-500 dark:text-gray-400 text-sm pointer-events-none"
-						>%</span>
+							>%</span
+						>
 					</div>
 					<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-						When any token group covering the chat's model is at or above this
-						fraction of its limit, new chats default to <code>flex</code>.
+						When any token group covering the chat's model is at or above this fraction of its
+						limit, new chats default to <code>flex</code>.
 					</p>
 				</div>
 			</div>
 
 			<div class="flex justify-end mt-5">
 				<button
-					class="px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white rounded-lg transition-colors"
-					on:click={saveFlexAutoFlipConfig}
+					class="px-3.5 py-1.5 rounded-full bg-book-cloth hover:bg-kraft disabled:opacity-50 text-white transition-colors duration-200 ease-paper"
+					onclick={saveFlexAutoFlipConfig}
 					disabled={flexAutoFlipSaving}
 				>
 					{flexAutoFlipSaving ? 'Saving…' : 'Save Flex Auto-Switch'}
@@ -455,14 +452,14 @@
 
 	{#if loading}
 		<div class="flex justify-center items-center h-64">
-			<div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+			<div class="animate-spin rounded-full h-12 w-12 border-b-2 border-book-cloth"></div>
 		</div>
 	{:else if tokenGroups.length === 0}
 		<div class="text-center py-12">
 			<p class="text-gray-500 dark:text-gray-400 mb-4">No token groups configured</p>
 			<button
-				class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors"
-				on:click={openCreateGroupModal}
+				class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white rounded-full transition-colors duration-200 ease-paper"
+				onclick={openCreateGroupModal}
 			>
 				Create Your First Token Group
 			</button>
@@ -471,7 +468,7 @@
 		<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 transition-all">
 			{#each tokenGroups as group}
 				<div
-					class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-100 dark:border-gray-700 transition-all hover:shadow-lg"
+					class="rounded-xl p-6 border-hairline border-gray-100 dark:border-gray-800 transition-all"
 				>
 					<div class="flex justify-between items-start mb-4">
 						<div>
@@ -486,14 +483,14 @@
 						</div>
 						<div class="flex gap-2">
 							<button
-								class="text-blue-500 hover:text-blue-700 text-sm font-medium px-2 py-1 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded"
-								on:click={() => openEditGroupModal(group)}
+								class="text-book-cloth dark:text-kraft hover:text-kraft text-sm font-medium px-2 py-1 hover:bg-book-cloth/10 dark:hover:bg-book-cloth/15 rounded"
+								onclick={() => openEditGroupModal(group)}
 							>
 								Edit
 							</button>
 							<button
-								class="text-red-500 hover:text-red-700 text-sm font-medium px-2 py-1 hover:bg-red-50 dark:hover:bg-red-900/20 rounded"
-								on:click={() => deleteTokenGroup(group.name)}
+								class="text-error-brick dark:text-error-brick-dark hover:text-error-brick text-sm font-medium px-2 py-1 hover:bg-error-brick/10 dark:hover:bg-error-brick/15 rounded"
+								onclick={() => deleteTokenGroup(group.name)}
 							>
 								Delete
 							</button>
@@ -508,7 +505,7 @@
 								{formatNumber(group.usage.total || 0)} / {formatNumber(group.limit || 0)}
 							</span>
 						</div>
-						<div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700 overflow-hidden">
+						<div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-800 overflow-hidden">
 							<div
 								class="{getProgressColor(
 									getProgressPercentage(group.usage.total || 0, group.limit)
@@ -521,9 +518,9 @@
 					<!-- Token Breakdown -->
 					<div class="grid grid-cols-3 gap-3 mb-4 text-center">
 						<div
-							class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3 border border-gray-100 dark:border-gray-700"
+							class="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-3 border-hairline border-gray-200 dark:border-gray-800"
 						>
-							<div class="text-lg font-semibold text-emerald-600 dark:text-emerald-400">
+							<div class="text-lg font-semibold text-success dark:text-success-dark">
 								{formatNumber(group.usage.in || 0)}
 							</div>
 							<div
@@ -533,9 +530,9 @@
 							</div>
 						</div>
 						<div
-							class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3 border border-gray-100 dark:border-gray-700"
+							class="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-3 border-hairline border-gray-200 dark:border-gray-800"
 						>
-							<div class="text-lg font-semibold text-blue-600 dark:text-blue-400">
+							<div class="text-lg font-semibold text-book-cloth dark:text-kraft">
 								{formatNumber(group.usage.out || 0)}
 							</div>
 							<div
@@ -545,9 +542,9 @@
 							</div>
 						</div>
 						<div
-							class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3 border border-gray-100 dark:border-gray-700"
+							class="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-3 border-hairline border-gray-200 dark:border-gray-800"
 						>
-							<div class="text-lg font-semibold text-purple-600 dark:text-purple-400">
+							<div class="text-lg font-semibold text-gray-900 dark:text-white">
 								{formatNumber(group.usage.total || 0)}
 							</div>
 							<div
@@ -568,7 +565,7 @@
 						<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
 							{#each group.models || [] as model}
 								<span
-									class="px-2.5 py-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-md text-xs font-medium border border-gray-200 dark:border-gray-600"
+									class="px-2.5 py-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-md text-xs font-medium border-hairline border-gray-100 dark:border-gray-800"
 								>
 									{model}
 								</span>
@@ -578,8 +575,8 @@
 
 					<!-- Reset Button -->
 					<button
-						class="w-full px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-white rounded-lg text-sm font-medium transition-colors"
-						on:click={() => resetUsage(group.name)}
+						class="w-full px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white rounded-lg text-sm font-medium transition-colors duration-200 ease-paper"
+						onclick={() => resetUsage(group.name)}
 					>
 						Reset Usage for This Group
 					</button>
@@ -591,18 +588,20 @@
 
 <!-- Create/Edit Group Modal -->
 {#if showCreateGroupModal}
-	<div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 backdrop-blur-sm p-4">
+	<div
+		class="fixed inset-0 bg-[#191919]/30 dark:bg-[#0F0F0F]/60 flex items-center justify-center z-50 backdrop-blur-sm p-4"
+	>
 		<div
-			class="bg-white dark:bg-gray-900 rounded-xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto flex flex-col border border-gray-200 dark:border-gray-700 animate-in fade-in zoom-in duration-200"
+			class="bg-white dark:bg-gray-900 rounded-xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto flex flex-col border-hairline border-gray-200 dark:border-gray-800 animate-in fade-in zoom-in duration-200"
 		>
 			<div
-				class="px-6 py-5 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center"
+				class="px-6 py-5 border-b-hairline border-gray-200 dark:border-gray-800 flex justify-between items-center"
 			>
 				<h3 class="text-xl font-semibold text-gray-900 dark:text-white">
 					{editingGroup ? 'Edit' : 'Create'} Token Group
 				</h3>
 				<button
-					on:click={closeModal}
+					onclick={closeModal}
 					class="text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors"
 				>
 					<svg
@@ -629,7 +628,7 @@
 					<input
 						bind:value={groupForm.name}
 						type="text"
-						class="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all placeholder-gray-400 dark:placeholder-gray-500"
+						class="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-book-cloth/40 outline-none transition-all placeholder-gray-400 dark:placeholder-gray-500"
 						placeholder="e.g., GPT-4 Models"
 						disabled={!!editingGroup}
 					/>
@@ -661,7 +660,7 @@
 						<input
 							bind:value={groupForm.limit}
 							type="number"
-							class="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all pr-20 placeholder-gray-400 dark:placeholder-gray-500"
+							class="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-book-cloth/40 outline-none transition-all pr-20 placeholder-gray-400 dark:placeholder-gray-500"
 							placeholder="1000000"
 							min="1"
 						/>
@@ -674,7 +673,7 @@
 					</p>
 				</div>
 
-				<div class="border-t border-gray-100 dark:border-gray-700 pt-4">
+				<div class="border-t-hairline border-gray-200 dark:border-gray-800 pt-4">
 					<label class="block text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">
 						Reset Strategy
 					</label>
@@ -682,17 +681,17 @@
 					<div class="grid grid-cols-2 gap-2 bg-gray-100 dark:bg-gray-800 p-1.5 rounded-xl mb-4">
 						<button
 							class="py-2 text-sm font-medium rounded-lg transition-all {resetStrategy === 'daily'
-								? 'bg-white dark:bg-gray-700 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-gray-200 dark:ring-gray-600'
-								: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-200/50 dark:hover:bg-gray-700/50'}"
-							on:click={() => (resetStrategy = 'daily')}
+								? 'bg-white dark:bg-gray-850 text-book-cloth dark:text-kraft shadow-sm ring-1 ring-gray-200 dark:ring-gray-700'
+								: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-200/50 dark:hover:bg-gray-800/50'}"
+							onclick={() => (resetStrategy = 'daily')}
 						>
 							Daily Reset
 						</button>
 						<button
 							class="py-2 text-sm font-medium rounded-lg transition-all {resetStrategy === 'window'
-								? 'bg-white dark:bg-gray-700 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-gray-200 dark:ring-gray-600'
-								: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-200/50 dark:hover:bg-gray-700/50'}"
-							on:click={() => (resetStrategy = 'window')}
+								? 'bg-white dark:bg-gray-850 text-book-cloth dark:text-kraft shadow-sm ring-1 ring-gray-200 dark:ring-gray-700'
+								: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-200/50 dark:hover:bg-gray-800/50'}"
+							onclick={() => (resetStrategy = 'window')}
 						>
 							Rolling Window
 						</button>
@@ -708,7 +707,7 @@
 								<input
 									bind:value={groupForm.resetTime}
 									type="time"
-									class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none transition-all"
+									class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-book-cloth/40 outline-none transition-all"
 								/>
 							</div>
 							<div>
@@ -718,7 +717,7 @@
 								<div class="relative">
 									<select
 										bind:value={groupForm.resetTimezone}
-										class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none appearance-none transition-all"
+										class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-book-cloth/40 outline-none appearance-none transition-all"
 									>
 										{#each timezoneOptions as timezone}
 											<option value={timezone}>{timezone}</option>
@@ -772,7 +771,7 @@
 									bind:value={groupForm.windowDuration}
 									type="number"
 									min="1"
-									class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none transition-all pr-16"
+									class="w-full px-3 py-2 bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-book-cloth/40 outline-none transition-all pr-16"
 								/>
 								<div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none">
 									<span class="text-gray-500 dark:text-gray-400 text-sm font-medium">hours</span>
@@ -807,13 +806,15 @@
 							Select Models
 						</label>
 						<span
-							class="text-xs bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-300 px-2 py-0.5 rounded-full font-medium"
+							class="text-xs bg-book-cloth/15 text-book-cloth dark:text-kraft px-2 py-0.5 rounded-full font-medium"
 						>
 							{groupForm.models.length} selected
 						</span>
 					</div>
 
-					<div class="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+					<div
+						class="border-hairline border-gray-200 dark:border-gray-800 rounded-lg overflow-hidden"
+					>
 						<div
 							class="max-h-48 overflow-y-auto bg-gray-50 dark:bg-gray-800 p-1 space-y-0.5 custom-scrollbar"
 						>
@@ -842,13 +843,13 @@
 							{:else}
 								{#each availableModels as model}
 									<label
-										class="flex items-center p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer group transition-colors select-none"
+										class="flex items-center p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-850 cursor-pointer group transition-colors select-none"
 									>
 										<input
 											type="checkbox"
-											class="rounded border-gray-300 text-blue-600 shadow-sm focus:ring-blue-500 dark:bg-gray-600 dark:border-gray-500 dark:checked:bg-blue-500"
+											class="rounded border-gray-300 accent-book-cloth shadow-sm dark:bg-gray-600 dark:border-gray-500"
 											checked={groupForm.models.includes(model.id)}
-											on:change={() => toggleModel(model.id)}
+											onchange={() => toggleModel(model.id)}
 										/>
 										<div class="ml-3 flex flex-col">
 											<span
@@ -867,17 +868,17 @@
 			</div>
 
 			<div
-				class="px-6 py-5 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex justify-end gap-3 rounded-b-xl"
+				class="px-6 py-5 border-t-hairline border-gray-200 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex justify-end gap-3 rounded-b-xl"
 			>
 				<button
-					class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
-					on:click={closeModal}
+					class="px-3.5 py-1.5 text-sm font-medium bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white rounded-full transition-colors duration-200 ease-paper"
+					onclick={closeModal}
 				>
 					Cancel
 				</button>
 				<button
-					class="px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow-sm shadow-blue-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed hover:shadow-md"
-					on:click={saveTokenGroup}
+					class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white rounded-full transition-colors duration-200 ease-paper disabled:opacity-50 disabled:cursor-not-allowed"
+					onclick={saveTokenGroup}
 					disabled={!groupForm.name || groupForm.models.length === 0}
 				>
 					{editingGroup ? 'Save Changes' : 'Create Group'}

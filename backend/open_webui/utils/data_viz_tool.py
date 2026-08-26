@@ -33,7 +33,6 @@ the override so it renders the working version without re-running the repair.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import uuid
 from typing import Any, Awaitable, Callable, List, Optional
@@ -55,16 +54,36 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 RENDER_TIMEOUT_S = 30.0
 
 
+# 64-bit FNV-1a parameters. We hash override keys with FNV-1a (not sha256) so
+# the FRONTEND can compute the IDENTICAL key synchronously WITHOUT crypto.subtle
+# — which is `undefined` on insecure (plain-HTTP) origins (a LAN IP or Docker
+# deployment without TLS, only `localhost`/HTTPS are "secure contexts"). Under
+# the old sha256 + crypto.subtle scheme the frontend hash threw on HTTP and the
+# auto-repaired override silently never applied. FNV-1a is deterministic,
+# allocation-free, and trivially reproducible in JS (BigInt).
+_FNV64_OFFSET = 0xCBF29CE484222325
+_FNV64_PRIME = 0x100000001B3
+_FNV64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
 def _override_key(widget_code: str) -> str:
     """Stable key for matching reload-time renders against persisted overrides.
-    Hash of the ORIGINAL (pre-repair) widget_code so the frontend can look up
-    by hashing whatever's in arguments.widget_code on the persisted message."""
-    h = hashlib.sha256(widget_code.encode("utf-8", errors="replace"))
-    return h.hexdigest()[:16]
+
+    Hashes the NUL-stripped widget_code. The persistence layer strips NUL (0x00)
+    from the stored tool-call arguments, so the frontend hashes the post-strip
+    code; we must hash the same normalized form here (pre-persist) or the keys
+    diverge and the reload-time override lookup misses. Must stay byte-for-byte
+    identical to the frontend `computeOverrideKey` (FNV-1a 64-bit, 16 hex)."""
+    normalized = (widget_code or "").replace("\x00", "")
+    h = _FNV64_OFFSET
+    for b in normalized.encode("utf-8", errors="replace"):
+        h ^= b
+        h = (h * _FNV64_PRIME) & _FNV64_MASK
+    return format(h, "016x")
 
 
 class DataVizTools:
-    """Built-in tool: show_widget(title, widget_code, loading_messages?)."""
+    """Built-in tools: load_viz_guide(use_case) + show_widget(title, widget_code, loading_messages?)."""
 
     class Valves(BaseModel):
         """Configuration placeholder — settings are managed via the admin panel."""
@@ -73,6 +92,50 @@ class DataVizTools:
 
     def __init__(self):
         self.valves = self.Valves()
+
+    async def load_viz_guide(
+        self,
+        use_case: str,
+        __request__: Optional[Request] = None,
+    ) -> str:
+        """
+        Load detailed visualization guidance for ONE use case, on demand.
+
+        Call this BEFORE `show_widget` when you're about to build a
+        use-case-specific widget. It returns the detailed patterns for that use
+        case so the full guide for every use case doesn't have to sit in context.
+
+        Args:
+            use_case: one of the keys listed under "Use-case guides" in the
+                system prompt — typically "diagram", "chart", or "art".
+                Mockups, cards, dashboards, and forms use the core guidance you
+                already have and need no guide.
+
+        Returns:
+            The detailed guidance text for that use case (or a short note if the
+            use case is unknown or has no separate guide).
+        """
+        from open_webui.utils.data_viz_prompts import get_viz_guide
+
+        if __request__ is None:
+            return (
+                "load_viz_guide is unavailable here — proceed with the core "
+                "guidance you already have."
+            )
+        try:
+            cfg = __request__.app.state.config
+            guide = get_viz_guide(cfg, use_case)
+        except Exception:
+            log.exception("data_viz: load_viz_guide failed (use_case=%r)", use_case)
+            return (
+                "Couldn't load that guide — proceed with the core guidance you "
+                "already have."
+            )
+        log.info(
+            "DATA VIZ: load_viz_guide use_case=%r -> %d chars",
+            use_case, len(guide),
+        )
+        return guide
 
     async def show_widget(
         self,
@@ -175,7 +238,24 @@ class DataVizTools:
                     )
                 return f"Widget '{title}' rendered."
 
-            # status == "error" (or anything unrecognized — treat as error).
+            if status != "error":
+                # Not a genuine frontend render-error. This is what the
+                # NON-interactive event callers return when there is no live
+                # client to render+confirm: the headless queue-drain caller
+                # (`get_headless_event_call`) returns {"status": False,
+                # "headless": True}, and `get_event_call`'s broadcast-incapable
+                # path (session_id=None → sio.call(to=None) raises) returns
+                # {"status": False, "error": ...}. Treat both as "no
+                # confirmation" and FAIL SOFT — never enter the repair loop on
+                # them. Otherwise every show_widget during a headless drain would
+                # fire a full bogus repair loop (and surface a spurious error to
+                # the model). Persist any in-progress fix so a later frontend
+                # load renders the latest attempt.
+                if attempts > 0:
+                    await _emit_override(__event_emitter__, original_key, code)
+                return f"Widget '{title}' rendered (no client confirmation)."
+
+            # status == "error": a real render failure reported by the frontend.
             error_message = (resp.get("error_message") or "unknown error").strip()
             error_stack = resp.get("error_stack") or None
 

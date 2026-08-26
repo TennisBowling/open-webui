@@ -1,29 +1,49 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { toast } from '$lib/utils/toast';
+	import { onMount, getContext } from 'svelte';
 	import { getLanguages, changeLanguage } from '$lib/i18n';
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { config, fontFamily, models, settings, theme, user } from '$lib/stores';
 
 	const i18n = getContext('i18n');
 
+	import { subscribeToPush, unsubscribeFromPush } from '$lib/apis/push';
+
 	import AdvancedParams from './Advanced/AdvancedParams.svelte';
 	import Textarea from '$lib/components/common/Textarea.svelte';
-	export let saveSettings: Function;
-	export let getModels: Function;
+	interface Props {
+		saveSettings: Function;
+		getModels: Function;
+	}
+
+	let { saveSettings, getModels, ...eventProps }: Props & Record<string, unknown> = $props();
 
 	// General
 	let themes = ['dark', 'light', 'oled-dark'];
-	let selectedTheme = 'system';
-	let selectedFont = 'system';
+	let selectedTheme = $state('system');
+	let selectedFont = $state('system');
 
-	let languages: Awaited<ReturnType<typeof getLanguages>> = [];
-	let lang = $i18n.language;
-	let notificationEnabled = false;
-	let system = '';
+	let languages: Awaited<ReturnType<typeof getLanguages>> = $state([]);
+	let lang = $state($i18n.language);
+	let notificationEnabled = $state(false);
+	let pushNotificationEnabled = $state(false);
+	let system = $state('');
 
-	let showAdvanced = false;
+	// Web Push needs a service worker + a secure context, and on iOS only works
+	// once the app is installed to the home screen. Detect rather than fail: the
+	// toggle explains why it can't be used instead of erroring on tap.
+	let pushSupported = $derived(
+		typeof window !== 'undefined' &&
+			'serviceWorker' in navigator &&
+			'PushManager' in window &&
+			window.isSecureContext &&
+			!!$config?.features?.webpush_public_key
+	);
+
+	let showAdvanced = $state(false);
 
 	const toggleNotification = async () => {
 		const permission = await Notification.requestPermission();
@@ -40,7 +60,56 @@
 		}
 	};
 
-	let params = {
+	// The browser wants applicationServerKey as raw bytes; the server hands out
+	// the standard unpadded url-safe base64 form.
+	const urlBase64ToUint8Array = (base64String: string) => {
+		const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+		const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+		const raw = atob(base64);
+		return Uint8Array.from([...raw].map((char) => char.charCodeAt(0)));
+	};
+
+	const togglePushNotification = async () => {
+		const registration = await navigator.serviceWorker.ready;
+
+		if (pushNotificationEnabled) {
+			const subscription = await registration.pushManager.getSubscription();
+			if (subscription) {
+				await unsubscribeFromPush(localStorage.token, subscription.endpoint).catch(() => null);
+				await subscription.unsubscribe();
+			}
+			pushNotificationEnabled = false;
+			saveSettings({ pushNotificationEnabled: false });
+			return;
+		}
+
+		if ((await Notification.requestPermission()) !== 'granted') {
+			toast.error(
+				$i18n.t(
+					'Response notifications cannot be activated as the website permissions have been denied. Please visit your browser settings to grant the necessary access.'
+				)
+			);
+			return;
+		}
+
+		try {
+			const subscription =
+				(await registration.pushManager.getSubscription()) ??
+				(await registration.pushManager.subscribe({
+					userVisibleOnly: true,
+					applicationServerKey: urlBase64ToUint8Array($config.features.webpush_public_key)
+				}));
+			await subscribeToPush(localStorage.token, subscription.toJSON());
+		} catch (error) {
+			toast.error(`${error}`);
+			return;
+		}
+
+		pushNotificationEnabled = true;
+		saveSettings({ pushNotificationEnabled: true });
+	};
+
+	let params = $state({
 		// Advanced
 		stream_response: null,
 		stream_delta_chunk_size: null,
@@ -66,10 +135,10 @@
 		num_keep: null,
 		max_tokens: null,
 		num_gpu: null
-	};
+	});
 
 	const saveHandler = async () => {
-		saveSettings({
+		const saved = await saveSettings({
 			system: system !== '' ? system : undefined,
 			params: {
 				stream_response: params.stream_response !== null ? params.stream_response : undefined,
@@ -105,7 +174,9 @@
 				format: params.format !== null ? params.format : undefined
 			}
 		});
-		dispatch('save');
+		if (saved !== false) {
+			dispatch('save');
+		}
 	};
 
 	onMount(async () => {
@@ -115,6 +186,7 @@
 		languages = await getLanguages();
 
 		notificationEnabled = $settings.notificationEnabled ?? false;
+		pushNotificationEnabled = $settings.pushNotificationEnabled ?? false;
 		system = $settings.system ?? '';
 
 		params = { ...params, ...$settings.params };
@@ -210,7 +282,7 @@
 							: 'outline-hidden'}"
 						bind:value={selectedTheme}
 						placeholder={$i18n.t('Select a theme')}
-						on:change={() => themeChangeHandler(selectedTheme)}
+						onchange={() => themeChangeHandler(selectedTheme)}
 					>
 						<option value="system">⚙️ {$i18n.t('System')}</option>
 						<option value="dark">🌑 {$i18n.t('Dark')}</option>
@@ -232,7 +304,7 @@
 							: 'outline-hidden'}"
 						bind:value={selectedFont}
 						placeholder={$i18n.t('Select a font')}
-						on:change={() => fontChangeHandler(selectedFont)}
+						onchange={() => fontChangeHandler(selectedFont)}
 					>
 						<option value="system">{$i18n.t('System (SF Pro on macOS)')}</option>
 						<option value="inter">Inter</option>
@@ -250,7 +322,7 @@
 							: 'outline-hidden'}"
 						bind:value={lang}
 						placeholder={$i18n.t('Select a language')}
-						on:change={(e) => {
+						onchange={(e) => {
 							changeLanguage(lang);
 						}}
 					>
@@ -284,8 +356,8 @@
 					<div class=" self-center text-xs font-medium">{$i18n.t('Notifications')}</div>
 
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={() => {
+						class="py-2 px-3 text-xs flex rounded-sm transition"
+						onclick={() => {
 							toggleNotification();
 						}}
 						type="button"
@@ -298,6 +370,45 @@
 					</button>
 				</div>
 			</div>
+
+			{#if $config?.features?.enable_automations}
+				<div>
+					<div class=" py-0.5 flex w-full justify-between">
+						<div class=" self-center text-xs font-medium">
+							{$i18n.t('Push Notifications')}
+						</div>
+
+						{#if pushSupported}
+							<button
+								class="py-2 px-3 text-xs flex rounded-sm transition"
+								onclick={() => {
+									togglePushNotification();
+								}}
+								type="button"
+							>
+								{#if pushNotificationEnabled === true}
+									<span class="ml-2 self-center">{$i18n.t('On')}</span>
+								{:else}
+									<span class="ml-2 self-center">{$i18n.t('Off')}</span>
+								{/if}
+							</button>
+						{:else}
+							<span class="py-2 px-3 text-xs self-center text-gray-500">
+								{$i18n.t('Unavailable')}
+							</span>
+						{/if}
+					</div>
+					<div class=" text-xs text-gray-500 dark:text-gray-500">
+						{#if pushSupported}
+							{$i18n.t('Get notified when an automation finishes, even with the app closed.')}
+						{:else}
+							{$i18n.t(
+								'Push needs an HTTPS connection. On iPhone and iPad, add this app to your Home Screen first.'
+							)}
+						{/if}
+					</div>
+				</div>
+			{/if}
 		</div>
 
 		{#if $user?.role === 'admin' || (($user?.permissions.chat?.controls ?? true) && ($user?.permissions.chat?.system_prompt ?? true))}
@@ -309,7 +420,7 @@
 					bind:value={system}
 					className={'w-full text-sm outline-hidden resize-vertical' +
 						($settings.highContrastMode
-							? ' p-2.5 border-2 border-gray-300 dark:border-gray-700 rounded-lg bg-transparent text-gray-900 dark:text-gray-100 focus:ring-1 focus:ring-blue-500 focus:border-blue-500 overflow-y-hidden'
+							? ' p-2.5 border-2 border-gray-300 dark:border-gray-700 rounded-lg bg-transparent text-gray-900 dark:text-gray-100 focus:ring-1 focus:ring-book-cloth focus:border-book-cloth overflow-y-hidden'
 							: '  dark:text-gray-300 ')}
 					rows="4"
 					placeholder={$i18n.t('Enter system prompt here')}
@@ -326,7 +437,7 @@
 							? 'text-gray-800 dark:text-gray-100'
 							: 'text-gray-400 dark:text-gray-500'}"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							showAdvanced = !showAdvanced;
 						}}>{showAdvanced ? $i18n.t('Hide') : $i18n.t('Show')}</button
 					>
@@ -342,7 +453,7 @@
 	<div class="flex justify-end pt-3 text-sm font-medium">
 		<button
 			class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:text-white dark:hover:bg-kraft transition-colors duration-200 ease-paper rounded-full"
-			on:click={() => {
+			onclick={() => {
 				saveHandler();
 			}}
 		>

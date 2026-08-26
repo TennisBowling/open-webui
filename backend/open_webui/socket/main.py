@@ -46,6 +46,7 @@ from open_webui.env import (
     STREAM_REPLAY_BUFFER_TTL_SECONDS,
     STREAM_CLIENT_ACK_INTERVAL_MS,
     STREAM_CLIENT_LAG_MAX_VERSIONS,
+    STREAM_HIDDEN_CATCHUP_MS,
     STREAM_RUNTIME_METRICS,
     STREAM_TOOL_RESULT_BODY_MAX_BYTES,
     STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE,
@@ -59,8 +60,10 @@ from open_webui.tasks import (
     stop_item_tasks,
     set_pending_model_switch,
     set_pending_service_tier,
-    list_task_ids_by_item_id,
+    set_pending_tool_selection,
+    list_generation_task_ids_by_item,
 )
+from open_webui.utils.live_tool_selection import normalize_live_tool_selection
 from open_webui.utils.redis import get_redis_connection
 from open_webui.utils.access_control import has_access, get_users_with_access
 from open_webui.models.token_usage import token_groups
@@ -78,6 +81,31 @@ log.setLevel(SRC_LOG_LEVELS["SOCKET"])
 
 
 REDIS = None
+
+
+# Engine.IO keepalive tuning (metered/slow-link downlink efficiency). The default
+# ~25s ping interval means each idle socket exchanges a ping/pong every 25s — a
+# steady background trickle that also spins up the radio on cellular. Widening the
+# interval cuts that keepalive chatter; dead-connection detection is slower but
+# the reconnect backstops (stream:subscribe re-sync, /snapshot + /deltas replay,
+# resume-poll) recover a stranded stream regardless of how fast the socket layer
+# notices the drop. Configurable via env; defaults widen 25s -> 45s.
+def _sio_ping_kwargs() -> dict:
+    try:
+        ping_interval = int(os.environ.get("WEBSOCKET_PING_INTERVAL", "45") or "45")
+    except (TypeError, ValueError):
+        ping_interval = 45
+    try:
+        ping_timeout = int(os.environ.get("WEBSOCKET_PING_TIMEOUT", "25") or "25")
+    except (TypeError, ValueError):
+        ping_timeout = 25
+    return {
+        "ping_interval": max(1, ping_interval),
+        "ping_timeout": max(1, ping_timeout),
+    }
+
+
+_SIO_PING_KWARGS = _sio_ping_kwargs()
 
 if WEBSOCKET_MANAGER == "redis":
     if WEBSOCKET_SENTINEL_HOSTS:
@@ -97,6 +125,7 @@ if WEBSOCKET_MANAGER == "redis":
         client_manager=mgr,
         max_http_buffer_size=WEBSOCKET_MAX_MESSAGE_SIZE,
         json=orjson_serializer,
+        **_SIO_PING_KWARGS,
     )
 else:
     sio = socketio.AsyncServer(
@@ -107,6 +136,7 @@ else:
         always_connect=True,
         max_http_buffer_size=WEBSOCKET_MAX_MESSAGE_SIZE,
         json=orjson_serializer,
+        **_SIO_PING_KWARGS,
     )
 
 
@@ -219,12 +249,6 @@ YDOC_MANAGER = YdocManager(
     redis=REDIS,
     redis_key_prefix=f"{REDIS_KEY_PREFIX}:ydoc:documents",
 )
-
-
-async def periodic_usage_pool_cleanup():
-    """Deprecated no-op retained for backward-compat with callers that still
-    schedule it at startup. USAGE_POOL was removed; nothing to clean."""
-    return
 
 
 app = socketio.ASGIApp(
@@ -368,7 +392,9 @@ async def set_token_group(
 ):
     """Set a token group"""
     # Try to update first, if not found create new
-    if not await token_groups.update_token_group(group_name, models, limit, window_duration):
+    if not await token_groups.update_token_group(
+        group_name, models, limit, window_duration
+    ):
         return await token_groups.create_token_group(
             group_name, models, limit or 0, reset_time, reset_timezone, window_duration
         )
@@ -378,7 +404,9 @@ async def update_token_group(
     group_name: str, models: list = None, limit: int = None, window_duration: int = None
 ):
     """Update an existing token group"""
-    return await token_groups.update_token_group(group_name, models, limit, window_duration)
+    return await token_groups.update_token_group(
+        group_name, models, limit, window_duration
+    )
 
 
 async def delete_token_group(group_name: str):
@@ -395,25 +423,76 @@ async def get_token_usage():
     return {name: group_data["usage"] for name, group_data in groups.items()}
 
 
+async def _caller_owns_task(task_id, user_id, role=None) -> bool:
+    """True if `task_id`'s owning chat belongs to `user_id` (admins always True).
+
+    A task's item id is the bare chat id (a generation) or
+    `subagent-rerun:{chat}:{entry}` (a rerun). Used to authorize the socket
+    model-switch / service-tier-switch handlers, which otherwise trust a
+    client-supplied task_id and let any user steer another user's generation."""
+    if role == "admin":
+        return True
+    if not task_id or not user_id:
+        return False
+    try:
+        from open_webui.tasks import get_task_item_id
+
+        item_id = await get_task_item_id(REDIS, task_id)
+    except Exception:
+        item_id = None
+    if not item_id:
+        return False
+    chat_id = item_id
+    if isinstance(item_id, str) and item_id.startswith("subagent-rerun:"):
+        parts = item_id.split(":")
+        chat_id = parts[1] if len(parts) > 1 else None
+    if not chat_id:
+        return False
+    try:
+        from open_webui.models.chats import Chats
+
+        return await Chats.get_chat_by_id_and_user_id(chat_id, user_id) is not None
+    except Exception:
+        return False
+
+
 @sio.on("usage")
 async def usage(sid, data):
-    if sid in SESSION_POOL:
-        model_id = data["model"]
-        usage_data = data.get("usage", {})
+    if sid not in SESSION_POOL or not isinstance(data, dict):
+        return
+    user = SESSION_POOL.get(sid)
+    user_id = user.get("id") if isinstance(user, dict) else None
+    model_id = data.get("model")
+    chat_id = data.get("chat_id")
+    if not user_id or not model_id:
+        return
 
-        # Get user_id from session pool and chat_id from data
-        user = SESSION_POOL.get(sid)
-        user_id = user.get("id") if user else None
-        chat_id = data.get("chat_id")
+    # P3_1: this handler writes SHARED accounting (rate-limit token groups, per-chat
+    # conversation totals, embedded USD cost, daily/model aggregates) from
+    # client-supplied model/usage/cost/chat_id. The server already accounts usage
+    # from the trusted provider stream (routers/openai.py) and NO legitimate client
+    # emits 'usage', so harden it: require the caller to OWN chat_id (no corrupting a
+    # victim's totals / rebinding the row's user_id), and NEVER take cost from the
+    # client (the rate card is the only trusted source of USD).
+    if chat_id:
+        try:
+            from open_webui.models.chats import Chats
 
-        log.info(
-            f"📊 [socket:usage] Received from frontend: model={model_id}, chat_id={chat_id}, user_id={user_id}"
-        )
+            if await Chats.get_chat_by_id_and_user_id(chat_id, user_id) is None:
+                log.warning(
+                    "[socket:usage] dropping usage for non-owned chat %s (user %s)",
+                    chat_id,
+                    user_id,
+                )
+                return
+        except Exception:
+            return
 
-        # Process token usage tracking with chat_id and user_id for analytics
-        await process_token_usage(
-            model_id, usage_data, chat_id=chat_id, user_id=user_id
-        )
+    usage_data = data.get("usage", {})
+    if isinstance(usage_data, dict) and "cost" in usage_data:
+        usage_data = {k: v for k, v in usage_data.items() if k != "cost"}
+
+    await process_token_usage(model_id, usage_data, chat_id=chat_id, user_id=user_id)
 
 
 @sio.on("model-switch")
@@ -425,6 +504,10 @@ async def model_switch(sid, data):
     if sid not in SESSION_POOL:
         return {"status": False, "message": "Session not found"}
 
+    _u = SESSION_POOL.get(sid) or {}
+    _uid = _u.get("id") if isinstance(_u, dict) else None
+    _role = _u.get("role") if isinstance(_u, dict) else None
+
     chat_id = data.get("chat_id")
     new_model_id = data.get("model_id")
     task_id = data.get("task_id")
@@ -435,6 +518,12 @@ async def model_switch(sid, data):
     log.info(
         f"Model switch request: chat_id={chat_id}, task_id={task_id}, new_model={new_model_id}"
     )
+
+    # C3: only the OWNER (or an admin) may steer a task/chat. Without this, a
+    # client-supplied task_id lets any user force a victim's running generation
+    # (and its subagents) onto an arbitrary/expensive/inaccessible model.
+    if task_id and not await _caller_owns_task(task_id, _uid, _role):
+        return {"status": False, "message": "Not authorized for this task"}
 
     # If a specific task_id is provided, switch for that task
     if task_id:
@@ -461,7 +550,16 @@ async def model_switch(sid, data):
 
     # If no task_id provided, try to find active tasks for the chat
     if chat_id:
-        task_ids = await list_task_ids_by_item_id(REDIS, chat_id)
+        # C3: require chat ownership before steering all of its tasks.
+        if _role != "admin":
+            try:
+                from open_webui.models.chats import Chats
+
+                if await Chats.get_chat_by_id_and_user_id(chat_id, _uid) is None:
+                    return {"status": False, "message": "Not authorized for this chat"}
+            except Exception:
+                return {"status": False, "message": "Not authorized for this chat"}
+        task_ids = await list_generation_task_ids_by_item(REDIS, chat_id)
         if task_ids:
             results = []
             for tid in task_ids:
@@ -505,6 +603,10 @@ async def service_tier_switch(sid, data):
     if sid not in SESSION_POOL:
         return {"status": False, "message": "Session not found"}
 
+    _u = SESSION_POOL.get(sid) or {}
+    _uid = _u.get("id") if isinstance(_u, dict) else None
+    _role = _u.get("role") if isinstance(_u, dict) else None
+
     chat_id = data.get("chat_id")
     new_tier = data.get("service_tier")
     task_id = data.get("task_id")
@@ -515,6 +617,18 @@ async def service_tier_switch(sid, data):
     log.info(
         f"service_tier change request: chat_id={chat_id}, task_id={task_id}, new_tier={new_tier}"
     )
+
+    # C3: only the owner (or an admin) may steer a task/chat.
+    if task_id and not await _caller_owns_task(task_id, _uid, _role):
+        return {"status": False, "message": "Not authorized for this task"}
+    if not task_id and chat_id and _role != "admin":
+        try:
+            from open_webui.models.chats import Chats
+
+            if await Chats.get_chat_by_id_and_user_id(chat_id, _uid) is None:
+                return {"status": False, "message": "Not authorized for this chat"}
+        except Exception:
+            return {"status": False, "message": "Not authorized for this chat"}
 
     # If a specific task_id is provided, change tier for that task
     if task_id:
@@ -540,7 +654,7 @@ async def service_tier_switch(sid, data):
 
     # If no task_id provided, queue for all active tasks on this chat
     if chat_id:
-        task_ids = await list_task_ids_by_item_id(REDIS, chat_id)
+        task_ids = await list_generation_task_ids_by_item(REDIS, chat_id)
         if task_ids:
             for tid in task_ids:
                 await set_pending_service_tier(tid, new_tier)
@@ -569,6 +683,159 @@ async def service_tier_switch(sid, data):
             return {"status": False, "message": "No active tasks found for this chat"}
 
     return {"status": False, "message": "No chat_id or task_id provided"}
+
+
+@sio.on("tool-selection:update")
+async def tool_selection_update(sid, data):
+    """Queue a complete tool selection for an active agentic generation.
+
+    The operation is acknowledged only after its latest-value snapshot is
+    stored. The owning agentic loop atomically consumes it immediately before
+    the next provider round, where it rebuilds both callable tools and provider
+    schemas.
+    """
+
+    if sid not in SESSION_POOL:
+        return {"status": False, "message": "Session not found"}
+    if not isinstance(data, dict):
+        return {"status": False, "message": "Invalid operation payload"}
+
+    session_user = SESSION_POOL.get(sid) or {}
+    user_id = session_user.get("id") if isinstance(session_user, dict) else None
+    role = session_user.get("role") if isinstance(session_user, dict) else None
+    chat_id = data.get("chat_id")
+    task_id = data.get("task_id")
+
+    if not task_id:
+        return {"status": False, "message": "No task_id provided"}
+    if not await _caller_owns_task(task_id, user_id, role):
+        return {"status": False, "message": "Not authorized for this task"}
+
+    try:
+        # Bound nested direct-server specs before retaining them in Redis.
+        if len(json.dumps(data.get("selection", {}), separators=(",", ":"))) > 1_000_000:
+            return {"status": False, "message": "Tool selection payload is too large"}
+        selection = normalize_live_tool_selection(data.get("selection"))
+    except (TypeError, ValueError) as exc:
+        return {"status": False, "message": str(exc)}
+
+    result = await set_pending_tool_selection(REDIS, str(task_id), selection)
+    if result.get("status"):
+        log.info(
+            "Tool selection update acknowledged: chat_id=%s task_id=%s operation_id=%s",
+            chat_id,
+            task_id,
+            selection.get("operation_id"),
+        )
+    return result
+
+
+def usage_has_data(usage_data: dict | None) -> bool:
+    """Return True only if a provider `usage` payload carries real information.
+
+    Some providers (notably the bare-id "C" gemini provider) emit a fully
+    zero-filled `usage` object on MANY intermediate streaming chunks, not just
+    the final one — e.g. ``{"prompt_tokens": 0, "completion_tokens": 0,
+    "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}, ...}``.
+    These payloads are syntactically non-empty (so a bare ``if usage:`` is
+    truthy) but contain no countable tokens and no cost. Recording them:
+      * pollutes ``token_usage_event`` with ~37% all-zero junk rows,
+      * clobbers ``conversation_token_usage.last_input_tokens`` to 0 — which is
+        exactly what the in-chat pill shows as "Latest Input", so the input
+        counter reads 0 after an agentic/tool-call turn,
+      * overwrites the per-message ``meta.usage`` and emits a zero live delta.
+
+    A payload counts as meaningful if it reports any prompt/completion/total
+    tokens, any cached input tokens, or any cost. Everything else is dropped.
+    """
+    if not usage_data:
+        return False
+    if (
+        usage_data.get("prompt_tokens")
+        or usage_data.get("completion_tokens")
+        or usage_data.get("total_tokens")
+    ):
+        return True
+    details = usage_data.get("prompt_tokens_details") or {}
+    if details.get("cached_tokens"):
+        return True
+    # A pure reasoning (or image) step can report 0 visible completion tokens
+    # while still doing real work — keep it so the reasoning count isn't lost.
+    # The zero-filled "C" gemini junk has reasoning_tokens=0, so it stays rejected.
+    completion_details = usage_data.get("completion_tokens_details") or {}
+    if completion_details.get("reasoning_tokens") or completion_details.get(
+        "image_tokens"
+    ):
+        return True
+    # The broken bare-id "C" gateway reports reasoning at the TOP LEVEL instead of
+    # nested under completion_tokens_details — a pure-reasoning chunk is still real.
+    if usage_data.get("reasoning_tokens"):
+        return True
+    # OpenRouter-routed payloads can bill a non-zero cost; preserve those even
+    # if (rarely) the token counts are absent, so cost accounting is intact.
+    cost = usage_data.get("cost")
+    if cost:
+        return True
+    cost_details = usage_data.get("cost_details") or {}
+    if cost_details.get("upstream_inference_cost"):
+        return True
+    return False
+
+
+def normalize_provider_usage(usage_data: dict | None) -> dict | None:
+    """Reshape a broken "C" gateway usage payload into the canonical OpenAI shape.
+
+    The bare-id "C" gateway intermittently reports reasoning tokens at the TOP
+    LEVEL (``usage["reasoning_tokens"]``) and EXCLUDES them from
+    ``completion_tokens`` — so ``total == prompt + completion + reasoning`` while
+    ``prompt + completion != total``. Every canonical provider instead folds
+    reasoning INTO ``completion_tokens`` and reports the breakdown under
+    ``completion_tokens_details.reasoning_tokens``. Left unnormalized, our OUTPUT
+    counts are short by the reasoning amount on these calls — every surface that
+    reads ``completion_tokens`` (process_token_usage, rebuild_token_analytics, the
+    in-chat pill, embedded cost) undercounts.
+
+    Returns a corrected COPY shaped exactly like a canonical payload: reasoning is
+    folded into ``completion_tokens`` and mirrored into the nested
+    ``completion_tokens_details.reasoning_tokens`` slot where readers expect it; the
+    misplaced top-level key is dropped. The input dict is left untouched.
+
+    Guarded so it NEVER touches a correct payload:
+      * only fires when a positive TOP-LEVEL ``reasoning_tokens`` is present,
+      * skips when reasoning is already nested (canonical) — avoids double counting,
+      * requires the arithmetic to PROVE reasoning is excluded
+        (``total == prompt + completion + reasoning`` AND ``total != prompt + completion``).
+    Idempotent: after folding, ``total == prompt + completion`` and the top-level key
+    is gone, so a second pass is a no-op. This is exactly why gpt-5.5 "C" (canonical:
+    reasoning already inside completion, no top-level key) is never modified.
+    """
+    if not isinstance(usage_data, dict):
+        return usage_data
+    top_reasoning = int(usage_data.get("reasoning_tokens") or 0)
+    if top_reasoning <= 0:
+        return usage_data
+    completion_details = usage_data.get("completion_tokens_details") or {}
+    if int(completion_details.get("reasoning_tokens") or 0) > 0:
+        # Reasoning already in the canonical slot — completion is assumed to
+        # include it; folding the top-level value too would double count.
+        return usage_data
+    prompt = int(usage_data.get("prompt_tokens") or 0)
+    completion = int(usage_data.get("completion_tokens") or 0)
+    total = int(usage_data.get("total_tokens") or 0)
+    # Only fold when the provider total proves reasoning sits OUTSIDE completion.
+    if not (
+        total
+        and total == prompt + completion + top_reasoning
+        and total != prompt + completion
+    ):
+        return usage_data
+    fixed = dict(usage_data)
+    fixed["completion_tokens"] = completion + top_reasoning
+    details = dict(completion_details)
+    details["reasoning_tokens"] = top_reasoning
+    fixed["completion_tokens_details"] = details
+    fixed.pop("reasoning_tokens", None)
+    return fixed
 
 
 async def process_token_usage(
@@ -609,6 +876,23 @@ async def process_token_usage(
         log.info(f"📊 [process_token_usage] No usage_data, returning early")
         return
 
+    # Drop fully-empty usage payloads (no tokens, no cost) BEFORE touching any
+    # tracking surface. Providers emit these zero-filled `usage` objects on
+    # intermediate streaming chunks; recording them clobbers the per-chat
+    # "last input" counter to 0 and floods the event table with junk rows.
+    # See usage_has_data() for the full rationale.
+    if not usage_has_data(usage_data):
+        log.debug(
+            f"📊 [process_token_usage] Skipping empty usage payload for model={model_id}"
+        )
+        return
+
+    # Reshape the broken bare-id "C" gateway payload — which reports reasoning at
+    # the top level and EXCLUDES it from completion_tokens — into canonical shape,
+    # so OUT (completion_tokens) includes reasoning on every analytics surface and
+    # the stored raw_usage is internally consistent. No-op for canonical payloads.
+    usage_data = normalize_provider_usage(usage_data)
+
     # Extract token counts with safe defaults
     prompt_tokens = usage_data.get("prompt_tokens", 0)
     completion_tokens = usage_data.get("completion_tokens", 0)
@@ -630,6 +914,7 @@ async def process_token_usage(
     # rate-card rows, which are priced at read time). Computed once here so the
     # analytics read path never has to parse raw_usage JSON.
     from open_webui.utils.pricing import embedded_cost as _embedded_cost
+
     row_embedded_cost = _embedded_cost(usage_data)
 
     log.info(
@@ -682,8 +967,22 @@ async def process_token_usage(
                 token_out=token_out,
                 token_total=token_total,
                 cache_read_tokens=cache_read_tokens,
+                # Subagent calls roll their tokens into the parent chat's totals
+                # but must not advance the parent pill's "Latest Input" snapshot —
+                # that should reflect the visible chat's own last turn.
+                is_own_turn=(event_source_type == "chat"),
             )
             log.info(f"📊 [process_token_usage] Conversation update result: {result}")
+
+            # Push the refreshed authoritative totals to the sessions viewing this
+            # chat so the in-chat token pill stays live without an HTTP poll. This
+            # is the ONLY live path that reflects subagent token roll-up on the
+            # parent pill (subagent usage events never reach the parent's own
+            # op=usage delta), and it carries the exact cumulative numbers a reload
+            # would read — so it also corrects the optimistic per-round delta path,
+            # which undercounts multi-round agentic turns.
+            if result is not None:
+                await push_chat_token_stats(user_id, chat_id, result)
         else:
             log.info(
                 f"📊 [process_token_usage] Skipping conversation update - chat_id={chat_id}, user_id={user_id}"
@@ -724,36 +1023,248 @@ async def process_token_usage(
             f"📊 [process_token_usage] ERROR updating analytics: {e}", exc_info=True
         )
 
-    # Push refreshed token-usage groups to every active session of this user
-    # so the frontend doesn't have to poll. Wire Contract #6.
-    if user_id:
-        try:
-            groups = await token_groups.get_token_groups()
-            await push_token_usage_update(user_id, groups)
-        except Exception as e:
-            log.error(
-                f"📊 [process_token_usage] ERROR pushing token-usage:update: {e}",
-                exc_info=True,
-            )
+    # Push refreshed token-usage groups so the frontend doesn't have to poll
+    # (Wire Contract #6). Trailing-coalesced: a burst of per-round usage events
+    # collapses to at most one push per TOKEN_USAGE_PUSH_MIN_INTERVAL, and the
+    # delayed push reads the totals AFTER the burst, so the bar always converges
+    # on the final numbers. Scheduled even without a user_id — the counters are
+    # instance-global, so any usage event moves every viewer's bar.
+    schedule_token_usage_push()
+
+    # Subscription-provider bars move on the provider's clock, not ours — a
+    # completed generation is the moment their reported usage actually
+    # advances, so kick a debounced refresh of the usage endpoints now instead
+    # of waiting out the poller interval. The delay gives the provider a beat
+    # to register the request; no-op when no connection is flagged.
+    try:
+        from open_webui.utils.subscription_usage import maybe_schedule_refresh
+
+        maybe_schedule_refresh(delay=2.0)
+    except Exception:
+        log.exception("subscription usage refresh scheduling failed")
 
 
-async def push_token_usage_update(user_id: str, groups: dict):
-    # Emit to the primary session only; other tabs of the same user pick it up
-    # via BroadcastChannel (F9). If no primary is currently elected (e.g. the
-    # previous primary just disconnected and nobody is online), skip silently —
-    # the next mount will fetch initial state.
-    primary_sid = get_primary_session(user_id)
-    if not primary_sid:
+# Live token-usage bar wire (Wire Contract #6). Token groups are INSTANCE-global
+# (the token_usage table has no user column) and GET /api/usage/groups is
+# get_verified_user, so the push goes to every authenticated session — the old
+# primary-session-only emit meant a phone chatting while another device held
+# primary NEVER saw the bar move (the BroadcastChannel fan-out that was supposed
+# to cover non-primary receivers cannot cross devices). Data-frugal for slow
+# cellular: trailing-coalesced (≤1 push per interval, converging on post-burst
+# totals), carries ONLY groups whose payload changed since the last push, plus
+# the full name list so client-side merges can drop deleted groups, and skips
+# the emit entirely when nothing changed (including the no-groups-configured
+# case).
+TOKEN_USAGE_PUSH_MIN_INTERVAL = 2.0
+_token_usage_push_last_at = 0.0
+_token_usage_push_task: Optional[asyncio.Task] = None
+_token_usage_push_last_sent: dict = {}
+
+
+def schedule_token_usage_push():
+    global _token_usage_push_task
+    if _token_usage_push_task is not None and not _token_usage_push_task.done():
+        # A push is already pending; it reads totals after the burst settles,
+        # so this event's contribution is covered.
         return
-    await sio.emit(
-        "events",
-        {
-            "chat_id": None,
-            "message_id": None,
-            "data": {"type": "token-usage:update", "data": {"groups": groups}},
+    try:
+        _token_usage_push_task = asyncio.get_running_loop().create_task(
+            _token_usage_push_soon()
+        )
+    except RuntimeError:
+        # No running loop (sync test context) — the next mount-time GET covers it.
+        pass
+
+
+async def _token_usage_push_soon():
+    global _token_usage_push_last_at
+    try:
+        wait = TOKEN_USAGE_PUSH_MIN_INTERVAL - (
+            time.monotonic() - _token_usage_push_last_at
+        )
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _token_usage_push_last_at = time.monotonic()
+        groups = await token_groups.get_token_groups()
+        changed = {
+            name: group
+            for name, group in groups.items()
+            if _token_usage_push_last_sent.get(name) != group
+        }
+        removed = [name for name in _token_usage_push_last_sent if name not in groups]
+        if not changed and not removed:
+            return
+        _token_usage_push_last_sent.clear()
+        _token_usage_push_last_sent.update(groups)
+        await push_token_usage_update(changed, list(groups.keys()))
+    except Exception:
+        log.exception("📊 [process_token_usage] token-usage:update push failed")
+
+
+async def push_token_usage_update(groups: dict, names: Optional[list] = None):
+    session_ids = list(SESSION_POOL.keys())
+    if not session_ids:
+        return
+    payload = {
+        "chat_id": None,
+        "message_id": None,
+        "data": {
+            "type": "token-usage:update",
+            # Unique id so a tab that receives both the direct emit and a
+            # sibling tab's BroadcastChannel rebroadcast dedups the copy.
+            "event_id": f"token-usage:{int(time.time() * 1000)}",
+            "data": {
+                "groups": groups,
+                # Full catalog of current group names: lets the client merge
+                # `groups` partially AND drop groups deleted server-side.
+                "names": names if names is not None else list(groups.keys()),
+            },
         },
-        to=primary_sid,
+    }
+    await asyncio.gather(
+        *[sio.emit("events", payload, to=sid) for sid in session_ids],
+        return_exceptions=True,
     )
+
+
+# Subscription-provider usage push. Same instance-global, every-session
+# delivery as push_token_usage_update (the flagged connections are admin-level
+# config, so every viewer's bar reads the same snapshot). Callers only invoke
+# this on actual change (refresh_subscription_usage diffs first), and the
+# snapshot is a handful of windows per connection, so the wire carries the
+# whole authoritative map — full replace, no merge protocol.
+async def push_subscription_usage_update(subscriptions: dict):
+    session_ids = list(SESSION_POOL.keys())
+    if not session_ids:
+        return
+    payload = {
+        "chat_id": None,
+        "message_id": None,
+        "data": {
+            "type": "subscription-usage:update",
+            "event_id": f"subscription-usage:{int(time.time() * 1000)}",
+            "data": {"subscriptions": subscriptions},
+        },
+    }
+    await asyncio.gather(
+        *[sio.emit("events", payload, to=sid) for sid in session_ids],
+        return_exceptions=True,
+    )
+
+
+# Per-chat throttle for the live token-usage pill push (chat:token-usage). The
+# push carries CUMULATIVE authoritative totals, so dropping an intermediate
+# update is always safe: the next push — or the post-run reconcile fetch the
+# frontend fires on `done` — carries the latest totals. This bounds the added
+# socket volume under heavy multi-round / high-subagent-fanout runs (important
+# for a phone on a limited data plan) while keeping the pill effectively live.
+CHAT_TOKEN_PUSH_MIN_INTERVAL = 0.5
+_chat_token_push_last: dict[str, float] = {}
+
+
+def _should_push_chat_token_stats(chat_id: str) -> bool:
+    if not chat_id:
+        return False
+    now = time.monotonic()
+    last = _chat_token_push_last.get(chat_id)
+    if last is not None and (now - last) < CHAT_TOKEN_PUSH_MIN_INTERVAL:
+        return False
+    _chat_token_push_last[chat_id] = now
+    # Opportunistic prune so a long-lived worker doesn't keep one entry per chat
+    # forever. Cheap: runs only when the map grows past a generous cap.
+    if len(_chat_token_push_last) > 1024:
+        cutoff = now - 300.0
+        for cid in [c for c, t in _chat_token_push_last.items() if t < cutoff]:
+            _chat_token_push_last.pop(cid, None)
+    return True
+
+
+async def _compute_chat_cost(chat_id: str) -> float:
+    """Authoritative per-chat USD cost — the SAME value a reload / HTTP reconcile
+    computes (``Analytics.get_chat_cost`` folds embedded + rate-card spend and
+    subagent roll-up via ``attributed_chat_id``).
+
+    Runs the sync aggregation off the event loop through ``_AsyncAnalyticsProxy``
+    (``attributed_chat_id`` is indexed, so it is a cheap grouped read). Factored
+    out as a module-level coroutine so the live-push path — and its tests — can
+    stub it. NEVER raises: a pricing/DB hiccup must degrade to $0 (segment hidden)
+    without breaking the token push it rides alongside.
+    """
+    if not chat_id or str(chat_id).startswith("local:"):
+        return 0.0
+    try:
+        from open_webui.models.analytics import Analytics
+
+        cost = await Analytics.get_chat_cost(chat_id)
+        return float(cost or 0.0)
+    except Exception as e:
+        log.debug(f"📊 [_compute_chat_cost] failed for chat {chat_id}: {e}")
+        return 0.0
+
+
+async def push_chat_token_stats(user_id: str, chat_id: str, stats) -> None:
+    """Push authoritative per-chat token totals + cost to the sessions viewing ``chat_id``.
+
+    ``stats`` is the ConversationTokenUsageResponse returned by
+    ``update_conversation_token_usage`` — the SAME cumulative numbers a chat
+    reload reads from the DB. Emitting it as a tiny stream-scoped ``chat:token-usage``
+    event keeps the in-chat token pill live without an HTTP poll, and because the
+    totals are attributed to the visible/parent ``chat_id`` it also surfaces
+    subagent token roll-up live (the subagent's own usage events never reach the
+    parent pill — see process_token_usage attribution).
+
+    Cost rides the SAME push: it is recomputed at read time (rate card) via
+    ``_compute_chat_cost`` after the throttle gate passes, so the $ segment updates
+    live and appears on a brand-new chat's first turn — instead of only after a
+    full reload. Previously cost was omitted here and reached the pill solely via
+    the debounced HTTP reconcile, which the frontend ``staleResponse`` guard could
+    drop whenever live token totals were transiently ahead of the DB read, pinning
+    the $ segment at its stale/zero value until the user reloaded.
+    """
+    if not (user_id and chat_id and stats is not None):
+        return
+    if str(chat_id).startswith("local:"):
+        return
+    if not _should_push_chat_token_stats(chat_id):
+        return
+    try:
+        # Only priced AFTER the throttle gate passes, so throttled-out pushes add
+        # no query load. Same authoritative number a reload computes.
+        cost = await _compute_chat_cost(chat_id)
+        payload = {
+            "chat_id": chat_id,
+            "message_id": None,
+            "data": {
+                "type": "chat:token-usage",
+                "data": {
+                    "chat_id": getattr(stats, "chat_id", chat_id),
+                    "total_input_tokens": int(
+                        getattr(stats, "total_input_tokens", 0) or 0
+                    ),
+                    "total_output_tokens": int(
+                        getattr(stats, "total_output_tokens", 0) or 0
+                    ),
+                    "total_tokens": int(getattr(stats, "total_tokens", 0) or 0),
+                    "total_cache_read_tokens": int(
+                        getattr(stats, "total_cache_read_tokens", 0) or 0
+                    ),
+                    "last_input_tokens": int(
+                        getattr(stats, "last_input_tokens", 0) or 0
+                    ),
+                    "last_output_tokens": int(
+                        getattr(stats, "last_output_tokens", 0) or 0
+                    ),
+                    "last_cache_read_tokens": int(
+                        getattr(stats, "last_cache_read_tokens", 0) or 0
+                    ),
+                    "message_count": int(getattr(stats, "message_count", 0) or 0),
+                    "cost": float(cost or 0.0),
+                },
+            },
+        }
+        await emit_to_primary(user_id, payload)
+    except Exception as e:
+        log.debug(f"📊 [push_chat_token_stats] emit failed for chat {chat_id}: {e}")
 
 
 @sio.event
@@ -1247,8 +1758,37 @@ async def disconnect(sid):
         # print(f"Unknown session ID {sid} disconnected")
 
 
+_GENERATION_SCOPED_EVENT_TYPES = {
+    "chat:completion",
+    "chat:done",
+    "chat:message:error",
+    "chat:tasks:cancel",
+}
+
+
+def _stamp_generation_identity(event_data, request_info):
+    """Attach request ownership to events that can settle a message lifecycle."""
+    if not isinstance(event_data, dict):
+        return event_data
+    if event_data.get("type") not in _GENERATION_SCOPED_EVENT_TYPES:
+        return event_data
+    generation_id = request_info.get("generation_id")
+    turn_id = request_info.get("turn_id")
+    if not generation_id and not turn_id:
+        return event_data
+    stamped = dict(event_data)
+    inner = dict(stamped.get("data")) if isinstance(stamped.get("data"), dict) else {}
+    if generation_id:
+        inner.setdefault("generation_id", generation_id)
+    if turn_id:
+        inner.setdefault("turn_id", turn_id)
+    stamped["data"] = inner
+    return stamped
+
+
 def get_event_emitter(request_info, update_db=True):
     async def __event_emitter__(event_data):
+        event_data = _stamp_generation_identity(event_data, request_info)
         user_id = request_info["user_id"]
 
         session_ids = list(
@@ -1316,7 +1856,8 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "content": content,
-                        }, return_model=False
+                        },
+                        return_model=False,
                     )
 
             if "type" in event_data and event_data["type"] == "replace":
@@ -1327,7 +1868,8 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                     {
                         "content": content,
-                    }, return_model=False
+                    },
+                    return_model=False,
                 )
 
             if "type" in event_data and event_data["type"] == "embeds":
@@ -1346,7 +1888,8 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                     {
                         "embeds": embeds,
-                    }, return_model=False
+                    },
+                    return_model=False,
                 )
 
             if "type" in event_data and event_data["type"] == "data_viz:override":
@@ -1370,10 +1913,20 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "dataVizOverrides": overrides,
-                        }, return_model=False
+                        },
+                        return_model=False,
                     )
 
             if "type" in event_data and event_data["type"] == "files":
+                # Container output imports already persist the descriptor into
+                # message.files themselves, then emit this {type:"files"} event; a
+                # blind extend re-appended the SAME descriptor (id + content), so
+                # the reloaded message carried every generated file twice. Merge
+                # with id + content-identity dedup instead (also correct for the
+                # multi-emit tool_result_files case: new files accumulate, repeats
+                # collapse).
+                from open_webui.utils.container_workspace import _merge_files
+
                 message = await Chats.get_message_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
@@ -1381,15 +1934,16 @@ def get_event_emitter(request_info, update_db=True):
 
                 if message is None:
                     message = {}
-                files = event_data.get("data", {}).get("files", [])
-                files.extend(message.get("files", []))
+                incoming = event_data.get("data", {}).get("files", []) or []
+                files = _merge_files(message.get("files", []), incoming)
 
                 await Chats.upsert_message_to_chat_by_id_and_message_id(
                     request_info["chat_id"],
                     request_info["message_id"],
                     {
                         "files": files,
-                    }, return_model=False
+                    },
+                    return_model=False,
                 )
 
             if event_data.get("type") in ["source", "citation"]:
@@ -1410,7 +1964,8 @@ def get_event_emitter(request_info, update_db=True):
                         request_info["message_id"],
                         {
                             "sources": sources,
-                        }, return_model=False
+                        },
+                        return_model=False,
                     )
 
     return __event_emitter__
@@ -1490,6 +2045,36 @@ async def broadcast_queue_event(user_id, chat_id, event_data, skip_sid=None):
     )
 
 
+async def broadcast_video_job_event(user_id, job: dict):
+    """Fan out video-ingest progress to every active session of ``user_id``.
+
+    Video jobs are not owned by a chat (one can be started before the chat
+    exists) so this deliberately fans out per-user rather than per-chat, and
+    carries the whole job document rather than a delta — a tab that just woke
+    up applies the same payload as one that watched the whole run. The DB row
+    is authoritative; missing one of these events only costs freshness, since
+    clients re-read active jobs on mount."""
+    session_ids = _unique_session_ids(
+        [sid for sid in USER_POOL.get(user_id, []) if sid and sid in SESSION_POOL]
+    )
+    if not session_ids:
+        return
+    await asyncio.gather(
+        *[
+            sio.emit(
+                "events",
+                {
+                    "chat_id": job.get("chat_id"),
+                    "message_id": None,
+                    "data": {"type": "video:job", "data": job},
+                },
+                to=sid,
+            )
+            for sid in session_ids
+        ]
+    )
+
+
 def is_primary_session(user_id, sid) -> bool:
     """B8 helper. Defensive fallback: if no primary is recorded for the user,
     treat every session as primary (so v2.1 emission still reaches the client
@@ -1550,11 +2135,29 @@ STREAM_ACTIVE_BY_CHAT: Dict[str, Set[str]] = {}
 STREAM_SUBSCRIPTION_STATE: Dict[str, Dict[str, dict]] = {}
 STREAM_CLIENT_ACKS: Dict[str, Dict[str, int]] = {}
 STREAM_SYNC_REQUIRED_SENT: Set[tuple[str, str]] = set()
+# Multi-client sync (G1): debounced periodic "catch up" nudges for stream-room
+# subscribers whose tab is document-hidden. Keyed by (sid, message_id) -> pending
+# asyncio.Task. While a hidden subscriber keeps getting its live token deltas
+# suppressed by the visibility gate, at most one coalesced chat:stream:sync_required
+# per STREAM_HIDDEN_CATCHUP_MS is emitted to it (the task clears its own key on
+# fire, so the next suppressed delta re-arms it). Cancelled on stream teardown /
+# disconnect so a finished stream stops nudging.
+_HIDDEN_CATCHUP_TASKS: Dict[tuple[str, str], asyncio.Task] = {}
 STREAM_REPLAY_BUFFERS: Dict[str, deque] = {}
 STREAM_REPLAY_BUFFER_BYTES: Dict[str, int] = {}
 STREAM_FIRST_DELTA_SENT: Set[str] = set()
 STREAM_VERSION_LOCAL: Dict[str, int] = {}
 STREAM_VERSION_LAST_STORED: Dict[str, int] = {}
+# Stream RUN id (epoch): a per-(message_id, generation-run) identity. A retry /
+# "Continue Response" reuses the SAME message_id but resets the version space to
+# 0 and wipes the replay buffer — without a run id on the wire, a client still
+# holding the old run's high version silently drops every delta of the new run
+# as "stale" (frozen/empty response), or worse, splices new-run deltas onto
+# old-run blocks. The run id makes version-space resets explicit: clients reset
+# their mirror when the run advances and ignore events from older runs. Minted
+# monotonically (never goes backwards even under clock adjustment) at
+# stream_version_init.
+STREAM_RUN_LOCAL: Dict[str, int] = {}
 STREAM_METRICS: Dict[str, int] = {}
 # Full large tool bodies are kept out of the socket hot path. Keyed by
 # message_id -> tool_call_id -> original result dict. In single-worker mode this
@@ -1580,6 +2183,21 @@ STREAM_SCOPED_TYPES = frozenset(
         "chat:done",
         "chat:message:error",
         "chat:tasks:cancel",
+        # Cross-device prompt sync: co-deliver a newly-submitted user message to
+        # other devices in this chat's stream room (see emit_chat_user_message).
+        # Stream-scoped so it reaches exactly the same-user sessions viewing this
+        # chat that already receive the assistant token stream — never the
+        # USER_POOL fanout. Not batchable/replayable (absent from
+        # _BATCHABLE_TYPES), so it bypasses the delta batch/ack machinery, and
+        # not a live-delta payload, so it is NOT suppressed to hidden tabs.
+        "chat:user-message",
+        # Live per-chat token-usage pill: authoritative cumulative totals pushed
+        # after each conversation_token_usage write (see push_chat_token_stats).
+        # Stream-scoped so it lands only on the same-user sessions viewing this
+        # chat. Carries the SAME numbers a chat reload reads from the DB, so it
+        # keeps the in-chat token pill live (including subagent roll-up) without
+        # any HTTP poll. Not batchable/replayable — it is a tiny standalone push.
+        "chat:token-usage",
     }
 )
 
@@ -1643,6 +2261,7 @@ def _index_stream(message_id: str, state: dict) -> None:
 def _delete_stream_state_now(message_id: str) -> None:
     clear_tool_result_bodies(message_id)
     _cancel_stream_cleanup(message_id)
+    _cancel_hidden_catchup_for_message(message_id)
     chat_id = STREAM_MESSAGE_TO_CHAT.pop(message_id, None)
     if chat_id:
         bucket = STREAM_ACTIVE_BY_CHAT.get(chat_id)
@@ -1655,6 +2274,7 @@ def _delete_stream_state_now(message_id: str) -> None:
     STREAM_FIRST_DELTA_SENT.discard(message_id)
     STREAM_VERSION_LOCAL.pop(message_id, None)
     STREAM_VERSION_LAST_STORED.pop(message_id, None)
+    STREAM_RUN_LOCAL.pop(message_id, None)
     if REDIS is not None:
         try:
             asyncio.ensure_future(_delete_redis_stream_replay_keys(message_id))
@@ -1685,7 +2305,9 @@ def _block_snapshot_signature(block) -> str:
 
 def _build_content_blocks_snapshot(existing: dict, blocks, dirty_from=None) -> dict:
     incoming = list(blocks or [])
-    prev = existing.get("content_blocks_snapshot") if isinstance(existing, dict) else None
+    prev = (
+        existing.get("content_blocks_snapshot") if isinstance(existing, dict) else None
+    )
     prev_blocks = prev.get("blocks") if isinstance(prev, dict) else None
     prev_sigs = prev.get("signatures") if isinstance(prev, dict) else None
     if not isinstance(prev_blocks, list) or not isinstance(prev_sigs, list):
@@ -1707,7 +2329,9 @@ def _build_content_blocks_snapshot(existing: dict, blocks, dirty_from=None) -> d
             dirty_from = int(dirty_from)
         except Exception:
             dirty_from = 0
-        dirty_from = max(0, min(dirty_from, len(incoming), len(prev_blocks), len(prev_sigs)))
+        dirty_from = max(
+            0, min(dirty_from, len(incoming), len(prev_blocks), len(prev_sigs))
+        )
 
     next_blocks = list(prev_blocks[:dirty_from])
     next_sigs = list(prev_sigs[:dirty_from])
@@ -1757,6 +2381,14 @@ def stream_version_init(
     STREAM_REPLAY_BUFFER_BYTES.pop(str(message_id), None)
     STREAM_VERSION_LOCAL[str(message_id)] = 0
     STREAM_VERSION_LAST_STORED[str(message_id)] = 0
+    # Mint the run id for this generation run. max() keeps runs strictly
+    # monotonic per message even if the wall clock steps backwards, and the
+    # double-init at run start (register_stream_start_if_needed + the v2.1
+    # emitter wrapper) stays within the same instant — clients treat any
+    # newer run as "reset your mirror", so a same-start rotation is harmless
+    # (no deltas are emitted between the two inits).
+    prev_run = stream_run_get(message_id)
+    STREAM_RUN_LOCAL[str(message_id)] = max(prev_run + 1, int(time.time() * 1000))
     if REDIS is not None:
         try:
             asyncio.ensure_future(_delete_redis_stream_replay_keys(str(message_id)))
@@ -1770,8 +2402,11 @@ def stream_version_init(
         "chat_id": chat_id,
         "user_id": user_id,
         "session_id": session_id,
-        "content_blocks_snapshot": _build_content_blocks_snapshot({}, content_blocks or []),
+        "content_blocks_snapshot": _build_content_blocks_snapshot(
+            {}, content_blocks or []
+        ),
         "status": "in_progress",
+        "run": STREAM_RUN_LOCAL[str(message_id)],
         "updated_at": time.time(),
     }
     try:
@@ -1794,7 +2429,10 @@ def stream_version_incr(message_id) -> int:
             current = 0
     nxt = int(current) + 1
     STREAM_VERSION_LOCAL[key] = nxt
-    if nxt - int(STREAM_VERSION_LAST_STORED.get(key, 0) or 0) >= STREAM_VERSION_STORE_FLUSH_EVERY:
+    if (
+        nxt - int(STREAM_VERSION_LAST_STORED.get(key, 0) or 0)
+        >= STREAM_VERSION_STORE_FLUSH_EVERY
+    ):
         stream_version_flush(key)
     return nxt
 
@@ -1825,6 +2463,24 @@ def stream_version_get(message_id) -> int:
         return int(STREAM_VERSION.get(message_id, 0) or 0)
     except Exception:
         return 0
+
+
+def stream_run_get(message_id) -> int:
+    """Current run id (epoch) for a message's stream, 0 when unknown.
+
+    Prefers the in-process map; falls back to the RAM stream state so a
+    grace-period (recently finished) stream still reports the run its terminal
+    snapshot was stamped with."""
+    key = str(message_id)
+    if key in STREAM_RUN_LOCAL:
+        return int(STREAM_RUN_LOCAL.get(key, 0) or 0)
+    try:
+        state = STREAM_STATE.get(message_id, {}) or {}
+        if isinstance(state, dict):
+            return int(state.get("run") or 0)
+    except Exception:
+        pass
+    return 0
 
 
 def set_stream_state(message_id, patch: dict) -> None:
@@ -1884,6 +2540,7 @@ def get_active_streams_for_chat(chat_id: str) -> list[dict]:
             {
                 "message_id": message_id,
                 "version": stream_version_get(message_id),
+                "run": stream_run_get(message_id),
                 "status": state.get("status", "in_progress"),
                 "updated_at": state.get("updated_at"),
             }
@@ -1950,7 +2607,10 @@ async def _append_redis_stream_replay_event(
     trim_count = 0
 
     if not track_bytes:
-        if STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and length > STREAM_REPLAY_BUFFER_MAX_EVENTS:
+        if (
+            STREAM_REPLAY_BUFFER_MAX_EVENTS > 0
+            and length > STREAM_REPLAY_BUFFER_MAX_EVENTS
+        ):
             trim_count = length - STREAM_REPLAY_BUFFER_MAX_EVENTS
             await REDIS.ltrim(key, -STREAM_REPLAY_BUFFER_MAX_EVENTS, -1)
         if STREAM_REPLAY_BUFFER_TTL_SECONDS > 0:
@@ -1960,8 +2620,10 @@ async def _append_redis_stream_replay_event(
         return
 
     while (
-        (STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and length > STREAM_REPLAY_BUFFER_MAX_EVENTS)
-        or (STREAM_REPLAY_BUFFER_MAX_BYTES > 0 and total_bytes > STREAM_REPLAY_BUFFER_MAX_BYTES)
+        STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and length > STREAM_REPLAY_BUFFER_MAX_EVENTS
+    ) or (
+        STREAM_REPLAY_BUFFER_MAX_BYTES > 0
+        and total_bytes > STREAM_REPLAY_BUFFER_MAX_BYTES
     ):
         old_raw = await REDIS.lpop(key)
         old_size = await REDIS.lpop(size_key)
@@ -1988,7 +2650,9 @@ def _stream_event_message_id(payload) -> Optional[str]:
         data = payload.get("data") if isinstance(payload, dict) else None
         inner = data.get("data") if isinstance(data, dict) else None
         if isinstance(inner, dict):
-            return str(inner.get("message_id") or payload.get("message_id") or "") or None
+            return (
+                str(inner.get("message_id") or payload.get("message_id") or "") or None
+            )
         return str(payload.get("message_id") or "") or None
     except Exception:
         return None
@@ -2037,7 +2701,10 @@ async def append_stream_replay_event(payload) -> None:
             STREAM_REPLAY_BUFFER_BYTES[message_id] = (
                 int(STREAM_REPLAY_BUFFER_BYTES.get(message_id, 0) or 0) + encoded_size
             )
-            while STREAM_REPLAY_BUFFER_MAX_EVENTS > 0 and len(buf) > STREAM_REPLAY_BUFFER_MAX_EVENTS:
+            while (
+                STREAM_REPLAY_BUFFER_MAX_EVENTS > 0
+                and len(buf) > STREAM_REPLAY_BUFFER_MAX_EVENTS
+            ):
                 old = buf.popleft()
                 STREAM_REPLAY_BUFFER_BYTES[message_id] = max(
                     0,
@@ -2063,9 +2730,41 @@ async def append_stream_replay_event(payload) -> None:
         log.exception("stream replay append failed")
 
 
-async def get_stream_replay_events(message_id: str, after_version: int) -> dict:
+async def get_stream_replay_events(
+    message_id: str, after_version: int, run: Optional[int] = None
+) -> dict:
     after_version = int(after_version or 0)
     current_version = stream_version_get(message_id)
+    current_run = stream_run_get(message_id)
+
+    # Run mismatch = the client's version space belongs to a DIFFERENT
+    # generation run of this message (retry/continue resets versions to 0 and
+    # wipes the buffer). Its after_version is meaningless here — replaying
+    # would splice new-run ops onto old-run content. Force a snapshot.
+    if run and current_run and int(run) != current_run:
+        stream_metric("replay.run_mismatch")
+        return {
+            "status": "miss",
+            "snapshot_required": True,
+            "run": current_run,
+            "from_version": after_version,
+            "to_version": current_version,
+            "events": [],
+        }
+    # A client claiming to be AHEAD of the live counter is holding a stale
+    # run's version (legacy client without a run id, or the run map was
+    # cleaned). "ok, no events" here would freeze it forever — force a
+    # snapshot instead.
+    if after_version > current_version:
+        stream_metric("replay.stale_epoch")
+        return {
+            "status": "miss",
+            "snapshot_required": True,
+            "run": current_run,
+            "from_version": after_version,
+            "to_version": current_version,
+            "events": [],
+        }
     try:
         if REDIS is not None:
             raw_entries = await REDIS.lrange(_stream_replay_key(message_id), 0, -1)
@@ -2097,6 +2796,7 @@ async def get_stream_replay_events(message_id: str, after_version: int) -> dict:
             return {
                 "status": "miss",
                 "snapshot_required": True,
+                "run": current_run,
                 "from_version": after_version,
                 "to_version": current_version,
                 "events": [],
@@ -2111,6 +2811,7 @@ async def get_stream_replay_events(message_id: str, after_version: int) -> dict:
     return {
         "status": "ok",
         "snapshot_required": False,
+        "run": current_run,
         "from_version": after_version,
         "to_version": current_version,
         "events": events,
@@ -2119,7 +2820,9 @@ async def get_stream_replay_events(message_id: str, after_version: int) -> dict:
 
 def _tool_body_size(body) -> int:
     try:
-        return len(json.dumps(body, ensure_ascii=False, default=str).encode("utf-8", "replace"))
+        return len(
+            json.dumps(body, ensure_ascii=False, default=str).encode("utf-8", "replace")
+        )
     except Exception:
         return 0
 
@@ -2129,7 +2832,9 @@ def _tool_body_key(message_id, tool_call_id) -> tuple[str, str]:
 
 
 def _spill_path(message_id: str, tool_call_id: str) -> str:
-    digest = hashlib.sha256(f"{message_id}:{tool_call_id}".encode("utf-8", "replace")).hexdigest()
+    digest = hashlib.sha256(
+        f"{message_id}:{tool_call_id}".encode("utf-8", "replace")
+    ).hexdigest()
     return os.path.join(STREAM_TOOL_RESULT_BODY_SPILL_DIR, f"{digest}.json")
 
 
@@ -2140,7 +2845,9 @@ def _spill_tool_result_body(message_id: str, tool_call_id: str, body: dict) -> N
         os.makedirs(STREAM_TOOL_RESULT_BODY_SPILL_DIR, exist_ok=True)
         path = _spill_path(message_id, tool_call_id)
         fd, tmp = tempfile.mkstemp(
-            prefix="tool-body-", suffix=".json.tmp", dir=STREAM_TOOL_RESULT_BODY_SPILL_DIR
+            prefix="tool-body-",
+            suffix=".json.tmp",
+            dir=STREAM_TOOL_RESULT_BODY_SPILL_DIR,
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2175,7 +2882,9 @@ def _read_spilled_tool_result_body(message_id: str, tool_call_id: str):
 
 
 def _remove_spilled_tool_result_body(message_id: str, tool_call_id: str) -> None:
-    info = (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}).pop(str(tool_call_id), None)
+    info = (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}).pop(
+        str(tool_call_id), None
+    )
     if not (TOOL_RESULT_BODY_SPILLS.get(str(message_id)) or {}):
         TOOL_RESULT_BODY_SPILLS.pop(str(message_id), None)
     path = info.get("path") if isinstance(info, dict) else None
@@ -2188,7 +2897,9 @@ def _remove_spilled_tool_result_body(message_id: str, tool_call_id: str) -> None
             log.debug("failed to remove spilled tool result body", exc_info=True)
 
 
-def _drop_live_tool_result_body(message_id: str, tool_call_id: str, *, spill: bool = True) -> None:
+def _drop_live_tool_result_body(
+    message_id: str, tool_call_id: str, *, spill: bool = True
+) -> None:
     global TOOL_RESULT_BODY_TOTAL_BYTES
     mid, tcid = str(message_id), str(tool_call_id)
     body = (TOOL_RESULT_BODIES.get(mid) or {}).pop(tcid, None)
@@ -2206,9 +2917,16 @@ def _drop_live_tool_result_body(message_id: str, tool_call_id: str, *, spill: bo
 def _enforce_tool_result_body_caps(message_id: str) -> None:
     if STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE > 0:
         sizes = TOOL_RESULT_BODY_SIZES.get(str(message_id)) or {}
-        while sum(sizes.values()) > STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE and sizes:
+        while (
+            sum(sizes.values()) > STREAM_TOOL_RESULT_BODY_MAX_BYTES_PER_MESSAGE
+            and sizes
+        ):
             victim = next(
-                ((mid, tcid) for (mid, tcid) in TOOL_RESULT_BODY_ORDER.keys() if mid == str(message_id)),
+                (
+                    (mid, tcid)
+                    for (mid, tcid) in TOOL_RESULT_BODY_ORDER.keys()
+                    if mid == str(message_id)
+                ),
                 None,
             )
             if victim is None:
@@ -2217,7 +2935,10 @@ def _enforce_tool_result_body_caps(message_id: str) -> None:
             sizes = TOOL_RESULT_BODY_SIZES.get(str(message_id)) or {}
 
     if STREAM_TOOL_RESULT_BODY_MAX_BYTES > 0:
-        while TOOL_RESULT_BODY_TOTAL_BYTES > STREAM_TOOL_RESULT_BODY_MAX_BYTES and TOOL_RESULT_BODY_ORDER:
+        while (
+            TOOL_RESULT_BODY_TOTAL_BYTES > STREAM_TOOL_RESULT_BODY_MAX_BYTES
+            and TOOL_RESULT_BODY_ORDER
+        ):
             victim_mid, victim_tcid = next(iter(TOOL_RESULT_BODY_ORDER.keys()))
             _drop_live_tool_result_body(victim_mid, victim_tcid, spill=True)
 
@@ -2237,7 +2958,9 @@ def set_tool_result_body(message_id, tool_call_id, result) -> None:
         TOOL_RESULT_BODY_SIZES.setdefault(mid, {})[tcid] = size
         TOOL_RESULT_BODY_ORDER.pop((mid, tcid), None)
         TOOL_RESULT_BODY_ORDER[(mid, tcid)] = size
-        TOOL_RESULT_BODY_TOTAL_BYTES = max(0, TOOL_RESULT_BODY_TOTAL_BYTES - int(existing_size or 0)) + size
+        TOOL_RESULT_BODY_TOTAL_BYTES = (
+            max(0, TOOL_RESULT_BODY_TOTAL_BYTES - int(existing_size or 0)) + size
+        )
         stream_metric("tool_body.store")
         stream_metric("tool_body.bytes", size)
         _enforce_tool_result_body_caps(mid)
@@ -2339,10 +3062,48 @@ def clear_stream_state(message_id, delay: float = STREAM_DONE_GRACE_SECONDS) -> 
     # If no loop is available, keep state rather than risking reload races.
 
 
+# Event types whose inner data gets stamped with the stream run id. These are
+# exactly the events a client uses to advance/finalize a per-message stream
+# mirror — the run id lets it detect a version-space reset (retry/continue on
+# the same message id) instead of misclassifying fresh deltas as stale.
+_RUN_STAMPED_TYPES = {
+    "chat:delta",
+    "chat:done",
+    "chat:message:error",
+    "chat:tasks:cancel",
+    "tool_call:result",
+}
+
+
+def _stamp_stream_run(payload) -> None:
+    """Attach the current run id to a stream event's inner data, in place.
+
+    Single chokepoint: every stream-scoped event flows through emit_to_primary
+    before batching/replay-buffering, so stamping here covers the live wire,
+    chat:delta:batch items, AND the replay buffer (which stores the same inner
+    dict by reference)."""
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or data.get("type") not in _RUN_STAMPED_TYPES:
+            return
+        inner = data.get("data")
+        if not isinstance(inner, dict) or "run" in inner:
+            return
+        message_id = inner.get("message_id") or payload.get("message_id")
+        if not message_id:
+            return
+        run = stream_run_get(message_id)
+        if run:
+            inner["run"] = run
+    except Exception:
+        pass
+
+
 async def emit_to_primary(user_id, payload):
     """Emit a single events payload. Stream-scoped v2.1 events route to the
     current chat room plus origin socket; unrelated tabs do not receive token
     deltas. Non-stream events retain the primary/fallback behavior."""
+    _stamp_stream_run(payload)
     # v2.1 batching layer: collapse per-tick chat:delta / tool_call:result
     # emissions into a single envelope per (user, chat). Batching by user only
     # can mix two chats and route a combined batch to the wrong stream room.
@@ -2362,6 +3123,124 @@ async def emit_to_primary(user_id, payload):
     if STREAM_DELTA_BATCH_ENABLED and STREAM_PROTOCOL_VERSION == "v2.1" and user_id:
         await _flush_delta_buffers_for_payload(user_id, payload)
     await _emit_to_primary_raw(user_id, payload)
+
+
+async def emit_chat_user_message(
+    user_id,
+    chat_id,
+    session_id,
+    assistant_message_id,
+    user_message,
+    leaf_message_id=None,
+):
+    """Co-deliver a newly-persisted USER message to other devices in this chat.
+
+    The assistant token stream already reaches every device in
+    ``stream_room(chat_id)`` (they joined via ``stream:subscribe``), but the
+    user's prompt was never broadcast — so a second device viewing the same chat
+    saw the answer appear with no question in front of it, parented to a stale
+    node. This emits the persisted user-message row (``user_message``, carrying
+    portable file urls) as a stream-scoped ``chat:user-message`` event so those
+    same devices can surgically insert the prompt bubble and parent the assistant
+    under it.
+
+    The envelope ``message_id`` is the ASSISTANT id (matching the stream) and the
+    payload also carries ``assistant_message_id`` so a receiver can re-parent the
+    assistant regardless of whether this event or the first ``chat:delta`` lands
+    first.
+
+    Because ``chat:user-message`` is in ``STREAM_SCOPED_TYPES``, routing through
+    ``emit_to_primary`` -> ``_emit_to_primary_raw`` fans it out to
+    ``stream_room(chat_id)`` members + the origin sid ONLY (same user, same
+    chat — the room is gated by ``Chats.user_owns_chat`` at subscribe time). It
+    is idempotent on the client (keyed by ``user_message.id``), so the origin
+    device receiving its own event is a harmless no-op.
+    """
+    if not (
+        user_id
+        and chat_id
+        and isinstance(user_message, dict)
+        and user_message.get("id")
+    ):
+        return False
+    if str(chat_id).startswith("local:"):
+        return False
+    payload = {
+        "chat_id": chat_id,
+        "message_id": assistant_message_id,
+        "session_id": session_id,
+        "data": {
+            "type": "chat:user-message",
+            "user_message": user_message,
+            "assistant_message_id": assistant_message_id,
+            "leaf_message_id": leaf_message_id,
+        },
+    }
+    # Keep the broadcast frame bounded: a screen-capture (canvas.toDataURL) image
+    # rides as an un-uploaded ``data:`` base64 url and can be several MB. Unlike
+    # chat:delta this event carries the user's attachments AND bypasses the
+    # batch-size splitter, so an oversized frame would be one giant un-batched
+    # emit. When that happens, skip the surgical insert and let the receiver's
+    # loadChat() backstop sync the prompt (it is already persisted) instead.
+    #
+    # Returns True iff the bubble was actually delivered. The queue-drain caller
+    # uses this to decide whether to clear the queue chip now (atomic with the
+    # bubble) or keep it until the loadChat backstop — so an undeliverable
+    # (oversized) drained bubble never leaves the message in neither place.
+    try:
+        size = _socket_payload_size(payload)
+        if size > SOCKET_BATCH_MAX_BYTES:
+            log.info(
+                "chat:user-message payload too large (%d bytes) for chat %s; "
+                "deferring cross-device sync to the loadChat backstop",
+                size,
+                chat_id,
+            )
+            return False
+    except Exception:
+        pass
+    try:
+        await emit_to_primary(user_id, payload)
+        return True
+    except Exception:
+        log.exception("emit_chat_user_message failed")
+        return False
+
+
+async def emit_user_fanout(user_id, payload):
+    """Deliver an events payload to EVERY session of ``user_id`` (+ the origin
+    session, if any), bypassing stream-scoped routing.
+
+    ``emit_to_primary`` / ``_emit_to_primary_raw`` target only the elected
+    primary session and stream-room subscribers. That is correct for a live
+    parent generation (the visible tab is provably in the stream room), but a
+    DETACHED subagent rerun has no active parent stream: primary-election +
+    stream-room membership are unreliable, so those live updates can miss the
+    user's background / non-subscriber tabs and leave a rerun card stuck. This
+    helper fans out to all of the user's sessions directly so a rerun's updates
+    always reach whichever tab the user is actually looking at. It mirrors the
+    wire shape of every other events emit (chat_id / message_id / data)."""
+    chat_id = payload.get("chat_id") if isinstance(payload, dict) else None
+    message_id = payload.get("message_id") if isinstance(payload, dict) else None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    origin_sid = payload.get("session_id") if isinstance(payload, dict) else None
+    sids = list(
+        {
+            *(USER_POOL.get(user_id, []) or []),
+            *([origin_sid] if origin_sid else []),
+        }
+    )
+    emit_calls = [
+        sio.emit(
+            "events",
+            {"chat_id": chat_id, "message_id": message_id, "data": data},
+            to=sid,
+        )
+        for sid in sids
+        if sid
+    ]
+    if emit_calls:
+        await asyncio.gather(*emit_calls)
 
 
 _COMPACT_OP_CODES = {
@@ -2411,7 +3290,7 @@ def _stream_payload_versions(payload) -> list[tuple[str, int]]:
         return [(message_id, version)] if message_id and version is not None else []
     if event_type == "chat:delta:batch":
         out: list[tuple[str, int]] = []
-        for item in ((payload.get("data") or {}).get("batch") or []):
+        for item in (payload.get("data") or {}).get("batch") or []:
             data = item.get("data") if isinstance(item, dict) else None
             inner = data.get("data") if isinstance(data, dict) else None
             if not isinstance(inner, dict) or data.get("type") != "chat:delta":
@@ -2423,13 +3302,28 @@ def _stream_payload_versions(payload) -> list[tuple[str, int]]:
         return out
     if event_type == "chat:delta:batch2":
         out: list[tuple[str, int]] = []
-        for group in ((payload.get("data") or {}).get("groups") or []):
+        for group in (payload.get("data") or {}).get("groups") or []:
             mid = str(group.get("message_id") or "") if isinstance(group, dict) else ""
-            base_version = int(group.get("base_version") or 0) if isinstance(group, dict) else 0
-            offset_versions = bool(group.get("version_mode") == "offset") if isinstance(group, dict) else False
+            base_version = (
+                int(group.get("base_version") or 0) if isinstance(group, dict) else 0
+            )
+            offset_versions = (
+                bool(group.get("version_mode") == "offset")
+                if isinstance(group, dict)
+                else False
+            )
             for delta in group.get("deltas") or []:
-                if mid and isinstance(delta, list) and delta and isinstance(delta[0], int):
-                    version = base_version + int(delta[0]) if offset_versions else int(delta[0])
+                if (
+                    mid
+                    and isinstance(delta, list)
+                    and delta
+                    and isinstance(delta[0], int)
+                ):
+                    version = (
+                        base_version + int(delta[0])
+                        if offset_versions
+                        else int(delta[0])
+                    )
                     out.append((mid, version))
         return out
     return []
@@ -2456,7 +3350,59 @@ def _is_batch_payload(payload) -> bool:
 
 
 def _is_live_delta_payload(payload) -> bool:
-    return _is_batchable_payload(payload) or _is_batch_payload(payload) or _payload_type(payload) == "browser:frame"
+    return (
+        _is_batchable_payload(payload)
+        or _is_batch_payload(payload)
+        or _payload_type(payload) == "browser:frame"
+    )
+
+
+def _inner_event_is_terminal(inner_event) -> bool:
+    if not isinstance(inner_event, dict):
+        return False
+    itype = inner_event.get("type")
+    if itype in ("chat:done", "chat:message:error", "chat:tasks:cancel"):
+        return True
+    if itype == "chat:completion":
+        idata = inner_event.get("data")
+        return isinstance(idata, dict) and idata.get("done") is True
+    return False
+
+
+def _subagent_update_is_terminal(data) -> bool:
+    if not isinstance(data, dict) or data.get("type") != "chat:subagent:update":
+        return False
+    inner = data.get("data")
+    if not isinstance(inner, dict):
+        return False
+    return _inner_event_is_terminal(inner.get("inner_event"))
+
+
+def _payload_has_terminal_subagent_event(payload) -> bool:
+    """True when the payload carries a TERMINAL subagent update (its inner_event is
+    chat:done / chat:message:error / chat:tasks:cancel / a done chat:completion),
+    either as a single chat:subagent:update or inside a chat:delta:batch.
+
+    Terminal subagent state must reach EVERY same-user tab — including a
+    backgrounded/hidden one — because, unlike the main chat stream, a subagent's
+    live card terminal is NOT in the stream replay buffer and is NOT carried by the
+    snapshot/resume endpoint. If the visibility gate suppresses it for a hidden
+    tab, that tab's card spins 'Researching…' forever once the user returns. The
+    non-terminal token stream stays suppressed for hidden tabs (handled below)."""
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    ptype = data.get("type")
+    if ptype == "chat:subagent:update":
+        return _subagent_update_is_terminal(data)
+    if ptype in ("chat:delta:batch", "chat:delta:batch2"):
+        for item in data.get("batch") or []:
+            idata = item.get("data") if isinstance(item, dict) else None
+            if _subagent_update_is_terminal(idata):
+                return True
+    return False
 
 
 def _make_sync_required_payload(payload, message_id: str, version: int) -> dict:
@@ -2471,21 +3417,101 @@ def _make_sync_required_payload(payload, message_id: str, version: int) -> dict:
     }
 
 
-async def _emit_sync_required_once(sid: str, payload, message_id: str, version: int) -> None:
+async def _emit_sync_required_once(
+    sid: str, payload, message_id: str, version: int
+) -> None:
     key = (sid, message_id)
     if key in STREAM_SYNC_REQUIRED_SENT:
         return
     STREAM_SYNC_REQUIRED_SENT.add(key)
     stream_metric("backpressure.sync_required")
-    await sio.emit("events", _make_sync_required_payload(payload, message_id, version), to=sid)
+    await sio.emit(
+        "events", _make_sync_required_payload(payload, message_id, version), to=sid
+    )
+
+
+async def _hidden_catchup_worker(sid: str, chat_id: str, message_id: str) -> None:
+    """After a debounce window, nudge a still-hidden subscriber to pull the current
+    snapshot for ``message_id`` (see STREAM_HIDDEN_CATCHUP_MS). Guarded so it only
+    fires while the socket is live, the subscriber is still hidden and subscribed to
+    this chat, and the stream is still in progress — otherwise it is a no-op."""
+    try:
+        await asyncio.sleep(max(0.05, STREAM_HIDDEN_CATCHUP_MS / 1000.0))
+        if not sid or sid not in SESSION_POOL:
+            return
+        if _is_visible_subscriber(chat_id, sid):
+            return
+        if sid not in (STREAM_SUBSCRIPTION_STATE.get(chat_id) or {}):
+            return
+        state = get_stream_state(message_id)
+        if not state or state.get("status") != "in_progress":
+            return
+        version = int(stream_version_get(message_id) or 0)
+        stream_metric("visibility.hidden_catchup")
+        await sio.emit(
+            "events",
+            _make_sync_required_payload(
+                {"chat_id": chat_id, "message_id": message_id, "session_id": None},
+                message_id,
+                version,
+            ),
+            to=sid,
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        pass
+    finally:
+        _HIDDEN_CATCHUP_TASKS.pop((sid, message_id), None)
+
+
+def _schedule_hidden_catchup(sid: str, chat_id: str, message_id: str) -> None:
+    """Debounced: arm at most one pending catch-up nudge per (sid, message_id).
+    The worker clears its own key on completion, so the next suppressed delta
+    re-arms it — yielding ~one nudge per STREAM_HIDDEN_CATCHUP_MS while suppression
+    continues, and none once the stream ends (deltas stop → no re-arm)."""
+    if STREAM_HIDDEN_CATCHUP_MS <= 0 or not (sid and chat_id and message_id):
+        return
+    key = (sid, message_id)
+    existing = _HIDDEN_CATCHUP_TASKS.get(key)
+    if existing is not None and not existing.done():
+        return
+    try:
+        _HIDDEN_CATCHUP_TASKS[key] = asyncio.ensure_future(
+            _hidden_catchup_worker(sid, chat_id, message_id)
+        )
+    except Exception:
+        pass
+
+
+def _cancel_hidden_catchup_for_message(message_id: str) -> None:
+    for key in list(_HIDDEN_CATCHUP_TASKS):
+        if key[1] == message_id:
+            task = _HIDDEN_CATCHUP_TASKS.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
 
 
 async def _should_emit_stream_payload_to_sid(sid: str, payload) -> bool:
     chat_id = str(payload.get("chat_id") or "") if isinstance(payload, dict) else ""
     if not chat_id:
         return True
-    if _is_live_delta_payload(payload) and not _is_visible_subscriber(chat_id, sid):
+    if (
+        _is_live_delta_payload(payload)
+        and not _is_visible_subscriber(chat_id, sid)
+        and not _payload_has_terminal_subagent_event(payload)
+    ):
         stream_metric("visibility.hidden_suppressed")
+        # G1 (multi-client): the tab is document-hidden so the high-frequency token
+        # stream is suppressed for perf — but rather than freeze it until chat:done,
+        # arm a coalesced catch-up so a passively-watched second screen / phone stays
+        # near-live (it pulls a fresh snapshot ~once per STREAM_HIDDEN_CATCHUP_MS).
+        mids = {mid for mid, _ in _stream_payload_versions(payload) if mid}
+        env_mid = payload.get("message_id") if isinstance(payload, dict) else None
+        if env_mid:
+            mids.add(str(env_mid))
+        for mid in mids:
+            _schedule_hidden_catchup(sid, chat_id, mid)
         return False
     caps = _subscriber_capabilities(chat_id, sid)
     if not caps.get("ack"):
@@ -2506,7 +3532,10 @@ def _make_delta_batch2_envelope(batch: list) -> Optional[dict]:
     groups: dict[str, dict] = {}
     for item in batch:
         data = item.get("data") if isinstance(item, dict) else None
-        if not isinstance(data, dict) or data.get("type") not in {"chat:delta", "tool_call:result"}:
+        if not isinstance(data, dict) or data.get("type") not in {
+            "chat:delta",
+            "tool_call:result",
+        }:
             return None
         inner = data.get("data") or {}
         if not isinstance(inner, dict):
@@ -2514,7 +3543,14 @@ def _make_delta_batch2_envelope(batch: list) -> Optional[dict]:
         message_id = str(inner.get("message_id") or item.get("message_id") or "")
         if not message_id:
             return None
-        group = groups.setdefault(message_id, {"message_id": message_id, "deltas": [], "tool_results": []})
+        group = groups.setdefault(
+            message_id, {"message_id": message_id, "deltas": [], "tool_results": []}
+        )
+        # Compact frames drop the per-delta dict (and its run stamp) — carry the
+        # run once per message group so the client can still run-gate the batch.
+        run = inner.get("run")
+        if run and "run" not in group:
+            group["run"] = run
         if data.get("type") == "chat:delta":
             version = int(inner.get("version") or 0)
             if "base_version" not in group:
@@ -2558,7 +3594,13 @@ def _compact_delta_frame(version: int, op: str, payload: dict) -> list:
     if op == "text_append":
         return [version, code, payload.get("block_idx"), payload.get("text") or ""]
     if op == "block_open":
-        return [version, code, payload.get("block_idx"), payload.get("type"), payload.get("attrs") or {}]
+        return [
+            version,
+            code,
+            payload.get("block_idx"),
+            payload.get("type"),
+            payload.get("attrs") or {},
+        ]
     if op == "block_close":
         return [
             version,
@@ -2568,11 +3610,17 @@ def _compact_delta_frame(version: int, op: str, payload: dict) -> list:
             payload.get("output"),
             payload.get("ended"),
             payload.get("results") or [],
+            payload.get("ended_at"),
         ]
     if op == "tool_call_add":
         return [version, code, payload.get("block_idx"), payload.get("tool_call")]
     if op == "tool_call_args_append":
-        return [version, code, payload.get("tool_call_id"), payload.get("args_delta") or ""]
+        return [
+            version,
+            code,
+            payload.get("tool_call_id"),
+            payload.get("args_delta") or "",
+        ]
     if op == "reasoning_detail_merge":
         return [version, code, payload.get("detail") or {}]
     if op == "sources":
@@ -2582,7 +3630,12 @@ def _compact_delta_frame(version: int, op: str, payload: dict) -> list:
     if op == "usage":
         return [version, code, payload.get("usage") or {}]
     if op == "replace":
-        return [version, code, payload.get("block_idx", 0), payload.get("content_blocks") or []]
+        return [
+            version,
+            code,
+            payload.get("block_idx", 0),
+            payload.get("content_blocks") or [],
+        ]
     if op == "snapshot":
         return [version, code]
     return [version, code, payload]
@@ -2594,7 +3647,11 @@ def _payload_for_sid(chat_id: str, sid: str, payload):
     caps = _subscriber_capabilities(chat_id, sid)
     if not caps.get("compact_batch"):
         return payload
-    batch = ((payload.get("data") or {}).get("batch") or []) if isinstance(payload, dict) else []
+    batch = (
+        ((payload.get("data") or {}).get("batch") or [])
+        if isinstance(payload, dict)
+        else []
+    )
     compact = _make_delta_batch2_envelope(batch)
     if compact:
         stream_metric("compact.batch2")
@@ -2625,12 +3682,38 @@ async def _emit_to_primary_raw(user_id, payload):
                     targets.append(sid)
         except Exception:
             pass
-        if origin_sid and origin_sid not in targets:
+        # Only treat origin_sid as a target when it is still a LIVE session. A
+        # stale launch-time origin — e.g. a long-running subagent whose viewing
+        # tab reconnected and got a NEW sid mid-run — must NOT be appended: a dead
+        # sid would make `targets` non-empty and SKIP the fan-out fallback below,
+        # so the actually-viewing tab is dropped. That is the
+        # chat:subagent:update black-hole: the tab still got the fan-out
+        # chat:subagent:start (so the card appears + the timer ticks), but every
+        # forwarded content update routed only to the dead origin sid, leaving the
+        # card empty for the whole run.
+        origin_live = False
+        try:
+            origin_live = bool(origin_sid) and origin_sid in SESSION_POOL
+        except Exception:
+            origin_live = bool(origin_sid)
+        if origin_live and origin_sid not in targets:
             targets.append(origin_sid)
-        # If nobody is subscribed yet (e.g. very early stream startup), fall back
-        # to the primary so at least one same-user tab can still relay/display.
-        if not targets and primary:
-            targets.append(primary)
+        # No live stream-room subscriber and no live origin. Rather than drop the
+        # event, fan out to all of the user's connected sessions — parity with how
+        # chat:subagent:start is delivered (which is why the start always lands) —
+        # so the viewing tab still receives it; then the elected primary as a final
+        # backstop. The per-sid visibility gate in _should_emit_stream_payload_to_sid
+        # still suppresses genuinely-hidden background tabs, so this is not a blanket
+        # fan-out of every token.
+        if not targets:
+            try:
+                for sid in USER_POOL.get(user_id, []) or []:
+                    if sid and sid not in targets:
+                        targets.append(sid)
+            except Exception:
+                pass
+            if primary and primary not in targets:
+                targets.append(primary)
     else:
         if primary:
             targets.append(primary)
@@ -2649,7 +3732,9 @@ async def _emit_to_primary_raw(user_id, payload):
     for sid in targets:
         if not await _should_emit_stream_payload_to_sid(sid, payload):
             continue
-        emit_calls.append(sio.emit("events", _payload_for_sid(chat_id, sid, payload), to=sid))
+        emit_calls.append(
+            sio.emit("events", _payload_for_sid(chat_id, sid, payload), to=sid)
+        )
     if emit_calls:
         await asyncio.gather(*emit_calls)
 
@@ -2755,9 +3840,11 @@ async def _enqueue_delta(user_id, payload) -> None:
         if message_id:
             STREAM_FIRST_DELTA_SENT.add(message_id)
         buf.append(payload)
-        _pending_delta_buffer_sizes[key] = _pending_delta_buffer_sizes.get(
-            key, SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES
-        ) + _socket_payload_size(payload) + 2
+        _pending_delta_buffer_sizes[key] = (
+            _pending_delta_buffer_sizes.get(key, SOCKET_BATCH_ENVELOPE_OVERHEAD_BYTES)
+            + _socket_payload_size(payload)
+            + 2
+        )
         if _pending_delta_buffer_sizes[key] >= SOCKET_BATCH_MAX_BYTES:
             asyncio.create_task(_flush_delta_buffer(key))
             return
@@ -2778,7 +3865,10 @@ async def _enqueue_delta(user_id, payload) -> None:
             except Exception:
                 pass
             return
-        delay = max(0, min(STREAM_DELTA_BATCH_WINDOW_MS, STREAM_DELTA_BATCH_MAX_DELAY_MS)) / 1000
+        delay = (
+            max(0, min(STREAM_DELTA_BATCH_WINDOW_MS, STREAM_DELTA_BATCH_MAX_DELAY_MS))
+            / 1000
+        )
         if delay <= 0:
             loop.call_soon(_schedule_flush, key)
         else:

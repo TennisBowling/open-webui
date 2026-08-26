@@ -1,12 +1,13 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import TagItem from './TagItem.svelte';
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
-	export let tags = [];
+	let { tags = [], ...eventProps } = $props();
 </script>
 
 {#each tags as tag}

@@ -1,8 +1,10 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { nonpassive } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { v4 as uuidv4 } from 'uuid';
 
-	import { goto } from '$app/navigation';
+	import { beforeNavigate, goto } from '$app/navigation';
 	import {
 		user,
 		chats,
@@ -14,6 +16,7 @@
 		showSidebar,
 		showSearch,
 		mobile,
+		online,
 		showArchivedChats,
 		pinnedChats,
 		scrollPaginationEnabled,
@@ -25,7 +28,10 @@
 		isApp,
 		models,
 		selectedFolder,
-		WEBUI_NAME
+		WEBUI_NAME,
+		bootstrapRevision,
+		messageEditingIds,
+		automationsUnreadCount
 	} from '$lib/stores';
 	import { onMount, getContext, tick, onDestroy } from 'svelte';
 	import type { Writable } from 'svelte/store';
@@ -43,16 +49,18 @@
 		importChat
 	} from '$lib/apis/chats';
 	import { createNewFolder, getFolders, updateFolderParentIdById } from '$lib/apis/folders';
-	import { consumeBootstrap } from '$lib/utils/bootstrap';
+	import { consumeBootstrap, hasBootstrap } from '$lib/utils/bootstrap';
 	import { getTimeRange } from '$lib/utils';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { readLocalStorageCache, writeLocalStorageCache } from '$lib/utils/cache';
 	import {
-		clearLocalStorageCache,
-		readLocalStorageCache,
-		writeLocalStorageCache
-	} from '$lib/utils/cache';
+		offlineChatMeta,
+		refreshOfflineChatMeta,
+		scheduleOfflinePrefetch,
+		requestPersistentStorage,
+		isOfflineChatStorageEnabled
+	} from '$lib/offline/manager';
 	import {
-		SIDEBAR_CACHE_TTL,
 		SIDEBAR_CHANNELS_CACHE_KEY,
 		SIDEBAR_FOLDERS_CACHE_KEY,
 		SIDEBAR_TAGS_CACHE_KEY,
@@ -79,38 +87,48 @@
 	import Sidebar from '../icons/Sidebar.svelte';
 	import PinnedModelList from './Sidebar/PinnedModelList.svelte';
 	import Note from '../icons/Note.svelte';
+	import Clock from '../icons/Clock.svelte';
 	import { slide } from 'svelte/transition';
 
 	const BREAKPOINT = 768;
 
-	let scrollTop = 0;
+	let scrollTop = $state(0);
 
-	let navElement;
-	let shiftKey = false;
+	let navElement = $state();
+	let shiftKey = $state(false);
 
-	let selectedChatId: string | null = null;
-	let pendingChatId: string | null = null;
-	$: activeChatId = pendingChatId ?? $chatId;
-	$: if (pendingChatId && $chatId === pendingChatId) {
-		pendingChatId = null;
-	}
-	let showPinnedChat = true;
+	let selectedChatId: string | null = $state(null);
+	let pendingChatId: string | null = $state(null);
+	let activeChatId = $derived(pendingChatId ?? $chatId);
+	$effect(() => {
+		if (pendingChatId && $chatId === pendingChatId) {
+			pendingChatId = null;
+		}
+	});
+	let showPinnedChat = $state(true);
 
-	let showCreateChannel = false;
+	let showCreateChannel = $state(false);
 
 	// Pagination variables
-	let chatListLoading = false;
-	let allChatsLoaded = false;
+	let chatListLoading = $state(false);
+	let allChatsLoaded = $state(false);
 
-	let showCreateFolderModal = false;
+	let showCreateFolderModal = $state(false);
 
-	let folders = {};
-	let folderRegistry = {};
+	let folders = $state({});
+	let folderRegistry = $state({});
 
 	let newFolderId = null;
 
 	let channelsRefreshPromise: Promise<void> | null = null;
 	let chatListRefreshPromise: Promise<void> | null = null;
+
+	// Set true once the sidebar stores have been hydrated (from bootstrap/network/
+	// a revalidation) this session. While the socket is connected, push events keep
+	// the stores live, so re-opening the sidebar can paint from stores and skip the
+	// refetch fan-out (Wire item #6).
+	let sidebarHydratedThisSession = false;
+	let unsubBootstrapRevision: (() => void) | null = null;
 
 	const getSidebarCacheKey = (name: string) => buildSidebarCacheKey($user?.id, name);
 
@@ -199,6 +217,67 @@
 		}
 	};
 
+	// Apply ONLY the sidebar components present in the pending bootstrap map,
+	// without any network fetch. Used when a background bootstrap revalidation
+	// (Wire item #4) re-fills the map with just the changed components and bumps
+	// bootstrapRevision. Missing components are left untouched (push events / the
+	// existing stores keep them current).
+	const applyBootstrapSidebarComponents = () => {
+		if (hasBootstrap('channels')) {
+			const c = consumeBootstrap<any[]>('channels');
+			if (Array.isArray(c)) {
+				channels.set(c);
+				writeLocalStorageCache(SIDEBAR_CHANNELS_CACHE_KEY, getSidebarCacheKey('channels'), c);
+			}
+		}
+		if (hasBootstrap('folders')) {
+			const f = consumeBootstrap<any[]>('folders');
+			if (Array.isArray(f)) {
+				applyFolderList(f);
+				writeLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY, getSidebarCacheKey('folders'), f);
+			}
+		}
+		if (hasBootstrap('tags')) {
+			const t = consumeBootstrap<any[]>('tags');
+			if (Array.isArray(t)) {
+				tags.set(t);
+				writeLocalStorageCache(SIDEBAR_TAGS_CACHE_KEY, getSidebarCacheKey('tags'), t);
+			}
+		}
+		if (hasBootstrap('pinned')) {
+			const p = consumeBootstrap<any[]>('pinned');
+			if (Array.isArray(p)) {
+				const decorated = p.map((c) => ({ ...c, time_range: getTimeRange(c.updated_at) }));
+				pinnedChats.set(decorated);
+				writeLocalStorageCache(
+					SIDEBAR_PINNED_CHATS_CACHE_KEY,
+					getSidebarCacheKey('pinned-chats'),
+					decorated
+				);
+			}
+		}
+		if (hasBootstrap('chats')) {
+			const ch = consumeBootstrap<any[]>('chats');
+			if (Array.isArray(ch)) {
+				const decorated = ch.map((c) => ({ ...c, time_range: getTimeRange(c.updated_at) }));
+				chats.set(decorated);
+				currentChatPage.set(1);
+				scrollPaginationEnabled.set(true);
+				writeLocalStorageCache(
+					SIDEBAR_CHATS_CACHE_KEY,
+					getSidebarCacheKey('chats:first-page'),
+					decorated
+				);
+			}
+		}
+		sidebarHydratedThisSession = true;
+
+		// Freshly revalidated rows — sweep offline copies against them.
+		if (isOfflineChatStorageEnabled() && $user?.id) {
+			scheduleOfflinePrefetch(localStorage.token, $user.id, 4000);
+		}
+	};
+
 	const initFolders = async () => {
 		const bootstrapFolders = consumeBootstrap<any[]>('folders');
 		if (Array.isArray(bootstrapFolders)) {
@@ -206,24 +285,17 @@
 			writeLocalStorageCache(
 				SIDEBAR_FOLDERS_CACHE_KEY,
 				getSidebarCacheKey('folders'),
-				bootstrapFolders,
-				SIDEBAR_CACHE_TTL
+				bootstrapFolders
 			);
 			return;
 		}
-		clearLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY);
 		const folderList = await getFolders(localStorage.token).catch((error) => {
 			toast.error(`${error}`);
 			return [];
 		});
 
 		applyFolderList(folderList);
-		writeLocalStorageCache(
-			SIDEBAR_FOLDERS_CACHE_KEY,
-			getSidebarCacheKey('folders'),
-			folderList,
-			SIDEBAR_CACHE_TTL
-		);
+		writeLocalStorageCache(SIDEBAR_FOLDERS_CACHE_KEY, getSidebarCacheKey('folders'), folderList);
 	};
 
 	const createFolder = async ({ name, data }) => {
@@ -283,19 +355,16 @@
 				writeLocalStorageCache(
 					SIDEBAR_CHANNELS_CACHE_KEY,
 					getSidebarCacheKey('channels'),
-					bootstrapChannels,
-					SIDEBAR_CACHE_TTL
+					bootstrapChannels
 				);
 				return;
 			}
-			clearLocalStorageCache(SIDEBAR_CHANNELS_CACHE_KEY);
 			const channelList = await getChannels(localStorage.token);
 			await channels.set(channelList);
 			writeLocalStorageCache(
 				SIDEBAR_CHANNELS_CACHE_KEY,
 				getSidebarCacheKey('channels'),
-				channelList,
-				SIDEBAR_CACHE_TTL
+				channelList
 			);
 		})();
 
@@ -317,9 +386,9 @@
 			const firstPage = 1;
 			currentChatPage.set(firstPage);
 			allChatsLoaded = false;
-			clearLocalStorageCache(SIDEBAR_TAGS_CACHE_KEY);
-			clearLocalStorageCache(SIDEBAR_PINNED_CHATS_CACHE_KEY);
-			clearLocalStorageCache(SIDEBAR_CHATS_CACHE_KEY);
+			// Deliberately no cache pre-clear here: if this refetch is interrupted
+			// (PWA suspended, network drop) a stale cache still paints instantly on
+			// next boot; the writes below replace it on success.
 
 			await initFolders();
 			await Promise.all([
@@ -330,12 +399,7 @@
 						? bootstrapTags
 						: await getAllTags(localStorage.token);
 					tags.set(_tags);
-					writeLocalStorageCache(
-						SIDEBAR_TAGS_CACHE_KEY,
-						getSidebarCacheKey('tags'),
-						_tags,
-						SIDEBAR_CACHE_TTL
-					);
+					writeLocalStorageCache(SIDEBAR_TAGS_CACHE_KEY, getSidebarCacheKey('tags'), _tags);
 				})(),
 				(async () => {
 					console.log('Init pinned chats');
@@ -347,8 +411,7 @@
 					writeLocalStorageCache(
 						SIDEBAR_PINNED_CHATS_CACHE_KEY,
 						getSidebarCacheKey('pinned-chats'),
-						_pinnedChats,
-						SIDEBAR_CACHE_TTL
+						_pinnedChats
 					);
 				})(),
 				(async () => {
@@ -361,14 +424,19 @@
 					writeLocalStorageCache(
 						SIDEBAR_CHATS_CACHE_KEY,
 						getSidebarCacheKey('chats:first-page'),
-						_chats,
-						SIDEBAR_CACHE_TTL
+						_chats
 					);
 				})()
 			]);
 
 			// Enable pagination
 			scrollPaginationEnabled.set(true);
+
+			// Sidebar rows are fresh now — the right moment for a stale-only
+			// offline prefetch sweep (throttled internally).
+			if (isOfflineChatStorageEnabled() && $user?.id) {
+				scheduleOfflinePrefetch(localStorage.token, $user.id, 4000);
+			}
 		})();
 
 		try {
@@ -379,19 +447,24 @@
 	};
 
 	const loadMoreChats = async () => {
+		if (chatListLoading) return;
 		chatListLoading = true;
+		try {
+			// Commit the page number only after the fetch succeeds: a failed page
+			// (offline scroll, transient error) must stay retryable on the next
+			// intersection without skipping a page or wedging the loader.
+			const nextPage = $currentChatPage + 1;
+			const newChatList = await getChatList(localStorage.token, nextPage);
+			currentChatPage.set(nextPage);
 
-		currentChatPage.set($currentChatPage + 1);
-
-		let newChatList = [];
-
-		newChatList = await getChatList(localStorage.token, $currentChatPage);
-
-		// once the bottom of the list has been reached (no results) there is no need to continue querying
-		allChatsLoaded = newChatList.length === 0;
-		await chats.set([...($chats ? $chats : []), ...newChatList]);
-
-		chatListLoading = false;
+			// once the bottom of the list has been reached (no results) there is no need to continue querying
+			allChatsLoaded = newChatList.length === 0;
+			await chats.set([...($chats ? $chats : []), ...newChatList]);
+		} catch (error) {
+			console.error('Failed to load more chats', error);
+		} finally {
+			chatListLoading = false;
+		}
 	};
 
 	const importChatHandler = async (items, pinned = false, folderId = null) => {
@@ -514,6 +587,337 @@
 		checkDirection();
 	};
 
+	// --- Interactive (finger-tracking) drag-to-open/close -------------------
+	// Live-follows the finger instead of only reacting to a discrete flick.
+	// Falls back to the legacy checkDirection()-based flick above when the
+	// user has prefers-reduced-motion enabled.
+	const SIDEBAR_DRAG_WIDTH = 260;
+	const DRAG_OPEN_FRACTION = 0.4;
+	const DRAG_OPEN_VELOCITY = 0.3; // px/ms
+	const DRAG_INTENT_THRESHOLD = 10; // px
+	const DRAG_SETTLE_MS = 200;
+
+	let reducedMotion = false;
+
+	// Mobile keeps the drawer panel mounted (translated offscreen + hidden +
+	// inert) so opening it — by drag or tap — is pure compositor work instead of
+	// mounting the whole chat list mid-gesture. Deferred to post-boot idle so
+	// the hidden DOM never competes with first paint.
+	let sidebarPrerenderReady = $state(false);
+
+	// iOS standalone-PWA: the system back-swipe starts at the same left edge as
+	// our open gesture. The edge strip preventDefaults touchstart (which
+	// suppresses the system gesture on current iOS), but WebKit has changed this
+	// across releases — as a second line of defense, cancel any history-pop
+	// navigation that lands while an edge-drag has actually ENGAGED (horizontal
+	// intent confirmed), so one swipe can never BOTH navigate back AND move the
+	// sidebar. The stamp is cleared on touchcancel — when the OS claims the
+	// touch (Android back gesture, iOS if a future WebKit ignores the
+	// preventDefault) the system gesture wins and its popstate must go through —
+	// and is never set by plain taps, so button/3-button-nav back is unaffected.
+	let lastEdgeGestureAt = 0;
+	beforeNavigate((navigation) => {
+		if (navigation.type !== 'popstate') return;
+		if (!$mobile) return;
+		if (Date.now() - lastEdgeGestureAt < 700) {
+			navigation.cancel();
+		}
+	});
+
+	// True whenever the sidebar's position is being manually driven (either
+	// actively dragged, or animating to its settled position after release).
+	// While true the element is force-mounted and its own Svelte `transition:slide`
+	// is suppressed so it never fights the manual transform.
+	let manualDragControl = $state(false);
+	// Set true immediately before manualDragControl is cleared as part of a
+	// manually-driven close, so that the Svelte outro transition (which only
+	// starts once `manualDragControl` has already flipped to false) still
+	// reads a suppressed (0ms) duration instead of replaying the close.
+	// Reset once that outro actually finishes (on:outroend below).
+	let suppressNextOutro = $state(false);
+	let dragActive = false;
+	let dragSettling = $state(false);
+	let dragIntent = null; // null | 'horizontal' | 'vertical'
+	let dragStartX = 0;
+	let dragStartY = 0;
+	let dragStartTime = 0;
+	let dragWasOpen = false;
+	let dragX = $state(-SIDEBAR_DRAG_WIDTH);
+	let dragSettleTimeout;
+
+	let dragFraction = $derived(
+		Math.min(1, Math.max(0, (dragX + SIDEBAR_DRAG_WIDTH) / SIDEBAR_DRAG_WIDTH))
+	);
+
+	const beginSidebarDrag = (touch) => {
+		if (!$mobile || reducedMotion || dragActive) return;
+		if (dragSettleTimeout) {
+			clearTimeout(dragSettleTimeout);
+			dragSettleTimeout = null;
+		}
+		dragActive = true;
+		dragSettling = false;
+		manualDragControl = true;
+		dragIntent = null;
+		dragStartX = touch.clientX;
+		dragStartY = touch.clientY;
+		dragStartTime = Date.now();
+		dragWasOpen = $showSidebar;
+		dragX = dragWasOpen ? 0 : -SIDEBAR_DRAG_WIDTH;
+	};
+
+	// Returns true when the caller should preventDefault() (horizontal drag confirmed).
+	const updateSidebarDrag = (touch) => {
+		if (!dragActive) return false;
+
+		const dx = touch.clientX - dragStartX;
+		const dy = touch.clientY - dragStartY;
+
+		if (dragIntent === null) {
+			if (Math.abs(dx) < DRAG_INTENT_THRESHOLD && Math.abs(dy) < DRAG_INTENT_THRESHOLD) {
+				return false;
+			}
+			if (Math.abs(dy) >= Math.abs(dx)) {
+				// Vertical scroll intent — abandon tracking entirely, let the
+				// browser handle native scrolling, don't revisit this touch.
+				dragActive = false;
+				manualDragControl = false;
+				dragIntent = 'vertical';
+				return false;
+			}
+			dragIntent = 'horizontal';
+		}
+
+		if (dragIntent !== 'horizontal') return false;
+
+		const base = dragWasOpen ? 0 : -SIDEBAR_DRAG_WIDTH;
+		dragX = Math.min(0, Math.max(-SIDEBAR_DRAG_WIDTH, base + dx));
+		return true;
+	};
+
+	// Clears `manualDragControl` once the manually-driven transform animation
+	// has had time to finish. If the panel is ending up closed, this is also
+	// the point where the Svelte `{#if}` will flip false and trigger the
+	// panel's outro transition — so `suppressNextOutro` must be set *in the
+	// same tick* as `manualDragControl` is cleared, not before and not after,
+	// otherwise the outro either fires with the wrong duration or (if set too
+	// early/late) leaks into an unrelated close/open.
+	const finishSidebarSettle = (open) => {
+		dragSettleTimeout = setTimeout(() => {
+			dragSettling = false;
+			if (!open) {
+				suppressNextOutro = true;
+			}
+			manualDragControl = false;
+			dragSettleTimeout = null;
+		}, DRAG_SETTLE_MS + 20);
+	};
+
+	const settleSidebarDrag = (touch) => {
+		if (!dragActive) return;
+
+		const horizontal = dragIntent === 'horizontal';
+		const dx = touch ? touch.clientX - dragStartX : 0;
+		const elapsed = Math.max(1, Date.now() - dragStartTime);
+		const velocity = dx / elapsed; // px/ms, positive = rightward
+
+		let open = dragWasOpen;
+		if (horizontal) {
+			if (dragWasOpen) {
+				const closingFraction = Math.max(0, -dx) / SIDEBAR_DRAG_WIDTH;
+				open = !(closingFraction > DRAG_OPEN_FRACTION || velocity < -DRAG_OPEN_VELOCITY);
+			} else {
+				const openingFraction = Math.max(0, dx) / SIDEBAR_DRAG_WIDTH;
+				open = openingFraction > DRAG_OPEN_FRACTION || velocity > DRAG_OPEN_VELOCITY;
+			}
+		}
+
+		dragActive = false;
+		dragIntent = null;
+
+		if (!manualDragControl) return;
+
+		dragSettling = true;
+		dragX = open ? 0 : -SIDEBAR_DRAG_WIDTH;
+		showSidebar.set(open);
+
+		finishSidebarSettle(open);
+	};
+
+	const cancelSidebarDrag = () => {
+		// Only an ACTIVE drag has anything to cancel. A touchcancel from a touch
+		// that never began a drag (e.g. a second resting finger cancelled by the
+		// OS during a settle) must not re-settle toward the stale dragWasOpen —
+		// that animates the panel against the store for a full width and back.
+		if (!dragActive) return;
+		dragActive = false;
+		dragIntent = null;
+		dragSettling = true;
+		dragX = dragWasOpen ? 0 : -SIDEBAR_DRAG_WIDTH;
+
+		if (dragSettleTimeout) clearTimeout(dragSettleTimeout);
+		finishSidebarSettle(dragWasOpen);
+	};
+
+	// Tap-to-close (backdrop click). This is NOT a drag — dx never crosses the
+	// intent threshold so `settleSidebarDrag` leaves the sidebar "open" and
+	// the actual close previously happened via a bare `showSidebar.set(false)`
+	// on the synthesized click, entirely bypassing the manual-transform +
+	// suppressed-outro machinery above (and racing the drag-settle timeout
+	// from the preceding touchstart/touchend). Route it through the same
+	// manually-driven close animation so there is exactly one close motion.
+	const closeSidebarAnimated = () => {
+		if (!$showSidebar && !manualDragControl) return;
+		if (reducedMotion) {
+			// Instant close — the subscriber skips animation under reduced motion
+			// and the mobile slide duration is 0.
+			showSidebar.set(false);
+			return;
+		}
+		if (dragSettleTimeout) clearTimeout(dragSettleTimeout);
+		dragActive = false;
+		dragIntent = null;
+		manualDragControl = true;
+		dragWasOpen = true;
+		dragSettling = true;
+		dragX = -SIDEBAR_DRAG_WIDTH;
+		showSidebar.set(false);
+		finishSidebarSettle(false);
+	};
+
+	// Store-driven open/close on mobile (hamburger tap, tap-a-chat auto-close,
+	// search-modal close, …). These previously animated via transition:slide,
+	// which animates *width* — a full relayout every frame on a phone. Route
+	// them through the same manual-transform machinery as the finger drag so
+	// every open/close is a compositor-only translateX.
+	const animateSidebarTo = (open) => {
+		if (dragSettleTimeout) clearTimeout(dragSettleTimeout);
+		dragActive = false;
+		dragIntent = null;
+		// If the panel has already been painted at a driven transform — mid-settle
+		// (retarget), prerendered at the closed position, or currently open — the
+		// CSS transition can simply be retargeted from wherever it visually is.
+		// Only a fresh mount (open before the idle prerender) needs to paint at
+		// the closed position for one frame first, hence the double-rAF: the
+		// first rAF runs before that frame paints, the second after.
+		const painted = manualDragControl || !open || sidebarPrerenderReady;
+		manualDragControl = true;
+		dragWasOpen = !open;
+		if (painted) {
+			dragSettling = true;
+			dragX = open ? 0 : -SIDEBAR_DRAG_WIDTH;
+		} else {
+			dragSettling = false;
+			dragX = -SIDEBAR_DRAG_WIDTH;
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					// A drag or close that raced in during these frames owns the settle.
+					if (!manualDragControl || dragActive || !$showSidebar) return;
+					dragSettling = true;
+					dragX = 0;
+				});
+			});
+		}
+		finishSidebarSettle(open);
+	};
+
+	// Edge-strip listeners — open gesture, sidebar currently closed.
+	// Start coords tracked here (not via dragStartX/Y) because beginSidebarDrag
+	// no-ops under reduced motion but tap-forwarding below must still work.
+	let edgeStartX = 0;
+	let edgeStartY = 0;
+	const onEdgeTouchStart = (e) => {
+		// Suppress iOS's history back-swipe, which starts from the same edge. This
+		// must happen on touchstart — by first touchmove the system gesture has
+		// already been committed. Costs vertical scrolling that starts in the
+		// leftmost 24px, which the drag-intent logic previously allowed.
+		// (Editable content under the strip needs no special-casing here: the
+		// strip is unmounted while a message is in edit mode and display:none'd
+		// under keyboard-open, so selection taps never reach this handler.)
+		if (e.cancelable) e.preventDefault();
+		edgeStartX = e.touches[0].clientX;
+		edgeStartY = e.touches[0].clientY;
+		beginSidebarDrag(e.touches[0]);
+	};
+	const onEdgeTouchMove = (e) => {
+		if (!dragActive) return;
+		if (updateSidebarDrag(e.touches[0])) {
+			// Horizontal intent confirmed — arm the popstate guard.
+			lastEdgeGestureAt = Date.now();
+			e.preventDefault();
+		}
+	};
+	const onEdgeTouchEnd = (e) => {
+		const horizontal = dragIntent === 'horizontal';
+		lastEdgeGestureAt = horizontal ? Date.now() : 0;
+		const touch = e.changedTouches[0];
+		settleSidebarDrag(touch);
+		// The strip sits above the leftmost 24px of the UI (incl. part of the
+		// navbar hamburger) and its touchstart preventDefault suppresses the
+		// native click — forward genuine taps to whatever is underneath so that
+		// column isn't tap-dead.
+		if (!horizontal && touch) {
+			const dx = Math.abs(touch.clientX - edgeStartX);
+			const dy = Math.abs(touch.clientY - edgeStartY);
+			if (dx < DRAG_INTENT_THRESHOLD && dy < DRAG_INTENT_THRESHOLD) {
+				const strip = e.currentTarget;
+				const under = document
+					.elementsFromPoint(touch.clientX, touch.clientY)
+					.find((el) => el !== strip);
+				if (under instanceof HTMLElement) {
+					under.click();
+				}
+			}
+		}
+	};
+	const onEdgeTouchCancel = () => {
+		// The OS claimed this touch (system back gesture) — its navigation must
+		// go through, so stand the popstate guard down.
+		lastEdgeGestureAt = 0;
+		cancelSidebarDrag();
+	};
+
+	// Panel/backdrop listeners — close gesture, sidebar currently open.
+	const onPanelTouchStart = (e) => {
+		if (!$showSidebar || dragActive) return;
+		// The iOS history back-swipe also triggers from the left edge while the
+		// sidebar is open — suppress it here too (see onEdgeTouchStart). But a
+		// preventDefault also kills the tap's synthetic click, and chat rows /
+		// folder chevrons start ~8px from the edge — so leave interactive
+		// targets alone (for those, the beforeNavigate popstate guard is still
+		// armed via the timestamp below).
+		if ($mobile && e.touches[0].clientX < 24) {
+			lastEdgeGestureAt = Date.now();
+			const target = e.target;
+			const interactive =
+				target instanceof Element && target.closest('a, button, input, textarea, [role="button"]');
+			if (e.cancelable && !interactive) {
+				e.preventDefault();
+			}
+		}
+		beginSidebarDrag(e.touches[0]);
+	};
+	const onPanelTouchMove = (e) => {
+		if (!dragActive) return;
+		if (updateSidebarDrag(e.touches[0])) {
+			// Horizontal intent confirmed — arm the popstate guard (a rightward
+			// edge-swipe over the open panel is the same system back-swipe zone).
+			lastEdgeGestureAt = Date.now();
+			e.preventDefault();
+		}
+	};
+	const onPanelTouchEnd = (e) => {
+		if (dragIntent === 'horizontal') {
+			lastEdgeGestureAt = Date.now();
+		}
+		settleSidebarDrag(e.changedTouches[0]);
+	};
+	const onPanelTouchCancel = () => {
+		// System claimed the touch — its navigation must go through.
+		lastEdgeGestureAt = 0;
+		cancelSidebarDrag();
+	};
+
 	const onKeyDown = (e) => {
 		if (e.key === 'Shift') {
 			shiftKey = true;
@@ -533,6 +937,8 @@
 		selectedChatId = null;
 	};
 
+	let prevShowSidebar = null;
+
 	let unsubscribers = [];
 	onMount(async () => {
 		showPinnedChat = localStorage?.showPinnedChat ? localStorage.showPinnedChat === 'true' : true;
@@ -545,13 +951,40 @@
 		hydrateSidebarDataFromCache();
 		await showSidebar.set(!$mobile ? localStorage.sidebar === 'true' : false);
 
+		// Offline-chat bookkeeping: load the availability map (cheap, meta-only)
+		// so ChatItems/ChatMenu can answer "will this open offline?" and ask for
+		// durable storage. The prefetch sweep itself is scheduled where FRESH
+		// sidebar rows land (initChatList / bootstrap revalidation) — at mount
+		// the rows are the localStorage cache and staleness checks against them
+		// would miss server-side updates. Re-sweep when connectivity returns.
+		if (isOfflineChatStorageEnabled() && $user?.id) {
+			requestPersistentStorage();
+			void refreshOfflineChatMeta($user.id);
+		} else {
+			// Setting off (or account switched to one with it off): a stale map
+			// from a previous session/user must not drive availability dimming.
+			offlineChatMeta.set(null);
+		}
+		let wasOnline = $online;
+
 		unsubscribers = [
+			online.subscribe((value) => {
+				if (value && !wasOnline && isOfflineChatStorageEnabled() && $user?.id) {
+					scheduleOfflinePrefetch(localStorage.token, $user.id, 3000);
+				}
+				wasOnline = value;
+			}),
 			_folders.subscribe((value) => {
 				if (Array.isArray(value)) {
 					buildFolderTree(value);
 				}
 			}),
 			mobile.subscribe((value) => {
+				// Crossing the breakpoint invalidates any pending outro-suppression
+				// (set for a mobile close that, with the always-mounted panel, never
+				// runs an outro) — a stale flag would zero the next desktop outro.
+				suppressNextOutro = false;
+
 				if ($showSidebar && value) {
 					showSidebar.set(false);
 				}
@@ -568,6 +1001,23 @@
 				}
 			}),
 			showSidebar.subscribe(async (value) => {
+				// Animate store-driven toggles on mobile through the manual-transform
+				// path. Skipped when the drag machinery already owns the motion toward
+				// the SAME target (manualDragControl set BEFORE the store flipped), on
+				// the initial subscription fire, and under reduced motion (instant is
+				// correct there). A toggle racing into a previous toggle's settle
+				// window (target disagrees) RETARGETS the transition instead of being
+				// swallowed — otherwise the panel sits dead for ~220ms then pops with
+				// no animation.
+				const changed = prevShowSidebar !== null && prevShowSidebar !== value;
+				prevShowSidebar = value;
+				if (changed && $mobile && !reducedMotion && !dragActive) {
+					const settleTargetOpen = dragX === 0;
+					if (!manualDragControl || settleTargetOpen !== value) {
+						animateSidebarTo(value);
+					}
+				}
+
 				localStorage.sidebar = value;
 
 				// nav element is not available on the first render
@@ -586,17 +1036,69 @@
 				}
 
 				if (value) {
-					await initChannels();
-					await initChatList();
+					// Wire item #6: while the socket is connected and the stores were
+					// hydrated this session, push events keep them live — paint from the
+					// stores and skip the channels+folders+tags+pinned+chats refetch.
+					// Refetch only when disconnected (could have missed pushes) or never
+					// hydrated.
+					if (sidebarHydratedThisSession && ($socket?.connected ?? false)) {
+						return;
+					}
+					// Offline, the refetch fan-out can only fail (error toasts over a
+					// perfectly good cached paint). Skip it and leave
+					// sidebarHydratedThisSession false — the socket-connect reconcile
+					// owns freshness once connectivity returns.
+					if (!$online) {
+						return;
+					}
+					try {
+						await initChannels();
+						await initChatList();
+						sidebarHydratedThisSession = true;
+					} catch (error) {
+						// Transient failure (e.g. connection dropped mid-fan-out): keep
+						// the cached paint; the reconnect reconcile refreshes.
+						console.error('Sidebar refetch failed', error);
+					}
 				}
 			})
 		];
 
+		// Wire item #4: re-consume sidebar components refreshed by a background
+		// bootstrap revalidation. The initial rev === 0 fire is skipped (the normal
+		// cache hydration + open-triggered init already cover first paint).
+		unsubBootstrapRevision = bootstrapRevision.subscribe((rev) => {
+			if (rev === 0) return;
+			applyBootstrapSidebarComponents();
+		});
+
 		window.addEventListener('keydown', onKeyDown);
 		window.addEventListener('keyup', onKeyUp);
 
-		window.addEventListener('touchstart', onTouchStart);
-		window.addEventListener('touchend', onTouchEnd);
+		reducedMotion =
+			typeof window.matchMedia === 'function' &&
+			window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+		// Mount the hidden mobile drawer once boot is idle, so the first open
+		// (drag or tap) never pays the chat-list mount cost mid-gesture.
+		{
+			const prerender = () => {
+				sidebarPrerenderReady = true;
+			};
+			if (typeof window.requestIdleCallback === 'function') {
+				window.requestIdleCallback(prerender, { timeout: 3000 });
+			} else {
+				// Safari/iOS: no requestIdleCallback.
+				setTimeout(prerender, 1200);
+			}
+		}
+
+		if (reducedMotion) {
+			// Reduced-motion fallback: simple discrete flick-to-toggle, no
+			// live finger-tracking or transform-driven animation.
+			window.addEventListener('touchstart', onTouchStart);
+			window.addEventListener('touchend', onTouchEnd);
+		}
 
 		window.addEventListener('focus', onFocus);
 		window.addEventListener('blur', onBlur);
@@ -617,11 +1119,23 @@
 			});
 		}
 
+		if (unsubBootstrapRevision) {
+			unsubBootstrapRevision();
+			unsubBootstrapRevision = null;
+		}
+
 		window.removeEventListener('keydown', onKeyDown);
 		window.removeEventListener('keyup', onKeyUp);
 
-		window.removeEventListener('touchstart', onTouchStart);
-		window.removeEventListener('touchend', onTouchEnd);
+		if (reducedMotion) {
+			window.removeEventListener('touchstart', onTouchStart);
+			window.removeEventListener('touchend', onTouchEnd);
+		}
+
+		if (dragSettleTimeout) {
+			clearTimeout(dragSettleTimeout);
+			dragSettleTimeout = null;
+		}
 
 		window.removeEventListener('focus', onFocus);
 		window.removeEventListener('blur', onBlur);
@@ -700,19 +1214,51 @@
 	}}
 />
 
-<!-- svelte-ignore a11y-no-static-element-interactions -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 
-{#if $showSidebar}
+{#if $showSidebar || manualDragControl}
 	<button
 		type="button"
 		aria-label={$i18n.t('Close Sidebar')}
 		class=" {$isApp
 			? ' ml-[4.5rem] md:ml-0'
 			: ''} fixed md:hidden z-40 top-0 right-0 left-0 bottom-0 bg-black/60 w-full min-h-screen h-screen flex justify-center overflow-hidden overscroll-contain cursor-default"
-		on:click={() => {
-			showSidebar.set(false);
+		style={manualDragControl
+			? `opacity: ${dragFraction}; transition: opacity ${dragSettling ? DRAG_SETTLE_MS : 0}ms ease-out;`
+			: ''}
+		onclick={() => {
+			if ($mobile) {
+				closeSidebarAnimated();
+			} else {
+				showSidebar.set(false);
+			}
 		}}
-	/>
+		use:nonpassive={['touchstart', () => onPanelTouchStart]}
+		use:nonpassive={['touchmove', () => onPanelTouchMove]}
+		ontouchend={onPanelTouchEnd}
+		ontouchcancel={onPanelTouchCancel}
+	></button>
+{/if}
+
+{#if $mobile && !$showSidebar && $messageEditingIds.size === 0}
+	<!-- Left-edge strip: touch target for the drag-to-open gesture when the
+	     sidebar is closed. Kept narrow so it doesn't intercept normal taps
+	     or horizontally-scrollable content (e.g. code blocks) elsewhere.
+	     touch-action:none + the touchstart preventDefault suppress iOS's
+	     history back-swipe, which starts from this same edge.
+	     Stands down entirely while a message is in edit mode (it hit-tests
+	     ABOVE the edit textarea, so it would swallow selection/caret taps in
+	     the leftmost 24px) and while the on-screen keyboard is up (same
+	     problem for the composer — hidden via #sidebar-edge-strip CSS). -->
+	<div
+		id="sidebar-edge-strip"
+		class="fixed top-0 left-0 h-full w-6 z-50"
+		style="touch-action: none;"
+		use:nonpassive={['touchstart', () => onEdgeTouchStart]}
+		use:nonpassive={['touchmove', () => onEdgeTouchMove]}
+		ontouchend={onEdgeTouchEnd}
+		ontouchcancel={onEdgeTouchCancel}
+	></div>
 {/if}
 
 <SearchModal
@@ -727,20 +1273,20 @@
 <button
 	id="sidebar-new-chat-button"
 	class="hidden"
-	on:click={() => {
+	onclick={() => {
 		goto('/');
 		newChatHandler();
 	}}
-/>
+></button>
 
 {#if !$mobile && !$showSidebar}
 	<div
-		class=" py-2 px-1.5 flex flex-col justify-between text-black dark:text-white hover:bg-gray-50/50 dark:hover:bg-gray-950/50 h-full border-e border-gray-50 dark:border-gray-850 z-10 transition-all"
+		class=" py-2 px-1.5 flex flex-col justify-between text-black dark:text-white hover:bg-gray-50/50 dark:hover:bg-gray-950/50 h-full border-e-hairline border-gray-50 dark:border-gray-850 z-10 transition-all"
 		id="sidebar"
 	>
 		<button
 			class="flex flex-col flex-1 {isWindows ? 'cursor-pointer' : 'cursor-[e-resize]'}"
-			on:click={async () => {
+			onclick={async () => {
 				showSidebar.set(!$showSidebar);
 			}}
 		>
@@ -776,7 +1322,7 @@
 							class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
 							href="/"
 							draggable="false"
-							on:click={async (e) => {
+							onclick={async (e) => {
 								e.stopImmediatePropagation();
 								e.preventDefault();
 
@@ -786,7 +1332,7 @@
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class=" self-center flex items-center justify-center size-9">
-								<PencilSquare className="size-4.5" />
+								<PencilSquare className="size-4.5" strokeWidth="2" />
 							</div>
 						</a>
 					</Tooltip>
@@ -796,7 +1342,7 @@
 					<Tooltip content={$i18n.t('Search')} placement="right">
 						<button
 							class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
-							on:click={(e) => {
+							onclick={(e) => {
 								e.stopImmediatePropagation();
 								e.preventDefault();
 
@@ -806,7 +1352,7 @@
 							aria-label={$i18n.t('Search')}
 						>
 							<div class=" self-center flex items-center justify-center size-9">
-								<Search className="size-4.5" />
+								<Search className="size-4.5" strokeWidth="2" />
 							</div>
 						</button>
 					</Tooltip>
@@ -818,7 +1364,7 @@
 							<a
 								class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
 								href="/notes"
-								on:click={async (e) => {
+								onclick={async (e) => {
 									e.stopImmediatePropagation();
 									e.preventDefault();
 
@@ -829,7 +1375,36 @@
 								aria-label={$i18n.t('Notes')}
 							>
 								<div class=" self-center flex items-center justify-center size-9">
-									<Note className="size-4.5" />
+									<Note className="size-4.5" strokeWidth="2" />
+								</div>
+							</a>
+						</Tooltip>
+					</div>
+				{/if}
+
+				{#if $config?.features?.enable_automations ?? false}
+					<div class="">
+						<Tooltip content={$i18n.t('Automations')} placement="right">
+							<a
+								class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
+								href="/automations"
+								onclick={async (e) => {
+									e.stopImmediatePropagation();
+									e.preventDefault();
+
+									goto('/automations');
+									itemClickHandler();
+								}}
+								draggable="false"
+								aria-label={$i18n.t('Automations')}
+							>
+								<div class=" self-center flex items-center justify-center size-9 relative">
+									<Clock className="size-4.5" strokeWidth="2" />
+									{#if $automationsUnreadCount > 0}
+										<div
+											class="absolute top-1.5 right-1.5 size-2 rounded-full bg-book-cloth ring-2 ring-white dark:ring-gray-950"
+										></div>
+									{/if}
 								</div>
 							</a>
 						</Tooltip>
@@ -842,7 +1417,7 @@
 							<a
 								class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
 								href="/workspace"
-								on:click={async (e) => {
+								onclick={async (e) => {
 									e.stopImmediatePropagation();
 									e.preventDefault();
 
@@ -857,7 +1432,7 @@
 										xmlns="http://www.w3.org/2000/svg"
 										fill="none"
 										viewBox="0 0 24 24"
-										stroke-width="1.5"
+										stroke-width="2"
 										stroke="currentColor"
 										class="size-4.5"
 									>
@@ -881,7 +1456,7 @@
 					{#if $user !== undefined && $user !== null}
 						<UserMenu
 							role={$user?.role}
-							on:show={(e) => {
+							onshow={(e) => {
 								if (e.detail === 'archived-chat') {
 									showArchivedChats.set(true);
 								}
@@ -907,21 +1482,40 @@
 	</div>
 {/if}
 
-{#if $showSidebar}
+{#if $showSidebar || manualDragControl || ($mobile && sidebarPrerenderReady)}
 	<div
 		bind:this={navElement}
 		id="sidebar"
-		class="h-screen max-h-[100dvh] min-h-screen select-none {$showSidebar
+		class="h-screen max-h-[100dvh] min-h-screen select-none {$showSidebar ||
+		manualDragControl ||
+		$mobile
 			? 'bg-gray-50 dark:bg-gray-950 z-50'
 			: ' bg-transparent z-0 '} {$isApp
 			? `ml-[4.5rem] md:ml-0 `
-			: ' transition-all duration-300 '} shrink-0 text-gray-900 dark:text-gray-200 text-sm fixed top-0 left-0 overflow-x-hidden
+			: ' md:transition-all md:duration-300 '} shrink-0 text-gray-900 dark:text-gray-200 text-sm fixed top-0 left-0 overflow-x-hidden
         "
-		transition:slide={{ duration: 250, axis: 'x' }}
+		style={manualDragControl
+			? `transform: translateX(${dragX}px); transition: transform ${dragSettling ? DRAG_SETTLE_MS : 0}ms ease-out; will-change: transform;`
+			: $mobile && !$showSidebar
+				? `transform: translateX(-${SIDEBAR_DRAG_WIDTH}px); visibility: hidden;`
+				: ''}
+		inert={$mobile && !$showSidebar && !manualDragControl ? true : undefined}
+		transition:slide={{
+			duration: $mobile || manualDragControl || suppressNextOutro ? 0 : 250,
+			axis: 'x'
+		}}
+		onoutroend={() => {
+			suppressNextOutro = false;
+		}}
 		data-state={$showSidebar}
+		use:nonpassive={['touchstart', () => onPanelTouchStart]}
+		use:nonpassive={['touchmove', () => onPanelTouchMove]}
+		ontouchend={onPanelTouchEnd}
+		ontouchcancel={onPanelTouchCancel}
 	>
 		<div
-			class=" my-auto flex flex-col justify-between h-screen max-h-[100dvh] w-[260px] overflow-x-hidden scrollbar-hidden z-50 {$showSidebar
+			class=" my-auto flex flex-col justify-between h-screen max-h-[100dvh] w-[260px] overflow-x-hidden scrollbar-hidden z-50 {$showSidebar ||
+			manualDragControl
 				? ''
 				: 'invisible'}"
 		>
@@ -932,7 +1526,7 @@
 					class="flex items-center rounded-xl size-8.5 h-full justify-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition no-drag-region"
 					href="/"
 					draggable="false"
-					on:click={newChatHandler}
+					onclick={newChatHandler}
 				>
 					<img
 						crossorigin="anonymous"
@@ -942,10 +1536,20 @@
 					/>
 				</a>
 
-				<a href="/" class="flex flex-1 px-1.5" on:click={newChatHandler}>
+				<a href="/" class="flex flex-1 px-1.5 items-center gap-1.5" onclick={newChatHandler}>
 					<div class=" self-center font-medium text-gray-850 dark:text-white font-primary">
 						{$WEBUI_NAME}
 					</div>
+
+					{#if !$online}
+						<Tooltip content={$i18n.t('Offline — showing saved data.')}>
+							<span
+								class="text-xs bg-red-500/15 text-red-600 dark:text-red-400 px-2 py-0.5 rounded-full font-medium"
+							>
+								{$i18n.t('Offline')}
+							</span>
+						</Tooltip>
+					{/if}
 				</a>
 				<Tooltip
 					content={$showSidebar ? $i18n.t('Close Sidebar') : $i18n.t('Open Sidebar')}
@@ -955,7 +1559,7 @@
 						class="flex rounded-xl size-8.5 justify-center items-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition {isWindows
 							? 'cursor-pointer'
 							: 'cursor-[w-resize]'}"
-						on:click={() => {
+						onclick={() => {
 							showSidebar.set(!$showSidebar);
 						}}
 						aria-label={$showSidebar ? $i18n.t('Close Sidebar') : $i18n.t('Open Sidebar')}
@@ -974,8 +1578,9 @@
 			</div>
 
 			<div
+				id="sidebar-scroll-container"
 				class="relative flex flex-col flex-1 overflow-y-auto scrollbar-hidden pt-3 pb-3"
-				on:scroll={(e) => {
+				onscroll={(e) => {
 					if (e.target.scrollTop === 0) {
 						scrollTop = 0;
 					} else {
@@ -987,27 +1592,25 @@
 					<div class="px-[7px] flex justify-center text-gray-800 dark:text-gray-200">
 						<a
 							id="sidebar-new-chat-button"
-							class="grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition outline-none"
+							class="grow flex items-center space-x-3 rounded-xl px-2.5 py-2 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition outline-none"
 							href="/"
 							draggable="false"
-							on:click={newChatHandler}
+							onclick={newChatHandler}
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class="self-center">
 								<PencilSquare className=" size-4.5" strokeWidth="2" />
 							</div>
 
-							<div class="flex self-center translate-y-[0.5px]">
-								<div class=" self-center text-sm font-primary">{$i18n.t('New Chat')}</div>
-							</div>
+							<div class="self-center text-sm font-primary">{$i18n.t('New Chat')}</div>
 						</a>
 					</div>
 
 					<div class="px-[7px] flex justify-center text-gray-800 dark:text-gray-200">
 						<button
 							id="sidebar-search-button"
-							class="grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition outline-none"
-							on:click={() => {
+							class="grow flex items-center space-x-3 rounded-xl px-2.5 py-2 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition outline-none"
+							onclick={() => {
 								showSearch.set(true);
 							}}
 							draggable="false"
@@ -1017,9 +1620,7 @@
 								<Search strokeWidth="2" className="size-4.5" />
 							</div>
 
-							<div class="flex self-center translate-y-[0.5px]">
-								<div class=" self-center text-sm font-primary">{$i18n.t('Search')}</div>
-							</div>
+							<div class="self-center text-sm font-primary">{$i18n.t('Search')}</div>
 						</button>
 					</div>
 
@@ -1027,9 +1628,9 @@
 						<div class="px-[7px] flex justify-center text-gray-800 dark:text-gray-200">
 							<a
 								id="sidebar-notes-button"
-								class="grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition"
+								class="grow flex items-center space-x-3 rounded-xl px-2.5 py-2 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition"
 								href="/notes"
-								on:click={itemClickHandler}
+								onclick={itemClickHandler}
 								draggable="false"
 								aria-label={$i18n.t('Notes')}
 							>
@@ -1037,9 +1638,30 @@
 									<Note className="size-4.5" strokeWidth="2" />
 								</div>
 
-								<div class="flex self-center translate-y-[0.5px]">
-									<div class=" self-center text-sm font-primary">{$i18n.t('Notes')}</div>
+								<div class="self-center text-sm font-primary">{$i18n.t('Notes')}</div>
+							</a>
+						</div>
+					{/if}
+
+					{#if $config?.features?.enable_automations ?? false}
+						<div class="px-[7px] flex justify-center text-gray-800 dark:text-gray-200">
+							<a
+								id="sidebar-automations-button"
+								class="grow flex items-center space-x-3 rounded-xl px-2.5 py-2 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition"
+								href="/automations"
+								onclick={itemClickHandler}
+								draggable="false"
+								aria-label={$i18n.t('Automations')}
+							>
+								<div class="self-center">
+									<Clock className="size-4.5" strokeWidth="2" />
 								</div>
+
+								<div class="self-center text-sm font-primary">{$i18n.t('Automations')}</div>
+
+								{#if $automationsUnreadCount > 0}
+									<div class="ml-auto size-2 rounded-full bg-book-cloth"></div>
+								{/if}
 							</a>
 						</div>
 					{/if}
@@ -1048,9 +1670,9 @@
 						<div class="px-[7px] flex justify-center text-gray-800 dark:text-gray-200">
 							<a
 								id="sidebar-workspace-button"
-								class="grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition"
+								class="grow flex items-center space-x-3 rounded-xl px-2.5 py-2 hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 transition"
 								href="/workspace"
-								on:click={itemClickHandler}
+								onclick={itemClickHandler}
 								draggable="false"
 								aria-label={$i18n.t('Workspace')}
 							>
@@ -1071,9 +1693,7 @@
 									</svg>
 								</div>
 
-								<div class="flex self-center translate-y-[0.5px]">
-									<div class=" self-center text-sm font-primary">{$i18n.t('Workspace')}</div>
-								</div>
+								<div class="self-center text-sm font-primary">{$i18n.t('Workspace')}</div>
 							</a>
 						</div>
 					{/if}
@@ -1120,7 +1740,7 @@
 							showCreateFolderModal = true;
 						}}
 						onAddLabel={$i18n.t('New Folder')}
-						on:drop={async (e) => {
+						ondrop={async (e) => {
 							const { type, id, item } = e.detail;
 
 							if (type === 'folder') {
@@ -1150,18 +1770,18 @@
 								selectedFolder.set(null);
 								initChatList();
 							}}
-							on:activate={(e) => {
+							onactivate={(e) => {
 								pendingChatId = e.detail;
 								selectedChatId = null;
 							}}
-							on:update={() => {
+							onupdate={() => {
 								initChatList();
 							}}
-							on:import={(e) => {
+							onimport={(e) => {
 								const { folderId, items } = e.detail;
 								importChatHandler(items, false, folderId);
 							}}
-							on:change={async () => {
+							onchange={async () => {
 								initChatList();
 							}}
 						/>
@@ -1172,13 +1792,13 @@
 					className="px-2 mt-0.5"
 					name={$i18n.t('Chats')}
 					chevron={false}
-					on:change={async (e) => {
+					onchange={async (e) => {
 						selectedFolder.set(null);
 					}}
-					on:import={(e) => {
+					onimport={(e) => {
 						importChatHandler(e.detail);
 					}}
-					on:drop={async (e) => {
+					ondrop={async (e) => {
 						const { type, id, item } = e.detail;
 
 						if (type === 'chat') {
@@ -1240,14 +1860,14 @@
 								<Folder
 									buttonClassName=" text-gray-500"
 									bind:open={showPinnedChat}
-									on:change={(e) => {
+									onchange={(e) => {
 										localStorage.setItem('showPinnedChat', e.detail);
 										console.log(e.detail);
 									}}
-									on:import={(e) => {
+									onimport={(e) => {
 										importChatHandler(e.detail, true);
 									}}
-									on:drop={async (e) => {
+									ondrop={async (e) => {
 										const { type, id, item } = e.detail;
 
 										if (type === 'chat') {
@@ -1290,7 +1910,7 @@
 									name={$i18n.t('Pinned')}
 								>
 									<div
-										class="ml-3 pl-1 mt-[1px] flex flex-col overflow-y-auto scrollbar-hidden border-s border-gray-100 dark:border-gray-900 text-gray-900 dark:text-gray-200"
+										class="ml-3 pl-1 flex flex-col overflow-y-auto scrollbar-hidden border-s border-gray-100 dark:border-gray-900 text-gray-900 dark:text-gray-200"
 									>
 										{#each $pinnedChats as chat, idx (`pinned-chat-${chat?.id ?? idx}`)}
 											<ChatItem
@@ -1300,20 +1920,20 @@
 												{shiftKey}
 												active={activeChatId === chat.id}
 												selected={selectedChatId === chat.id}
-												on:activate={(e) => {
+												onactivate={(e) => {
 													pendingChatId = e.detail;
 													selectedChatId = null;
 												}}
-												on:select={() => {
+												onselect={() => {
 													selectedChatId = chat.id;
 												}}
-												on:unselect={() => {
+												onunselect={() => {
 													selectedChatId = null;
 												}}
-												on:change={async () => {
+												onchange={async () => {
 													initChatList();
 												}}
-												on:tag={(e) => {
+												ontag={(e) => {
 													const { type, name } = e.detail;
 													tagEventHandler(type, name, chat.id);
 												}}
@@ -1365,20 +1985,20 @@
 										{shiftKey}
 										active={activeChatId === chat.id}
 										selected={selectedChatId === chat.id}
-										on:activate={(e) => {
+										onactivate={(e) => {
 											pendingChatId = e.detail;
 											selectedChatId = null;
 										}}
-										on:select={() => {
+										onselect={() => {
 											selectedChatId = chat.id;
 										}}
-										on:unselect={() => {
+										onunselect={() => {
 											selectedChatId = null;
 										}}
-										on:change={async () => {
+										onchange={async () => {
 											initChatList();
 										}}
-										on:tag={(e) => {
+										ontag={(e) => {
 											const { type, name } = e.detail;
 											tagEventHandler(type, name, chat.id);
 										}}
@@ -1387,7 +2007,7 @@
 
 								{#if $scrollPaginationEnabled && !allChatsLoaded}
 									<Loader
-										on:visible={(e) => {
+										onvisible={(e) => {
 											if (!chatListLoading) {
 												loadMoreChats();
 											}
@@ -1422,14 +2042,14 @@
 					{#if $user !== undefined && $user !== null}
 						<UserMenu
 							role={$user?.role}
-							on:show={(e) => {
+							onshow={(e) => {
 								if (e.detail === 'archived-chat') {
 									showArchivedChats.set(true);
 								}
 							}}
 						>
 							<div
-								class=" flex items-center rounded-2xl py-2 px-1.5 w-full hover:bg-gray-100/50 dark:hover:bg-gray-900/50 transition"
+								class=" flex items-center rounded-2xl py-2 px-1.5 w-full hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition"
 							>
 								<div class=" self-center mr-3">
 									<img

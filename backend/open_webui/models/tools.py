@@ -35,6 +35,10 @@ class ToolMeta(BaseModel):
     description: Optional[str] = None
     manifest: Optional[dict] = {}
     parallelizable: Optional[bool] = False
+    # Optional user-set icon (data URL or absolute URL) rendered wherever the
+    # tool surfaces in the UI. Declared explicitly because this model drops
+    # unknown keys.
+    icon: Optional[str] = None
 
 
 class ToolModel(BaseModel):

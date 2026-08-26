@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext } from 'svelte';
 
 	import { user, config, settings } from '$lib/stores';
@@ -20,26 +20,30 @@
 
 	const i18n = getContext('i18n');
 
-	export let saveHandler: Function;
-	export let saveSettings: Function;
+	interface Props {
+		saveHandler: Function;
+		saveSettings: Function;
+	}
+
+	let { saveHandler, saveSettings }: Props = $props();
 
 	let loaded = false;
 
-	let profileImageUrl = '';
-	let name = '';
-	let bio = '';
+	let profileImageUrl = $state('');
+	let name = $state('');
+	let bio = $state('');
 
-	let _gender = '';
-	let gender = '';
-	let dateOfBirth = '';
+	let _gender = $state('');
+	let gender = $state('');
+	let dateOfBirth = $state('');
 
-	let webhookUrl = '';
-	let showAPIKeys = false;
+	let webhookUrl = $state('');
+	let showAPIKeys = $state(false);
 
-	let JWTTokenCopied = false;
+	let JWTTokenCopied = $state(false);
 
-	let APIKey = '';
-	let APIKeyCopied = false;
+	let APIKey = $state('');
+	let APIKeyCopied = $state(false);
 	let profileImageInputElement: HTMLInputElement;
 
 	const submitHandler = async () => {
@@ -50,12 +54,15 @@
 		}
 
 		if (webhookUrl !== $settings?.notifications?.webhook_url) {
-			saveSettings({
+			const saved = await saveSettings({
 				notifications: {
 					...$settings.notifications,
 					webhook_url: webhookUrl
 				}
 			});
+			if (saved === false) {
+				return false;
+			}
 		}
 
 		const updatedUser = await updateUserProfile(localStorage.token, {
@@ -71,7 +78,7 @@
 		if (updatedUser) {
 			// Get Session User Info
 			const sessionUser = await getSessionUser(localStorage.token).catch((error) => {
-				toast.error(`${error}`);
+				toast.error(`${error?.detail ?? error}`);
 				return null;
 			});
 
@@ -92,7 +99,7 @@
 
 	onMount(async () => {
 		const user = await getSessionUser(localStorage.token).catch((error) => {
-			toast.error(`${error}`);
+			toast.error(`${error?.detail ?? error}`);
 			return null;
 		});
 
@@ -170,7 +177,7 @@
 								<select
 									class="w-full text-sm dark:text-gray-300 bg-transparent outline-hidden"
 									bind:value={_gender}
-									on:change={(e) => {
+									onchange={(e) => {
 										console.log(_gender);
 
 										if (_gender === 'custom') {
@@ -248,7 +255,7 @@
 				<button
 					class=" text-xs font-medium text-gray-500"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						showAPIKeys = !showAPIKeys;
 					}}>{showAPIKeys ? $i18n.t('Hide') : $i18n.t('Show')}</button
 				>
@@ -267,7 +274,7 @@
 
 								<button
 									class="ml-1.5 px-1.5 py-1 dark:hover:bg-gray-850 transition rounded-lg"
-									on:click={() => {
+									onclick={() => {
 										copyToClipboard(localStorage.token);
 										JWTTokenCopied = true;
 										setTimeout(() => {
@@ -325,7 +332,7 @@
 
 									<button
 										class="ml-1.5 px-1.5 py-1 dark:hover:bg-gray-850 transition rounded-lg"
-										on:click={() => {
+										onclick={() => {
 											copyToClipboard(APIKey);
 											APIKeyCopied = true;
 											setTimeout(() => {
@@ -369,8 +376,8 @@
 
 									<Tooltip content={$i18n.t('Create new key')}>
 										<button
-											class=" px-1.5 py-1 dark:hover:bg-gray-850transition rounded-lg"
-											on:click={() => {
+											class=" px-1.5 py-1 dark:hover:bg-gray-850 transition rounded-lg"
+											onclick={() => {
 												createAPIKeyHandler();
 											}}
 										>
@@ -392,8 +399,8 @@
 									</Tooltip>
 								{:else}
 									<button
-										class="flex gap-1.5 items-center font-medium px-3.5 py-1.5 rounded-lg bg-gray-100/70 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-850 transition"
-										on:click={() => {
+										class="flex gap-1.5 items-center font-medium px-3.5 py-1.5 rounded-lg bg-gray-100/70 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition"
+										onclick={() => {
 											createAPIKeyHandler();
 										}}
 									>
@@ -413,7 +420,7 @@
 	<div class="flex justify-end pt-3 text-sm font-medium">
 		<button
 			class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:text-white dark:hover:bg-kraft transition-colors duration-200 ease-paper rounded-full"
-			on:click={async () => {
+			onclick={async () => {
 				const res = await submitHandler();
 
 				if (res) {

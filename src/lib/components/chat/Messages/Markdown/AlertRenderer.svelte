@@ -1,4 +1,4 @@
-<script lang="ts" context="module">
+<script lang="ts" module>
 	import { marked, type Token } from 'marked';
 
 	type AlertType = 'NOTE' | 'TIP' | 'IMPORTANT' | 'WARNING' | 'CAUTION';
@@ -15,30 +15,32 @@
 		tokens: Token[];
 	}
 
+	// Warm-palette alert accents (see src/lib/utils/statusColors.ts philosophy):
+	// five distinguishable on-brand hues instead of default-Tailwind neon.
 	const alertStyles: Record<AlertType, AlertTheme> = {
 		NOTE: {
-			border: 'border-sky-500',
-			text: 'text-sky-500',
+			border: 'border-gray-400 dark:border-gray-500',
+			text: 'text-gray-500 dark:text-gray-400',
 			icon: Info
 		},
 		TIP: {
-			border: 'border-emerald-500',
-			text: 'text-emerald-500',
+			border: 'border-success dark:border-success-dark',
+			text: 'text-success dark:text-success-dark',
 			icon: LightBulb
 		},
 		IMPORTANT: {
-			border: 'border-purple-500',
-			text: 'text-purple-500',
+			border: 'border-book-cloth',
+			text: 'text-book-cloth dark:text-kraft',
 			icon: Star
 		},
 		WARNING: {
-			border: 'border-yellow-500',
-			text: 'text-yellow-500',
+			border: 'border-warning dark:border-warning-dark',
+			text: 'text-warning dark:text-warning-dark',
 			icon: ArrowRightCircle
 		},
 		CAUTION: {
-			border: 'border-rose-500',
-			text: 'text-rose-500',
+			border: 'border-error-brick dark:border-error-brick-dark',
+			text: 'text-error-brick dark:text-error-brick-dark',
 			icon: Bolt
 		}
 	};
@@ -71,12 +73,27 @@
 	import MarkdownTokens from './MarkdownTokens.svelte';
 	import type { ComponentType } from 'svelte';
 
-	export let token: Token;
-	export let alert: AlertData;
-	export let id = '';
-	export let tokenIdx = 0;
-	export let onTaskClick: ((event: MouseEvent) => void) | undefined = undefined;
-	export let onSourceClick: ((event: MouseEvent) => void) | undefined = undefined;
+	interface Props {
+		token: Token;
+		alert: AlertData;
+		id?: string;
+		tokenIdx?: number;
+		sandboxFiles?: any[];
+		onTaskClick?: ((event: MouseEvent) => void) | undefined;
+		onSourceClick?: ((event: MouseEvent) => void) | undefined;
+	}
+
+	let {
+		token,
+		alert,
+		id = '',
+		tokenIdx = 0,
+		sandboxFiles = [],
+		onTaskClick = undefined,
+		onSourceClick = undefined
+	}: Props = $props();
+
+	const SvelteComponent = $derived(alertStyles[alert.type].icon);
 </script>
 
 <!--
@@ -101,10 +118,16 @@ Renders the following Markdown as alerts:
 -->
 <div class={`border-l-4 pl-2.5 ${alertStyles[alert.type].border} my-0.5`}>
 	<div class="{alertStyles[alert.type].text} items-center flex gap-1 py-1.5">
-		<svelte:component this={alertStyles[alert.type].icon} className="inline-block size-4" />
+		<SvelteComponent className="inline-block size-4" />
 		<span class=" font-medium">{alert.type}</span>
 	</div>
 	<div class="pb-2">
-		<MarkdownTokens id={`${id}-${tokenIdx}`} tokens={alert.tokens} {onTaskClick} {onSourceClick} />
+		<MarkdownTokens
+			id={`${id}-${tokenIdx}`}
+			tokens={alert.tokens}
+			{sandboxFiles}
+			{onTaskClick}
+			{onSourceClick}
+		/>
 	</div>
 </div>

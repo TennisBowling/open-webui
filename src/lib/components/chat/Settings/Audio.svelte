@@ -1,6 +1,9 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
+	import { onMount, getContext } from 'svelte';
 
 	import { user, settings, config } from '$lib/stores';
 	import { getVoices as _getVoices } from '$lib/apis/audio';
@@ -8,33 +11,38 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	export let saveSettings: Function;
+	interface Props {
+		saveSettings: Function;
+	}
+
+	let { saveSettings, ...eventProps }: Props & Record<string, unknown> = $props();
 
 	// Audio
 	let conversationMode = false;
-	let speechAutoSend = false;
-	let responseAutoPlayback = false;
-	let nonLocalVoices = false;
+	let speechAutoSend = $state(false);
+	let responseAutoPlayback = $state(false);
+	let nonLocalVoices = $state(false);
 
-	let STTEngine = '';
-	let STTLanguage = '';
+	let STTEngine = $state('');
+	let STTLanguage = $state('');
 
-	let TTSEngine = '';
-	let TTSEngineConfig = {};
+	let TTSEngine = $state('');
+	let TTSEngineConfig = $state({});
 
-	let TTSModel = null;
-	let TTSModelProgress = null;
+	let TTSModel = $state(null);
+	let TTSModelProgress = $state(null);
 	let TTSModelLoading = false;
 
-	let voices = [];
-	let voice = '';
+	let voices = $state([]);
+	let voice = $state('');
 
 	// Audio speed control
-	let playbackRate = 1;
+	let playbackRate = $state(1);
 
 	const getVoices = async () => {
 		if (TTSEngine === 'browser-kokoro') {
@@ -105,10 +113,6 @@
 		await getVoices();
 	});
 
-	$: if (TTSEngine && TTSEngineConfig) {
-		onTTSEngineChange();
-	}
-
 	const onTTSEngineChange = async () => {
 		if (TTSEngine === 'browser-kokoro') {
 			await loadKokoro();
@@ -150,13 +154,18 @@
 			}
 		}
 	};
+	$effect(() => {
+		if (TTSEngine && TTSEngineConfig) {
+			onTTSEngineChange();
+		}
+	});
 </script>
 
 <form
 	id="tab-audio"
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
-		saveSettings({
+	onsubmit={preventDefault(async () => {
+		const saved = await saveSettings({
 			audio: {
 				stt: {
 					engine: STTEngine !== '' ? STTEngine : undefined,
@@ -172,8 +181,10 @@
 				}
 			}
 		});
-		dispatch('save');
-	}}
+		if (saved !== false) {
+			dispatch('save');
+		}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll max-h-[28rem] md:max-h-full">
 		<div>
@@ -222,7 +233,7 @@
 
 				<button
 					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					onclick={() => {
 						toggleSpeechAutoSend();
 					}}
 					type="button"
@@ -277,7 +288,7 @@
 
 				<button
 					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					onclick={() => {
 						toggleResponseAutoPlayback();
 					}}
 					type="button"

@@ -1,5 +1,5 @@
 <script lang="ts">
-	export let token;
+	let { token } = $props();
 </script>
 
 {token?.raw}

@@ -1,19 +1,26 @@
 <script lang="ts">
 	import Modal from '$lib/components/common/Modal.svelte';
 	import { getContext } from 'svelte';
-	export let show = false;
-	export let model = null;
-	export let feedbacks = [];
-	export let onClose: () => void = () => {};
 	const i18n = getContext('i18n');
 	import XMark from '$lib/components/icons/XMark.svelte';
+	interface Props {
+		show?: boolean;
+		model?: any;
+		feedbacks?: any;
+		onClose?: () => void;
+	}
+
+	let {
+		show = $bindable(false),
+		model = null,
+		feedbacks = [],
+		onClose = () => {}
+	}: Props = $props();
 
 	const close = () => {
 		show = false;
 		onClose();
 	};
-
-	$: topTags = model ? getTopTagsForModel(model.id, feedbacks) : [];
 
 	const getTopTagsForModel = (modelId: string, feedbacks: any[], topN = 5) => {
 		const tagCounts = new Map();
@@ -29,6 +36,7 @@
 			.slice(0, topN)
 			.map(([tag, count]) => ({ tag, count }));
 	};
+	let topTags = $derived(model ? getTopTagsForModel(model.id, feedbacks) : []);
 </script>
 
 <Modal size="sm" bind:show>
@@ -37,7 +45,11 @@
 			<div class="text-lg font-medium self-center">
 				{model.name}
 			</div>
-			<button class="self-center" on:click={close} aria-label="Close">
+			<button
+				class="self-center p-1 rounded-full text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={close}
+				aria-label="Close"
+			>
 				<XMark className={'size-5'} />
 			</button>
 		</div>
@@ -59,7 +71,7 @@
 				<button
 					class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:text-white dark:hover:bg-kraft transition-colors duration-200 ease-paper rounded-full"
 					type="button"
-					on:click={close}
+					onclick={close}
 				>
 					{$i18n.t('Close')}
 				</button>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import { marked } from 'marked';
 	marked.use({
 		breaks: true,
@@ -104,11 +105,11 @@
 	});
 
 	import { onMount, onDestroy, tick, getContext } from 'svelte';
-	import { createEventDispatcher } from 'svelte';
 	import { mobile } from '$lib/stores';
 
 	const i18n = getContext('i18n');
-	const eventDispatch = createEventDispatcher();
+	const eventDispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { Fragment, DOMParser } from 'prosemirror-model';
 	import { EditorState, Plugin, PluginKey, TextSelection, Selection } from 'prosemirror-state';
@@ -141,15 +142,12 @@
 
 	import { PASTED_TEXT_CHARACTER_LIMIT } from '$lib/constants';
 	import { createLowlight } from 'lowlight';
-	import hljs from 'highlight.js';
+	import hljs from 'highlight.js/lib/common';
 
 	import type { SocketIOCollaborationProvider } from './RichTextInput/Collaboration';
 
-	export let oncompositionstart = (e) => {};
-	export let oncompositionend = (e) => {};
-	export let onChange = (e) => {};
-
-	// create a lowlight instance with all languages loaded
+	// create a lowlight instance from highlight.js's common language set
+	// (the editor's code-block syntax set; see highlight.js/lib/common import)
 	const lowlight = createLowlight(
 		hljs.listLanguages().reduce(
 			(obj, lang) => {
@@ -160,104 +158,11 @@
 		)
 	);
 
-	export let editor: Editor | null = null;
-
-	export let socket = null;
-	export let user = null;
-	export let files = [];
-
-	export let documentId = '';
-
-	export let className = 'input-prose';
-	export let placeholder = $i18n.t('Type here...');
-	let _placeholder = placeholder;
-
-	$: if (placeholder !== _placeholder) {
-		setPlaceholder();
-	}
-
-	const setPlaceholder = () => {
-		_placeholder = placeholder;
-		if (editor) {
-			editor?.view.dispatch(editor.state.tr);
-		}
-	};
-
-	export let richText = true;
-	export let dragHandle = false;
-	export let link = false;
-	export let image = false;
-	export let fileHandler = false;
-	export let suggestions = null;
-
-	export let onFileDrop = (currentEditor, files, pos) => {
-		files.forEach((file) => {
-			const fileReader = new FileReader();
-
-			fileReader.readAsDataURL(file);
-			fileReader.onload = () => {
-				currentEditor
-					.chain()
-					.insertContentAt(pos, {
-						type: 'image',
-						attrs: {
-							src: fileReader.result
-						}
-					})
-					.focus()
-					.run();
-			};
-		});
-	};
-
-	export let onFilePaste = (currentEditor, files, htmlContent) => {
-		files.forEach((file) => {
-			if (htmlContent) {
-				// if there is htmlContent, stop manual insertion & let other extensions handle insertion via inputRule
-				// you could extract the pasted file from this url string and upload it to a server for example
-				console.log(htmlContent); // eslint-disable-line no-console
-				return false;
-			}
-
-			const fileReader = new FileReader();
-
-			fileReader.readAsDataURL(file);
-			fileReader.onload = () => {
-				currentEditor
-					.chain()
-					.insertContentAt(currentEditor.state.selection.anchor, {
-						type: 'image',
-						attrs: {
-							src: fileReader.result
-						}
-					})
-					.focus()
-					.run();
-			};
-		});
-	};
-
-	export let onSelectionUpdate = (e) => {};
-
-	export let id = '';
-	export let value = '';
-	export let html = '';
-
-	export let json = false;
-	export let raw = false;
-	export let editable = true;
-	export let collaboration = false;
-
-	export let showFormattingToolbar = true;
-
-	export let preserveBreaks = false;
-	export let generateAutoCompletion: Function = async () => null;
-	export let autocomplete = false;
-	export let messageInput = false;
-	export let shiftEnter = false;
-	export let largeTextAsFile = false;
-	export let insertPromptAsRichText = false;
-	export let floatingMenuPlacement = 'bottom-start';
+	// Buffers a setText() call that arrives before onMount has constructed
+	// `editor` (e.g. MessageInput's replayEditorQueue seeding text right after
+	// the fallback textarea swaps to this rich editor on blur). Without this,
+	// the seed silently no-ops and the user's typed draft is wiped.
+	let pendingSetText: string | null = null;
 
 	let content = null;
 	let htmlValue = '';
@@ -271,9 +176,9 @@
 	// can handle the text; the hot path that must stay fast is local editing.
 	const LONG_TEXT_INPUT_CHARACTER_THRESHOLD = 20000;
 
-	let plainTextMode = false;
-	let plainTextValue = '';
-	let plainTextareaElement: HTMLTextAreaElement | null = null;
+	let plainTextMode = $state(false);
+	let plainTextValue = $state('');
+	let plainTextareaElement: HTMLTextAreaElement | null = $state(null);
 	let pendingPlainSelection: { start: number; end: number } | null = null;
 
 	// Set by onTransaction before it assigns `value` internally; consumed by
@@ -283,9 +188,9 @@
 
 	let provider: SocketIOCollaborationProvider | null = null;
 
-	let floatingMenuElement: Element | null = null;
-	let bubbleMenuElement: Element | null = null;
-	let element: Element | null = null;
+	let floatingMenuElement: Element | null = $state(null);
+	let bubbleMenuElement: Element | null = $state(null);
+	let element: Element | null = $state(null);
 
 	const options = {
 		throwOnError: false
@@ -430,16 +335,6 @@
 
 		eventDispatch('keydown', { event });
 	};
-
-	$: if (editor) {
-		editor.setOptions({
-			editable: editable
-		});
-	}
-
-	$: if (value === null && html !== null && editor) {
-		editor.commands.setContent(html);
-	}
 
 	export const getWordAtDocPos = () => {
 		if (plainTextMode) {
@@ -595,7 +490,12 @@
 			deactivatePlainTextMode();
 		}
 
-		if (!editor) return;
+		if (!editor) {
+			// editor isn't constructed yet (onMount hasn't run) — buffer the text
+			// and flush it once onMount creates the editor, instead of dropping it.
+			pendingSetText = text ?? '';
+			return;
+		}
 
 		// reset the editor content
 		editor.commands.clearContent();
@@ -838,6 +738,136 @@
 	});
 
 	import { listDragHandlePlugin } from './RichTextInput/listDragHandlePlugin.js';
+	interface Props {
+		oncompositionstart?: any;
+		oncompositionend?: any;
+		onChange?: any;
+		editor?: Editor | null;
+		socket?: any;
+		user?: any;
+		files?: any;
+		documentId?: string;
+		className?: string;
+		placeholder?: any;
+		richText?: boolean;
+		dragHandle?: boolean;
+		link?: boolean;
+		image?: boolean;
+		fileHandler?: boolean;
+		suggestions?: any;
+		onFileDrop?: any;
+		onFilePaste?: any;
+		onSelectionUpdate?: any;
+		id?: string;
+		value?: string;
+		html?: string;
+		json?: boolean;
+		raw?: boolean;
+		editable?: boolean;
+		collaboration?: boolean;
+		showFormattingToolbar?: boolean;
+		preserveBreaks?: boolean;
+		generateAutoCompletion?: Function;
+		autocomplete?: boolean;
+		messageInput?: boolean;
+		shiftEnter?: boolean;
+		largeTextAsFile?: boolean;
+		insertPromptAsRichText?: boolean;
+		floatingMenuPlacement?: string;
+	}
+
+	let {
+		oncompositionstart = (e) => {},
+		oncompositionend = (e) => {},
+		onChange = (e) => {},
+		editor = $bindable(null),
+		socket = null,
+		user = null,
+		files = [],
+		documentId = '',
+		className = 'input-prose',
+		placeholder = $i18n.t('Type here...'),
+		richText = true,
+		dragHandle = false,
+		link = false,
+		image = false,
+		fileHandler = false,
+		suggestions = null,
+		onFileDrop = (currentEditor, files, pos) => {
+			files.forEach((file) => {
+				const fileReader = new FileReader();
+
+				fileReader.readAsDataURL(file);
+				fileReader.onload = () => {
+					currentEditor
+						.chain()
+						.insertContentAt(pos, {
+							type: 'image',
+							attrs: {
+								src: fileReader.result
+							}
+						})
+						.focus()
+						.run();
+				};
+			});
+		},
+		onFilePaste = (currentEditor, files, htmlContent) => {
+			files.forEach((file) => {
+				if (htmlContent) {
+					// if there is htmlContent, stop manual insertion & let other extensions handle insertion via inputRule
+					// you could extract the pasted file from this url string and upload it to a server for example
+					console.log(htmlContent); // eslint-disable-line no-console
+					return false;
+				}
+
+				const fileReader = new FileReader();
+
+				fileReader.readAsDataURL(file);
+				fileReader.onload = () => {
+					currentEditor
+						.chain()
+						.insertContentAt(currentEditor.state.selection.anchor, {
+							type: 'image',
+							attrs: {
+								src: fileReader.result
+							}
+						})
+						.focus()
+						.run();
+				};
+			});
+		},
+		onSelectionUpdate = (e) => {},
+		id = '',
+		value = $bindable(''),
+		html = '',
+		json = false,
+		raw = false,
+		editable = true,
+		collaboration = false,
+		showFormattingToolbar = true,
+		preserveBreaks = false,
+		generateAutoCompletion = async () => null,
+		autocomplete = false,
+		messageInput = false,
+		shiftEnter = false,
+		largeTextAsFile = false,
+		insertPromptAsRichText = false,
+		floatingMenuPlacement = 'bottom-start',
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	// Seed this from inside the mount/effect closures below. Initializing it
+	// directly from a prop captures only that prop's first value in Svelte 5.
+	let _placeholder = $state('');
+
+	const setPlaceholder = () => {
+		_placeholder = placeholder;
+		if (editor) {
+			editor.view.dispatch(editor.state.tr);
+		}
+	};
 
 	const ListItemDragHandle = Extension.create({
 		name: 'listItemDragHandle',
@@ -852,6 +882,7 @@
 	});
 
 	onMount(async () => {
+		_placeholder = placeholder;
 		content = value;
 
 		if (json) {
@@ -985,23 +1016,20 @@
 					: []),
 				...(collaboration && provider ? [provider.getEditorExtension()] : [])
 			],
-			content: collaboration ? undefined : content,
-			autofocus: messageInput && !$mobile ? true : false,
-			onTransaction: ({ transaction, appendedTransactions }) => {
-				// force re-render so `editor.isActive` works as expected
-				editor = editor;
-				if (!editor) return;
+				content: collaboration ? undefined : content,
+				autofocus: messageInput && !$mobile ? true : false,
+				onTransaction: ({ transaction, appendedTransactions }) => {
+					if (!editor) return;
 
 				// In long-text mode the native textarea is the source of truth.
 				// Hidden TipTap cleanup transactions must not emit an empty prompt
 				// over the top of the long text the user is editing.
 				if (plainTextMode) return;
 
-				// We're about to drive the `value` prop ourselves; tell the
-				// `$: onValueChange()` reactive (which also fires because we
-				// just reassigned `editor`) to no-op so it doesn't re-serialize
-				// the whole doc and run Turndown a second time.
-				_suppressOnValueChange = true;
+					// We're about to drive the `value` prop ourselves; tell the
+					// onValueChange effect to no-op so it doesn't re-serialize the
+					// whole doc and run Turndown a second time.
+					_suppressOnValueChange = true;
 
 				// Selection-only transactions don't change the document, so
 				// the serialized HTML/JSON/markdown can't have changed either.
@@ -1160,11 +1188,11 @@
 						if (messageInput) {
 							// Check if the current selection is inside a structured block (like codeBlock or list)
 							const { state } = view;
-							const { $head } = state.selection;
+							const { $head: selectionHead } = state.selection;
 
 							// Recursive function to check ancestors for specific node types
 							function isInside(nodeTypes: string[]): boolean {
-								let currentNode = $head;
+								let currentNode = selectionHead;
 								while (currentNode) {
 									if (nodeTypes.includes(currentNode.parent.type.name)) {
 										return true;
@@ -1198,9 +1226,9 @@
 								const isCtrlPressed = event.ctrlKey || event.metaKey; // metaKey is for Cmd key on Mac
 
 								const { state } = view;
-								const { $from } = state.selection;
-								const lineStart = $from.before($from.depth);
-								const lineEnd = $from.after($from.depth);
+								const { $from: selectionFrom } = state.selection;
+								const lineStart = selectionFrom.before(selectionFrom.depth);
+								const lineEnd = selectionFrom.after(selectionFrom.depth);
 								const lineText = state.doc.textBetween(lineStart, lineEnd, '\n', '\0').trim();
 								if (event.shiftKey && !isCtrlPressed) {
 									if (lineText.startsWith('```')) {
@@ -1367,6 +1395,15 @@
 			enablePasteRules: richText
 		});
 
+		// Flush any setText() call that arrived before `editor` existed above.
+		// Null the buffer first so the recursive setText() call below can't
+		// re-trigger this flush.
+		if (pendingSetText !== null) {
+			const bufferedText = pendingSetText;
+			pendingSetText = null;
+			setText(bufferedText);
+		}
+
 		if (plainTextMode) {
 			setRichEditorInputId(false);
 		}
@@ -1388,16 +1425,11 @@
 		}
 	});
 
-	$: if (value !== null && editor && !collaboration && !plainTextMode) {
-		onValueChange();
-	}
-
 	const onValueChange = () => {
 		if (!editor) return;
 
-		// onTransaction just drove `value` from inside the editor and bumped
-		// `editor` to flush Svelte reactives - this reactive then fires with
-		// nothing left to do. Bail before re-serializing the whole doc and
+		// onTransaction just drove `value` from inside the editor, so this effect
+		// has nothing left to do. Bail before re-serializing the whole doc and
 		// running Turndown again.
 		if (_suppressOnValueChange) {
 			_suppressOnValueChange = false;
@@ -1422,7 +1454,14 @@
 			.replace(/\u00a0/g, ' ');
 
 		if (value === '') {
-			editor.commands.clearContent(); // Clear content if value is empty
+			// Only clear when the doc actually has content: clearContent() on an
+			// already-empty doc still emits a docChanged transaction whose
+			// onChange({md:''}) clobbers the parent's prompt right when a
+			// freshly-mounted editor is about to be seeded (fallback-textarea →
+			// rich-editor swap), wiping the user's draft.
+			if (!editor.isEmpty) {
+				editor.commands.clearContent(); // Clear content if value is empty
+			}
 			selectTemplate();
 
 			return;
@@ -1454,6 +1493,28 @@
 			}
 		}
 	};
+	$effect(() => {
+		if (placeholder !== _placeholder) {
+			setPlaceholder();
+		}
+	});
+	$effect(() => {
+		if (editor) {
+			editor.setOptions({
+				editable: editable
+			});
+		}
+	});
+	$effect(() => {
+		if (value === null && html !== null && editor) {
+			editor.commands.setContent(html);
+		}
+	});
+	$effect(() => {
+		if (value !== null && editor && !collaboration && !plainTextMode) {
+			onValueChange();
+		}
+	});
 </script>
 
 {#if plainTextMode}
@@ -1465,17 +1526,16 @@
 			: ''}"
 		value={plainTextValue}
 		spellcheck="false"
-		placeholder={placeholder}
+		{placeholder}
 		aria-label={placeholder}
 		disabled={!editable}
-		on:input={handlePlainTextareaInput}
-		on:paste={handlePlainTextareaPaste}
-		on:keydown={handlePlainTextareaKeydown}
-		on:keyup={(event) => eventDispatch('keyup', { event })}
-		on:compositionstart={(event) => oncompositionstart(event)}
-		on:compositionend={(event) => oncompositionend(event)}
-		on:focus={(event) => eventDispatch('focus', { event })}
-	/>
+		oninput={handlePlainTextareaInput}
+		onpaste={handlePlainTextareaPaste}
+		onkeydown={handlePlainTextareaKeydown}
+		onkeyup={(event) => eventDispatch('keyup', { event })}
+		oncompositionstart={(event) => oncompositionstart(event)}
+		oncompositionend={(event) => oncompositionend(event)}
+		onfocus={(event) => eventDispatch('focus', { event })}></textarea>
 {/if}
 
 {#if richText && showFormattingToolbar && !plainTextMode}
@@ -1493,4 +1553,4 @@
 	class="relative w-full min-w-full h-full min-h-fit {plainTextMode
 		? 'hidden'
 		: ''} {className} {!editable ? 'cursor-not-allowed' : ''}"
-/>
+></div>

@@ -1,13 +1,10 @@
-<script>
+<script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 
 	let map;
-	let mapElement;
+	let mapElement = $state();
 
-	export let setViewLocation = [51.505, -0.09];
-	export let points = [];
-
-	export let onClick = (e) => {};
+	let { setViewLocation = [51.505, -0.09], points = $bindable([]), onClick = (e) => {} } = $props();
 
 	let markerGroupLayer = null;
 
@@ -80,5 +77,5 @@
 </script>
 
 <div class=" z-10 w-full">
-	<div bind:this={mapElement} class="h-96 z-10" />
+	<div bind:this={mapElement} class="h-96 z-10"></div>
 </div>

@@ -1,35 +1,39 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import type { Banner } from '$lib/types';
-	import { onMount, createEventDispatcher, getContext } from 'svelte';
+	import { onMount, getContext } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import DOMPurify from 'dompurify';
 	import { marked } from 'marked';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { statusChipClass } from '$lib/utils/statusColors';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	const i18n = getContext('i18n');
 
-	export let banner: Banner = {
-		id: '',
-		type: 'info',
-		title: '',
-		content: '',
-		url: '',
-		dismissible: true,
-		timestamp: Math.floor(Date.now() / 1000)
-	};
-	export let className = 'mx-2 px-2 rounded-lg';
+	interface Props {
+		banner?: Banner;
+		className?: string;
+		dismissed?: boolean;
+	}
 
-	export let dismissed = false;
+	let {
+		banner = {
+			id: '',
+			type: 'info',
+			title: '',
+			content: '',
+			url: '',
+			dismissible: true,
+			timestamp: Math.floor(Date.now() / 1000)
+		},
+		className = 'mx-2 px-2 rounded-lg',
+		dismissed = $bindable(false),
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	let mounted = false;
-
-	const classNames: Record<string, string> = {
-		info: 'bg-blue-500/20 text-blue-700 dark:text-blue-200 ',
-		success: 'bg-green-500/20 text-green-700 dark:text-green-200',
-		warning: 'bg-yellow-500/20 text-yellow-700 dark:text-yellow-200',
-		error: 'bg-red-500/20 text-red-700 dark:text-red-200'
-	};
+	let mounted = $state(false);
 
 	const dismiss = (id) => {
 		dismissed = true;
@@ -46,14 +50,14 @@
 {#if !dismissed}
 	{#if mounted}
 		<div
-			class="{className} top-0 left-0 right-0 py-1 flex justify-center items-center relative border border-transparent text-gray-800 dark:text-gary-100 bg-transparent backdrop-blur-xl z-30"
+			class="{className} top-0 left-0 right-0 py-1 flex justify-center items-center relative border border-transparent text-gray-800 dark:text-gray-100 bg-transparent backdrop-blur-xl z-30"
 			transition:fade={{ delay: 100, duration: 300 }}
 		>
 			<div class=" flex flex-col md:flex-row md:items-center flex-1 text-sm w-fit gap-1.5">
 				<div class="flex justify-between self-start">
 					<div
-						class=" text-xs font-semibold {classNames[banner.type] ??
-							classNames['info']}  w-fit px-2 rounded-sm uppercase line-clamp-1 mr-0.5"
+						class=" text-xs font-semibold {statusChipClass[banner.type] ??
+							statusChipClass['info']}  w-fit px-2 rounded-md uppercase line-clamp-1 mr-0.5"
 					>
 						{#if banner.type.toLowerCase() === 'info'}
 							{$i18n.t('Info')}
@@ -135,10 +139,10 @@
 			<div class="flex self-start">
 				<button
 					aria-label={$i18n.t('Close Banner')}
-					on:click={() => {
+					onclick={() => {
 						dismiss(banner.id);
 					}}
-					class="  -mt-1 -mb-2 -translate-y-[1px] ml-1.5 mr-1 text-gray-400 dark:hover:text-white"
+					class="  -mt-1 -mb-2 -translate-y-[1px] ml-1.5 mr-1 text-gray-400 hover:text-gray-600 dark:hover:text-white"
 					>&times;</button
 				>
 			</div>

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
@@ -27,28 +27,28 @@
 	import GarbageBin from '../icons/GarbageBin.svelte';
 	import ViewSelector from './common/ViewSelector.svelte';
 
-	let shiftKey = false;
+	let shiftKey = $state(false);
 
 	const i18n = getContext('i18n');
-	let promptsImportInputElement: HTMLInputElement;
-	let loaded = false;
+	let promptsImportInputElement: HTMLInputElement = $state();
+	let loaded = $state(false);
 
-	let importFiles = '';
-	let query = '';
+	// Must be a FileList or null: unlike Svelte 4, runes-mode `bind:files` is
+	// two-way and assigns straight back to `input.files`, so a '' or [] seed
+	// throws "Failed to convert value to 'FileList'" while the component is
+	// mounting — which took the whole Prompts page down.
+	let importFiles: FileList | null = $state(null);
+	let query = $state('');
 
-	let prompts = [];
+	let prompts = $state([]);
 
-	let showDeleteConfirm = false;
-	let deletePrompt = null;
+	let showDeleteConfirm = $state(false);
+	let deletePrompt = $state(null);
 
-	let tagsContainerElement: HTMLDivElement;
-	let viewOption = '';
+	let tagsContainerElement: HTMLDivElement = $state();
+	let viewOption = $state('');
 
-	let filteredItems = [];
-
-	$: if (prompts && query !== undefined && viewOption !== undefined) {
-		setFilteredItems();
-	}
+	let filteredItems = $state([]);
 
 	const setFilteredItems = () => {
 		filteredItems = prompts.filter((p) => {
@@ -155,6 +155,11 @@
 			window.removeEventListener('blur', onBlur);
 		};
 	});
+	$effect(() => {
+		if (prompts && query !== undefined && viewOption !== undefined) {
+			setFilteredItems();
+		}
+	});
 </script>
 
 <svelte:head>
@@ -167,7 +172,7 @@
 	<DeleteConfirmDialog
 		bind:show={showDeleteConfirm}
 		title={$i18n.t('Delete prompt?')}
-		on:confirm={() => {
+		onconfirm={() => {
 			deleteHandler(deletePrompt);
 		}}
 	>
@@ -184,7 +189,7 @@
 			type="file"
 			accept=".json"
 			hidden
-			on:change={() => {
+			onchange={() => {
 				console.log(importFiles);
 
 				const reader = new FileReader();
@@ -206,7 +211,7 @@
 					prompts = await getPromptList(localStorage.token);
 					await _prompts.set(await getPrompts(localStorage.token));
 
-					importFiles = [];
+					importFiles = null;
 					promptsImportInputElement.value = '';
 				};
 
@@ -228,7 +233,7 @@
 				{#if $user?.role === 'admin'}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-						on:click={() => {
+						onclick={() => {
 							promptsImportInputElement.click();
 						}}
 					>
@@ -240,7 +245,7 @@
 					{#if prompts.length}
 						<button
 							class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-							on:click={async () => {
+							onclick={async () => {
 								let blob = new Blob([JSON.stringify(prompts)], {
 									type: 'application/json'
 								});
@@ -254,7 +259,7 @@
 					{/if}
 				{/if}
 				<a
-					class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+					class=" px-2 py-1.5 max-md:p-2.5 max-md:min-w-9 max-md:min-h-9 max-md:justify-center rounded-full bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper font-medium text-sm flex items-center"
 					href="/workspace/prompts/create"
 				>
 					<Plus className="size-3" strokeWidth="2.5" />
@@ -266,7 +271,7 @@
 	</div>
 
 	<div
-		class="py-2 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100 dark:border-gray-850"
+		class="py-2 bg-white dark:bg-gray-900 rounded-2xl border-hairline border-gray-100 dark:border-gray-850"
 	>
 		<div class=" flex w-full space-x-2 py-0.5 px-3.5 pb-2">
 			<div class="flex flex-1">
@@ -280,14 +285,14 @@
 				/>
 
 				{#if query}
-					<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
+					<div class="self-center pl-1.5 bg-transparent">
 						<button
-							class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-							on:click={() => {
+							class="p-0.5 max-md:p-2 rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-850 transition"
+							onclick={() => {
 								query = '';
 							}}
 						>
-							<XMark className="size-3" strokeWidth="2" />
+							<XMark className="size-3 max-md:size-4" strokeWidth="2" />
 						</button>
 					</div>
 				{/if}
@@ -296,7 +301,7 @@
 
 		<div
 			class="px-3 flex w-full bg-transparent overflow-x-auto scrollbar-none -mx-1"
-			on:wheel={(e) => {
+			onwheel={(e) => {
 				if (e.deltaY !== 0) {
 					e.preventDefault();
 					e.currentTarget.scrollLeft += e.deltaY;
@@ -350,13 +355,13 @@
 								</Tooltip>
 							</div>
 						</div>
-						<div class="flex flex-row gap-0.5 self-center">
+						<div class="flex flex-row gap-0.5 max-md:gap-1 self-center">
 							{#if shiftKey}
 								<Tooltip content={$i18n.t('Delete')}>
 									<button
-										class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+										class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											deleteHandler(prompt);
 										}}
 									>
@@ -381,7 +386,7 @@
 									onClose={() => {}}
 								>
 									<button
-										class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+										class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 										type="button"
 									>
 										<EllipsisHorizontal className="size-5" />

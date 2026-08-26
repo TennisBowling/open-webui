@@ -1,4 +1,24 @@
+<script lang="ts" module>
+	// Lazy chunks kept off the first-message-render path. Each loader caches its
+	// promise so repeated renders hand {#await} the SAME promise — a fresh
+	// promise per render would re-enter the pending branch (visible churn while
+	// streaming) even though the module itself is cached.
+	let _codeBlockPromise: Promise<any> | null = null;
+	const loadCodeBlock = () =>
+		(_codeBlockPromise ??= import('$lib/components/chat/Messages/CodeBlock.svelte'));
+	let _dataVizPromise: Promise<any> | null = null;
+	const loadDataVizWidget = () =>
+		(_dataVizPromise ??= import('$lib/components/chat/Messages/DataVizWidget.svelte'));
+	let _subagentBlockPromise: Promise<any> | null = null;
+	const loadSubagentBlock = () => (_subagentBlockPromise ??= import('./SubagentBlock.svelte'));
+	// Lazy reasoning body fetcher (dynamic import also breaks the cycle
+	// ReasoningText → Markdown → MarkdownTokens).
+	let _reasoningTextPromise: Promise<any> | null = null;
+	const loadReasoningText = () => (_reasoningTextPromise ??= import('../ReasoningText.svelte'));
+</script>
+
 <script lang="ts">
+	import MarkdownTokens from './MarkdownTokens.svelte';
 	import DOMPurify from 'dompurify';
 	import { onMount, getContext } from 'svelte';
 	const i18n = getContext('i18n');
@@ -8,10 +28,10 @@
 
 	import { marked, type Token } from 'marked';
 	import { unescapeHtml } from '$lib/utils';
+	import { getCachedMarkdownTokens, setCachedMarkdownTokens } from '../Markdown.svelte';
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
-	const loadCodeBlock = () => import('$lib/components/chat/Messages/CodeBlock.svelte');
 	import MarkdownInlineTokens from '$lib/components/chat/Messages/Markdown/MarkdownInlineTokens.svelte';
 	import KatexRenderer from './KatexRenderer.svelte';
 	import AlertRenderer, { alertComponent } from './AlertRenderer.svelte';
@@ -22,8 +42,6 @@
 	import Source from './Source.svelte';
 	import { settings } from '$lib/stores';
 	import HtmlToken from './HTMLToken.svelte';
-	import DataVizWidget from '$lib/components/chat/Messages/DataVizWidget.svelte';
-	import SubagentBlock from './SubagentBlock.svelte';
 
 	const parseToolCallArguments = (raw: unknown): Record<string, any> => {
 		if (raw == null) return {};
@@ -54,31 +72,65 @@
 			.trim();
 	};
 
-	export let id: string;
-	export let tokens: Token[];
-	export let top = true;
+	interface Props {
+		id: string;
+		tokens: Token[];
+		top?: boolean;
+		done?: boolean;
+		chatId?: string;
+		messageId?: string;
+		dataVizOverrides?: Record<string, string>;
+		sandboxFiles?: any[];
+		save?: boolean;
+		preview?: boolean;
+		editCodeBlock?: boolean;
+		topPadding?: boolean;
+		onSave?: Function;
+		onUpdate?: Function;
+		onPreview?: Function;
+		onTaskClick?: Function;
+		onSourceClick?: Function;
+	}
 
-	export let done = true;
-	export let chatId = '';
-	export let messageId = '';
-	export let dataVizOverrides: Record<string, string> = {};
-	export let sandboxFiles: any[] = [];
-
-	export let save = false;
-	export let preview = false;
-
-	export let editCodeBlock = true;
-	export let topPadding = false;
-
-	export let onSave: Function = () => {};
-	export let onUpdate: Function = () => {};
-	export let onPreview: Function = () => {};
-
-	export let onTaskClick: Function = () => {};
-	export let onSourceClick: Function = () => {};
+	let {
+		id,
+		tokens,
+		top = true,
+		done = true,
+		chatId = '',
+		messageId = '',
+		dataVizOverrides = {},
+		sandboxFiles = [],
+		save = false,
+		preview = false,
+		editCodeBlock = true,
+		topPadding = false,
+		onSave = () => {},
+		onUpdate = () => {},
+		onPreview = () => {},
+		onTaskClick = () => {},
+		onSourceClick = () => {}
+	}: Props = $props();
 
 	const headerComponent = (depth: number) => {
 		return 'h' + depth;
+	};
+
+	// Reuse the module-level markdown token cache from Markdown.svelte for the
+	// secondary/nested lex calls below (e.g. reasoning/details sub-content) so
+	// re-renders of an unchanged nested block don't re-run a full marked.lexer
+	// pass. Only cache once the message is `done`, matching the top-level
+	// Markdown.svelte behavior (streaming content changes every render, so
+	// caching it would just churn the LRU without benefit).
+	const lexWithCache = (text: string) => {
+		if (done) {
+			const cached = getCachedMarkdownTokens(text);
+			if (cached) return cached;
+			const lexed = marked.lexer(text);
+			setCachedMarkdownTokens(text, lexed);
+			return lexed;
+		}
+		return marked.lexer(text);
 	};
 
 	const exportTableToCSVHandler = (token, tokenIdx = 0) => {
@@ -135,8 +187,7 @@
 	{:else if token.type === 'code'}
 		{#if token.raw.includes('```')}
 			{#await loadCodeBlock() then CodeBlock}
-				<svelte:component
-					this={CodeBlock.default}
+				<CodeBlock.default
 					id={`${id}-${tokenIdx}`}
 					collapsed={$settings?.collapseCodeBlocks ?? false}
 					{token}
@@ -167,13 +218,13 @@
 					class=" w-full text-sm text-left text-gray-500 dark:text-gray-400 max-w-full rounded-xl"
 				>
 					<thead
-						class="text-xs text-gray-700 uppercase bg-white dark:bg-gray-900 dark:text-gray-400 border-none"
+						class="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-gray-850 dark:text-gray-400 border-none"
 					>
 						<tr class="">
 							{#each token.header as header, headerIdx}
 								<th
 									scope="col"
-									class="px-2.5! py-2! cursor-pointer border-b border-gray-100! dark:border-gray-800!"
+									class="px-2.5! py-2! cursor-pointer border-b-hairline border-gray-100! dark:border-gray-850!"
 									style={token.align[headerIdx] ? '' : `text-align: ${token.align[headerIdx]}`}
 								>
 									<div class="gap-1.5 text-left">
@@ -200,7 +251,7 @@
 											1 ===
 										rowIdx
 											? ''
-											: 'border-b border-gray-50! dark:border-gray-850!'}"
+											: 'border-b-hairline border-gray-100! dark:border-gray-850!'}"
 										style={token.align[cellIdx] ? `text-align: ${token.align[cellIdx]}` : ''}
 									>
 										<div class="break-normal">
@@ -223,8 +274,8 @@
 			<div class=" absolute top-1 right-1.5 z-20 invisible group-hover:visible">
 				<Tooltip content={$i18n.t('Export to CSV')}>
 					<button
-						class="p-1 rounded-lg bg-transparent transition"
-						on:click={(e) => {
+						class="tap-target p-1 max-md:p-2 rounded-lg bg-transparent transition"
+						onclick={(e) => {
 							e.stopPropagation();
 							exportTableToCSVHandler(token, tokenIdx);
 						}}
@@ -237,10 +288,10 @@
 	{:else if token.type === 'blockquote'}
 		{@const alert = alertComponent(token)}
 		{#if alert}
-			<AlertRenderer {token} {alert} />
+			<AlertRenderer {id} {tokenIdx} {token} {alert} {sandboxFiles} {onTaskClick} {onSourceClick} />
 		{:else}
 			<blockquote dir="auto">
-				<svelte:self
+				<MarkdownTokens
 					id={`${id}-${tokenIdx}`}
 					tokens={token.tokens}
 					{done}
@@ -248,6 +299,7 @@
 					{chatId}
 					{messageId}
 					{dataVizOverrides}
+					{sandboxFiles}
 					{onTaskClick}
 					{onSourceClick}
 				/>
@@ -263,7 +315,7 @@
 								class=" translate-y-[1px] -translate-x-1"
 								type="checkbox"
 								checked={item.checked}
-								on:change={(e) => {
+								onchange={(e) => {
 									onTaskClick({
 										id: id,
 										token: token,
@@ -276,12 +328,16 @@
 							/>
 						{/if}
 
-						<svelte:self
+						<MarkdownTokens
 							id={`${id}-${tokenIdx}-${itemIdx}`}
 							tokens={item.tokens}
 							top={token.loose}
 							{done}
 							{editCodeBlock}
+							{chatId}
+							{messageId}
+							{dataVizOverrides}
+							{sandboxFiles}
 							{onTaskClick}
 							{onSourceClick}
 						/>
@@ -297,7 +353,7 @@
 								class=""
 								type="checkbox"
 								checked={item.checked}
-								on:change={(e) => {
+								onchange={(e) => {
 									onTaskClick({
 										id: id,
 										token: token,
@@ -310,23 +366,31 @@
 							/>
 
 							<div>
-								<svelte:self
+								<MarkdownTokens
 									id={`${id}-${tokenIdx}-${itemIdx}`}
 									tokens={item.tokens}
 									top={token.loose}
 									{done}
 									{editCodeBlock}
+									{chatId}
+									{messageId}
+									{dataVizOverrides}
+									{sandboxFiles}
 									{onTaskClick}
 									{onSourceClick}
 								/>
 							</div>
 						{:else}
-							<svelte:self
+							<MarkdownTokens
 								id={`${id}-${tokenIdx}-${itemIdx}`}
 								tokens={item.tokens}
 								top={token.loose}
 								{done}
 								{editCodeBlock}
+								{chatId}
+								{messageId}
+								{dataVizOverrides}
+								{sandboxFiles}
 								{onTaskClick}
 								{onSourceClick}
 							/>
@@ -337,55 +401,87 @@
 		{/if}
 	{:else if token.type === 'details' && token?.attributes?.type === 'tool_calls' && token?.attributes?.name === 'show_widget'}
 		{@const args = parseToolCallArguments(token.attributes.arguments)}
-		<DataVizWidget
-			title={args.title ?? 'widget'}
-			widgetCode={args.widget_code ?? ''}
-			loadingMessages={Array.isArray(args.loading_messages) ? args.loading_messages : []}
-			{chatId}
-			{messageId}
-			{dataVizOverrides}
-		/>
+		{#await loadDataVizWidget() then DataVizWidget}
+			<DataVizWidget.default
+				title={args.title ?? 'widget'}
+				widgetCode={args.widget_code ?? ''}
+				loadingMessages={Array.isArray(args.loading_messages) ? args.loading_messages : []}
+				{chatId}
+				{messageId}
+				{dataVizOverrides}
+			/>
+		{/await}
 	{:else if token.type === 'details' && token?.attributes?.type === 'subagent_launch'}
-		<SubagentBlock attributes={token.attributes} />
+		{#await loadSubagentBlock() then SubagentBlock}
+			<SubagentBlock.default
+				attributes={token.attributes}
+				parentChatId={chatId}
+				parentMessageId={messageId}
+				{sandboxFiles}
+			/>
+		{/await}
 	{:else if token.type === 'details'}
+		{@const isReasoning = token?.attributes?.type === 'reasoning'}
+		{@const reasoningId = isReasoning ? `${id}-${tokenIdx}` : ''}
 		<Collapsible
 			title={token.summary}
-			open={$settings?.expandDetails ?? false}
+			id={reasoningId}
+			reasoningKey={reasoningId}
+			open={isReasoning ? undefined : ($settings?.expandDetails ?? false)}
 			attributes={token?.attributes}
 			className="w-full space-y-1"
 			dir="auto"
 		>
-			<div class=" mb-1.5" slot="content">
-				{#if token?.attributes?.type === 'reasoning'}
-					<div class="text-sm text-gray-600 dark:text-gray-400">
-						<svelte:self
+			{#snippet content()}
+				<div class=" mb-1.5">
+					{#if token?.attributes?.type === 'reasoning'}
+						<div class="text-sm text-gray-600 dark:text-gray-400">
+							{#if token?.attributes?.content_lazy === 'true'}
+								<!-- Server withheld the reasoning text (lazy stub). This slot
+								     only mounts while the block is expanded, so the fetch fires
+								     exactly on first expand. Attr-embedded ids win so subagent
+								     transcripts (another chat's blocks) fetch from the right row. -->
+								{#await loadReasoningText() then ReasoningText}
+									<ReasoningText.default
+										id={`${id}-${tokenIdx}-d`}
+										chatId={token?.attributes?.chat_id || chatId}
+										messageId={token?.attributes?.message_id || messageId}
+										contentRef={token?.attributes?.content_ref ?? ''}
+									/>
+								{/await}
+							{:else}
+								<MarkdownTokens
+									id={`${id}-${tokenIdx}-d`}
+									tokens={lexWithCache(normalizeReasoningDetailsText(token.text))}
+									attributes={token?.attributes}
+									{done}
+									{editCodeBlock}
+									{chatId}
+									{messageId}
+									{dataVizOverrides}
+									{sandboxFiles}
+									{onTaskClick}
+									{onSourceClick}
+								/>
+							{/if}
+						</div>
+					{:else}
+						<MarkdownTokens
 							id={`${id}-${tokenIdx}-d`}
-							tokens={marked.lexer(normalizeReasoningDetailsText(token.text))}
+							tokens={lexWithCache(token.text)}
 							attributes={token?.attributes}
 							{done}
 							{editCodeBlock}
 							{chatId}
 							{messageId}
 							{dataVizOverrides}
+							{sandboxFiles}
 							{onTaskClick}
 							{onSourceClick}
 						/>
-					</div>
-				{:else}
-					<svelte:self
-						id={`${id}-${tokenIdx}-d`}
-						tokens={marked.lexer(token.text)}
-						attributes={token?.attributes}
-						{done}
-						{editCodeBlock}
-						{chatId}
-						{messageId}
-						{dataVizOverrides}
-						{onTaskClick}
-						{onSourceClick}
-					/>
-				{/if}
-			</div>
+					{/if}
+				</div>
+			{/snippet}
 		</Collapsible>
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
@@ -395,7 +491,15 @@
 			title={token.fileId}
 			width="100%"
 			frameborder="0"
-			onload="this.style.height=(this.contentWindow.document.body.scrollHeight+20)+'px';"
+			onload={(event) => {
+				const frame = event.currentTarget;
+				try {
+					const bodyHeight = frame.contentDocument?.body?.scrollHeight;
+					if (bodyHeight) frame.style.height = `${bodyHeight + 20}px`;
+				} catch {
+					// Cross-origin frames are intentionally not introspectable.
+				}
+			}}
 		></iframe>
 	{:else if token.type === 'paragraph'}
 		<p dir="auto">
@@ -415,6 +519,7 @@
 						id={`${id}-${tokenIdx}-t`}
 						tokens={token.tokens}
 						{done}
+						{sandboxFiles}
 						{onSourceClick}
 					/>
 				{:else}
@@ -441,7 +546,7 @@
 			<KatexRenderer content={token.text} displayMode={token?.displayMode ?? false} />
 		{/if}
 	{:else if token.type === 'space'}
-		<div class="my-2" />
+		<div class="my-2"></div>
 	{:else}
 		{console.log('Unknown token', token)}
 	{/if}

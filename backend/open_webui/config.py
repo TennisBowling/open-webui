@@ -1263,6 +1263,17 @@ PRICING_SYNC_INTERVAL_HOURS = PersistentConfig(
     int(os.environ.get("PRICING_SYNC_INTERVAL_HOURS", "12")),
 )
 
+# Auto-discover per-model reasoning-effort support from OpenRouter's catalog and
+# use it to drive the chat effort selectors for OpenRouter models. When on, base
+# OpenRouter models are enriched at model-list time with a live ``reasoning``
+# descriptor, and the model editor surfaces the discovered efforts + a manual
+# override. Admin-authored per-model config always wins over discovery.
+ENABLE_OPENROUTER_REASONING_DISCOVERY = PersistentConfig(
+    "ENABLE_OPENROUTER_REASONING_DISCOVERY",
+    "openrouter.reasoning_discovery_enabled",
+    os.environ.get("ENABLE_OPENROUTER_REASONING_DISCOVERY", "True").lower() == "true",
+)
+
 
 ####################################
 # MODELS
@@ -1294,6 +1305,21 @@ TOOL_SERVER_CONNECTIONS = PersistentConfig(
     tool_server_connections,
 )
 
+# 0 = unlimited (the default). Long-running tools (deep-analysis containers,
+# bash, browser/web research) must not be cut off by a hidden cap; the model's
+# own `timeout` tool argument still bounds a call when it passes one (see
+# MCPClient.call_tool). Admins can set a hard cap here if they want one.
+try:
+    default_mcp_tool_call_timeout = int(os.environ.get("MCP_CALL_TIMEOUT", "0"))
+except (TypeError, ValueError):
+    default_mcp_tool_call_timeout = 0
+
+MCP_TOOL_CALL_TIMEOUT = PersistentConfig(
+    "MCP_TOOL_CALL_TIMEOUT",
+    "tool_server.mcp_tool_call_timeout",
+    max(0, default_mcp_tool_call_timeout),
+)
+
 ####################################
 # CONTAINER WORKSPACE
 ####################################
@@ -1310,10 +1336,10 @@ CONTAINER_DATA_ROOT = PersistentConfig(
     os.environ.get("CONTAINER_DATA_ROOT", "/mnt/microns/openllm-containers"),
 )
 
-DEFAULT_CONTAINER_SYSTEM_PROMPT = """Container workspace is enabled for this chat.
+DEFAULT_CONTAINER_SYSTEM_PROMPT = f"""Container workspace is enabled for this chat.
 Use /workspace/inputs for uploaded files and /workspace/outputs for files the user should receive.
 Files in /workspace/outputs persist across turns; when the user asks to modify a previous output, edit the existing file there instead of creating an unrelated copy.
-When you create files for the user, save them under /workspace/outputs. Open WebUI will attach generated files automatically. If you mention a generated file, refer to its filename or use a sandbox:/workspace/... link only for files that actually exist."""
+When you create files for the user, save them under /workspace/outputs. {WEBUI_NAME} will attach generated files automatically. If you mention a generated file, refer to its filename or use a sandbox:/workspace/... link only for files that actually exist."""
 
 CONTAINER_MCP_SERVER_ID = PersistentConfig(
     "CONTAINER_MCP_SERVER_ID",
@@ -2534,12 +2560,6 @@ DOCLING_OCR_LANG = PersistentConfig(
     os.getenv("DOCLING_OCR_LANG", "eng,fra,deu,spa"),
 )
 
-DOCLING_PDF_BACKEND = PersistentConfig(
-    "DOCLING_PDF_BACKEND",
-    "rag.docling_pdf_backend",
-    os.getenv("DOCLING_PDF_BACKEND", "dlparse_v4"),
-)
-
 DOCLING_TABLE_MODE = PersistentConfig(
     "DOCLING_TABLE_MODE",
     "rag.docling_table_mode",
@@ -2602,12 +2622,6 @@ DOCUMENT_INTELLIGENCE_KEY = PersistentConfig(
     "DOCUMENT_INTELLIGENCE_KEY",
     "rag.document_intelligence_key",
     os.getenv("DOCUMENT_INTELLIGENCE_KEY", ""),
-)
-
-MISTRAL_OCR_API_KEY = PersistentConfig(
-    "MISTRAL_OCR_API_KEY",
-    "rag.mistral_ocr_api_key",
-    os.getenv("MISTRAL_OCR_API_KEY", ""),
 )
 
 BYPASS_EMBEDDING_AND_RETRIEVAL = PersistentConfig(
@@ -2728,12 +2742,6 @@ RAG_EMBEDDING_ENGINE = PersistentConfig(
     "RAG_EMBEDDING_ENGINE",
     "rag.embedding_engine",
     os.environ.get("RAG_EMBEDDING_ENGINE", ""),
-)
-
-PDF_EXTRACT_IMAGES = PersistentConfig(
-    "PDF_EXTRACT_IMAGES",
-    "rag.pdf_extract_images",
-    os.environ.get("PDF_EXTRACT_IMAGES", "False").lower() == "true",
 )
 
 RAG_EMBEDDING_MODEL = PersistentConfig(
@@ -3018,7 +3026,7 @@ JINA_READER_VIEWPORT_HEIGHT = PersistentConfig(
 JINA_READER_TIMEOUT = PersistentConfig(
     "JINA_READER_TIMEOUT",
     "rag.web.search.jina_reader_timeout",
-    int(os.getenv("JINA_READER_TIMEOUT", "30")),
+    int(os.getenv("JINA_READER_TIMEOUT", "180")),
 )
 
 # Legacy Exa Contents/Fetch Settings (kept for older persisted configs; web_fetch uses Jina Reader)
@@ -3088,13 +3096,99 @@ from open_webui.utils.data_viz_prompts import (
     MODULE_MOCKUP_INTERACTIVE as _DATA_VIZ_DEFAULT_MOCKUP_INTERACTIVE,
     MODULE_CHART_DATAVIZ as _DATA_VIZ_DEFAULT_CHART_DATAVIZ,
     MODULE_ART as _DATA_VIZ_DEFAULT_ART,
-    MODULE_ELICITATION as _DATA_VIZ_DEFAULT_ELICITATION,
 )
 
 ENABLE_DATA_VIZ = PersistentConfig(
     "ENABLE_DATA_VIZ",
     "data_viz.enable",
     os.getenv("ENABLE_DATA_VIZ", "False").lower() == "true",
+)
+
+####################################
+# Automations (scheduled tasks)
+####################################
+
+ENABLE_AUTOMATIONS = PersistentConfig(
+    "ENABLE_AUTOMATIONS",
+    "automations.enable",
+    os.getenv("ENABLE_AUTOMATIONS", "False").lower() == "true",
+)
+
+# Ceiling on ARMED automations per user (active with a scheduled next run — a
+# completed one-off deactivates itself and stops counting). Every armed row is a
+# recurring, unattended, billable generation, so this is the blast-radius bound.
+AUTOMATIONS_MAX_ACTIVE_PER_USER = PersistentConfig(
+    "AUTOMATIONS_MAX_ACTIVE_PER_USER",
+    "automations.max_active_per_user",
+    int(os.getenv("AUTOMATIONS_MAX_ACTIVE_PER_USER", "10")),
+)
+
+# VAPID keypair for Web Push. Generated once on first boot and persisted (see
+# the lifespan bootstrap in main.py) so subscriptions survive restarts — a
+# rotated key silently invalidates every existing subscription.
+WEBPUSH_VAPID_PUBLIC_KEY = PersistentConfig(
+    "WEBPUSH_VAPID_PUBLIC_KEY",
+    "webpush.vapid_public_key",
+    os.getenv("WEBPUSH_VAPID_PUBLIC_KEY", ""),
+)
+
+WEBPUSH_VAPID_PRIVATE_KEY = PersistentConfig(
+    "WEBPUSH_VAPID_PRIVATE_KEY",
+    "webpush.vapid_private_key",
+    os.getenv("WEBPUSH_VAPID_PRIVATE_KEY", ""),
+)
+
+####################################
+# Video inputs
+####################################
+
+ENABLE_VIDEO_INPUT = PersistentConfig(
+    "ENABLE_VIDEO_INPUT",
+    "video.enable",
+    os.getenv("ENABLE_VIDEO_INPUT", "True").lower() == "true",
+)
+
+# Frames sampled per second of source. Gemini samples video at ~1 fps natively,
+# so 1 keeps every frame the model would look at while shrinking the payload.
+VIDEO_DEFAULT_FPS = PersistentConfig(
+    "VIDEO_DEFAULT_FPS",
+    "video.default_fps",
+    float(os.getenv("VIDEO_DEFAULT_FPS", "1")),
+)
+
+VIDEO_DEFAULT_QUALITY = PersistentConfig(
+    "VIDEO_DEFAULT_QUALITY",
+    "video.default_quality",
+    os.getenv("VIDEO_DEFAULT_QUALITY", "720p"),
+)
+
+# Gemini transcribes the audio track (billed separately as audio_tokens), which
+# is usually worth the ~25 tokens/sec it costs.
+VIDEO_DEFAULT_AUDIO = PersistentConfig(
+    "VIDEO_DEFAULT_AUDIO",
+    "video.default_audio",
+    os.getenv("VIDEO_DEFAULT_AUDIO", "True").lower() == "true",
+)
+
+# Cap on the *downloaded source*, not the processed output. Guards disk and
+# bandwidth; it is not a limit on what may be sent to a model.
+VIDEO_MAX_SOURCE_SIZE_MB = PersistentConfig(
+    "VIDEO_MAX_SOURCE_SIZE_MB",
+    "video.max_source_size_mb",
+    int(os.getenv("VIDEO_MAX_SOURCE_SIZE_MB", "2048")),
+)
+
+# Purely advisory: the composer warns past this, but never blocks a send.
+VIDEO_WARN_DURATION_SECONDS = PersistentConfig(
+    "VIDEO_WARN_DURATION_SECONDS",
+    "video.warn_duration_seconds",
+    int(os.getenv("VIDEO_WARN_DURATION_SECONDS", "600")),
+)
+
+ENABLE_VIDEO_URL_INGEST = PersistentConfig(
+    "ENABLE_VIDEO_URL_INGEST",
+    "video.enable_url_ingest",
+    os.getenv("ENABLE_VIDEO_URL_INGEST", "True").lower() == "true",
 )
 
 DATA_VIZ_SHARED_CORE_PROMPT = PersistentConfig(
@@ -3150,17 +3244,6 @@ DATA_VIZ_MODULE_ART_PROMPT = PersistentConfig(
     os.getenv("DATA_VIZ_MODULE_ART_PROMPT", _DATA_VIZ_DEFAULT_ART),
 )
 
-DATA_VIZ_MODULE_ELICITATION_ENABLED = PersistentConfig(
-    "DATA_VIZ_MODULE_ELICITATION_ENABLED",
-    "data_viz.module.elicitation.enabled",
-    os.getenv("DATA_VIZ_MODULE_ELICITATION_ENABLED", "True").lower() == "true",
-)
-DATA_VIZ_MODULE_ELICITATION_PROMPT = PersistentConfig(
-    "DATA_VIZ_MODULE_ELICITATION_PROMPT",
-    "data_viz.module.elicitation.prompt",
-    os.getenv("DATA_VIZ_MODULE_ELICITATION_PROMPT", _DATA_VIZ_DEFAULT_ELICITATION),
-)
-
 # Auto-repair: when a rendered widget throws a runtime error in the iframe,
 # re-prompt the model with the error and replace the broken widget in-place.
 DATA_VIZ_AUTO_REPAIR_ENABLED = PersistentConfig(
@@ -3191,6 +3274,50 @@ DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT = PersistentConfig(
 )
 
 ####################################
+# Chat Semantic Search (message embeddings)
+####################################
+
+# Standalone multimodal embedder (qwen3-vl-embedding-8b, 4096-dim) used to power
+# semantic chat search. These three are admin-editable at runtime (Admin > Settings >
+# Embeddings) and bridged into open_webui.utils.chat_embedder's live globals so a
+# change takes effect without a restart. CHAT_EMBED_DIM is intentionally NOT here —
+# it's pinned to the pgvector column dimension and changing it needs a migration.
+ENABLE_CHAT_SEMANTIC_SEARCH = PersistentConfig(
+    "ENABLE_CHAT_SEMANTIC_SEARCH",
+    "chat_semantic.enable",
+    os.environ.get("ENABLE_CHAT_SEMANTIC_SEARCH", "true").lower()
+    in ("1", "true", "yes"),
+)
+
+# Bare llama-swap base URL: all requests go to {url}/v1/embeddings and llama-swap
+# routes (and cold-starts) the right upstream by the `model` field in the body.
+CHAT_EMBED_URL = PersistentConfig(
+    "CHAT_EMBED_URL",
+    "chat_semantic.embed_url",
+    os.environ.get("CHAT_EMBED_URL", "http://127.0.0.1:8085").rstrip("/"),
+)
+
+CHAT_EMBED_MODEL = PersistentConfig(
+    "CHAT_EMBED_MODEL",
+    "chat_semantic.embed_model",
+    os.environ.get("CHAT_EMBED_MODEL", "qwen3-vl-embedding-8b"),
+)
+
+# Deferred-batching knobs: messages are never embedded at write time — they accumulate
+# until the periodic sweep, which sends them in one strictly-sequential burst.
+CHAT_EMBED_SWEEP_INTERVAL = PersistentConfig(
+    "CHAT_EMBED_SWEEP_INTERVAL",
+    "chat_semantic.sweep_interval",
+    int(os.environ.get("CHAT_EMBED_SWEEP_INTERVAL", "120")),
+)
+
+CHAT_EMBED_TEXT_BATCH = PersistentConfig(
+    "CHAT_EMBED_TEXT_BATCH",
+    "chat_semantic.text_batch",
+    int(os.environ.get("CHAT_EMBED_TEXT_BATCH", "16")),
+)
+
+####################################
 # Subagents
 ####################################
 
@@ -3211,6 +3338,16 @@ SUBAGENT_DEFAULT_MODEL = PersistentConfig(
     "SUBAGENT_DEFAULT_MODEL",
     "subagents.default_model",
     os.getenv("SUBAGENT_DEFAULT_MODEL", ""),
+)
+
+# Optional long-context successor for a subagent. When the active subagent
+# model rejects an input because its context window is exhausted, the runner
+# atomically replaces that failed turn with a retry on this model and persists
+# the switch on the hidden chat. Empty disables context fallback.
+SUBAGENT_CONTEXT_FALLBACK_MODEL = PersistentConfig(
+    "SUBAGENT_CONTEXT_FALLBACK_MODEL",
+    "subagents.context_fallback_model",
+    os.getenv("SUBAGENT_CONTEXT_FALLBACK_MODEL", ""),
 )
 
 # Prepended to the subagent model's own system prompt when running an inner
@@ -3276,14 +3413,11 @@ ENABLE_ASK_USER = PersistentConfig(
 
 # Appended to the parent chat's system prompt when ask_user is enabled. Teaches
 # the model when and how to use the tool. Admin-editable.
-DEFAULT_ASK_USER_PARENT_PROMPT = """You can ask the user a question and pause until they answer, using the `ask_user` tool.
+DEFAULT_ASK_USER_PARENT_PROMPT = """You can ask the user a question and pause until they answer, using the `ask_user` tool (its schema documents the question format).
 
-Use it when you hit a genuine decision point where the user's input changes what you do next — an ambiguous requirement, a choice between real alternatives, a missing preference you can't infer. Do NOT use it for things you can reasonably decide yourself, and do NOT use it to narrate progress.
+Use it only at a genuine decision point where their input changes what you do next — an ambiguous requirement, a choice between real alternatives, a missing preference you can't infer. Do NOT use it for things you can reasonably decide yourself, and do NOT use it to narrate progress.
 
-- `questions`: 1-4 questions. Each has a `question` (the full text), an optional short `header` label (max ~12 chars, e.g. "Auth method"), `multiSelect` (true to let the user pick several options), `allowOther` (true to offer a free-text "Other" escape hatch — default true), and `options`: 2-4 `{label, description}` choices. Omit `options` (or pass an empty list) to ask a pure free-form question with just a text box.
-- Keep options distinct and mutually exclusive (unless `multiSelect`). If you recommend one, put it first and add "(Recommended)" to its label.
-
-The user's answer comes back as the tool result. Continue the task using their choices. If the result says the user skipped, proceed with your best judgment and note the assumption you made."""
+The user's answer comes back as the tool result; continue using their choice. If they skipped, proceed with your best judgment and note the assumption."""
 
 ASK_USER_PARENT_PROMPT = PersistentConfig(
     "ASK_USER_PARENT_PROMPT",
@@ -3334,7 +3468,7 @@ SUBAGENT_ALLOW_EXTERNAL_TOOLS = PersistentConfig(
     os.getenv("SUBAGENT_ALLOW_EXTERNAL_TOOLS", "False").lower() == "true",
 )
 
-DEFAULT_SUBAGENT_EXTERNAL_TOOLS_PROMPT = """You are running as a subagent inside a parent Open WebUI chat. You may have access to selected external tools from the parent chat. Use them only when they help complete the task your parent delegated.
+DEFAULT_SUBAGENT_EXTERNAL_TOOLS_PROMPT = f"""You are running as a subagent inside a parent {WEBUI_NAME} chat. You may have access to selected external tools from the parent chat. Use them only when they help complete the task your parent delegated.
 
 If a container or workspace tool is available, it uses the same /workspace as the main chat and any other subagents in this chat. Treat it as shared state: inspect existing files before editing, avoid overwriting unrelated work, and save user-facing outputs under /workspace/outputs."""
 
@@ -3682,6 +3816,35 @@ AUDIO_STT_OPENAI_API_KEY = PersistentConfig(
     os.getenv("AUDIO_STT_OPENAI_API_KEY", OPENAI_API_KEY),
 )
 
+AUDIO_STT_OPENROUTER_API_KEY = PersistentConfig(
+    "AUDIO_STT_OPENROUTER_API_KEY",
+    "audio.stt.openrouter.api_key",
+    os.getenv("AUDIO_STT_OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
+)
+
+audio_stt_openrouter_temperature = os.getenv(
+    "AUDIO_STT_OPENROUTER_TEMPERATURE", ""
+).strip()
+try:
+    audio_stt_openrouter_temperature = (
+        float(audio_stt_openrouter_temperature)
+        if audio_stt_openrouter_temperature
+        else None
+    )
+except ValueError:
+    audio_stt_openrouter_temperature = None
+if (
+    audio_stt_openrouter_temperature is not None
+    and not 0 <= audio_stt_openrouter_temperature <= 1
+):
+    audio_stt_openrouter_temperature = None
+
+AUDIO_STT_OPENROUTER_TEMPERATURE = PersistentConfig(
+    "AUDIO_STT_OPENROUTER_TEMPERATURE",
+    "audio.stt.openrouter.temperature",
+    audio_stt_openrouter_temperature,
+)
+
 AUDIO_STT_ENGINE = PersistentConfig(
     "AUDIO_STT_ENGINE",
     "audio.stt.engine",
@@ -3757,6 +3920,12 @@ AUDIO_TTS_OPENAI_PARAMS = PersistentConfig(
     "AUDIO_TTS_OPENAI_PARAMS",
     "audio.tts.openai.params",
     audio_tts_openai_params,
+)
+
+AUDIO_TTS_OPENROUTER_API_KEY = PersistentConfig(
+    "AUDIO_TTS_OPENROUTER_API_KEY",
+    "audio.tts.openrouter.api_key",
+    os.getenv("AUDIO_TTS_OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
 )
 
 

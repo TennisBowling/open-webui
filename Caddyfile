@@ -1,0 +1,33 @@
+# Minimal HTTP/2 + HTTP/3 (QUIC) front for the Open WebUI fork.
+#
+# Bare uvicorn (start_modified.sh) speaks HTTP/1.1 only. On a high-latency /
+# metered iOS PWA link the ~122-request cold load serializes across ~6 TCP
+# connections and head-of-line-blocks. Putting Caddy in front gives:
+#   - h2 multiplexing (all 122 requests over one connection)
+#   - h3 / QUIC with 0-RTT resumption and connection migration (survives an iOS
+#     Wi-Fi ↔ cellular radio handoff without a full reconnect)
+#   - automatic TLS (h2/h3 require it)
+#   - Brotli/gzip negotiation and transparent WebSocket upgrade for socket.io
+#
+# Usage:
+#   1. Replace chat.example.com below with your real domain (DNS → this host).
+#   2. Run start_modified.sh (it now trusts X-Forwarded-* from loopback).
+#   3. caddy run --config ./Caddyfile
+#
+# For a purely local / IP-only test, replace the domain line with `:443` plus
+# `tls internal`, or `http://localhost` to skip TLS (h2/h3 will be unavailable).
+
+chat.example.com {
+	encode zstd br gzip
+
+	# Upstream is the loopback uvicorn from start_modified.sh. WebSockets
+	# (socket.io at /ws/) upgrade transparently through reverse_proxy.
+	reverse_proxy 127.0.0.1:8081 {
+		# Long-lived streaming responses (SSE / chat token stream) must not be
+		# buffered or prematurely timed out by the proxy.
+		flush_interval -1
+	}
+
+	# HTTP/3 is advertised automatically via Alt-Svc; browsers upgrade after the
+	# first h2 response. No extra config needed on recent Caddy.
+}

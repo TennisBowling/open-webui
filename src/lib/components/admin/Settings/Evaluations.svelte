@@ -1,9 +1,14 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { models, settings, user, config } from '$lib/stores';
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
 
-	const dispatch = createEventDispatcher();
+	import { toast } from '$lib/utils/toast';
+	import { models, settings, user, config } from '$lib/stores';
+	import { onMount, getContext, tick } from 'svelte';
+
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	import { getModels } from '$lib/apis';
 	import { getConfig, updateConfig } from '$lib/apis/evaluations';
 
@@ -16,8 +21,8 @@
 
 	const i18n = getContext('i18n');
 
-	let evaluationConfig = null;
-	let showAddModel = false;
+	let evaluationConfig = $state(null);
+	let showAddModel = $state(false);
 
 	const submitHandler = async () => {
 		evaluationConfig = await updateConfig(localStorage.token, evaluationConfig).catch((err) => {
@@ -88,17 +93,17 @@
 
 <ArenaModelModal
 	bind:show={showAddModel}
-	on:submit={async (e) => {
+	onsubmit={async (e) => {
 		addModelHandler(e.detail);
 	}}
 />
 
 <form
 	class="flex flex-col h-full justify-between text-sm"
-	on:submit|preventDefault={() => {
+	onsubmit={preventDefault(() => {
 		submitHandler();
 		dispatch('save');
-	}}
+	})}
 >
 	<div class="overflow-y-scroll scrollbar-hidden h-full">
 		{#if evaluationConfig !== null}
@@ -129,7 +134,7 @@
 									<button
 										class="p-1"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											showAddModel = true;
 										}}
 									>
@@ -146,10 +151,10 @@
 								{#each evaluationConfig.EVALUATION_ARENA_MODELS as model, index}
 									<Model
 										{model}
-										on:edit={(e) => {
+										onedit={(e) => {
 											editModelHandler(e.detail, index);
 										}}
-										on:delete={(e) => {
+										ondelete={(e) => {
 											deleteModelHandler(index);
 										}}
 									/>

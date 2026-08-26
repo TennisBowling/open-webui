@@ -15,17 +15,7 @@
 
 	const i18n = getContext('i18n');
 
-	export let boilerplate = '';
-	export let value = '';
-
-	export let onSave = () => {};
-	export let onChange = () => {};
-
 	let _value = '';
-
-	$: if (value) {
-		updateValue();
-	}
 
 	const updateValue = () => {
 		if (_value !== value) {
@@ -65,8 +55,23 @@
 		];
 	}
 
-	export let id = '';
-	export let lang = '';
+	interface Props {
+		boilerplate?: string;
+		value?: string;
+		onSave?: any;
+		onChange?: any;
+		id?: string;
+		lang?: string;
+	}
+
+	let {
+		boilerplate = '',
+		value = $bindable(''),
+		onSave = () => {},
+		onChange = () => {},
+		id = '',
+		lang = ''
+	}: Props = $props();
 
 	let codeEditor;
 
@@ -116,10 +121,6 @@
 		editorTheme.of([]),
 		editorLanguage.of([])
 	];
-
-	$: if (lang) {
-		setLanguage();
-	}
 
 	const setLanguage = async () => {
 		const language = await getLang();
@@ -197,6 +198,16 @@
 			document.removeEventListener('keydown', keydownHandler);
 		};
 	});
+	$effect(() => {
+		if (value) {
+			updateValue();
+		}
+	});
+	$effect(() => {
+		if (lang) {
+			setLanguage();
+		}
+	});
 </script>
 
-<div id="code-textarea-{id}" class="h-full w-full text-sm" />
+<div id="code-textarea-{id}" class="h-full w-full text-sm"></div>

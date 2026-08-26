@@ -10,7 +10,7 @@
 	dayjs.extend(relativeTime);
 	dayjs.extend(localizedFormat);
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { updateUserRole, getUsers, deleteUserById } from '$lib/apis/users';
 
@@ -36,22 +36,22 @@
 
 	const i18n = getContext('i18n');
 
-	let page = 1;
+	let page = $state(1);
 
-	let users = null;
-	let total = null;
+	let users = $state(null);
+	let total = $state(null);
 
-	let query = '';
-	let orderBy = 'created_at'; // default sort key
-	let direction = 'asc'; // default sort order
+	let query = $state('');
+	let orderBy = $state('created_at'); // default sort key
+	let direction = $state('asc'); // default sort order
 
-	let selectedUser = null;
+	let selectedUser = $state(null);
 
-	let showDeleteConfirmDialog = false;
-	let showAddUserModal = false;
+	let showDeleteConfirmDialog = $state(false);
+	let showAddUserModal = $state(false);
 
-	let showUserChatsModal = false;
-	let showEditUserModal = false;
+	let showUserChatsModal = $state(false);
+	let showEditUserModal = $state(false);
 
 	const deleteUserHandler = async (id) => {
 		const res = await deleteUserById(localStorage.token, id).catch((error) => {
@@ -96,18 +96,22 @@
 		}
 	};
 
-	$: if (page) {
-		getUserList();
-	}
+	$effect(() => {
+		if (page) {
+			getUserList();
+		}
+	});
 
-	$: if (query !== null && orderBy && direction) {
-		getUserList();
-	}
+	$effect(() => {
+		if (query !== null && orderBy && direction) {
+			getUserList();
+		}
+	});
 </script>
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteUserHandler(selectedUser.id);
 	}}
 />
@@ -117,7 +121,7 @@
 		bind:show={showEditUserModal}
 		{selectedUser}
 		sessionUser={$user}
-		on:save={async () => {
+		onsave={async () => {
 			getUserList();
 		}}
 	/>
@@ -125,7 +129,7 @@
 
 <AddUserModal
 	bind:show={showAddUserModal}
-	on:save={async () => {
+	onsave={async () => {
 		getUserList();
 	}}
 />
@@ -135,7 +139,7 @@
 {/if}
 
 {#if ($config?.license_metadata?.seats ?? null) !== null && total && total > $config?.license_metadata?.seats}
-	<div class=" mt-1 mb-2 text-xs text-red-500">
+	<div class=" mt-1 mb-2 text-xs text-error-brick dark:text-error-brick-dark">
 		<Banner
 			className="mx-0"
 			banner={{
@@ -160,11 +164,11 @@
 			<div class="flex-shrink-0">
 				{$i18n.t('Users')}
 			</div>
-			<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850" />
+			<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850"></div>
 
 			{#if ($config?.license_metadata?.seats ?? null) !== null}
 				{#if total > $config?.license_metadata?.seats}
-					<span class="text-lg font-medium text-red-500"
+					<span class="text-lg font-medium text-error-brick dark:text-error-brick-dark"
 						>{total} of {$config?.license_metadata?.seats}
 						<span class="text-sm font-normal">{$i18n.t('available users')}</span></span
 					>
@@ -207,7 +211,7 @@
 					<Tooltip content={$i18n.t('Add User')}>
 						<button
 							class=" p-2 rounded-xl hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center space-x-1"
-							on:click={() => {
+							onclick={() => {
 								showAddUserModal = !showAddUserModal;
 							}}
 						>
@@ -226,7 +230,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('role')}
+						onclick={() => setSortKey('role')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Role')}
@@ -249,7 +253,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('name')}
+						onclick={() => setSortKey('name')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Name')}
@@ -272,7 +276,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('email')}
+						onclick={() => setSortKey('email')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Email')}
@@ -296,7 +300,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('last_active_at')}
+						onclick={() => setSortKey('last_active_at')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Last Active')}
@@ -319,7 +323,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('created_at')}
+						onclick={() => setSortKey('created_at')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Created at')}
@@ -339,7 +343,7 @@
 						</div>
 					</th>
 
-					<th scope="col" class="px-2.5 py-2 text-right" />
+					<th scope="col" class="px-2.5 py-2 text-right"></th>
 				</tr>
 			</thead>
 			<tbody class="">
@@ -348,7 +352,7 @@
 						<td class="px-3 py-1 min-w-[7rem] w-28">
 							<button
 								class=" translate-y-0.5"
-								on:click={() => {
+								onclick={() => {
 									selectedUser = user;
 									showEditUserModal = !showEditUserModal;
 								}}
@@ -389,8 +393,8 @@
 								{#if $config.features.enable_admin_chat_access && user.role !== 'admin'}
 									<Tooltip content={$i18n.t('Chats')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-											on:click={async () => {
+											class="self-center w-fit text-sm px-2 py-2 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
+											onclick={async () => {
 												showUserChatsModal = !showUserChatsModal;
 												selectedUser = user;
 											}}
@@ -402,8 +406,8 @@
 
 								<Tooltip content={$i18n.t('Edit User')}>
 									<button
-										class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-										on:click={async () => {
+										class="self-center w-fit text-sm px-2 py-2 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
+										onclick={async () => {
 											showEditUserModal = !showEditUserModal;
 											selectedUser = user;
 										}}
@@ -428,8 +432,8 @@
 								{#if user.role !== 'admin'}
 									<Tooltip content={$i18n.t('Delete User')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-											on:click={async () => {
+											class="self-center w-fit text-sm px-2 py-2 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
+											onclick={async () => {
 												showDeleteConfirmDialog = true;
 												selectedUser = user;
 											}}

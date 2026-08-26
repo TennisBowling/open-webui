@@ -111,8 +111,6 @@ for source in log_sources:
 log.setLevel(SRC_LOG_LEVELS["CONFIG"])
 
 WEBUI_NAME = os.environ.get("WEBUI_NAME", "Open WebUI")
-if WEBUI_NAME != "Open WebUI":
-    WEBUI_NAME += " (Open WebUI)"
 
 WEBUI_FAVICON_URL = "https://openwebui.com/favicon.png"
 
@@ -395,6 +393,18 @@ DISABLE_STREAM_SNAPSHOT_DB_WRITES = (
 
 ENABLE_QUERIES_CACHE = os.environ.get("ENABLE_QUERIES_CACHE", "False").lower() == "true"
 
+# Default `reasoning.context` sent with reasoning requests: "all_turns" lets the
+# model use the reasoning we replay from earlier turns, "current_turn" makes it
+# reason fresh each turn, and "" / "auto" sends nothing so each model keeps its
+# own default. Defaults to all_turns because replaying reasoning is pointless if
+# the model is not permitted to read it — MEASURED, gpt-5.4 and gpt-5.5 default
+# to current_turn and were discarding it. Models that reject the field are
+# detected and remembered at runtime (utils/reasoning_context.py), so this does
+# not need to be narrowed per model.
+REASONING_CONTEXT_MODE = (
+    os.environ.get("REASONING_CONTEXT_MODE", "all_turns").strip().lower()
+)
+
 ####################################
 # REDIS
 ####################################
@@ -553,14 +563,14 @@ if LICENSE_PUBLIC_KEY:
 # MODELS
 ####################################
 
-MODELS_CACHE_TTL = os.environ.get("MODELS_CACHE_TTL", "1")
+MODELS_CACHE_TTL = os.environ.get("MODELS_CACHE_TTL", "300")
 if MODELS_CACHE_TTL == "":
     MODELS_CACHE_TTL = None
 else:
     try:
         MODELS_CACHE_TTL = int(MODELS_CACHE_TTL)
     except Exception:
-        MODELS_CACHE_TTL = 1
+        MODELS_CACHE_TTL = 300
 
 
 ####################################
@@ -667,6 +677,16 @@ STREAM_CLIENT_ACK_INTERVAL_MS = max(50, _int_env("STREAM_CLIENT_ACK_INTERVAL_MS"
 STREAM_CLIENT_LAG_MAX_VERSIONS = max(
     1, _int_env("STREAM_CLIENT_LAG_MAX_VERSIONS", 512)
 )
+# Multi-client sync: a stream-room subscriber whose tab is document-hidden has its
+# high-frequency token deltas suppressed (perf) by the visibility gate. To keep a
+# passively-watched second screen / phone near-live rather than frozen until
+# chat:done, the server nudges such a subscriber with a coalesced
+# `chat:stream:sync_required` at most once per this interval while it stays hidden
+# and the stream is active — the client then pulls the current snapshot. 0 disables
+# the periodic nudge (falls back to the pre-existing catch-up on refocus / at done).
+STREAM_HIDDEN_CATCHUP_MS = max(
+    0, _int_env("STREAM_HIDDEN_CATCHUP_MS", 1000)
+)
 STREAM_DB_CHECKPOINT_POLICY = (
     os.environ.get("STREAM_DB_CHECKPOINT_POLICY", "periodic").strip().lower()
     or "periodic"
@@ -713,9 +733,31 @@ AGENTIC_MAX_TOOL_ROUNDS = _int_env("AGENTIC_MAX_TOOL_ROUNDS", 0)
 # up. Models occasionally end a turn on a bare reasoning block or an empty
 # completion; without this the agentic loop just stops with no answer. Applies to
 # regular chats AND subagents (the subagent inner pipeline re-enters the same
-# loop). Does NOT retry provider errors or user cancels — only the "successful but
-# empty" case. Each retry is a full LLM round, so keep this small. 0 disables.
-AGENTIC_EMPTY_ROUND_MAX_RETRIES = _int_env("AGENTIC_EMPTY_ROUND_MAX_RETRIES", 3)
+# loop). Retries any UNPRODUCTIVE round — empty, reasoning-only, or a failed/errored
+# request — by re-issuing the same request; only a genuine user cancel is not retried.
+# Each retry is a full LLM round, so keep this modest. 0 disables.
+AGENTIC_EMPTY_ROUND_MAX_RETRIES = _int_env("AGENTIC_EMPTY_ROUND_MAX_RETRIES", 5)
+
+# Conversation compaction (utils/compaction.py + utils/COMPACTION.md). When the
+# LAST model response's usage.total_tokens reaches this fraction of the model's
+# declared context window, the conversation is summarized once and the outbound
+# payload is cut at the anchor. 0.80 matches goose's DEFAULT_COMPACTION_THRESHOLD.
+#
+# The check runs before EVERY model request, including between rounds inside one
+# agentic turn (OpenHands' shape: one gate on every step, so there is no mid-turn
+# vs. inter-turn distinction to keep in sync).
+#
+# A model whose connection declares NO context window never auto-compacts —
+# `resolve_context_length` returns None rather than 0 exactly so that stays
+# decidable (llama-swap declares no window). Set ENABLE_CONVERSATION_COMPACTION
+# false to disable the feature entirely; nothing else about the chat changes.
+ENABLE_CONVERSATION_COMPACTION = (
+    os.environ.get("ENABLE_CONVERSATION_COMPACTION", "true").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+COMPACTION_THRESHOLD = min(
+    0.99, max(0.05, _float_env("COMPACTION_THRESHOLD", 0.80))
+)
 
 # Per-subagent wall-clock timeout (seconds). DISABLED by default (0): subagents
 # must be free to research as deeply as they need, for as long as they need —
@@ -757,6 +799,30 @@ ASK_USER_TIMEOUT_SECONDS = _int_env("ASK_USER_TIMEOUT_SECONDS", 3600)
 # delivery even across a reload/zero-tab gap or (latently) a multi-worker split.
 # Kept small for snappy resume without hammering the DB.
 ASK_USER_POLL_INTERVAL_SECONDS = _int_env("ASK_USER_POLL_INTERVAL_SECONDS", 2)
+
+# Max number of scheduled automations allowed to run concurrently per worker.
+# A single sweep pass can find many automations due at the same wall-clock
+# minute (everyone's 9am), and each one is a full generation pipeline. Kept
+# small: these are unattended runs, so latency does not matter and a burst
+# starving interactive chats would.
+AUTOMATION_MAX_CONCURRENCY = _int_env("AUTOMATION_MAX_CONCURRENCY", 2)
+
+# Per-run wall-clock timeout (seconds). Unlike subagents this is ENABLED by
+# default: nobody is watching an automation, so a run whose tool genuinely hangs
+# would otherwise pin a worker slot forever. On timeout the run is recorded as
+# `timeout` and the user is notified.
+AUTOMATION_RUN_TIMEOUT_SECONDS = _int_env("AUTOMATION_RUN_TIMEOUT_SECONDS", 900)
+
+# How often the scheduler asks "what is due?". The floor on schedule frequency
+# is one hour, so this only bounds how late a run starts, not how often one can
+# be scheduled.
+AUTOMATION_SWEEP_INTERVAL_SECONDS = _int_env("AUTOMATION_SWEEP_INTERVAL_SECONDS", 30)
+
+# How far past its due time an automation may still fire. Past this, the
+# occurrence is recorded as `missed` and skipped — so coming back from a
+# multi-hour outage advances every schedule quietly instead of storming the
+# providers with a day of backlogged runs.
+AUTOMATION_MISFIRE_GRACE_SECONDS = _int_env("AUTOMATION_MISFIRE_GRACE_SECONDS", 1800)
 
 
 ####################################
@@ -843,19 +909,40 @@ AIOHTTP_CLIENT_SESSION_SSL = (
     os.environ.get("AIOHTTP_CLIENT_SESSION_SSL", "True").lower() == "true"
 )
 
+# Poll interval (seconds) for subscription-provider usage endpoints (connections
+# flagged `subscription_usage`). Between polls, a debounced refresh also fires
+# right after each completed generation, so this mainly bounds how fast usage
+# from OTHER clients of the same subscription shows up.
+try:
+    SUBSCRIPTION_USAGE_POLL_INTERVAL = int(
+        os.environ.get("SUBSCRIPTION_USAGE_POLL_INTERVAL", "30")
+    )
+except ValueError:
+    SUBSCRIPTION_USAGE_POLL_INTERVAL = 30
+
+
+# Remote MCP servers (and their OAuth metadata endpoints) are connected to from
+# inside the trust boundary, so by default we block targets that resolve to
+# private/reserved/loopback/link-local addresses (SSRF defense). Operators who
+# legitimately run internal MCP servers can allowlist specific hosts or CIDRs
+# here (comma-separated), e.g. "mcp.internal.example.com,10.0.0.0/8,::1".
+MCP_ALLOWED_PRIVATE_HOSTS = [
+    h.strip().lower()
+    for h in os.environ.get("MCP_ALLOWED_PRIVATE_HOSTS", "").split(",")
+    if h.strip()
+]
+
 
 # Streaming chat-completion timeout. The streaming request to the upstream model
 # provider must NOT use aiohttp's built-in 5-minute `total` default — a long
 # reasoning answer or a deep research subagent legitimately streams for many
 # minutes, and a `total` cap cancels it mid-generation (surfaces as a spurious
-# CancelledError that strands subagents). We therefore set `total=None` and guard
-# only against a genuinely DEAD connection with `sock_read` — the max gap allowed
-# BETWEEN received bytes. An actively-generating model emits tokens well within
-# this window, so it never trips during real work; a stalled/half-open socket
-# trips it and fails cleanly instead of hanging forever. Set to 0/empty to
-# disable the sock_read guard too (fully unbounded).
+# CancelledError that strands subagents). We therefore set `total=None`. By
+# default we also leave `sock_read=None` so there is no hidden "no bytes for N
+# seconds" cap; operators who prefer a dead/half-open socket guard can opt in by
+# setting AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ to a positive integer.
 AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = os.environ.get(
-    "AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ", "600"
+    "AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ", "0"
 )
 if AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ in ("", "0"):
     AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = None
@@ -865,7 +952,26 @@ else:
             AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ
         )
     except Exception:
-        AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = 600
+        AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ = None
+
+# NON-streaming chat-completion sock_read guard. A non-streaming request receives
+# the WHOLE response body in one shot only AFTER the model finishes generating, so
+# "max gap between received bytes" (sock_read) effectively equals the entire
+# single-round generation time. Any default value here is therefore a hidden
+# per-round cap on non-streaming subagents. Default to fully unbounded; operators
+# can opt in to a dead/half-open socket guard by setting a positive integer.
+AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ = os.environ.get(
+    "AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ", "0"
+)
+if AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ in ("", "0"):
+    AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ = None
+else:
+    try:
+        AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ = int(
+            AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ
+        )
+    except Exception:
+        AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ = None
 
 AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST = os.environ.get(
     "AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST",

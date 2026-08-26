@@ -1,0 +1,26 @@
+2026/07/20-21:21:59.709 227df2 Reusing MANIFEST /home/tennisbowling/open-webui/chrome-profile/Default/IndexedDB/http_127.0.0.1_8084.indexeddb.leveldb/MANIFEST-000001
+2026/07/20-21:21:59.709 227df2 Recovering log #254
+2026/07/20-21:21:59.709 227df2 Reusing old log /home/tennisbowling/open-webui/chrome-profile/Default/IndexedDB/http_127.0.0.1_8084.indexeddb.leveldb/000254.log 
+2026/07/20-21:21:59.710 227df2 Delete type=2 #253
+2026/07/20-21:22:21.220 227df3 Level-0 table #259: started
+2026/07/20-21:22:21.221 227df3 Level-0 table #259: 484 bytes OK
+2026/07/20-21:22:21.222 227df3 Delete type=0 #254
+2026/07/20-21:22:21.222 227df3 Manual compaction at level-0 from '\x00T\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00U\x00\x00\x00' @ 0 : 0; will stop at '\x00T\x00\x00\x05' @ 1622 : 1
+2026/07/20-21:22:21.222 227df3 Compacting 1@0 + 1@1 files
+2026/07/20-21:22:21.223 227df3 Generated table #260@0: 107 keys, 1314 bytes
+2026/07/20-21:22:21.223 227df3 Compacted 1@0 + 1@1 files => 1314 bytes
+2026/07/20-21:22:21.224 227df3 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/07/20-21:22:21.224 227df3 Delete type=2 #259
+2026/07/20-21:22:21.224 227df2 Manual compaction at level-0 from '\x00T\x00\x00\x05' @ 1622 : 1 .. '\x00U\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/20-21:22:45.714 227df2 Level-0 table #262: started
+2026/07/20-21:22:45.714 227df2 Level-0 table #262: 482 bytes OK
+2026/07/20-21:22:45.716 227df2 Delete type=2 #256
+2026/07/20-21:22:45.716 227df2 Delete type=0 #258
+2026/07/20-21:22:45.716 227df2 Manual compaction at level-0 from '\x00U\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00V\x00\x00\x00' @ 0 : 0; will stop at '\x00U\x00\x00\x05' @ 1641 : 1
+2026/07/20-21:22:45.716 227df2 Compacting 1@0 + 1@1 files
+2026/07/20-21:22:45.717 227df2 Generated table #263@0: 111 keys, 1345 bytes
+2026/07/20-21:22:45.717 227df2 Compacted 1@0 + 1@1 files => 1345 bytes
+2026/07/20-21:22:45.718 227df2 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/07/20-21:22:45.718 227df2 Delete type=2 #262
+2026/07/20-21:22:45.718 227df2 Manual compaction at level-0 from '\x00U\x00\x00\x05' @ 1641 : 1 .. '\x00V\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/21-03:00:08.092 227df2 Manual compaction at level-0 from '\x00V\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00W\x00\x00\x00' @ 0 : 0; will stop at (end)

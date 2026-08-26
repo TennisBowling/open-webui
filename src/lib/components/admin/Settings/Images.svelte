@@ -1,7 +1,10 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
 
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { toast } from '$lib/utils/toast';
+
+	import { onMount, getContext } from 'svelte';
 	import { config as backendConfig, user } from '$lib/stores';
 
 	import { getBackendConfig } from '$lib/apis';
@@ -18,16 +21,19 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Textarea from '$lib/components/common/Textarea.svelte';
-	const dispatch = createEventDispatcher();
+
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	let loading = false;
+	let loading = $state(false);
 
-	let config = null;
-	let imageGenerationConfig = null;
+	let config = $state(null);
+	let imageGenerationConfig = $state(null);
 
-	let models = null;
+	let models = $state(null);
 
 	let samplers = [
 		'DPM++ 2M',
@@ -66,7 +72,7 @@
 		'Beta'
 	];
 
-	let requiredWorkflowNodes = [
+	let requiredWorkflowNodes = $state([
 		{
 			type: 'prompt',
 			key: 'text',
@@ -97,7 +103,7 @@
 			key: 'seed',
 			node_ids: ''
 		}
-	];
+	]);
 
 	const getModels = async () => {
 		models = await getImageGenerationModels(localStorage.token).catch((error) => {
@@ -230,9 +236,9 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden pr-2">
 		{#if config && imageGenerationConfig}
@@ -248,7 +254,7 @@
 						<div class="px-1">
 							<Switch
 								bind:state={config.enabled}
-								on:change={(e) => {
+								onchange={(e) => {
 									const enabled = e.detail;
 
 									if (enabled) {
@@ -293,10 +299,10 @@
 					<div class=" self-center text-xs font-medium">{$i18n.t('Image Generation Engine')}</div>
 					<div class="flex items-center relative">
 						<select
-							class=" dark:bg-gray-900 w-fit pr-8 cursor-pointer rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
+							class=" dark:bg-gray-900 w-fit pr-8 cursor-pointer rounded-lg px-2 p-1 text-xs bg-transparent outline-hidden text-right"
 							bind:value={config.engine}
 							placeholder={$i18n.t('Select Engine')}
-							on:change={async () => {
+							onchange={async () => {
 								updateConfigHandler();
 							}}
 						>
@@ -325,7 +331,7 @@
 							<button
 								class="px-2.5 bg-gray-50 hover:bg-gray-100 text-gray-800 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-100 rounded-lg transition"
 								type="button"
-								on:click={async () => {
+								onclick={async () => {
 									await updateConfigHandler();
 									const res = await verifyConfigUrl(localStorage.token).catch((error) => {
 										toast.error(`${error}`);
@@ -461,7 +467,7 @@
 							<button
 								class="px-2.5 bg-gray-50 hover:bg-gray-100 text-gray-800 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-100 rounded-lg transition"
 								type="button"
-								on:click={async () => {
+								onclick={async () => {
 									await updateConfigHandler();
 									const res = await verifyConfigUrl(localStorage.token).catch((error) => {
 										toast.error(`${error}`);
@@ -521,7 +527,7 @@
 									hidden
 									type="file"
 									accept=".json"
-									on:change={(e) => {
+									onchange={(e) => {
 										const file = e.target.files[0];
 										const reader = new FileReader();
 
@@ -537,7 +543,7 @@
 								<button
 									class="w-full text-sm font-medium py-2 bg-transparent hover:bg-gray-50 border border-dashed border-gray-50 dark:border-gray-850 dark:hover:bg-gray-850 text-center rounded-xl"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										document.getElementById('upload-comfyui-workflow-input')?.click();
 									}}
 								>
@@ -560,7 +566,7 @@
 									<div class="flex w-full items-center">
 										<div class="shrink-0">
 											<div
-												class=" capitalize line-clamp-1 font-medium px-3 py-1 w-20 text-center bg-green-500/10 text-green-700 dark:text-green-200"
+												class=" capitalize line-clamp-1 font-medium px-3 py-1 w-20 text-center bg-success/10 text-success dark:text-success-dark"
 											>
 												{node.type}{node.type === 'prompt' ? '*' : ''}
 											</div>

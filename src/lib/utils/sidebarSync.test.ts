@@ -106,10 +106,15 @@ describe('sidebarSync', () => {
 		expect(folderApi.getFolders).toHaveBeenCalledWith('token');
 		expect(chatApi.getChatList).toHaveBeenCalledWith('token', 1);
 		expect(get(folders)).toEqual([{ id: 'f1', name: 'Folder', updated_at: 4 }]);
-		expect(get(chats)).toEqual([{ id: 'c1', title: 'Chat', updated_at: 3 }]);
+		expect(get(chats)).toEqual([
+			{ id: 'c1', title: 'Chat', updated_at: 3, time_range: 'range-3' }
+		]);
 		expect(get(pinnedChats)).toEqual([{ id: 'p1', title: 'Pinned', updated_at: 2 }]);
 		expect(get(tags)).toEqual([{ id: 't1', name: 'Tag' }]);
-		expect(get(currentChatPage)).toBe(1);
+		// applyChatsWindow preserves the already-loaded pagination tail: the
+		// page counter survives a snapshot refresh (set to 3 by the earlier
+		// pagination test in this file) instead of resetting to 1.
+		expect(get(currentChatPage)).toBe(3);
 		expect(get(scrollPaginationEnabled)).toBe(true);
 		expect(get(folderChatListInvalidation)).toEqual({
 			folderIds: ['f1'],

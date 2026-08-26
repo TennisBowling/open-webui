@@ -1,0 +1,83 @@
+2026/07/27-01:05:41.437 1376a2 Reusing MANIFEST /home/tennisbowling/open-webui/chrome-profile/Default/IndexedDB/http_localhost_8081.indexeddb.leveldb/MANIFEST-000001
+2026/07/27-01:05:41.437 1376a2 Recovering log #120
+2026/07/27-01:05:41.437 1376a2 Reusing old log /home/tennisbowling/open-webui/chrome-profile/Default/IndexedDB/http_localhost_8081.indexeddb.leveldb/000120.log 
+2026/07/27-01:05:41.499 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:05:41.501 1376a2 Generated table #123@1: 206 keys, 860505 bytes
+2026/07/27-01:05:41.501 1376a2 Compacted 1@1 + 1@2 files => 860505 bytes
+2026/07/27-01:05:41.502 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:35:23.076 1376a1 Level-0 table #125: started
+2026/07/27-01:35:23.076 1376a1 Level-0 table #125: 489 bytes OK
+2026/07/27-01:35:23.077 1376a1 Delete type=2 #119
+2026/07/27-01:35:23.077 1376a1 Delete type=0 #120
+2026/07/27-01:35:23.077 1376a1 Delete type=2 #121
+2026/07/27-01:35:23.078 1376a1 Manual compaction at level-0 from '\x00)\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00*\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:35:23.491 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:35:23.494 1376a2 Generated table #126@1: 206 keys, 860505 bytes
+2026/07/27-01:35:23.494 1376a2 Compacted 1@1 + 1@2 files => 860505 bytes
+2026/07/27-01:35:23.494 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:35:23.494 1376a2 Delete type=2 #123
+2026/07/27-01:35:23.494 1376a2 Delete type=2 #125
+2026/07/27-01:36:09.982 1376a1 Level-0 table #128: started
+2026/07/27-01:36:09.983 1376a1 Level-0 table #128: 9115 bytes OK
+2026/07/27-01:36:09.983 1376a1 Delete type=0 #124
+2026/07/27-01:36:09.984 1376a1 Manual compaction at level-0 from '\x00*\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00+\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:36:10.322 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:36:10.325 1376a2 Generated table #129@1: 209 keys, 868228 bytes
+2026/07/27-01:36:10.325 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:36:10.325 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:39:26.737 1376a1 Level-0 table #131: started
+2026/07/27-01:39:26.738 1376a1 Level-0 table #131: 487 bytes OK
+2026/07/27-01:39:26.739 1376a1 Delete type=0 #127
+2026/07/27-01:39:26.739 1376a1 Delete type=2 #128
+2026/07/27-01:39:26.739 1376a1 Delete type=2 #126
+2026/07/27-01:39:26.739 1376a1 Manual compaction at level-0 from '\x00+\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00,\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:39:27.122 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:39:27.124 1376a2 Generated table #132@1: 209 keys, 868228 bytes
+2026/07/27-01:39:27.124 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:39:27.124 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:39:27.124 1376a2 Delete type=2 #129
+2026/07/27-01:39:27.124 1376a2 Delete type=2 #131
+2026/07/27-01:42:12.287 1376a1 Level-0 table #134: started
+2026/07/27-01:42:12.288 1376a1 Level-0 table #134: 486 bytes OK
+2026/07/27-01:42:12.289 1376a1 Delete type=0 #130
+2026/07/27-01:42:12.289 1376a5 Manual compaction at level-0 from '\x00,\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00-\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:42:12.692 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:42:12.694 1376a2 Generated table #135@1: 209 keys, 868228 bytes
+2026/07/27-01:42:12.694 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:42:12.695 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:48:47.516 1376a1 Level-0 table #137: started
+2026/07/27-01:48:47.517 1376a1 Level-0 table #137: 487 bytes OK
+2026/07/27-01:48:47.517 1376a1 Delete type=2 #134
+2026/07/27-01:48:47.517 1376a1 Delete type=2 #132
+2026/07/27-01:48:47.517 1376a1 Delete type=0 #133
+2026/07/27-01:48:47.517 1376a1 Manual compaction at level-0 from '\x00-\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00.\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:48:47.965 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:48:47.967 1376a2 Generated table #138@1: 209 keys, 868228 bytes
+2026/07/27-01:48:47.967 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:48:47.968 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:48:47.968 1376a2 Delete type=2 #135
+2026/07/27-01:48:47.968 1376a2 Delete type=2 #137
+2026/07/27-01:49:57.112 1376a1 Level-0 table #140: started
+2026/07/27-01:49:57.112 1376a1 Level-0 table #140: 489 bytes OK
+2026/07/27-01:49:57.113 1376a1 Delete type=0 #136
+2026/07/27-01:49:57.113 1376a2 Manual compaction at level-0 from '\x00.\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00/\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:49:57.495 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:49:57.497 1376a2 Generated table #141@1: 209 keys, 868228 bytes
+2026/07/27-01:49:57.497 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:49:57.498 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:49:57.498 1376a2 Delete type=2 #140
+2026/07/27-01:49:57.498 1376a2 Delete type=2 #138
+2026/07/27-01:51:06.079 1376a9 Level-0 table #143: started
+2026/07/27-01:51:06.080 1376a9 Level-0 table #143: 489 bytes OK
+2026/07/27-01:51:06.082 1376a9 Delete type=0 #139
+2026/07/27-01:51:06.082 1376a1 Manual compaction at level-0 from '\x00/\x00\x00\x00' @ 72057594037927935 : 1 .. '\x000\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/07/27-01:51:06.476 1376a2 Compacting 1@1 + 1@2 files
+2026/07/27-01:51:06.478 1376a2 Generated table #144@1: 209 keys, 868228 bytes
+2026/07/27-01:51:06.478 1376a2 Compacted 1@1 + 1@2 files => 868228 bytes
+2026/07/27-01:51:06.479 1376a2 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/07/27-01:51:06.479 1376a2 Delete type=2 #143
+2026/07/27-01:51:06.479 1376a2 Delete type=2 #141
+2026/07/27-01:51:37.079 1376a1 Level-0 table #146: started
+2026/07/27-01:51:37.080 1376a1 Level-0 table #146: 484 bytes OK
+2026/07/27-01:51:37.081 1376a1 Delete type=0 #142
+2026/07/27-01:51:37.081 1376a1 Manual compaction at level-0 from '\x000\x00\x00\x00' @ 72057594037927935 : 1 .. '\x001\x00\x00\x00' @ 0 : 0; will stop at (end)

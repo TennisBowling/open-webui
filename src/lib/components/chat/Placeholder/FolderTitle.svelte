@@ -7,7 +7,7 @@
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { selectedFolder } from '$lib/stores';
 
@@ -22,15 +22,21 @@
 	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Emoji from '$lib/components/common/Emoji.svelte';
-	import EmojiPicker from '$lib/components/common/EmojiPicker.svelte';
 
-	export let folder = null;
+	interface Props {
+		folder?: any;
+		onUpdate?: Function;
+		onDelete?: Function;
+	}
 
-	export let onUpdate: Function = (folderId) => {};
-	export let onDelete: Function = (folderId) => {};
+	let {
+		folder = $bindable(null),
+		onUpdate = (folderId) => {},
+		onDelete = (folderId) => {}
+	}: Props = $props();
 
-	let showFolderModal = false;
-	let showDeleteConfirm = false;
+	let showFolderModal = $state(false);
+	let showDeleteConfirm = $state(false);
 
 	const updateHandler = async ({ name, meta, data }) => {
 		if (name === '') {
@@ -137,7 +143,7 @@
 	<DeleteConfirmDialog
 		bind:show={showDeleteConfirm}
 		title={$i18n.t('Delete folder?')}
-		on:confirm={() => {
+		onconfirm={() => {
 			deleteHandler();
 		}}
 	>
@@ -155,23 +161,25 @@
 
 	<div class="mb-3 px-6 @md:max-w-3xl justify-between w-full flex relative group items-center">
 		<div class="text-center flex gap-3.5 items-center">
-			<EmojiPicker
-				onClose={() => {}}
-				onSubmit={(name) => {
-					console.log(name);
-					updateIconHandler(name);
-				}}
-			>
-				<button
-					class=" rounded-full bg-gray-50 dark:bg-gray-800 size-11 flex justify-center items-center"
+			{#await import('$lib/components/common/EmojiPicker.svelte') then { default: EmojiPicker }}
+				<EmojiPicker
+					onClose={() => {}}
+					onSubmit={(name) => {
+						console.log(name);
+						updateIconHandler(name);
+					}}
 				>
-					{#if folder?.meta?.icon}
-						<Emoji className="size-6" shortCode={folder.meta.icon} />
-					{:else}
-						<Folder className="size-4.5" strokeWidth="2" />
-					{/if}
-				</button>
-			</EmojiPicker>
+					<button
+						class=" rounded-full bg-gray-50 dark:bg-gray-800 size-11 flex justify-center items-center"
+					>
+						{#if folder?.meta?.icon}
+							<Emoji className="size-6" shortCode={folder.meta.icon} />
+						{:else}
+							<Folder className="size-4.5" strokeWidth="2" />
+						{/if}
+					</button>
+				</EmojiPicker>
+			{/await}
 
 			<div class="text-3xl">
 				{folder.name}
@@ -191,7 +199,10 @@
 					exportHandler();
 				}}
 			>
-				<button class="p-1.5 dark:hover:bg-gray-850 rounded-full touch-auto" on:click={(e) => {}}>
+				<button
+					class="p-1.5 max-md:p-2.5 dark:hover:bg-gray-850 rounded-full touch-auto"
+					onclick={(e) => {}}
+				>
 					<EllipsisHorizontal className="size-4" strokeWidth="2.5" />
 				</button>
 			</FolderMenu>

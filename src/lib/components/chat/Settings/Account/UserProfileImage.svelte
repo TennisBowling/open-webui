@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext } from 'svelte';
 
 	const i18n = getContext('i18n');
@@ -9,12 +9,19 @@
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
-	export let profileImageUrl;
-	export let user = null;
+	interface Props {
+		profileImageUrl: any;
+		user?: any;
+		imageClassName?: string;
+	}
 
-	export let imageClassName = 'size-14 md:size-18';
+	let {
+		profileImageUrl = $bindable(),
+		user = null,
+		imageClassName = 'size-14 md:size-18'
+	}: Props = $props();
 
-	let profileImageInputElement;
+	let profileImageInputElement = $state();
 </script>
 
 <input
@@ -23,7 +30,7 @@
 	type="file"
 	hidden
 	accept="image/*"
-	on:change={(e) => {
+	onchange={(e) => {
 		const files = profileImageInputElement.files ?? [];
 		let reader = new FileReader();
 		reader.onload = (event) => {
@@ -84,7 +91,7 @@
 		<button
 			class="relative rounded-full dark:bg-gray-700"
 			type="button"
-			on:click={() => {
+			onclick={() => {
 				profileImageInputElement.click();
 			}}
 		>
@@ -110,19 +117,19 @@
 			</div>
 		</button>
 	</div>
-	<div class="flex flex-col w-full justify-center mt-2">
+	<div class="flex flex-col w-full justify-center mt-2 gap-2">
 		<button
-			class=" text-xs text-center text-gray-500 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
+			class="min-h-[36px] flex items-center justify-center text-xs text-center text-gray-500 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
 			type="button"
-			on:click={async () => {
+			onclick={async () => {
 				profileImageUrl = `${WEBUI_BASE_URL}/user.png`;
 			}}>{$i18n.t('Remove')}</button
 		>
 
 		<button
-			class=" text-xs text-center text-gray-800 dark:text-gray-400 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
+			class="min-h-[36px] flex items-center justify-center text-xs text-center text-gray-800 dark:text-gray-400 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
 			type="button"
-			on:click={async () => {
+			onclick={async () => {
 				if (canvasPixelTest()) {
 					profileImageUrl = generateInitialsImage(user?.name);
 				} else {
@@ -139,9 +146,9 @@
 		>
 
 		<button
-			class=" text-xs text-center text-gray-800 dark:text-gray-400 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
+			class="min-h-[36px] flex items-center justify-center text-xs text-center text-gray-800 dark:text-gray-400 rounded-lg py-0.5 opacity-0 group-hover:opacity-100 transition-all"
 			type="button"
-			on:click={async () => {
+			onclick={async () => {
 				const url = await getGravatarUrl(localStorage.token, user?.email);
 
 				profileImageUrl = url;

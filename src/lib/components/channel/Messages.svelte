@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import dayjs from 'dayjs';
 	import relativeTime from 'dayjs/plugin/relativeTime';
@@ -9,7 +9,7 @@
 	dayjs.extend(relativeTime);
 	dayjs.extend(isToday);
 	dayjs.extend(isYesterday);
-	import { tick, getContext, onMount, createEventDispatcher } from 'svelte';
+	import { tick, getContext, onMount } from 'svelte';
 
 	import { settings, user } from '$lib/stores';
 
@@ -20,18 +20,31 @@
 
 	const i18n = getContext('i18n');
 
-	export let id = null;
-	export let channel = null;
-	export let messages = [];
-	export let replyToMessage = null;
-	export let top = false;
-	export let thread = false;
+	interface Props {
+		id?: any;
+		channel?: any;
+		messages?: any;
+		replyToMessage?: any;
+		top?: boolean;
+		thread?: boolean;
+		onLoad?: Function;
+		onReply?: Function;
+		onThread?: Function;
+	}
 
-	export let onLoad: Function = () => {};
-	export let onReply: Function = () => {};
-	export let onThread: Function = () => {};
+	let {
+		id = null,
+		channel = null,
+		messages = $bindable([]),
+		replyToMessage = null,
+		top = false,
+		thread = false,
+		onLoad = () => {},
+		onReply = () => {},
+		onThread = () => {}
+	}: Props = $props();
 
-	let messagesLoading = false;
+	let messagesLoading = $state(false);
 
 	const loadMoreMessages = async () => {
 		// scroll slightly down to disable continuous loading
@@ -52,7 +65,7 @@
 	<div>
 		{#if !top}
 			<Loader
-				on:visible={(e) => {
+				onvisible={(e) => {
 					console.info('visible');
 					if (!messagesLoading) {
 						loadMoreMessages();
@@ -197,6 +210,6 @@
 			/>
 		{/each}
 
-		<div class="pb-6" />
+		<div class="pb-6"></div>
 	</div>
 {/if}

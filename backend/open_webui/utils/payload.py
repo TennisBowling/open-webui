@@ -5,6 +5,8 @@ from open_webui.utils.misc import (
     replace_system_message_content,
 )
 
+import hashlib
+import os
 from typing import Callable, Optional
 from open_webui.utils import fast_json as json
 from datetime import datetime
@@ -137,6 +139,71 @@ def apply_ephemeral_cache_control_to_last_message(
         return form_data
 
     return {**form_data, "messages": [*messages[:-1], _with_cache_control(last_message)]}
+
+
+def _jsonb_key(key: str):
+    # Postgres jsonb object-key order: by length, then bytewise.
+    return (len(key), key)
+
+
+def canonicalize_wire_key_order(value):
+    """Rebuild dicts (recursively) with keys in Postgres-jsonb order.
+
+    Provider prompt caches key on byte-exact request prefixes, but Python dicts
+    serialize in INSERTION order — so the same message produced two ways sends
+    two different byte sequences. The concrete failure this kills: a live
+    agentic round ships tool_calls / reasoning_details dicts in provider wire
+    order, the finished turn persists them into chat_message.meta (jsonb,
+    which re-sorts object keys), and the NEXT turn replays the jsonb order —
+    identical values, different bytes, prompt cache broken at every turn
+    boundary. Canonicalizing at the send boundary makes outbound bytes
+    independent of where the dicts came from. jsonb's own order is the canon
+    deliberately: persisted history already reads back in it, so deploying
+    this changes only live-round bytes, not replayed history.
+    """
+    if isinstance(value, dict):
+        return {
+            k: canonicalize_wire_key_order(value[k])
+            for k in sorted(value, key=_jsonb_key)
+        }
+    if isinstance(value, list):
+        return [canonicalize_wire_key_order(v) for v in value]
+    return value
+
+
+# Provider prompt caches key on the request's byte-exact prefix, so a single
+# silently-unstable segment (system prompt variable, reordered tools, mutated
+# history message) kills every hit. This fingerprint makes that diagnosable
+# from the log alone: compare two requests' chains — the first differing hash
+# names the exact segment WE changed; identical chains on a cache miss mean
+# the miss is provider-side. Hashes are computed over the same serialization
+# that goes on the wire (insertion order, no key sorting).
+ENABLE_CACHE_PREFIX_FP = (
+    os.environ.get("ENABLE_CACHE_PREFIX_FP", "true").lower() == "true"
+)
+
+ENABLE_WIRE_CANONICALIZATION = (
+    os.environ.get("ENABLE_WIRE_CANONICALIZATION", "true").lower() == "true"
+)
+
+
+def cache_prefix_fingerprint(payload: dict) -> str:
+    """Compact hash chain of the outbound payload's cache-relevant segments:
+    ``tools=<h> m=<h0>,<h1>,…`` (one 6-hex hash per message, in order)."""
+
+    def h(obj) -> str:
+        try:
+            raw = json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            raw = repr(obj)
+        return hashlib.blake2s(raw.encode("utf-8", "replace")).hexdigest()[:6]
+
+    parts = []
+    tools = payload.get("tools")
+    parts.append(f"tools={h(tools)}" if tools else "tools=-")
+    messages = payload.get("messages") or []
+    parts.append("m=" + ",".join(h(m) for m in messages))
+    return " ".join(parts)
 
 
 def remove_open_webui_params(params: dict) -> dict:

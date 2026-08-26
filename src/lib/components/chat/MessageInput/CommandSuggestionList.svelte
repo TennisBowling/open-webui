@@ -9,17 +9,27 @@
 
 	import { onMount } from 'svelte';
 
-	export let char = '';
-	export let query = '';
-	export let command: (payload: { id: string; label: string }) => void;
+	interface Props {
+		char?: string;
+		query?: string;
+		command: (payload: { id: string; label: string }) => void;
+		onSelect?: any;
+		onUpload?: any;
+		insertTextHandler?: any;
+	}
 
-	export let onSelect = (e) => {};
-	export let onUpload = (e) => {};
-	export let insertTextHandler = (text) => {};
+	let {
+		char = '',
+		query = '',
+		command,
+		onSelect = (e) => {},
+		onUpload = (e) => {},
+		insertTextHandler = (text) => {}
+	}: Props = $props();
 
-	let suggestionElement = null;
-	let loading = false;
-	let filteredItems = [];
+	let suggestionElement = $state(null);
+	let loading = $state(false);
+	let filteredItems = $state([]);
 
 	const init = async () => {
 		loading = true;
@@ -70,7 +80,7 @@
 <div
 	class="{(filteredItems ?? []).length > 0
 		? ''
-		: 'hidden'} rounded-2xl shadow-lg border border-gray-200 dark:border-gray-800 flex flex-col bg-white dark:bg-gray-850 w-72 p-1"
+		: 'hidden'} rounded-2xl shadow-lg border-hairline border-gray-100 dark:border-gray-800 flex flex-col bg-white dark:bg-gray-850 w-72 p-1"
 	id="suggestions-container"
 >
 	<div class="overflow-y-auto scrollbar-thin max-h-60">

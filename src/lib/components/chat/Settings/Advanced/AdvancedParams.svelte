@@ -9,11 +9,6 @@
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	export let onChange: (params: any) => void = () => {};
-
-	export let admin = false;
-	export let custom = false;
-
 	const defaultParams: any = {
 		// Advanced
 		stream_response: null, // Set stream responses for this model individually
@@ -48,15 +43,29 @@
 		num_gpu: null
 	};
 
-	export let params = defaultParams;
-	$: if (params) {
-		onChange(params);
+	interface Props {
+		onChange?: (params: any) => void;
+		admin?: boolean;
+		custom?: boolean;
+		params?: any;
 	}
+
+	let {
+		onChange = () => {},
+		admin = false,
+		custom = false,
+		params = $bindable(defaultParams)
+	}: Props = $props();
+	$effect(() => {
+		if (params) {
+			onChange(params);
+		}
+	});
 
 	const inputValue = (event: Event) => (event.currentTarget as HTMLInputElement).value;
 </script>
 
-<div class=" space-y-1 text-xs pb-safe-bottom">
+<div class=" space-y-1 text-xs pb-safe">
 	<div>
 		<Tooltip
 			content={$i18n.t(
@@ -70,8 +79,8 @@
 					{$i18n.t('Stream Chat Response')}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					class="py-2 px-3 text-xs flex rounded-sm transition"
+					onclick={() => {
 						params.stream_response =
 							(params?.stream_response ?? null) === null
 								? true
@@ -107,9 +116,9 @@
 						{$i18n.t('Stream Delta Chunk Size')}
 					</div>
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+						class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							params.stream_delta_chunk_size =
 								(params?.stream_delta_chunk_size ?? null) === null ? 1 : null;
 						}}
@@ -140,7 +149,7 @@
 						<input
 							bind:value={params.stream_delta_chunk_size}
 							type="number"
-							class=" bg-transparent text-center w-14"
+							class=" bg-transparent text-center w-20"
 							min="1"
 							step="any"
 						/>
@@ -163,8 +172,8 @@
 					{$i18n.t('Function Calling')}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					class="py-2 px-3 text-xs flex rounded-sm transition"
+					onclick={() => {
 						params.function_calling = (params?.function_calling ?? null) === null ? 'native' : null;
 					}}
 					type="button"
@@ -193,9 +202,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.seed = (params?.seed ?? null) === null ? 0 : null;
 					}}
 				>
@@ -238,9 +247,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.stop = (params?.stop ?? null) === null ? '' : null;
 					}}
 				>
@@ -281,9 +290,9 @@
 					{$i18n.t('Temperature')}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.temperature = (params?.temperature ?? null) === null ? 0.8 : null;
 					}}
 				>
@@ -313,7 +322,7 @@
 					<input
 						bind:value={params.temperature}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="2"
 						step="any"
@@ -336,9 +345,9 @@
 					{$i18n.t('Reasoning Effort')}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.reasoning_effort = (params?.reasoning_effort ?? null) === null ? 'medium' : null;
 					}}
 				>
@@ -380,9 +389,9 @@
 					{'logit_bias'}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.logit_bias = (params?.logit_bias ?? null) === null ? '' : null;
 					}}
 				>
@@ -426,9 +435,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.max_tokens = (params?.max_tokens ?? null) === null ? 128 : null;
 					}}
 				>
@@ -458,7 +467,7 @@
 					<input
 						bind:value={params.max_tokens}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-2"
 						step="1"
 					/>
@@ -480,9 +489,9 @@
 					{'top_k'}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.top_k = (params?.top_k ?? null) === null ? 40 : null;
 					}}
 				>
@@ -512,7 +521,7 @@
 					<input
 						bind:value={params.top_k}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="100"
 						step="any"
@@ -536,9 +545,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.top_p = (params?.top_p ?? null) === null ? 0.9 : null;
 					}}
 				>
@@ -568,7 +577,7 @@
 					<input
 						bind:value={params.top_p}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="1"
 						step="any"
@@ -591,9 +600,9 @@
 					{'min_p'}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.min_p = (params?.min_p ?? null) === null ? 0.0 : null;
 					}}
 				>
@@ -623,7 +632,7 @@
 					<input
 						bind:value={params.min_p}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="1"
 						step="any"
@@ -647,9 +656,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.frequency_penalty = (params?.frequency_penalty ?? null) === null ? 1.1 : null;
 					}}
 				>
@@ -679,7 +688,7 @@
 					<input
 						bind:value={params.frequency_penalty}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-2"
 						max="2"
 						step="any"
@@ -703,9 +712,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded transition flex-shrink-0 outline-none"
+					class="py-2 px-3 text-xs flex rounded transition flex-shrink-0 outline-none"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.presence_penalty = (params?.presence_penalty ?? null) === null ? 0.0 : null;
 					}}
 				>
@@ -735,7 +744,7 @@
 					<input
 						bind:value={params.presence_penalty}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-2"
 						max="2"
 						step="any"
@@ -756,9 +765,9 @@
 					{'mirostat'}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.mirostat = (params?.mirostat ?? null) === null ? 0 : null;
 					}}
 				>
@@ -788,7 +797,7 @@
 					<input
 						bind:value={params.mirostat}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="2"
 						step="1"
@@ -811,9 +820,9 @@
 					{'mirostat_eta'}
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.mirostat_eta = (params?.mirostat_eta ?? null) === null ? 0.1 : null;
 					}}
 				>
@@ -843,7 +852,7 @@
 					<input
 						bind:value={params.mirostat_eta}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="1"
 						step="any"
@@ -867,9 +876,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.mirostat_tau = (params?.mirostat_tau ?? null) === null ? 5.0 : null;
 					}}
 				>
@@ -899,7 +908,7 @@
 					<input
 						bind:value={params.mirostat_tau}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="10"
 						step="any"
@@ -921,9 +930,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.repeat_last_n = (params?.repeat_last_n ?? null) === null ? 64 : null;
 					}}
 				>
@@ -953,7 +962,7 @@
 					<input
 						bind:value={params.repeat_last_n}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-1"
 						max="128"
 						step="1"
@@ -977,9 +986,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.tfs_z = (params?.tfs_z ?? null) === null ? 1 : null;
 					}}
 				>
@@ -1009,7 +1018,7 @@
 					<input
 						bind:value={params.tfs_z}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="0"
 						max="2"
 						step="any"
@@ -1033,9 +1042,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded transition flex-shrink-0 outline-none"
+					class="py-2 px-3 text-xs flex rounded transition flex-shrink-0 outline-none"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.repeat_penalty = (params?.repeat_penalty ?? null) === null ? 1.1 : null;
 					}}
 				>
@@ -1065,7 +1074,7 @@
 					<input
 						bind:value={params.repeat_penalty}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-2"
 						max="2"
 						step="any"
@@ -1089,9 +1098,9 @@
 						{'use_mmap'}
 					</div>
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+						class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							params.use_mmap = (params?.use_mmap ?? null) === null ? true : null;
 						}}
 					>
@@ -1130,9 +1139,9 @@
 					</div>
 
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+						class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							params.use_mlock = (params?.use_mlock ?? null) === null ? true : null;
 						}}
 					>
@@ -1172,8 +1181,8 @@
 					{'think'} ({$i18n.t('Ollama')})
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					class="py-2 px-3 text-xs flex rounded-sm transition"
+					onclick={() => {
 						params.think = (params?.think ?? null) === null ? true : params.think ? false : null;
 					}}
 					type="button"
@@ -1201,8 +1210,8 @@
 					{'format'} ({$i18n.t('Ollama')})
 				</div>
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition"
-					on:click={() => {
+					class="py-2 px-3 text-xs flex rounded-sm transition"
+					onclick={() => {
 						params.format = (params?.format ?? null) === null ? 'json' : null;
 					}}
 					type="button"
@@ -1241,9 +1250,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.num_keep = (params?.num_keep ?? null) === null ? 24 : null;
 					}}
 				>
@@ -1273,7 +1282,7 @@
 					<input
 						bind:value={params.num_keep}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-1"
 						step="1"
 					/>
@@ -1294,9 +1303,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.num_ctx = (params?.num_ctx ?? null) === null ? 2048 : null;
 					}}
 				>
@@ -1326,7 +1335,7 @@
 					<input
 						bind:value={params.num_ctx}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="-1"
 						step="1"
 					/>
@@ -1349,9 +1358,9 @@
 				</div>
 
 				<button
-					class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+					class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.num_batch = (params?.num_batch ?? null) === null ? 512 : null;
 					}}
 				>
@@ -1381,7 +1390,7 @@
 					<input
 						bind:value={params.num_batch}
 						type="number"
-						class=" bg-transparent text-center w-14"
+						class=" bg-transparent text-center w-20"
 						min="256"
 						step="256"
 					/>
@@ -1405,9 +1414,9 @@
 					</div>
 
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+						class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							params.num_thread = (params?.num_thread ?? null) === null ? 2 : null;
 						}}
 					>
@@ -1437,7 +1446,7 @@
 						<input
 							bind:value={params.num_thread}
 							type="number"
-							class=" bg-transparent text-center w-14"
+							class=" bg-transparent text-center w-20"
 							min="1"
 							max="256"
 							step="1"
@@ -1461,9 +1470,9 @@
 					</div>
 
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+						class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							params.num_gpu = (params?.num_gpu ?? null) === null ? 0 : null;
 						}}
 					>
@@ -1493,7 +1502,7 @@
 						<input
 							bind:value={params.num_gpu}
 							type="number"
-							class=" bg-transparent text-center w-14"
+							class=" bg-transparent text-center w-20"
 							min="0"
 							max="256"
 							step="1"
@@ -1516,8 +1525,8 @@
 						{'keep_alive'} ({$i18n.t('Ollama')})
 					</div>
 					<button
-						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={() => {
+						class="py-2 px-3 text-xs flex rounded-sm transition"
+						onclick={() => {
 							params.keep_alive = (params?.keep_alive ?? null) === null ? '5m' : null;
 						}}
 						type="button"
@@ -1554,7 +1563,7 @@
 									class=" text-xs w-full bg-transparent outline-none"
 									placeholder={$i18n.t('Custom Parameter Name')}
 									value={key}
-									on:change={(e) => {
+									onchange={(e) => {
 										const newKey = inputValue(e).trim();
 										if (newKey && newKey !== key) {
 											params.custom_params[newKey] = params.custom_params[key];
@@ -1568,9 +1577,9 @@
 								/>
 							</div>
 							<button
-								class="p-1 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
+								class="py-2 px-3 text-xs flex rounded-sm transition shrink-0 outline-hidden"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									delete params.custom_params[key];
 									params = {
 										...params,
@@ -1597,7 +1606,7 @@
 				<button
 					class=" flex gap-2 items-center w-full text-center justify-center mt-1 mb-5"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						params.custom_params = (params?.custom_params ?? {}) || {};
 						params.custom_params['custom_param_name'] = 'custom_param_value';
 					}}

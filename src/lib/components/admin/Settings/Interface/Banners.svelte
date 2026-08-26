@@ -4,14 +4,13 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import EllipsisVertical from '$lib/components/icons/EllipsisVertical.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
-	import Sortable from 'sortablejs';
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
-	export let banners = [];
+	let { banners = $bindable([]) } = $props();
 
 	let sortable = null;
-	let bannerListElement = null;
+	let bannerListElement = $state(null);
 
 	const positionChangeHandler = () => {
 		const bannerIdOrder = Array.from(bannerListElement.children).map((child) =>
@@ -25,23 +24,13 @@
 		});
 	};
 
-	const classNames: Record<string, string> = {
-		info: 'bg-blue-500/20 text-blue-700 dark:text-blue-200 ',
-		success: 'bg-green-500/20 text-green-700 dark:text-green-200',
-		warning: 'bg-yellow-500/20 text-yellow-700 dark:text-yellow-200',
-		error: 'bg-red-500/20 text-red-700 dark:text-red-200'
-	};
-
-	$: if (banners) {
-		init();
-	}
-
-	const init = () => {
+	const init = async () => {
 		if (sortable) {
 			sortable.destroy();
 		}
 
 		if (bannerListElement) {
+			const { default: Sortable } = await import('sortablejs');
 			sortable = new Sortable(bannerListElement, {
 				animation: 150,
 				handle: '.item-handle',
@@ -51,6 +40,11 @@
 			});
 		}
 	};
+	$effect(() => {
+		if (banners) {
+			init();
+		}
+	});
 </script>
 
 <div class=" flex flex-col gap-3 {banners?.length > 0 ? 'mt-2' : ''}" bind:this={bannerListElement}>
@@ -90,7 +84,7 @@
 			<button
 				class="pr-3"
 				type="button"
-				on:click={() => {
+				onclick={() => {
 					banners.splice(bannerIdx, 1);
 					banners = banners;
 				}}

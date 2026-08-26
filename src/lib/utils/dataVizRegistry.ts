@@ -24,21 +24,6 @@ import {
 
 export type { WidgetRenderRequest, WidgetRenderResponse };
 
-export type WidgetRenderHandler = (req: WidgetRenderRequest) => Promise<WidgetRenderResponse>;
-
-/**
- * No-op kept for back-compat with DataVizWidget which still calls this on
- * mount. The actual live verification happens via liveRenderWidget regardless
- * of whether a widget is mounted.
- */
-export function registerWidgetHandler(
-	_messageId: string,
-	_overrideKey: string,
-	_handler: WidgetRenderHandler
-): () => void {
-	return () => {};
-}
-
 /**
  * Called by Chat.svelte's chatEventHandler when a `data_viz:render` event
  * arrives from the backend's show_widget tool. Spins up a hidden iframe,

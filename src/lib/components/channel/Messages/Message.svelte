@@ -37,24 +37,37 @@
 	import Skeleton from '$lib/components/chat/Messages/Skeleton.svelte';
 	import ArrowUpLeftAlt from '$lib/components/icons/ArrowUpLeftAlt.svelte';
 
-	export let message;
-	export let showUserProfile = true;
-	export let thread = false;
+	interface Props {
+		message: any;
+		showUserProfile?: boolean;
+		thread?: boolean;
+		replyToMessage?: boolean;
+		disabled?: boolean;
+		onDelete?: Function;
+		onEdit?: Function;
+		onReply?: Function;
+		onThread?: Function;
+		onReaction?: Function;
+	}
 
-	export let replyToMessage = false;
-	export let disabled = false;
+	let {
+		message,
+		showUserProfile = true,
+		thread = false,
+		replyToMessage = false,
+		disabled = false,
+		onDelete = () => {},
+		onEdit = () => {},
+		onReply = () => {},
+		onThread = () => {},
+		onReaction = () => {}
+	}: Props = $props();
 
-	export let onDelete: Function = () => {};
-	export let onEdit: Function = () => {};
-	export let onReply: Function = () => {};
-	export let onThread: Function = () => {};
-	export let onReaction: Function = () => {};
+	let showButtons = $state(false);
 
-	let showButtons = false;
-
-	let edit = false;
-	let editedContent = null;
-	let showDeleteConfirmDialog = false;
+	let edit = $state(false);
+	let editedContent = $state(null);
+	let showDeleteConfirmDialog = $state(false);
 </script>
 
 <ConfirmDialog
@@ -72,10 +85,10 @@
 		class="flex flex-col justify-between px-5 {showUserProfile
 			? 'pt-1.5 pb-0.5'
 			: ''} w-full max-w-full mx-auto group hover:bg-gray-300/5 dark:hover:bg-gray-700/5 transition relative {replyToMessage
-			? 'border-l-4 border-blue-500 bg-blue-100/10 dark:bg-blue-100/5 pl-4'
+			? 'border-l-4 border-book-cloth bg-book-cloth/10 dark:bg-book-cloth/5 pl-4'
 			: ''} {(message?.reply_to_message?.meta?.model_id ?? message?.reply_to_message?.user_id) ===
 		$user?.id
-			? 'border-l-4 border-orange-500 bg-orange-100/10 dark:bg-orange-100/5 pl-4'
+			? 'border-l-4 border-kraft bg-manilla/40 dark:bg-manilla-dark/20 pl-4'
 			: ''}"
 	>
 		{#if !edit && !disabled}
@@ -83,7 +96,7 @@
 				class=" absolute {showButtons ? '' : 'invisible group-hover:visible'} right-1 -top-2 z-10"
 			>
 				<div
-					class="flex gap-1 rounded-lg bg-white dark:bg-gray-850 shadow-md p-0.5 border border-gray-100 dark:border-gray-850"
+					class="flex gap-1 rounded-lg bg-white dark:bg-gray-850 shadow-md p-0.5 border-hairline border-gray-100 dark:border-gray-850"
 				>
 					<EmojiPicker
 						onClose={() => (showButtons = false)}
@@ -94,8 +107,8 @@
 					>
 						<Tooltip content={$i18n.t('Add Reaction')}>
 							<button
-								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1"
-								on:click={() => {
+								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1 max-md:p-2"
+								onclick={() => {
 									showButtons = true;
 								}}
 							>
@@ -106,8 +119,8 @@
 
 					<Tooltip content={$i18n.t('Reply')}>
 						<button
-							class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-0.5"
-							on:click={() => {
+							class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-0.5 max-md:p-2"
+							onclick={() => {
 								onReply(message);
 							}}
 						>
@@ -118,8 +131,8 @@
 					{#if !thread}
 						<Tooltip content={$i18n.t('Reply in Thread')}>
 							<button
-								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1"
-								on:click={() => {
+								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1 max-md:p-2"
+								onclick={() => {
 									onThread(message.id);
 								}}
 							>
@@ -131,8 +144,8 @@
 					{#if message.user_id === $user?.id || $user?.role === 'admin'}
 						<Tooltip content={$i18n.t('Edit')}>
 							<button
-								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1"
-								on:click={() => {
+								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1 max-md:p-2"
+								onclick={() => {
 									edit = true;
 									editedContent = message.content;
 								}}
@@ -143,8 +156,8 @@
 
 						<Tooltip content={$i18n.t('Delete')}>
 							<button
-								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1"
-								on:click={() => (showDeleteConfirmDialog = true)}
+								class="hover:bg-gray-100 dark:hover:bg-gray-800 transition rounded-lg p-1 max-md:p-2"
+								onclick={() => (showDeleteConfirmDialog = true)}
 							>
 								<GarbageBin />
 							</button>
@@ -162,7 +175,7 @@
 
 				<button
 					class="ml-12 flex items-center space-x-2 relative z-0"
-					on:click={() => {
+					onclick={() => {
 						const messageElement = document.getElementById(
 							`message-${message.reply_to_message.id}`
 						);
@@ -311,8 +324,8 @@
 							<div class="flex space-x-1.5">
 								<button
 									id="close-edit-message-button"
-									class="px-3.5 py-1.5 bg-white dark:bg-gray-900 hover:bg-gray-100 text-gray-800 dark:text-gray-100 transition rounded-3xl"
-									on:click={() => {
+									class="px-3.5 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition rounded-full"
+									onclick={() => {
 										edit = false;
 										editedContent = null;
 									}}
@@ -322,8 +335,8 @@
 
 								<button
 									id="confirm-edit-message-button"
-									class="px-3.5 py-1.5 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-gray-800 transition rounded-3xl"
-									on:click={async () => {
+									class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-full"
+									onclick={async () => {
 										onEdit(editedContent);
 										edit = false;
 										editedContent = null;
@@ -357,9 +370,9 @@
 											class="flex items-center gap-1.5 transition rounded-xl px-2 py-1 cursor-pointer {reaction.user_ids.includes(
 												$user?.id
 											)
-												? ' bg-blue-300/10 outline outline-blue-500/50 outline-1'
+												? ' bg-book-cloth/15 outline outline-book-cloth/50 outline-1'
 												: 'bg-gray-300/10 dark:bg-gray-500/10 hover:outline hover:outline-gray-700/30 dark:hover:outline-gray-300/30 hover:outline-1'}"
-											on:click={() => {
+											onclick={() => {
 												onReaction(reaction.name);
 											}}
 										>
@@ -395,7 +408,7 @@
 						<div class="flex items-center gap-1.5 -mt-0.5 mb-1.5">
 							<button
 								class="flex items-center text-xs py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition"
-								on:click={() => {
+								onclick={() => {
 									onThread(message.id);
 								}}
 							>
@@ -426,7 +439,7 @@
 
 	@keyframes highlightAnimation {
 		0% {
-			background-color: rgba(0, 60, 255, 0.1);
+			background-color: rgba(204, 120, 92, 0.15);
 		}
 		100% {
 			background-color: transparent;

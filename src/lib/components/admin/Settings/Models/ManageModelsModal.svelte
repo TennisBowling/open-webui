@@ -1,10 +1,8 @@
-<script>
-	import { toast } from 'svelte-sonner';
+<script lang="ts">
+	import { toast } from '$lib/utils/toast';
 
-	import { createEventDispatcher, getContext, onMount } from 'svelte';
+	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
-
 	import { user } from '$lib/stores';
 
 	import XMark from '$lib/components/icons/XMark.svelte';
@@ -14,10 +12,14 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import ManageMultipleOllama from './Manage/ManageMultipleOllama.svelte';
 
-	export let show = false;
+	interface Props {
+		show?: boolean;
+	}
 
-	let selected = null;
-	let ollamaConfig = null;
+	let { show = $bindable(false) }: Props = $props();
+
+	let selected = $state(null);
+	let ollamaConfig = $state(null);
 
 	onMount(async () => {
 		if ($user?.role === 'admin') {
@@ -45,7 +47,7 @@
 			</div>
 			<button
 				class="self-center"
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -70,7 +72,7 @@
 								class="min-w-fit p-1.5 {selected === 'ollama'
 									? ''
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
-								on:click={() => {
+								onclick={() => {
 									selected = 'ollama';
 								}}>{$i18n.t('Ollama')}</button
 							>
@@ -79,7 +81,7 @@
 								class="min-w-fit p-1.5 {selected === 'llamacpp'
 									? ''
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
-								on:click={() => {
+								onclick={() => {
 									selected = 'llamacpp';
 								}}>{$i18n.t('Llama.cpp')}</button
 							> -->

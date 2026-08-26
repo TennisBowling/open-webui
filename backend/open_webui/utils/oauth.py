@@ -6,6 +6,7 @@ import sys
 import urllib
 import uuid
 import json
+import asyncio
 from datetime import datetime, timedelta
 
 import re
@@ -29,6 +30,15 @@ from typing import Optional
 from open_webui.models.auths import Auths
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.users import Users
+from open_webui.utils.mcp.oauth import (
+    MCPOAuthError as _SSRFError,
+    MCPOAuthHTTPError as _MCPOAuthHTTPError,
+    fetch_json as _mcp_fetch_json,
+    is_terminal_token_error as _is_terminal_token_error,
+    request_refresh_grant as _request_refresh_grant,
+    token_expires_at as _token_expires_at,
+    validate_public_url as _validate_mcp_url,
+)
 
 
 from open_webui.models.groups import Groups, GroupModel, GroupUpdateForm, GroupForm
@@ -241,7 +251,7 @@ async def get_oauth_client_info_with_dynamic_client_registration(
         ).rstrip("/")
 
         oauth_client_metadata = OAuthClientMetadata(
-            client_name="Open WebUI",
+            client_name=request.app.state.WEBUI_NAME,
             redirect_uris=[f"{redirect_base_url}/oauth/clients/{client_id}/callback"],
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
@@ -250,7 +260,13 @@ async def get_oauth_client_info_with_dynamic_client_registration(
 
         # Attempt to fetch OAuth server metadata to get registration endpoint & scopes
         discovery_urls = get_discovery_urls(oauth_server_url)
+        ssrf_allow = _mcp_oauth_extra_allow(oauth_server_url)
         for url in discovery_urls:
+            try:
+                await _validate_mcp_url(url, extra_allow=ssrf_allow)
+            except _SSRFError as e:
+                log.error(f"Blocked OAuth discovery URL {url}: {e}")
+                continue
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, ssl=AIOHTTP_CLIENT_SESSION_SSL
@@ -287,6 +303,10 @@ async def get_oauth_client_info_with_dynamic_client_registration(
         )
 
         # Perform dynamic client registration and return client info
+        await _validate_mcp_url(
+            registration_url,
+            extra_allow=_mcp_oauth_extra_allow(oauth_server_url, oauth_server_metadata_url),
+        )
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 registration_url, json=registration_data, ssl=AIOHTTP_CLIENT_SESSION_SSL
@@ -328,11 +348,53 @@ async def get_oauth_client_info_with_dynamic_client_registration(
         raise e
 
 
+def _mcp_oauth_extra_allow(*urls) -> list:
+    """Hosts to permit through the SSRF guard on the global MCP OAuth path.
+
+    The admin-configured server's own host is trusted (the admin chose it), so a
+    server-returned registration/token endpoint on that same host is allowed,
+    while one redirected to a *different* internal host (e.g. cloud metadata)
+    is still blocked.
+    """
+    hosts = []
+    for u in urls:
+        if not u:
+            continue
+        try:
+            host = urllib.parse.urlparse(u).hostname
+        except Exception:
+            host = None
+        if host:
+            hosts.append(host.lower())
+    return hosts
+
+
+class OAuthRefreshTransientError(Exception):
+    """A token refresh failed for a recoverable reason (5xx / 429 / network /
+    missing metadata). The session must NOT be deleted — a later retry can
+    succeed. Distinct from a terminal failure (invalid_grant), which clears it.
+    """
+
+
 class OAuthClientManager:
     def __init__(self, app):
         self.oauth = OAuth()
         self.app = app
         self.clients = {}
+        # Per (client_id, user) refresh serialization: an OAuth 2.1 provider that
+        # rotates refresh tokens (e.g. Notion) revokes the whole grant if a
+        # rotated-away token is replayed, so concurrent refreshes of the same
+        # session must not both POST the same refresh token (audit B2).
+        self._refresh_locks = {}
+        self._refresh_locks_guard = asyncio.Lock()
+
+    async def _get_refresh_lock(self, key: str) -> asyncio.Lock:
+        async with self._refresh_locks_guard:
+            lock = self._refresh_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._refresh_locks[key] = lock
+            return lock
 
     def add_client(self, client_id, oauth_client_info: OAuthClientInformationFull):
         kwargs = {
@@ -382,14 +444,24 @@ class OAuthClientManager:
         return client["client_info"] if client else None
 
     def get_server_metadata_url(self, client_id):
-        if client_id in self.clients:
-            client = self.clients[client_id]
-            return (
-                client._server_metadata_url
-                if hasattr(client, "_server_metadata_url")
-                else None
-            )
+        # The authlib client (not the wrapper dict) carries _server_metadata_url.
+        # Reading it off the dict always returned None, so refresh always failed
+        # and the session was deleted (audit B1).
+        client = self.get_client(client_id)
+        if client is not None:
+            return getattr(client, "_server_metadata_url", None)
         return None
+
+    def get_token_endpoint(self, client_id):
+        """Resolve the token endpoint without a network round-trip when possible.
+
+        DCR stores the parsed authorization-server metadata on the client_info,
+        so prefer its token_endpoint; the metadata-URL fetch is only a fallback.
+        """
+        info = self.get_client_info(client_id)
+        server_metadata = getattr(info, "server_metadata", None)
+        token_endpoint = getattr(server_metadata, "token_endpoint", None)
+        return str(token_endpoint) if token_endpoint else None
 
     async def get_oauth_token(
         self, user_id: str, client_id: str, force_refresh: bool = False
@@ -416,65 +488,104 @@ class OAuthClientManager:
                 )
                 return None
 
-            if force_refresh or datetime.now() + timedelta(
-                minutes=5
-            ) >= datetime.fromtimestamp(session.expires_at):
+            def _needs_refresh(s) -> bool:
+                return force_refresh or datetime.now() + timedelta(
+                    minutes=5
+                ) >= datetime.fromtimestamp(s.expires_at)
+
+            if not _needs_refresh(session):
+                return session.token
+
+            # Serialize refresh per (client_id, user) so concurrent callers don't
+            # both replay the same (rotating) refresh token (audit B2).
+            lock = await self._get_refresh_lock(f"{client_id}:{user_id}")
+            async with lock:
+                # Re-read inside the lock: another task may have just refreshed.
+                session = await OAuthSessions.get_session_by_provider_and_user_id(
+                    client_id, user_id
+                )
+                if not session:
+                    return None
+                if not _needs_refresh(session):
+                    return session.token
+
                 log.debug(
                     f"Token refresh needed for user {user_id}, client_id {session.provider}"
                 )
-                refreshed_token = await self._refresh_token(session)
+                try:
+                    refreshed_token = await self._refresh_token(session)
+                except OAuthRefreshTransientError as exc:
+                    # Recoverable failure — keep the session and the (possibly
+                    # still usable) token; a later attempt can succeed.
+                    log.warning(
+                        f"Transient token refresh failure for user {user_id}, "
+                        f"client_id {session.provider}; keeping session: {exc}"
+                    )
+                    return session.token
                 if refreshed_token:
                     return refreshed_token
-                else:
-                    log.warning(
-                        f"Token refresh failed for user {user_id}, client_id {session.provider}, deleting session {session.id}"
-                    )
-                    await OAuthSessions.delete_session_by_id(session.id)
-                    return None
-            return session.token
+                # Terminal failure (invalid_grant): the grant is dead.
+                log.warning(
+                    f"Token refresh failed terminally for user {user_id}, "
+                    f"client_id {session.provider}, deleting session {session.id}"
+                )
+                await OAuthSessions.delete_session_by_id(session.id)
+                return None
 
+        except OAuthRefreshTransientError:
+            raise
         except Exception as e:
             log.error(f"Error getting OAuth token for user {user_id}: {e}")
             return None
 
     async def _refresh_token(self, session) -> dict:
         """
-        Refresh an OAuth token if needed, with concurrency protection.
-
-        Args:
-            session: The OAuth session object
+        Refresh an OAuth token.
 
         Returns:
-            dict: Refreshed token data, or None if refresh failed
+            dict: Refreshed token data on success, or None on a TERMINAL failure.
+
+        Raises:
+            OAuthRefreshTransientError: on a recoverable failure (caller keeps
+                the session rather than deleting it).
         """
-        try:
-            # Perform the actual refresh
-            refreshed_token = await self._perform_token_refresh(session)
-
-            if refreshed_token:
-                # Update the session with new token data
-                session = await OAuthSessions.update_session_by_id(
-                    session.id, refreshed_token
+        refreshed_token = await self._perform_token_refresh(session)
+        if refreshed_token:
+            # Update the session with new token data
+            updated = await OAuthSessions.update_session_by_id(
+                session.id, refreshed_token
+            )
+            if not updated:
+                # The provider already consumed (and for a rotating provider like
+                # Notion, rotated away) the old refresh token, but we failed to
+                # persist the new one. Keeping the now-dead token for replay would
+                # revoke the entire grant on the next refresh. Delete the session
+                # and force re-auth instead of treating this as transient (which
+                # would keep — and later replay — the dead token). Mirrors the
+                # per-user path's clear-on-persist-failure.
+                log.error(
+                    f"Failed to persist refreshed token for session {session.id}; "
+                    f"deleting session to force re-auth rather than replay a "
+                    f"rotated-away refresh token"
                 )
-                log.info(f"Successfully refreshed token for session {session.id}")
-                return session.token
-            else:
-                log.error(f"Failed to refresh token for session {session.id}")
+                await OAuthSessions.delete_session_by_id(session.id)
                 return None
-
-        except Exception as e:
-            log.error(f"Error refreshing token for session {session.id}: {e}")
-            return None
+            log.info(f"Successfully refreshed token for session {updated.id}")
+            return updated.token
+        log.error(f"Failed to refresh token for session {session.id}")
+        return None
 
     async def _perform_token_refresh(self, session) -> dict:
         """
         Perform the actual OAuth token refresh.
 
-        Args:
-            session: The OAuth session object
-
         Returns:
-            dict: New token data, or None if refresh failed
+            dict: New token data on success, or None on a TERMINAL failure
+            (invalid_grant etc.).
+
+        Raises:
+            OAuthRefreshTransientError: on a recoverable failure (5xx / 429 /
+                network / missing metadata).
         """
         client_id = session.provider
         token_data = session.token
@@ -483,79 +594,84 @@ class OAuthClientManager:
             log.warning(f"No refresh token available for session {session.id}")
             return None
 
+        client = self.get_client(client_id)
+        if not client:
+            log.error(f"No OAuth client found for provider {client_id}")
+            raise OAuthRefreshTransientError(f"No OAuth client for {client_id}")
+
+        # Hosts trusted for this provider's OAuth endpoints (the AS host the
+        # admin's server advertised). Blocks a metadata doc that redirects the
+        # token endpoint to a different internal host.
+        ssrf_allow = _mcp_oauth_extra_allow(self.get_server_metadata_url(client_id))
+
+        # Prefer the token endpoint stored from discovery; only fetch metadata
+        # over the network as a fallback. The metadata GET and the refresh POST
+        # both go through the shared, SSRF-hardened MCP OAuth helpers so the admin
+        # path cannot drift from the per-user one (which is what produced the
+        # NULL-expires_at crash and a divergent terminal-error list here).
+        token_endpoint = self.get_token_endpoint(client_id)
+        if not token_endpoint:
+            metadata_url = self.get_server_metadata_url(client_id)
+            try:
+                openid_data = await _mcp_fetch_json(metadata_url, extra_allow=ssrf_allow)
+                token_endpoint = openid_data.get("token_endpoint")
+            except Exception as e:
+                raise OAuthRefreshTransientError(
+                    f"Failed to fetch OAuth metadata for {client_id}: {e}"
+                ) from e
+        if not token_endpoint:
+            raise OAuthRefreshTransientError(
+                f"No token endpoint found for client_id {client_id}"
+            )
+
+        extra_data = {}
+        if getattr(client, "client_secret", None):
+            extra_data["client_secret"] = client.client_secret
+
         try:
-            client = self.get_client(client_id)
-            if not client:
-                log.error(f"No OAuth client found for provider {client_id}")
+            # request_refresh_grant validates the (server-controlled) token
+            # endpoint, POSTs without following redirects, and defaults expires_at.
+            new_token_data = await _request_refresh_grant(
+                token_endpoint,
+                client_id=client.client_id,
+                refresh_token=token_data["refresh_token"],
+                extra_data=extra_data,
+                extra_allow=ssrf_allow,
+            )
+        except _MCPOAuthHTTPError as exc:
+            log.error(
+                f"Token refresh failed for client_id {client_id}: "
+                f"{exc.status} - {exc.body[:300]}"
+            )
+            # A terminal error (invalid_grant / bare 401) means the grant is dead:
+            # return None so the caller deletes the session. Anything else is
+            # transient and should be retried (caller keeps the session).
+            if _is_terminal_token_error(exc):
                 return None
-
-            token_endpoint = None
-            async with aiohttp.ClientSession(trust_env=True) as session_http:
-                async with session_http.get(
-                    self.get_server_metadata_url(client_id)
-                ) as r:
-                    if r.status == 200:
-                        openid_data = await r.json()
-                        token_endpoint = openid_data.get("token_endpoint")
-                    else:
-                        log.error(
-                            f"Failed to fetch OpenID configuration for client_id {client_id}"
-                        )
-            if not token_endpoint:
-                log.error(f"No token endpoint found for client_id {client_id}")
-                return None
-
-            # Prepare refresh request
-            refresh_data = {
-                "grant_type": "refresh_token",
-                "refresh_token": token_data["refresh_token"],
-                "client_id": client.client_id,
-            }
-            if hasattr(client, "client_secret") and client.client_secret:
-                refresh_data["client_secret"] = client.client_secret
-
-            # Make refresh request
-            async with aiohttp.ClientSession(trust_env=True) as session_http:
-                async with session_http.post(
-                    token_endpoint,
-                    data=refresh_data,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                ) as r:
-                    if r.status == 200:
-                        new_token_data = await r.json()
-
-                        # Merge with existing token data (preserve refresh_token if not provided)
-                        if "refresh_token" not in new_token_data:
-                            new_token_data["refresh_token"] = token_data[
-                                "refresh_token"
-                            ]
-
-                        # Add timestamp for tracking
-                        new_token_data["issued_at"] = datetime.now().timestamp()
-
-                        # Calculate expires_at if we have expires_in
-                        if (
-                            "expires_in" in new_token_data
-                            and "expires_at" not in new_token_data
-                        ):
-                            new_token_data["expires_at"] = int(
-                                datetime.now().timestamp()
-                                + new_token_data["expires_in"]
-                            )
-
-                        log.debug(f"Token refresh successful for client_id {client_id}")
-                        return new_token_data
-                    else:
-                        error_text = await r.text()
-                        log.error(
-                            f"Token refresh failed for client_id {client_id}: {r.status} - {error_text}"
-                        )
-                        return None
-
+            raise OAuthRefreshTransientError(
+                f"Token endpoint returned {exc.status} for {client_id}"
+            ) from exc
+        except _SSRFError as e:
+            # A blocked token endpoint (SSRF) or malformed JSON — keep the session.
+            raise OAuthRefreshTransientError(
+                f"Token refresh request failed for {client_id}: {e}"
+            ) from e
         except Exception as e:
-            log.error(f"Exception during token refresh for client_id {client_id}: {e}")
-            return None
+            raise OAuthRefreshTransientError(
+                f"Exception during token refresh for {client_id}: {e}"
+            ) from e
+
+        # Preserve the existing refresh token if the provider didn't rotate one.
+        if "refresh_token" not in new_token_data:
+            new_token_data["refresh_token"] = token_data["refresh_token"]
+        new_token_data["issued_at"] = datetime.now().timestamp()
+        # expires_at is guaranteed present by request_refresh_grant.
+        if not new_token_data.get("access_token"):
+            raise OAuthRefreshTransientError(
+                f"Refresh response missing access_token for {client_id}"
+            )
+        log.debug(f"Token refresh successful for client_id {client_id}")
+        return new_token_data
 
     async def handle_authorize(self, request, client_id: str) -> RedirectResponse:
         client = self.get_client(client_id)
@@ -594,11 +710,11 @@ class OAuthClientManager:
                     # Add timestamp for tracking
                     token["issued_at"] = datetime.now().timestamp()
 
-                    # Calculate expires_at if we have expires_in
-                    if "expires_in" in token and "expires_at" not in token:
-                        token["expires_at"] = (
-                            datetime.now().timestamp() + token["expires_in"]
-                        )
+                    # expires_at is a NOT NULL column; default it when the
+                    # provider omits expires_in (e.g. Notion non-expiring tokens)
+                    # so the session can be stored instead of crashing on NULL.
+                    if "expires_at" not in token:
+                        token["expires_at"] = _token_expires_at(token)
 
                     # Clean up any existing sessions for this user/client_id first
                     sessions = await OAuthSessions.get_sessions_by_user_id(user_id)

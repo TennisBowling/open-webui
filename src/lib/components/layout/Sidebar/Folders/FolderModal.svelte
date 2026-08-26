@@ -1,11 +1,13 @@
 <script lang="ts">
-	import { getContext, createEventDispatcher, onMount, tick } from 'svelte';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { getContext, onMount, tick } from 'svelte';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Modal from '$lib/components/common/Modal.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { user } from '$lib/stores';
@@ -14,22 +16,30 @@
 	import { getFolderById } from '$lib/apis/folders';
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let onSubmit: Function = (e) => {};
+	interface Props {
+		show?: boolean;
+		onSubmit?: Function;
+		folderId?: any;
+		edit?: boolean;
+	}
 
-	export let folderId = null;
-	export let edit = false;
+	let {
+		show = $bindable(false),
+		onSubmit = (e) => {},
+		folderId = null,
+		edit = false
+	}: Props = $props();
 
 	let folder = null;
-	let name = '';
-	let meta = {
+	let name = $state('');
+	let meta = $state({
 		background_image_url: null
-	};
-	let data = {
+	});
+	let data = $state({
 		system_prompt: ''
-	};
+	});
 
-	let loading = false;
+	let loading = $state(false);
 
 	const submitHandler = async () => {
 		loading = true;
@@ -71,19 +81,23 @@
 		}
 	};
 
-	$: if (show) {
-		init();
-	}
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 
-	$: if (!show && !edit) {
-		name = '';
-		meta = {
-			background_image_url: null
-		};
-		data = {
-			system_prompt: ''
-		};
-	}
+	$effect(() => {
+		if (!show && !edit) {
+			name = '';
+			meta = {
+				background_image_url: null
+			};
+			data = {
+				system_prompt: ''
+			};
+		}
+	});
 </script>
 
 <Modal size="md" bind:show>
@@ -97,8 +111,8 @@
 				{/if}
 			</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -110,9 +124,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class="flex flex-col w-full mt-1">
 						<div class=" mb-1 text-xs text-gray-500">{$i18n.t('Folder Name')}</div>
@@ -134,7 +148,7 @@
 						type="file"
 						hidden
 						accept="image/*"
-						on:change={(e) => {
+						onchange={(e) => {
 							const inputFiles = e.target.files;
 
 							let reader = new FileReader();
@@ -167,7 +181,7 @@
 							<button
 								aria-labelledby="chat-background-label background-image-url-state"
 								class="p-1 px-3 text-xs flex rounded-sm transition"
-								on:click={() => {
+								onclick={() => {
 									if (meta?.background_image_url !== null) {
 										meta.background_image_url = null;
 									} else {
@@ -208,7 +222,7 @@
 
 					<div class="flex justify-end pt-3 text-sm font-medium gap-1.5">
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-950 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
+							class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-full flex flex-row space-x-1 items-center {loading
 								? ' cursor-not-allowed'
 								: ''}"
 							type="submit"

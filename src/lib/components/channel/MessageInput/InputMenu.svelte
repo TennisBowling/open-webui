@@ -18,60 +18,67 @@
 
 	const i18n = getContext('i18n');
 
-	export let screenCaptureHandler: Function;
-	export let uploadFilesHandler: Function;
-
-	export let onClose: Function = () => {};
-
-	let show = false;
-
-	$: if (show) {
-		init();
+	interface Props {
+		screenCaptureHandler: Function;
+		uploadFilesHandler: Function;
+		onClose?: Function;
+		children?: import('svelte').Snippet;
 	}
 
+	let { screenCaptureHandler, uploadFilesHandler, onClose = () => {}, children }: Props = $props();
+
+	let show = $state(false);
+
 	const init = async () => {};
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 </script>
 
 <Dropdown
 	bind:show
-	on:change={(e) => {
+	onchange={(e) => {
 		if (e.detail === false) {
 			onClose();
 		}
 	}}
 >
 	<Tooltip content={$i18n.t('More')}>
-		<slot />
+		{@render children?.()}
 	</Tooltip>
 
-	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[200px] rounded-2xl px-1 py-1  border border-gray-100  dark:border-gray-800 z-999 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
-			sideOffset={4}
-			alignOffset={-6}
-			side="bottom"
-			align="start"
-			transition={flyAndScale}
-		>
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl"
-				on:click={() => {
-					uploadFilesHandler();
-				}}
+	{#snippet content()}
+		<div>
+			<DropdownMenu.Content
+				class="w-full max-w-[200px] rounded-2xl px-1 py-1  border-hairline border-gray-100  dark:border-gray-800 z-999 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
+				sideOffset={4}
+				alignOffset={-6}
+				side="bottom"
+				align="start"
+				transition={flyAndScale}
 			>
-				<Clip />
-				<div class="line-clamp-1">{$i18n.t('Upload Files')}</div>
-			</DropdownMenu.Item>
+				<DropdownMenu.Item
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl"
+					onclick={() => {
+						uploadFilesHandler();
+					}}
+				>
+					<Clip />
+					<div class="line-clamp-1">{$i18n.t('Upload Files')}</div>
+				</DropdownMenu.Item>
 
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50  rounded-xl"
-				on:click={() => {
-					screenCaptureHandler();
-				}}
-			>
-				<Camera />
-				<div class=" line-clamp-1">{$i18n.t('Capture')}</div>
-			</DropdownMenu.Item>
-		</DropdownMenu.Content>
-	</div>
+				<DropdownMenu.Item
+					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50  rounded-xl"
+					onclick={() => {
+						screenCaptureHandler();
+					}}
+				>
+					<Camera />
+					<div class=" line-clamp-1">{$i18n.t('Capture')}</div>
+				</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</div>
+	{/snippet}
 </Dropdown>

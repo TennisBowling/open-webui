@@ -653,37 +653,41 @@ def test_tool_result_ref_hydrates_from_message_body_store():
     assert out[1]["content"] == [{"type": "text", "text": "full fetched body"}]
 
 
-def test_tool_result_ref_without_body_fails_loudly():
-    import pytest
-
-    with pytest.raises(ValueError):
-        blocks_to_api_messages(
-            [
-                {
-                    "role": "assistant",
-                    "content_blocks": [
-                        {
-                            "type": "tool_calls",
-                            "content": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {"name": "web_fetch", "arguments": "{}"},
-                                }
-                            ],
-                            "results": [
-                                {
-                                    "tool_call_id": "call_1",
-                                    "result_ref": "call_1",
-                                    "result_lazy": True,
-                                    "content": "",
-                                }
-                            ],
-                        }
-                    ],
-                }
-            ]
-        )
+def test_tool_result_ref_without_body_degrades_to_placeholder():
+    """A lost out-of-line body must never fail the whole outbound conversion
+    (that exact raise killed entire turns in production — see the degrade
+    comment in _hydrate_tool_result_refs). The tool message still validates
+    upstream via a non-empty descriptive placeholder."""
+    out = blocks_to_api_messages(
+        [
+            {
+                "role": "assistant",
+                "content_blocks": [
+                    {
+                        "type": "tool_calls",
+                        "content": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "web_fetch", "arguments": "{}"},
+                            }
+                        ],
+                        "results": [
+                            {
+                                "tool_call_id": "call_1",
+                                "result_ref": "call_1",
+                                "result_lazy": True,
+                                "content": "",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    tool_msg = next(m for m in out if m.get("role") == "tool")
+    text = tool_msg["content"][0]["text"]
+    assert text  # non-empty so the upstream API accepts the message
 
 
 # -- A2: copy-on-write hydration does not mutate caller input -----------------
@@ -1113,7 +1117,9 @@ def test_missing_subagent_result_body_degrades_instead_of_raising():
     out = _hydrate_tool_result_refs(blocks, bodies={})  # body missing
     assert out[0]["results"][0].get("content", "") == ""
 
-    # A regular tool with a missing body still raises (unchanged behavior).
+    # A regular tool with a missing body degrades to a descriptive placeholder
+    # (raising here used to kill the whole outbound conversion over one lost
+    # body — see the degrade comment in _hydrate_tool_result_refs).
     reg = [
         {
             "type": "tool_calls",
@@ -1126,6 +1132,92 @@ def test_missing_subagent_result_body_degrades_instead_of_raising():
             ],
         }
     ]
-    import pytest as _pytest
-    with _pytest.raises(ValueError):
-        _hydrate_tool_result_refs(reg, bodies={})
+    hydrated = _hydrate_tool_result_refs(reg, bodies={})
+    assert hydrated[0]["results"][0]["content"]  # non-empty placeholder
+
+
+# ---------------------------------------------------------------------------
+# align_reasoning_rounds_to_blocks / round_base_messages (retry-seam fixes,
+# chat 32dac004 2026-08-03)
+# ---------------------------------------------------------------------------
+
+from open_webui.utils.messages import (  # noqa: E402
+    align_reasoning_rounds_to_blocks,
+    count_assistant_emissions,
+    round_base_messages,
+)
+
+
+def _tc_block(call_id):
+    return {
+        "type": "tool_calls",
+        "content": [
+            {"id": call_id, "type": "function", "function": {"name": "t", "arguments": "{}"}}
+        ],
+        "results": [{"tool_call_id": call_id, "content": "r"}],
+    }
+
+
+def test_align_reasoning_rounds_pads_stale_seed():
+    # Retry sibling seeded from a client-carried map: fewer entries than the
+    # blocks expand to. Alignment pads with None so appends land on the RIGHT
+    # emission instead of misfiling onto an inherited round.
+    blocks = [_tc_block("c1"), _tc_block("c2"), {"type": "text", "content": "done"}]
+    emissions = count_assistant_emissions(blocks)
+    rounds = [[{"text": "r0"}]]
+    align_reasoning_rounds_to_blocks(rounds, blocks)
+    assert len(rounds) == emissions
+    assert rounds[0] == [{"text": "r0"}]
+    assert all(r is None for r in rounds[1:])
+
+
+def test_align_reasoning_rounds_truncates_overlong_seed():
+    # Rewound/trimmed blocks beside a full-length map: dropped rounds' entries go.
+    blocks = [_tc_block("c1")]
+    emissions = count_assistant_emissions(blocks)
+    rounds = [[{"text": f"r{i}"}] for i in range(5)]
+    align_reasoning_rounds_to_blocks(rounds, blocks)
+    assert len(rounds) == emissions
+    assert rounds[0] == [{"text": "r0"}]
+
+
+def test_align_reasoning_rounds_noop_when_aligned_or_invalid():
+    blocks = [_tc_block("c1")]
+    rounds = [[{"text": "r0"}]] * count_assistant_emissions(blocks)
+    before = list(rounds)
+    align_reasoning_rounds_to_blocks(rounds, blocks)
+    assert rounds == before
+    align_reasoning_rounds_to_blocks(None, blocks)  # non-list: no raise
+    empty = []
+    align_reasoning_rounds_to_blocks(empty, None)  # no blocks: stays empty
+    assert empty == []
+
+
+def test_round_base_messages_strips_current_turn_carrier():
+    # Continuation base ends with THIS message's content_blocks-carrying dict
+    # (what round 1 sent). Between-rounds assemblies re-carry the turn
+    # themselves, so the tail must go — keeping it doubled the whole inherited
+    # turn on the wire (+66k tokens/round in the incident chat).
+    base = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content_blocks": [_tc_block("c1")], "id": "m1"},
+    ]
+    assert round_base_messages(base, "m1") == base[:2]
+    # Also stripped on id match alone (legacy carrier without blocks).
+    base[-1] = {"role": "assistant", "content": "partial", "id": "m1"}
+    assert round_base_messages(base, "m1") == base[:2]
+
+
+def test_round_base_messages_keeps_normal_and_prefill_bases():
+    # Normal turn: base ends with the user message — untouched (identity).
+    base = [{"role": "user", "content": "u"}]
+    assert round_base_messages(base, "m1") is base
+    # API-client prefill: trailing assistant with no blocks and a foreign/no id
+    # is not ours to strip.
+    prefill = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "The answer is"},
+    ]
+    assert round_base_messages(prefill, "m1") is prefill
+    assert round_base_messages([], "m1") == []

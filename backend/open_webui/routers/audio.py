@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 import html
 from functools import lru_cache
@@ -29,8 +30,8 @@ from fastapi import (
     APIRouter,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -45,6 +46,7 @@ from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
     ENV,
     SRC_LOG_LEVELS,
     DEVICE_TYPE,
@@ -65,6 +67,12 @@ log.setLevel(SRC_LOG_LEVELS["AUDIO"])
 
 SPEECH_CACHE_DIR = CACHE_DIR / "audio" / "speech"
 SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_TTS_MODELS_CACHE_TTL_SECONDS = 5 * 60
+_OPENROUTER_TTS_MODELS_CACHE = {"models": [], "fetched_at": 0.0}
+OPENROUTER_STT_MODELS_CACHE_TTL_SECONDS = 5 * 60
+_OPENROUTER_STT_MODELS_CACHE = {"models": [], "fetched_at": 0.0}
 
 
 ##########################################
@@ -155,6 +163,7 @@ class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
     OPENAI_PARAMS: Optional[dict] = None
+    OPENROUTER_API_KEY: str = ""
     API_KEY: str
     ENGINE: str
     MODEL: str
@@ -168,6 +177,8 @@ class TTSConfigForm(BaseModel):
 class STTConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_TEMPERATURE: Optional[float] = Field(None, ge=0, le=1)
     ENGINE: str
     MODEL: str
     SUPPORTED_CONTENT_TYPES: list[str] = []
@@ -185,6 +196,13 @@ class AudioConfigUpdateForm(BaseModel):
     stt: STTConfigForm
 
 
+class OpenRouterTTSPreviewForm(BaseModel):
+    API_KEY: str
+    MODEL: str
+    VOICE: str
+    INPUT: str
+
+
 @router.get("/config")
 async def get_audio_config(request: Request, user=Depends(get_admin_user)):
     return {
@@ -192,6 +210,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
             "OPENAI_PARAMS": request.app.state.config.TTS_OPENAI_PARAMS,
+            "OPENROUTER_API_KEY": request.app.state.config.TTS_OPENROUTER_API_KEY,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -204,6 +223,8 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
         "stt": {
             "OPENAI_API_BASE_URL": request.app.state.config.STT_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.STT_OPENAI_API_KEY,
+            "OPENROUTER_API_KEY": request.app.state.config.STT_OPENROUTER_API_KEY,
+            "OPENROUTER_TEMPERATURE": request.app.state.config.STT_OPENROUTER_TEMPERATURE,
             "ENGINE": request.app.state.config.STT_ENGINE,
             "MODEL": request.app.state.config.STT_MODEL,
             "SUPPORTED_CONTENT_TYPES": request.app.state.config.STT_SUPPORTED_CONTENT_TYPES,
@@ -225,6 +246,7 @@ async def update_audio_config(
     request.app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
     request.app.state.config.TTS_OPENAI_PARAMS = form_data.tts.OPENAI_PARAMS
+    request.app.state.config.TTS_OPENROUTER_API_KEY = form_data.tts.OPENROUTER_API_KEY
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
     request.app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     request.app.state.config.TTS_MODEL = form_data.tts.MODEL
@@ -240,6 +262,10 @@ async def update_audio_config(
 
     request.app.state.config.STT_OPENAI_API_BASE_URL = form_data.stt.OPENAI_API_BASE_URL
     request.app.state.config.STT_OPENAI_API_KEY = form_data.stt.OPENAI_API_KEY
+    request.app.state.config.STT_OPENROUTER_API_KEY = form_data.stt.OPENROUTER_API_KEY
+    request.app.state.config.STT_OPENROUTER_TEMPERATURE = (
+        form_data.stt.OPENROUTER_TEMPERATURE
+    )
     request.app.state.config.STT_ENGINE = form_data.stt.ENGINE
     request.app.state.config.STT_MODEL = form_data.stt.MODEL
     request.app.state.config.STT_SUPPORTED_CONTENT_TYPES = (
@@ -271,6 +297,7 @@ async def update_audio_config(
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
             "OPENAI_PARAMS": request.app.state.config.TTS_OPENAI_PARAMS,
+            "OPENROUTER_API_KEY": request.app.state.config.TTS_OPENROUTER_API_KEY,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "SPLIT_ON": request.app.state.config.TTS_SPLIT_ON,
             "AZURE_SPEECH_REGION": request.app.state.config.TTS_AZURE_SPEECH_REGION,
@@ -280,6 +307,8 @@ async def update_audio_config(
         "stt": {
             "OPENAI_API_BASE_URL": request.app.state.config.STT_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.STT_OPENAI_API_KEY,
+            "OPENROUTER_API_KEY": request.app.state.config.STT_OPENROUTER_API_KEY,
+            "OPENROUTER_TEMPERATURE": request.app.state.config.STT_OPENROUTER_TEMPERATURE,
             "ENGINE": request.app.state.config.STT_ENGINE,
             "MODEL": request.app.state.config.STT_MODEL,
             "SUPPORTED_CONTENT_TYPES": request.app.state.config.STT_SUPPORTED_CONTENT_TYPES,
@@ -292,6 +321,303 @@ async def update_audio_config(
             "AZURE_MAX_SPEAKERS": request.app.state.config.AUDIO_STT_AZURE_MAX_SPEAKERS,
         },
     }
+
+
+def normalize_openrouter_tts_model(model: dict) -> Optional[dict]:
+    """Return only the OpenRouter TTS metadata needed by the UI."""
+    if not isinstance(model, dict):
+        return None
+
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return None
+
+    architecture = model.get("architecture")
+    output_modalities = (
+        architecture.get("output_modalities", [])
+        if isinstance(architecture, dict)
+        else []
+    )
+    if "speech" not in output_modalities:
+        return None
+
+    supported_voices = model.get("supported_voices")
+    if not isinstance(supported_voices, list):
+        supported_voices = []
+
+    pricing = model.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+
+    return {
+        "id": model_id,
+        "name": model.get("name") or model_id,
+        "description": model.get("description") or "",
+        "context_length": model.get("context_length") or 0,
+        "pricing": {
+            "prompt": pricing.get("prompt") or "0",
+            "completion": pricing.get("completion") or "0",
+        },
+        "voices": [
+            voice for voice in supported_voices if isinstance(voice, str) and voice
+        ],
+    }
+
+
+def normalize_openrouter_stt_model(model: dict) -> Optional[dict]:
+    """Return the live OpenRouter STT metadata used by the admin model picker."""
+    if not isinstance(model, dict):
+        return None
+
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return None
+
+    architecture = model.get("architecture")
+    output_modalities = (
+        architecture.get("output_modalities", [])
+        if isinstance(architecture, dict)
+        else []
+    )
+    if "transcription" not in output_modalities:
+        return None
+
+    pricing = model.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+
+    supported_parameters = model.get("supported_parameters")
+    if not isinstance(supported_parameters, list):
+        supported_parameters = []
+
+    return {
+        "id": model_id,
+        "name": model.get("name") or model_id,
+        "description": model.get("description") or "",
+        "context_length": model.get("context_length") or 0,
+        "pricing": {
+            "prompt": pricing.get("prompt") or "0",
+            "completion": pricing.get("completion") or "0",
+        },
+        "supported_parameters": [
+            parameter
+            for parameter in supported_parameters
+            if isinstance(parameter, str) and parameter
+        ],
+    }
+
+
+async def get_openrouter_tts_models(*, refresh: bool = False) -> list[dict]:
+    """Fetch OpenRouter's live, keyless speech-model catalog with a short TTL."""
+    now = time.monotonic()
+    cached_models = _OPENROUTER_TTS_MODELS_CACHE["models"]
+    cached_at = _OPENROUTER_TTS_MODELS_CACHE["fetched_at"]
+
+    if (
+        not refresh
+        and cached_models
+        and now - cached_at < OPENROUTER_TTS_MODELS_CACHE_TTL_SECONDS
+    ):
+        return cached_models
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                f"{OPENROUTER_API_BASE_URL}/models",
+                params={
+                    "output_modalities": "speech",
+                    "sort": "pricing-low-to-high",
+                    "limit": 100,
+                },
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    error = data.get("error", {}) if isinstance(data, dict) else {}
+                    message = (
+                        error.get("message") if isinstance(error, dict) else str(error)
+                    )
+                    raise RuntimeError(message or f"HTTP {response.status}")
+
+        catalog_items = data.get("data", []) if isinstance(data, dict) else []
+        models = []
+        for item in catalog_items:
+            model = normalize_openrouter_tts_model(item)
+            if model is not None:
+                models.append(model)
+
+        if not models:
+            raise RuntimeError("OpenRouter returned no text-to-speech models")
+
+        _OPENROUTER_TTS_MODELS_CACHE["models"] = models
+        _OPENROUTER_TTS_MODELS_CACHE["fetched_at"] = now
+        return models
+    except Exception as e:
+        log.exception("Failed to fetch the OpenRouter TTS model catalog")
+        if cached_models:
+            return cached_models
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to load OpenRouter text-to-speech models: {e}",
+        )
+
+
+async def get_openrouter_stt_models(*, refresh: bool = False) -> list[dict]:
+    """Fetch OpenRouter's keyless audio-to-transcription catalog with a short TTL."""
+    now = time.monotonic()
+    cached_models = _OPENROUTER_STT_MODELS_CACHE["models"]
+    cached_at = _OPENROUTER_STT_MODELS_CACHE["fetched_at"]
+
+    if (
+        not refresh
+        and cached_models
+        and now - cached_at < OPENROUTER_STT_MODELS_CACHE_TTL_SECONDS
+    ):
+        return cached_models
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                f"{OPENROUTER_API_BASE_URL}/models",
+                params={
+                    "output_modalities": "transcription",
+                    "sort": "pricing-low-to-high",
+                    "limit": 100,
+                },
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    error = data.get("error", {}) if isinstance(data, dict) else {}
+                    message = (
+                        error.get("message") if isinstance(error, dict) else str(error)
+                    )
+                    raise RuntimeError(message or f"HTTP {response.status}")
+
+        catalog_items = data.get("data", []) if isinstance(data, dict) else []
+        models = [
+            normalized
+            for item in catalog_items
+            if (normalized := normalize_openrouter_stt_model(item)) is not None
+        ]
+        if not models:
+            raise RuntimeError("OpenRouter returned no speech-to-text models")
+
+        _OPENROUTER_STT_MODELS_CACHE["models"] = models
+        _OPENROUTER_STT_MODELS_CACHE["fetched_at"] = now
+        return models
+    except Exception as e:
+        log.exception("Failed to fetch the OpenRouter STT model catalog")
+        if cached_models:
+            return cached_models
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to load OpenRouter speech-to-text models: {e}",
+        )
+
+
+async def synthesize_openrouter_audio(
+    request: Request,
+    *,
+    api_key: str,
+    model: str,
+    voice: str,
+    input_text: str,
+    extra_payload: Optional[dict] = None,
+) -> tuple[bytes, dict]:
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OpenRouter API key is not configured",
+        )
+    if not model or not voice:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An OpenRouter text-to-speech model and voice are required",
+        )
+    if not input_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Text to synthesize is required",
+        )
+
+    payload = {
+        **(extra_payload or {}),
+        "input": input_text,
+        "model": model,
+        "voice": voice,
+        "response_format": "mp3",
+    }
+    app_url = str(request.app.state.config.WEBUI_URL or request.base_url).rstrip("/")
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(
+                url=f"{OPENROUTER_API_BASE_URL}/audio/speech",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer": app_url,
+                    "X-OpenRouter-Title": request.app.state.WEBUI_NAME,
+                },
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                if response.status != 200:
+                    try:
+                        response_data = await response.json(content_type=None)
+                        error = response_data.get("error", {})
+                        detail = (
+                            error.get("message")
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
+                    except Exception:
+                        detail = await response.text()
+
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=f"OpenRouter: {detail or 'Text-to-speech request failed'}",
+                    )
+
+                return await response.read(), payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("OpenRouter text-to-speech request failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"OpenRouter: {e}",
+        )
+
+
+@router.post("/openrouter/preview")
+async def preview_openrouter_speech(
+    request: Request,
+    form_data: OpenRouterTTSPreviewForm,
+    user=Depends(get_admin_user),
+):
+    if len(form_data.INPUT) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Voice previews are limited to 500 characters",
+        )
+
+    audio, _ = await synthesize_openrouter_audio(
+        request,
+        api_key=form_data.API_KEY,
+        model=form_data.MODEL,
+        voice=form_data.VOICE,
+        input_text=form_data.INPUT,
+    )
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def load_speech_pipeline(request):
@@ -381,7 +707,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             detail = None
 
             status_code = 500
-            detail = f"Open WebUI: Server Connection Error"
+            detail = f"{request.app.state.WEBUI_NAME}: Server Connection Error"
 
             if r is not None:
                 status_code = r.status
@@ -397,6 +723,23 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                 status_code=status_code,
                 detail=detail,
             )
+
+    elif request.app.state.config.TTS_ENGINE == "openrouter":
+        audio, payload = await synthesize_openrouter_audio(
+            request,
+            api_key=request.app.state.config.TTS_OPENROUTER_API_KEY,
+            model=request.app.state.config.TTS_MODEL,
+            voice=payload.get("voice") or request.app.state.config.TTS_VOICE,
+            input_text=payload.get("input", ""),
+            extra_payload=payload,
+        )
+
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(audio)
+        async with aiofiles.open(file_body_path, "w") as f:
+            await f.write(json.dumps(payload))
+
+        return FileResponse(file_path, media_type="audio/mpeg")
 
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         voice_id = payload.get("voice", "")
@@ -450,7 +793,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
             raise HTTPException(
                 status_code=getattr(r, "status", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                detail=detail if detail else f"{request.app.state.WEBUI_NAME}: Server Connection Error",
             )
 
     elif request.app.state.config.TTS_ENGINE == "azure":
@@ -509,7 +852,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
             raise HTTPException(
                 status_code=getattr(r, "status", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                detail=detail if detail else f"{request.app.state.WEBUI_NAME}: Server Connection Error",
             )
 
     elif request.app.state.config.TTS_ENGINE == "transformers":
@@ -550,6 +893,85 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             await f.write(json.dumps(payload))
 
         return FileResponse(file_path)
+
+
+def transcribe_openrouter_audio(
+    request: Request, file_path: str, metadata: Optional[dict] = None
+) -> dict:
+    """Send one audio chunk to OpenRouter's OpenAI-compatible STT endpoint."""
+    api_key = request.app.state.config.STT_OPENROUTER_API_KEY
+    model = request.app.state.config.STT_MODEL
+    if not api_key:
+        raise ValueError("OpenRouter API key is not configured")
+    if not model:
+        raise ValueError("An OpenRouter speech-to-text model is required")
+
+    filename = os.path.basename(file_path)
+    requested_language = (metadata or {}).get("language")
+    if WHISPER_LANGUAGE:
+        requested_language = WHISPER_LANGUAGE
+    languages = [requested_language] if requested_language else []
+    languages.append(None)
+
+    temperature = request.app.state.config.STT_OPENROUTER_TEMPERATURE
+    app_url = str(request.app.state.config.WEBUI_URL or request.base_url).rstrip("/")
+    response = None
+
+    try:
+        for language in languages:
+            payload = {"model": model, "response_format": "json"}
+            if language:
+                payload["language"] = language
+            if temperature is not None:
+                payload["temperature"] = str(temperature)
+
+            mime_type, _ = mimetypes.guess_type(file_path)
+            with open(file_path, "rb") as audio_file:
+                file_part = (
+                    (filename, audio_file, mime_type)
+                    if mime_type
+                    else (filename, audio_file)
+                )
+                response = requests.post(
+                    url=f"{OPENROUTER_API_BASE_URL}/audio/transcriptions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "HTTP-Referer": app_url,
+                        "X-OpenRouter-Title": request.app.state.WEBUI_NAME,
+                    },
+                    files={"file": file_part},
+                    data=payload,
+                    timeout=AIOHTTP_CLIENT_TIMEOUT,
+                )
+
+            if response.status_code == 200:
+                break
+
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+            raise ValueError("OpenRouter returned an invalid transcription response")
+        return data
+    except Exception as e:
+        log.exception("OpenRouter speech-to-text request failed")
+        detail = ""
+        if response is not None:
+            try:
+                response_data = response.json()
+                error = (
+                    response_data.get("error", {})
+                    if isinstance(response_data, dict)
+                    else {}
+                )
+                detail = (
+                    error.get("message", "")
+                    if isinstance(error, dict)
+                    else str(error)
+                )
+            except Exception:
+                detail = response.text
+
+        raise ValueError(f"OpenRouter: {detail or str(e)}") from e
 
 
 def transcription_handler(request, file_path, metadata):
@@ -637,7 +1059,16 @@ def transcription_handler(request, file_path, metadata):
                 except Exception:
                     detail = f"External: {e}"
 
-            raise Exception(detail if detail else "Open WebUI: Server Connection Error")
+            raise Exception(detail if detail else f"{request.app.state.WEBUI_NAME}: Server Connection Error")
+
+    elif request.app.state.config.STT_ENGINE == "openrouter":
+        data = transcribe_openrouter_audio(request, file_path, metadata)
+
+        transcript_file = f"{file_dir}/{id}.json"
+        with open(transcript_file, "w") as f:
+            json.dump(data, f)
+
+        return data
 
     elif request.app.state.config.STT_ENGINE == "deepgram":
         try:
@@ -708,7 +1139,7 @@ def transcription_handler(request, file_path, metadata):
                         detail = f"External: {res['error'].get('message', '')}"
                 except Exception:
                     detail = f"External: {e}"
-            raise Exception(detail if detail else "Open WebUI: Server Connection Error")
+            raise Exception(detail if detail else f"{request.app.state.WEBUI_NAME}: Server Connection Error")
 
     elif request.app.state.config.STT_ENGINE == "azure":
         # Check file exists and size
@@ -825,7 +1256,7 @@ def transcription_handler(request, file_path, metadata):
 
             raise HTTPException(
                 status_code=getattr(r, "status_code", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                detail=detail if detail else f"{request.app.state.WEBUI_NAME}: Server Connection Error",
             )
 
 
@@ -1056,7 +1487,18 @@ def get_available_models(request: Request) -> list[dict]:
 
 
 @router.get("/models")
-async def get_models(request: Request, user=Depends(get_verified_user)):
+async def get_models(
+    request: Request,
+    engine: Optional[str] = None,
+    refresh: bool = False,
+    user=Depends(get_verified_user),
+):
+    effective_engine = engine or request.app.state.config.TTS_ENGINE
+    if effective_engine == "openrouter":
+        return {"models": await get_openrouter_tts_models(refresh=refresh)}
+    if effective_engine == "openrouter-stt":
+        return {"models": await get_openrouter_stt_models(refresh=refresh)}
+
     return {"models": get_available_models(request)}
 
 
@@ -1162,7 +1604,26 @@ def get_elevenlabs_voices(api_key: str) -> dict:
 
 
 @router.get("/voices")
-async def get_voices(request: Request, user=Depends(get_verified_user)):
+async def get_voices(
+    request: Request,
+    engine: Optional[str] = None,
+    model: Optional[str] = None,
+    user=Depends(get_verified_user),
+):
+    effective_engine = engine or request.app.state.config.TTS_ENGINE
+    if effective_engine == "openrouter":
+        model_id = model or request.app.state.config.TTS_MODEL
+        models = await get_openrouter_tts_models()
+        selected_model = next(
+            (candidate for candidate in models if candidate["id"] == model_id), None
+        )
+        return {
+            "voices": [
+                {"id": voice, "name": voice}
+                for voice in (selected_model or {}).get("voices", [])
+            ]
+        }
+
     return {
         "voices": [
             {"id": k, "name": v} for k, v in get_available_voices(request).items()

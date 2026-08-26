@@ -24,9 +24,10 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
+	import ArrowPath from '$lib/components/icons/ArrowPath.svelte';
 
 	import ModelEditor from '$lib/components/workspace/Models/ModelEditor.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Cog6 from '$lib/components/icons/Cog6.svelte';
 	import ConfigureModelsModal from './Models/ConfigureModelsModal.svelte';
@@ -39,37 +40,25 @@
 	import Eye from '$lib/components/icons/Eye.svelte';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
-	let shiftKey = false;
+	let shiftKey = $state(false);
 
-	let modelsImportInProgress = false;
-	let importFiles;
-	let modelsImportInputElement: HTMLInputElement;
+	let modelsImportInProgress = $state(false);
+	let modelsRefreshInProgress = $state(false);
+	let importFiles = $state();
+	let modelsImportInputElement: HTMLInputElement = $state();
 
-	let models = null;
+	let models = $state(null);
 
 	let workspaceModels = null;
 	let baseModels = null;
 
-	let filteredModels = [];
-	let selectedModelId = null;
+	let filteredModels = $state([]);
+	let selectedModelId = $state(null);
 
-	let showConfigModal = false;
-	let showManageModal = false;
+	let showConfigModal = $state(false);
+	let showManageModal = $state(false);
 
-	$: if (models) {
-		filteredModels = models
-			.filter((m) => searchValue === '' || m.name.toLowerCase().includes(searchValue.toLowerCase()))
-			.sort((a, b) => {
-				// // Check if either model is inactive and push them to the bottom
-				// if ((a.is_active ?? true) !== (b.is_active ?? true)) {
-				// 	return (b.is_active ?? true) - (a.is_active ?? true);
-				// }
-				// If both models' active states are the same, sort alphabetically
-				return (a?.name ?? a?.id ?? '').localeCompare(b?.name ?? b?.id ?? '');
-			});
-	}
-
-	let searchValue = '';
+	let searchValue = $state('');
 
 	const downloadModels = async (models) => {
 		let blob = new Blob([JSON.stringify(models)], {
@@ -78,14 +67,9 @@
 		saveAs(blob, `models-export-${Date.now()}.json`);
 	};
 
-	const init = async () => {
-		models = null;
-
-		workspaceModels = await getBaseModels(localStorage.token);
-		baseModels = await getModels(localStorage.token, null, true);
-
-		models = baseModels.map((m) => {
-			const workspaceModel = workspaceModels.find((wm) => wm.id === m.id);
+	const mergeModels = (providerModels, configuredModels) => {
+		return providerModels.map((m) => {
+			const workspaceModel = configuredModels.find((wm) => wm.id === m.id);
 
 			if (workspaceModel) {
 				return {
@@ -104,36 +88,25 @@
 		});
 	};
 
-	const upsertModelHandler = async (model) => {
-		model.base_model_id = null;
+	const loadModelCatalog = async (refresh = false) => {
+		// These endpoints are independent. Running them serially made page load
+		// pay database latency first and provider latency second.
+		const [nextWorkspaceModels, nextBaseModels] = await Promise.all([
+			getBaseModels(localStorage.token),
+			getModels(localStorage.token, null, true, refresh)
+		]);
 
-		if (workspaceModels.find((m) => m.id === model.id)) {
-			const res = await updateModelById(localStorage.token, model.id, model).catch((error) => {
-				return null;
-			});
+		workspaceModels = nextWorkspaceModels;
+		baseModels = nextBaseModels;
+		models = mergeModels(baseModels, workspaceModels);
+	};
 
-			if (res) {
-				toast.success($i18n.t('Model updated successfully'));
-			}
-		} else {
-			const res = await createNewModel(localStorage.token, {
-				meta: {},
-				id: model.id,
-				name: model.name,
-				base_model_id: null,
-				params: {},
-				access_control: {},
-				...model
-			}).catch((error) => {
-				return null;
-			});
+	const init = async () => {
+		models = null;
+		await loadModelCatalog();
+	};
 
-			if (res) {
-				toast.success($i18n.t('Model updated successfully'));
-			}
-		}
-		await init();
-
+	const syncGlobalModels = async () => {
 		_models.set(
 			await getModels(
 				localStorage.token,
@@ -142,9 +115,78 @@
 		);
 	};
 
+	const applyWorkspaceModel = (workspaceModel) => {
+		workspaceModels = [
+			...workspaceModels.filter((model) => model.id !== workspaceModel.id),
+			workspaceModel
+		];
+		models = mergeModels(baseModels, workspaceModels);
+	};
+
+	const refreshModelCatalog = async () => {
+		if (modelsRefreshInProgress) {
+			return;
+		}
+
+		modelsRefreshInProgress = true;
+		try {
+			// refresh=true bypasses both the in-memory base catalog and the
+			// provider-level TTL caches, then stores the fresh result.
+			await loadModelCatalog(true);
+			await syncGlobalModels();
+			toast.success($i18n.t('Model list refreshed'));
+		} catch (error) {
+			console.error(error);
+			toast.error($i18n.t('Failed to refresh models'));
+		} finally {
+			modelsRefreshInProgress = false;
+		}
+	};
+
+	const upsertModelHandler = async (model) => {
+		model.base_model_id = null;
+
+		let savedModel = null;
+		if (workspaceModels.find((m) => m.id === model.id)) {
+			savedModel = await updateModelById(localStorage.token, model.id, model).catch((error) => {
+				toast.error(`${error}`);
+				return null;
+			});
+		} else {
+			savedModel = await createNewModel(localStorage.token, {
+				meta: {},
+				id: model.id,
+				name: model.name,
+				base_model_id: null,
+				params: {},
+				access_control: {},
+				...model
+			}).catch((error) => {
+				toast.error(`${error}`);
+				return null;
+			});
+		}
+
+		if (!savedModel) {
+			return false;
+		}
+
+		// The provider catalog did not change, so merge the returned DB row into
+		// the current page instead of rediscovering every provider.
+		applyWorkspaceModel(savedModel);
+		toast.success($i18n.t('Model updated successfully'));
+
+		await syncGlobalModels().catch((error) => {
+			console.error(error);
+			toast.error($i18n.t('Failed to refresh models'));
+		});
+		return true;
+	};
+
 	const toggleModelHandler = async (model) => {
+		let savedModel = null;
 		if (!Object.keys(model).includes('base_model_id')) {
-			await createNewModel(localStorage.token, {
+			savedModel = await createNewModel(localStorage.token, {
 				id: model.id,
 				name: model.name,
 				base_model_id: null,
@@ -153,19 +195,23 @@
 				access_control: {},
 				is_active: model.is_active
 			}).catch((error) => {
+				toast.error(`${error}`);
 				return null;
 			});
 		} else {
-			await toggleModelById(localStorage.token, model.id);
+			savedModel = await toggleModelById(localStorage.token, model.id).catch((error) => {
+				toast.error(`${error}`);
+				return null;
+			});
 		}
 
-		// await init();
-		_models.set(
-			await getModels(
-				localStorage.token,
-				$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
-			)
-		);
+		if (savedModel) {
+			applyWorkspaceModel(savedModel);
+			await syncGlobalModels().catch((error) => {
+				console.error(error);
+				toast.error($i18n.t('Failed to refresh models'));
+			});
+		}
 	};
 
 	const hideModelHandler = async (model) => {
@@ -186,7 +232,7 @@
 					})
 		);
 
-		upsertModelHandler(model);
+		await upsertModelHandler(model);
 	};
 
 	const copyLinkHandler = async (model) => {
@@ -241,6 +287,22 @@
 			window.removeEventListener('blur-sm', onBlur);
 		};
 	});
+	$effect(() => {
+		if (models) {
+			filteredModels = models
+				.filter(
+					(m) => searchValue === '' || m.name.toLowerCase().includes(searchValue.toLowerCase())
+				)
+				.sort((a, b) => {
+					// // Check if either model is inactive and push them to the bottom
+					// if ((a.is_active ?? true) !== (b.is_active ?? true)) {
+					// 	return (b.is_active ?? true) - (a.is_active ?? true);
+					// }
+					// If both models' active states are the same, sort alphabetically
+					return (a?.name ?? a?.id ?? '').localeCompare(b?.name ?? b?.id ?? '');
+				});
+		}
+	});
 </script>
 
 <ConfigureModelsModal bind:show={showConfigModal} initHandler={init} />
@@ -252,18 +314,33 @@
 			<div class="flex justify-between items-center">
 				<div class="flex items-center md:self-center text-xl font-medium px-0.5">
 					{$i18n.t('Models')}
-					<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850" />
+					<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850"></div>
 					<span class="text-lg font-medium text-gray-500 dark:text-gray-300"
 						>{filteredModels.length}</span
 					>
 				</div>
 
 				<div class="flex items-center gap-1.5">
+					<Tooltip content={$i18n.t('Refresh')}>
+						<button
+							class="p-1 rounded-full flex items-center disabled:cursor-wait disabled:opacity-60"
+							type="button"
+							aria-label={$i18n.t('Refresh')}
+							disabled={modelsRefreshInProgress}
+							onclick={refreshModelCatalog}
+						>
+							<ArrowPath
+								className="size-4 {modelsRefreshInProgress ? 'animate-spin' : ''}"
+								strokeWidth="2"
+							/>
+						</button>
+					</Tooltip>
+
 					<Tooltip content={$i18n.t('Manage Models')}>
 						<button
 							class=" p-1 rounded-full flex gap-1 items-center"
 							type="button"
-							on:click={() => {
+							onclick={() => {
 								showManageModal = true;
 							}}
 						>
@@ -275,7 +352,7 @@
 						<button
 							class=" p-1 rounded-full flex gap-1 items-center"
 							type="button"
-							on:click={() => {
+							onclick={() => {
 								showConfigModal = true;
 							}}
 						>
@@ -299,7 +376,7 @@
 						<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
 							<button
 								class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-								on:click={() => {
+								onclick={() => {
 									searchValue = '';
 								}}
 							>
@@ -315,7 +392,7 @@
 			{#if models.length > 0}
 				{#each filteredModels as model, modelIdx (model.id)}
 					<div
-						class=" flex space-x-4 cursor-pointer w-full px-3 py-2 dark:hover:bg-white/5 hover:bg-black/5 rounded-lg transition {model
+						class=" flex space-x-4 cursor-pointer w-full px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg transition {model
 							?.meta?.hidden
 							? 'opacity-50 dark:opacity-50'
 							: ''}"
@@ -324,7 +401,7 @@
 						<button
 							class=" flex flex-1 text-left space-x-3.5 cursor-pointer w-full"
 							type="button"
-							on:click={() => {
+							onclick={() => {
 								selectedModelId = model.id;
 							}}
 						>
@@ -371,9 +448,9 @@
 							{#if shiftKey}
 								<Tooltip content={model?.meta?.hidden ? $i18n.t('Show') : $i18n.t('Hide')}>
 									<button
-										class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+										class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											hideModelHandler(model);
 										}}
 									>
@@ -386,9 +463,9 @@
 								</Tooltip>
 							{:else}
 								<button
-									class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+									class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										selectedModelId = model.id;
 									}}
 								>
@@ -423,7 +500,7 @@
 									onClose={() => {}}
 								>
 									<button
-										class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+										class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 										type="button"
 									>
 										<EllipsisHorizontal className="size-5" />
@@ -436,7 +513,7 @@
 									>
 										<Switch
 											bind:state={model.is_active}
-											on:change={async () => {
+											onchange={async () => {
 												toggleModelHandler(model);
 											}}
 										/>
@@ -465,7 +542,7 @@
 						type="file"
 						accept=".json"
 						hidden
-						on:change={() => {
+						onchange={() => {
 							if (importFiles.length > 0) {
 								const reader = new FileReader();
 								reader.onload = async (event) => {
@@ -494,7 +571,7 @@
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-200 transition"
 						disabled={modelsImportInProgress}
-						on:click={() => {
+						onclick={() => {
 							modelsImportInputElement.click();
 						}}
 					>
@@ -523,7 +600,7 @@
 
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-200 transition"
-						on:click={async () => {
+						onclick={async () => {
 							downloadModels(models);
 						}}
 					>
@@ -554,10 +631,11 @@
 			edit
 			model={models.find((m) => m.id === selectedModelId)}
 			preset={false}
-			onSubmit={(model) => {
+			onSubmit={async (model) => {
 				console.log(model);
-				upsertModelHandler(model);
-				selectedModelId = null;
+				if (await upsertModelHandler(model)) {
+					selectedModelId = null;
+				}
 			}}
 			onBack={() => {
 				selectedModelId = null;

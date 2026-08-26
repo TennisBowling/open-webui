@@ -8,11 +8,34 @@ export type DecodedToolArguments =
 	| boolean
 	| null;
 
+// Glyph shown at the head of a collapsed tool-call row. Kept as a small closed
+// set so `ToolCallIcon` can map it to an inline SVG without a dynamic import.
+export type ToolIcon =
+	| 'search'
+	| 'globe'
+	| 'browser'
+	| 'terminal'
+	| 'file'
+	| 'file-edit'
+	| 'image'
+	| 'plug'
+	| 'tool';
+
 export interface ToolCallSummary {
-	kind: 'web_search' | 'web_fetch' | 'browser' | 'generic';
+	kind: 'web_search' | 'web_fetch' | 'browser' | 'shell' | 'file' | 'generic';
+	icon: ToolIcon;
+	// Verb phrase — "Searched", "Ran", "Read". Never the raw tool name unless
+	// there is nothing better to say about it.
 	title: string;
-	subtitle?: string;
-	badge?: string;
+	// The one argument that identifies this call: the query, the path, the
+	// command. Rendered muted next to the title.
+	detail?: string;
+	// `detail` is code (a path/command/tool name) and should be monospaced.
+	detailMono?: boolean;
+	// Trailing count/size chip — "10 results", "exit 1".
+	meta?: string;
+	// Renders `meta` in the error color (a non-zero shell exit, mainly).
+	metaError?: boolean;
 }
 
 export interface WebSearchItem {
@@ -679,9 +702,10 @@ export const getToolCallSummary = (
 
 		return {
 			kind: 'web_search',
-			title: query ? `Search: “${truncateEnd(query, 72)}”` : 'web_search',
-			subtitle: done && count != null ? formatCount(count, 'result') : undefined,
-			badge: 'web'
+			icon: 'search',
+			title: done ? 'Searched' : 'Searching',
+			detail: query ? `“${truncateEnd(query, 96)}”` : undefined,
+			meta: done && count != null ? formatCount(count, 'result') : undefined
 		};
 	}
 
@@ -703,13 +727,21 @@ export const getToolCallSummary = (
 				: parseDeclaredFetchCount(rawResultString)
 			: null;
 
+		const hosts = requestedUrls.map((url) => getDomain(url) || url).filter(Boolean);
+		const size = typeof summary?.size === 'number' ? summary.size : null;
+
 		return {
 			kind: 'web_fetch',
-			title: done
-				? `Fetched ${count != null ? formatCount(count, 'page') : 'web pages'}`
-				: `Fetching ${requestedUrls.length ? formatCount(requestedUrls.length, 'URL') : 'web pages'}…`,
-			subtitle: done ? undefined : requestedUrls.map((url) => getDomain(url) || url).join(', '),
-			badge: 'web'
+			icon: 'globe',
+			title: done ? 'Read' : 'Reading',
+			detail: hosts.length ? truncateEnd(hosts.join(', '), 72) : undefined,
+			meta: done
+				? count != null && count > 1
+					? formatCount(count, 'page')
+					: size != null
+						? formatCharacterCount(size)
+						: undefined
+				: undefined
 		};
 	}
 
@@ -717,10 +749,7 @@ export const getToolCallSummary = (
 		return getBrowserToolCallSummary(name, rawArgs, rawResult, done);
 	}
 
-	return {
-		kind: 'generic',
-		title: `View Result from ${name}`
-	};
+	return getGenericToolCallSummary(name, rawArgs, rawResult, done);
 };
 
 // Pull the host the action settled on out of the result text's `URL:` line
@@ -749,63 +778,408 @@ const getBrowserToolCallSummary = (
 	// Only decode the result host when the action is finished AND the host can't
 	// already be derived from the args (navigate carries its own url) — keeps the
 	// collapsed-row path from decoding big snapshots on every render.
-	const onSuffix = (host: string) => (host ? ` on ${host}` : '');
 
-	const summary = (title: string): ToolCallSummary => ({
+	const summary = (title: string, detail?: string): ToolCallSummary => ({
 		kind: 'browser',
+		icon: 'browser',
 		title,
-		badge: 'browser'
+		detail
 	});
 
 	switch (name) {
 		case 'browser_navigate': {
 			const url = typeof args.url === 'string' ? args.url.trim() : '';
 			const host = getDomain(url) || (done ? browserHostFromResult(rawResult) : '') || url;
-			return {
-				kind: 'browser',
-				title: done ? `Browsed ${host || 'page'}` : `Browsing ${host || 'page'}…`,
-				subtitle: url || undefined,
-				badge: 'browser'
-			};
+			return summary(done ? 'Browsed' : 'Browsing', host || undefined);
 		}
 		case 'browser_snapshot': {
 			const host = done ? browserHostFromResult(rawResult) : '';
-			return summary(done ? `Read page${onSuffix(host)}` : 'Reading page…');
+			return summary(done ? 'Read page' : 'Reading page', host || undefined);
 		}
 		case 'browser_screenshot': {
 			const host = done ? browserHostFromResult(rawResult) : '';
-			return summary(done ? `Captured screenshot${onSuffix(host)}` : 'Capturing screenshot…');
+			return summary(done ? 'Captured screenshot' : 'Capturing screenshot', host || undefined);
 		}
 		case 'browser_click': {
 			const ref = typeof args.ref === 'string' ? args.ref : '';
-			const target = ref ? ` ${ref}` : '';
-			return summary(done ? `Clicked${target}` : `Clicking${target}…`);
+			return summary(done ? 'Clicked' : 'Clicking', ref || undefined);
 		}
 		case 'browser_type': {
 			const ref = typeof args.ref === 'string' ? args.ref : '';
 			const text = typeof args.text === 'string' ? truncatePreview(args.text) : '';
-			const into = ref ? ` into ${ref}` : '';
-			const preview = text ? ` “${text}”` : '';
-			return summary(done ? `Typed${preview}${into}` : `Typing${into}…`);
+			const into = ref ? ` → ${ref}` : '';
+			return summary(done ? 'Typed' : 'Typing', text ? `“${text}”${into}` : ref || undefined);
 		}
 		case 'browser_select': {
 			const ref = typeof args.ref === 'string' ? args.ref : '';
-			const target = ref ? ` ${ref}` : '';
-			return summary(done ? `Selected option${target}` : `Selecting option${target}…`);
+			return summary(done ? 'Selected option' : 'Selecting option', ref || undefined);
 		}
 		case 'browser_press_key': {
 			const key = typeof args.key === 'string' ? args.key.trim() : '';
-			const target = key ? ` ${key}` : ' key';
-			return summary(done ? `Pressed${target}` : `Pressing${target}…`);
+			return summary(done ? 'Pressed' : 'Pressing', key || 'key');
 		}
 		case 'browser_back': {
-			return summary(done ? 'Went back' : 'Going back…');
+			return summary(done ? 'Went back' : 'Going back');
 		}
 		case 'browser_wait': {
-			return summary(done ? 'Waited for page' : 'Waiting for page…');
+			return summary(done ? 'Waited for page' : 'Waiting for page');
 		}
 		default: {
-			return summary(done ? 'Browser action' : 'Browser action…');
+			return summary(done ? 'Browser action' : 'Browser action');
 		}
 	}
+};
+
+// ---------------------------------------------------------------------------
+// Generic (non web/browser) tool calls
+// ---------------------------------------------------------------------------
+
+// Arguments worth showing next to a tool name in the collapsed row, most
+// identifying first. `bash` carries `command`, the file tools carry `path`,
+// MCP search tools carry `q`/`query`, and so on. Anything not listed falls back
+// to the first short-ish string argument.
+const PRIMARY_ARG_KEYS = [
+	'command',
+	'cmd',
+	'path',
+	'file_path',
+	'filename',
+	'query',
+	'q',
+	'url',
+	'urls',
+	'source',
+	'prompt',
+	'question',
+	'name',
+	'title',
+	'text',
+	'city',
+	'location',
+	'id'
+];
+
+const SHELL_TOOL_RE = /(^|_)(bash|shell|sh|exec|run_command|terminal)$/i;
+const READ_TOOL_RE = /(^|_)(read|read_file|cat|view|open_file)$/i;
+const WRITE_TOOL_RE = /(^|_)(write|write_file|create_file|save_file)$/i;
+const EDIT_TOOL_RE = /(^|_)(edit|edit_file|patch|apply_patch|str_replace)$/i;
+const LIST_TOOL_RE = /(^|_)(ls|list|list_files|list_directory|glob|find)$/i;
+const SEARCH_TOOL_RE = /(^|_)(search|grep|search_web|websearch|query)$/i;
+const IMAGE_TOOL_RE = /(^|_)(view_image|image|screenshot|render_image)$/i;
+
+// Strip the container workspace prefix so paths read as project-relative.
+const shortenPath = (value: string) => {
+	const trimmed = value.trim().replace(/^sandbox:/i, '');
+	const relative = trimmed.replace(/^\/workspace\/?/, '');
+	return truncateMiddle(relative || trimmed, 64);
+};
+
+const firstLine = (value: string) => {
+	const line = value.split('\n').find((candidate) => candidate.trim().length > 0) ?? '';
+	return line.trim();
+};
+
+export const getToolArgumentPreview = (args: Record<string, unknown>): string => {
+	const keys = [
+		...PRIMARY_ARG_KEYS.filter((key) => typeof args[key] === 'string' && args[key]),
+		...Object.keys(args).filter(
+			(key) => !PRIMARY_ARG_KEYS.includes(key) && typeof args[key] === 'string' && args[key]
+		)
+	];
+	const key = keys[0];
+	if (!key) {
+		const entries = Object.entries(args).filter(([, value]) => value != null && value !== '');
+		if (!entries.length) return '';
+		return truncateEnd(
+			entries.map(([k, v]) => `${k}: ${compactWhitespace(String(v))}`).join(', '),
+			72
+		);
+	}
+	const value = String(args[key]);
+	if (key === 'path' || key === 'file_path' || key === 'source' || key === 'filename') {
+		return shortenPath(value);
+	}
+	return truncateEnd(compactWhitespace(firstLine(value)), 96);
+};
+
+// The tool name the model sees is not always the name a human wants to read:
+// MCP tools ship as `mcp_<8hex>_<real name>` and many use kebab-case.
+export const friendlyToolName = (name: string) => {
+	const match = typeof name === 'string' ? name.match(/^mcp_[0-9a-f]{8}_(.+)$/) : null;
+	return match ? match[1] : (name ?? '');
+};
+
+// `get_comments` / `notion-fetch` → "Get comments" / "Notion fetch". The row
+// reads as a sentence next to its argument, so the identifier casing has to go.
+const humanizeToolName = (name: string) => {
+	const words = name.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+	if (!words) return '';
+	return words.charAt(0).toUpperCase() + words.slice(1);
+};
+
+const getGenericToolCallSummary = (
+	name: ToolName,
+	rawArgs: unknown,
+	rawResult: unknown,
+	done: boolean
+): ToolCallSummary => {
+	const args = getToolArgumentsObject(rawArgs);
+	const label = friendlyToolName(String(name ?? ''));
+
+	if (SHELL_TOOL_RE.test(label)) {
+		const command = typeof args.command === 'string' ? args.command : '';
+		// A non-zero exit is the single most useful thing to surface without
+		// expanding, and the shell preamble is the first line of the result.
+		const resultHead = done ? decodeToolResultText(rawResult).slice(0, 200) : '';
+		const exitMatch = resultHead.match(/^exit_code:\s*(-?\d+)/m);
+		const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : null;
+		return {
+			kind: 'shell',
+			icon: 'terminal',
+			title: done ? 'Ran' : 'Running',
+			// Flattened, not first-line: heredocs and `python3 -c "` make the first
+			// line a stub that says nothing about what actually ran.
+			detail: command ? truncateEnd(compactWhitespace(command), 96) : undefined,
+			detailMono: true,
+			meta: exitCode ? `exit ${exitCode}` : undefined,
+			metaError: !!exitCode
+		};
+	}
+
+	const pathArg =
+		typeof args.path === 'string'
+			? args.path
+			: typeof args.file_path === 'string'
+				? args.file_path
+				: typeof args.source === 'string'
+					? args.source
+					: '';
+
+	if (pathArg && (READ_TOOL_RE.test(label) || WRITE_TOOL_RE.test(label) || EDIT_TOOL_RE.test(label))) {
+		const verbDone = READ_TOOL_RE.test(label) ? 'Read' : WRITE_TOOL_RE.test(label) ? 'Wrote' : 'Edited';
+		const verbLive = READ_TOOL_RE.test(label)
+			? 'Reading'
+			: WRITE_TOOL_RE.test(label)
+				? 'Writing'
+				: 'Editing';
+		return {
+			kind: 'file',
+			icon: EDIT_TOOL_RE.test(label) || WRITE_TOOL_RE.test(label) ? 'file-edit' : 'file',
+			title: done ? verbDone : verbLive,
+			detail: shortenPath(pathArg),
+			detailMono: true
+		};
+	}
+
+	const detail = getToolArgumentPreview(args);
+	const isMcp = typeof name === 'string' && /^mcp_[0-9a-f]{8}_/.test(name);
+	const icon: ToolIcon = IMAGE_TOOL_RE.test(label)
+		? 'image'
+		: SEARCH_TOOL_RE.test(label)
+			? 'search'
+			: LIST_TOOL_RE.test(label)
+				? 'file'
+				: isMcp
+					? 'plug'
+					: 'tool';
+
+	return {
+		kind: 'generic',
+		icon,
+		title: humanizeToolName(label) || 'Tool',
+		detailMono: false,
+		detail: detail || undefined
+	};
+};
+
+// ---------------------------------------------------------------------------
+// Result / argument shaping for the expanded panel
+// ---------------------------------------------------------------------------
+
+export type GenericToolResult =
+	| { kind: 'empty' }
+	| { kind: 'error'; message: string; details: string }
+	| { kind: 'shell'; exitCode: number | null; stdout: string; stderr: string }
+	| { kind: 'json'; text: string }
+	| { kind: 'text'; text: string };
+
+// Shell tools answer with the CAM preamble:
+//     exit_code: 0
+//
+//     --- stdout ---
+//     …
+//     --- stderr ---
+//     …
+const SHELL_RESULT_RE = /^exit_code:\s*(-?\d+)\s*$/m;
+
+export const parseGenericToolResult = (raw: unknown, errored = false): GenericToolResult => {
+	const text = decodeToolResultText(raw);
+	const trimmed = text.trim();
+
+	if (!trimmed) return { kind: 'empty' };
+
+	const shellMatch = trimmed.match(SHELL_RESULT_RE);
+	if (shellMatch && /^exit_code:/.test(trimmed)) {
+		const exitCode = Number.parseInt(shellMatch[1], 10);
+		const body = trimmed.slice(shellMatch.index! + shellMatch[0].length);
+		const stdoutMatch = body.match(/---\s*stdout\s*---\n?([\s\S]*?)(?=\n---\s*stderr\s*---|$)/i);
+		const stderrMatch = body.match(/---\s*stderr\s*---\n?([\s\S]*)$/i);
+		return {
+			kind: 'shell',
+			exitCode,
+			stdout: (stdoutMatch?.[1] ?? (stdoutMatch || stderrMatch ? '' : body)).replace(/^\n+/, '').trimEnd(),
+			stderr: (stderrMatch?.[1] ?? '').replace(/^\n+/, '').trimEnd()
+		};
+	}
+
+	if (errored || /^Error:\s/i.test(trimmed)) {
+		const withoutPrefix = trimmed.replace(/^Error:\s*/i, '');
+		const [head, ...rest] = withoutPrefix.split('\n');
+		return { kind: 'error', message: head.trim(), details: rest.join('\n').trim() };
+	}
+
+	if (looksLikeJSON(trimmed)) {
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (parsed && typeof parsed === 'object') {
+				return { kind: 'json', text: JSON.stringify(parsed, null, 2) };
+			}
+		} catch {
+			// fall through to plain text
+		}
+	}
+
+	return { kind: 'text', text };
+};
+
+export interface ToolArgEntry {
+	key: string;
+	value: string;
+	// `block` values get their own full-width code panel; `inline` values sit on
+	// the same line as their key.
+	kind: 'inline' | 'block';
+}
+
+const INLINE_ARG_MAX = 88;
+
+export const getToolArgEntries = (rawArgs: unknown): ToolArgEntry[] => {
+	const decoded = decodeToolArguments(rawArgs);
+	if (decoded == null || decoded === '') return [];
+	if (typeof decoded !== 'object' || Array.isArray(decoded)) {
+		const value = String(decoded);
+		return [{ key: '', value, kind: value.includes('\n') ? 'block' : 'inline' }];
+	}
+
+	const args = decoded as Record<string, unknown>;
+	const keys = Object.keys(args);
+	const ordered = [
+		...PRIMARY_ARG_KEYS.filter((key) => keys.includes(key)),
+		...keys.filter((key) => !PRIMARY_ARG_KEYS.includes(key))
+	];
+
+	return ordered.map((key) => {
+		const raw = args[key];
+		const value =
+			typeof raw === 'string'
+				? raw
+				: raw == null
+					? String(raw)
+					: JSON.stringify(raw, null, raw && typeof raw === 'object' ? 2 : undefined);
+		return {
+			key,
+			value,
+			kind: value.includes('\n') || value.length > INLINE_ARG_MAX ? 'block' : 'inline'
+		};
+	});
+};
+
+// `edit`-shaped calls carry the before/after text as two arguments. Rendering
+// them as a diff is the only way the change is actually readable.
+export const getToolEditDiff = (
+	name: string,
+	rawArgs: unknown
+): { path: string; oldText: string; newText: string } | null => {
+	if (!EDIT_TOOL_RE.test(friendlyToolName(name ?? ''))) return null;
+	const args = getToolArgumentsObject(rawArgs);
+	const oldText = typeof args.old_string === 'string' ? args.old_string : '';
+	const newText = typeof args.new_string === 'string' ? args.new_string : '';
+	if (!oldText && !newText) return null;
+	const path = typeof args.path === 'string' ? args.path : ((args.file_path as string) ?? '');
+	return { path, oldText, newText };
+};
+
+// ---------------------------------------------------------------------------
+// Excerpt cleanup
+// ---------------------------------------------------------------------------
+
+// Search snippets and fetched page bodies are raw scrape: image refs, markdown
+// link syntax, and the extractor's `[...]` elision markers stitching together
+// dozens of near-identical fragments ("$26.00 USD Cushion / Black", "26.0",
+// "26.00 USD Cushion / Charcoal / XL", …). Showing that verbatim is what made
+// the result list unreadable, so the excerpt is rebuilt from the fragments that
+// actually say something: prose-like, not already said, in order.
+const isProseFragment = (fragment: string) => {
+	if (fragment.length < 24) return false;
+	// Extractors split mid-sentence ("ve ever owned, return them for another").
+	// A usable fragment starts the way a sentence does.
+	if (!/^["“'([]?[A-Z0-9]/.test(fragment)) return false;
+	const words = fragment.split(/\s+/).filter(Boolean);
+	if (words.length < 5) return false;
+	// "26.00 USD Cushion / Charcoal / XL" — variant/SKU rows, never prose.
+	if ((fragment.match(/\//g) ?? []).length > 1) return false;
+	const digits = fragment.replace(/[^0-9]/g, '').length;
+	if (digits / fragment.length > 0.18) return false;
+	const letters = fragment.replace(/[^a-z]/gi, '').length;
+	return letters / fragment.length > 0.55;
+};
+
+// One scraped line often repeats the same clause for every product variant
+// ("… 61% Merino Wool, 36% Nylon, 3% Lycra Spandex" ×20). Cut at the first
+// repetition so the excerpt says it once.
+const collapseRepeatedRuns = (fragment: string) => {
+	const words = fragment.split(' ');
+	if (words.length > 400) words.length = 400;
+	for (let i = 0; i < words.length; i += 1) {
+		for (let run = 4; run <= 12; run += 1) {
+			if (i + 2 * run > words.length) break;
+			if (words.slice(i, i + run).join(' ') === words.slice(i + run, i + 2 * run).join(' ')) {
+				return words.slice(0, i + run).join(' ');
+			}
+		}
+	}
+	return fragment;
+};
+
+export const cleanExcerpt = (value: string, max = 320, avoid = '') => {
+	if (!value) return '';
+	const head = value.length > max * 8 ? value.slice(0, max * 8) : value;
+	const stripped = head
+		.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+		.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+		.replace(/^#{1,6}\s+/gm, '')
+		.replace(/[*_`>|]/g, ' ');
+
+	const kept: string[] = [];
+	// `avoid` is the row's own title: a snippet that just restates it is dead
+	// space in a list where the title is already the first thing you read.
+	const seen = avoid ? [compactWhitespace(avoid).toLowerCase()] : [];
+	let keptLength = 0;
+	for (const rawFragment of stripped.split(/\[\.\.\.\]|\n{2,}|\n/)) {
+		const fragment = collapseRepeatedRuns(
+			compactWhitespace(rawFragment).replace(/^[-•*+]\s+/, '')
+		);
+		if (!isProseFragment(fragment)) continue;
+		const lower = fragment.toLowerCase();
+		// Scrapes repeat the same sentence with small variations; keep the first.
+		if (seen.some((previous) => previous.includes(lower.slice(0, 40)))) continue;
+		seen.push(lower);
+		kept.push(fragment);
+		keptLength += fragment.length + 3;
+		if (keptLength >= max) break;
+	}
+
+	// Nothing prose-like survived (a pure price table, say) — fall back to the
+	// flattened text so the row is never mysteriously blank.
+	const joined = kept.length ? kept.join(' · ') : compactWhitespace(stripped);
+	return truncateEnd(joined, max);
 };

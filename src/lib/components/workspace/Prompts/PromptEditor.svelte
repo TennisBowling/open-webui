@@ -1,8 +1,10 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { onMount, tick, getContext } from 'svelte';
 
 	import Textarea from '$lib/components/common/Textarea.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import AccessControl from '../common/AccessControl.svelte';
 	import LockClosed from '$lib/components/icons/LockClosed.svelte';
@@ -11,28 +13,34 @@
 	import { slugify } from '$lib/utils';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
-	export let onSubmit: Function;
-	export let edit = false;
-	export let prompt = null;
-	export let clone = false;
+	interface Props {
+		onSubmit: Function;
+		edit?: boolean;
+		prompt?: any;
+		clone?: boolean;
+	}
+
+	let { onSubmit, edit = false, prompt = null, clone = false }: Props = $props();
 
 	const i18n = getContext('i18n');
 
-	let loading = false;
+	let loading = $state(false);
 
-	let title = '';
-	let command = '';
-	let content = '';
+	let title = $state('');
+	let command = $state('');
+	let content = $state('');
 
-	let accessControl = {};
+	let accessControl = $state({});
 
-	let showAccessControlModal = false;
+	let showAccessControlModal = $state(false);
 
-	let hasManualEdit = false;
+	let hasManualEdit = $state(false);
 
-	$: if (!edit && !hasManualEdit) {
-		command = title !== '' ? slugify(title) : '';
-	}
+	$effect(() => {
+		if (!edit && !hasManualEdit) {
+			command = title !== '' ? slugify(title) : '';
+		}
+	});
 
 	// Track manual edits
 	function handleCommandInput(e: Event) {
@@ -89,9 +97,9 @@
 <div class="w-full max-h-full flex justify-center">
 	<form
 		class="flex flex-col w-full mb-10"
-		on:submit|preventDefault={() => {
+		onsubmit={preventDefault(() => {
 			submitHandler();
-		}}
+		})}
 	>
 		<div class="my-2">
 			<Tooltip
@@ -106,7 +114,7 @@
 				<div class="flex flex-col w-full">
 					<div class="flex items-center">
 						<input
-							class="text-2xl font-semibold w-full bg-transparent outline-hidden"
+							class="text-2xl font-semibold w-full bg-transparent outline-hidden font-primary"
 							placeholder={$i18n.t('Title')}
 							bind:value={title}
 							required
@@ -116,7 +124,7 @@
 							<button
 								class="bg-gray-50 hover:bg-gray-100 text-black dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-white transition px-2 py-1 rounded-full flex gap-1 items-center"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									showAccessControlModal = true;
 								}}
 							>
@@ -135,7 +143,7 @@
 							class=" w-full bg-transparent outline-hidden"
 							placeholder={$i18n.t('Command')}
 							bind:value={command}
-							on:input={handleCommandInput}
+							oninput={handleCommandInput}
 							required
 							disabled={edit}
 						/>
@@ -181,7 +189,7 @@
 
 		<div class="my-4 flex justify-end pb-20">
 			<button
-				class=" text-sm w-full lg:w-fit px-4 py-2 transition rounded-lg {loading
+				class=" text-sm w-full lg:w-fit px-4 py-2 transition-colors duration-200 ease-paper rounded-full {loading
 					? ' cursor-not-allowed bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:hover:bg-kraft dark:text-white'
 					: 'bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:hover:bg-kraft dark:text-white'} flex w-full justify-center"
 				type="submit"

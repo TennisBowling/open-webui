@@ -1,104 +1,108 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { config, models, settings, user } from '$lib/stores';
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { onMount, getContext } from 'svelte';
+	import { toast } from '$lib/utils/toast';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import { updateUserInfo } from '$lib/apis/users';
 	import { getUserPosition } from '$lib/utils';
 	import Minus from '$lib/components/icons/Minus.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
-	import ManageFloatingActionButtonsModal from './Interface/ManageFloatingActionButtonsModal.svelte';
 	import ManageImageCompressionModal from './Interface/ManageImageCompressionModal.svelte';
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	export let saveSettings: Function;
+	interface Props {
+		saveSettings: Function;
+	}
 
-	let backgroundImageUrl = null;
-	let inputFiles = null;
-	let filesInputElement;
+	let { saveSettings, ...eventProps }: Props & Record<string, unknown> = $props();
+
+	let backgroundImageUrl = $state(null);
+	let inputFiles = $state(null);
+	let filesInputElement = $state();
 
 	// Addons
-	let titleAutoGenerate = true;
-	let autoFollowUps = true;
-	let autoTags = true;
+	let titleAutoGenerate = $state(true);
+	let autoFollowUps = $state(true);
+	let autoTags = $state(true);
 
-	let responseAutoCopy = false;
-	let widescreenMode = false;
+	let responseAutoCopy = $state(false);
+	let widescreenMode = $state(false);
 	let splitLargeChunks = false;
-	let scrollOnBranchChange = true;
-	let userLocation = false;
+	let scrollOnBranchChange = $state(true);
+	let userLocation = $state(false);
 
 	// Interface
 	let defaultModelId = '';
-	let showUsername = false;
+	let showUsername = $state(false);
 
-	let notificationSound = true;
-	let notificationSoundAlways = false;
+	let notificationSound = $state(true);
+	let notificationSoundAlways = $state(false);
 
-	let highContrastMode = false;
+	let highContrastMode = $state(false);
 
-	let detectArtifacts = true;
-	let displayMultiModelResponsesInTabs = false;
+	let detectArtifacts = $state(true);
+	let displayMultiModelResponsesInTabs = $state(false);
 
-	let richTextInput = true;
-	let showFormattingToolbar = false;
-	let insertPromptAsRichText = false;
-	let promptAutocomplete = false;
+	let richTextInput = $state(true);
+	let showFormattingToolbar = $state(false);
+	let insertPromptAsRichText = $state(false);
+	let promptAutocomplete = $state(false);
 
-	let largeTextAsFile = false;
+	let largeTextAsFile = $state(false);
 
-	let insertSuggestionPrompt = false;
-	let keepFollowUpPrompts = false;
-	let insertFollowUpPrompt = false;
+	let insertSuggestionPrompt = $state(false);
+	let keepFollowUpPrompts = $state(false);
+	let insertFollowUpPrompt = $state(false);
 
-	let regenerateMenu = true;
+	let regenerateMenu = $state(true);
 
-	let landingPageMode = '';
-	let chatBubble = true;
-	let chatDirection: 'LTR' | 'RTL' | 'auto' = 'auto';
-	let ctrlEnterToSend = false;
-	let copyFormatted = false;
+	let landingPageMode = $state('');
+	let chatBubble = $state(true);
+	let chatDirection: 'LTR' | 'RTL' | 'auto' = $state('auto');
+	let ctrlEnterToSend = $state(false);
+	let copyFormatted = $state(false);
 
-	let temporaryChatByDefault = false;
-	let chatFadeStreamingText = true;
-	let collapseCodeBlocks = false;
-	let expandDetails = false;
-	let autoExpandReasoningDuringStreaming = false;
-	let bundleAgenticSteps = true;
-	let agenticStepsAutoExpand = true;
-	let showChatTitleInTab = true;
+	let temporaryChatByDefault = $state(false);
+	let chatFadeStreamingText = $state(true);
+	let collapseCodeBlocks = $state(false);
+	let expandDetails = $state(false);
+	let autoExpandReasoningDuringStreaming = $state(false);
+	let bundleAgenticSteps = $state(true);
+	let agenticStepsAutoExpand = $state(true);
+	let showChatTitleInTab = $state(true);
 
-	let showFloatingActionButtons = true;
-	let floatingActionButtons = null;
 
-	let imageCompression = false;
-	let imageCompressionSize = {
+	let imageCompression = $state(false);
+	let imageCompressionSize = $state({
 		width: '',
 		height: ''
-	};
-	let imageCompressionInChannels = true;
+	});
+	let imageCompressionInChannels = $state(true);
 
 	// chat export
-	let stylizedPdfExport = true;
+	let stylizedPdfExport = $state(true);
 
 	// Admin - Show Update Available Toast
-	let showUpdateToast = true;
-	let showChangelog = true;
+	let showUpdateToast = $state(true);
+	let showChangelog = $state(true);
 
-	let showEmojiInCall = false;
-	let voiceInterruption = false;
-	let hapticFeedback = false;
+	let showEmojiInCall = $state(false);
+	let voiceInterruption = $state(false);
+	let hapticFeedback = $state(false);
 
-	let webSearch = null;
+	let webSearch = $state(null);
 
-	let iframeSandboxAllowSameOrigin = false;
-	let iframeSandboxAllowForms = false;
+	let iframeSandboxAllowSameOrigin = $state(false);
+	let iframeSandboxAllowForms = $state(false);
 
-	let showManageFloatingActionButtonsModal = false;
-	let showManageImageCompressionModal = false;
+	let showManageImageCompressionModal = $state(false);
 
 	const toggleLandingPageMode = async () => {
 		landingPageMode = landingPageMode === '' ? 'chat' : '';
@@ -171,7 +175,7 @@
 	};
 
 	const updateInterfaceHandler = async () => {
-		saveSettings({
+		return await saveSettings({
 			models: [defaultModelId],
 			imageCompressionSize: imageCompressionSize
 		});
@@ -244,31 +248,22 @@
 		hapticFeedback = $settings?.hapticFeedback ?? false;
 		ctrlEnterToSend = $settings?.ctrlEnterToSend ?? false;
 
-		showFloatingActionButtons = $settings?.showFloatingActionButtons ?? true;
-		floatingActionButtons = $settings?.floatingActionButtons ?? null;
 
 		imageCompression = $settings?.imageCompression ?? false;
 		imageCompressionSize = $settings?.imageCompressionSize ?? { width: '', height: '' };
 		imageCompressionInChannels = $settings?.imageCompressionInChannels ?? true;
 
-		defaultModelId = $settings?.models?.at(0) ?? '';
-		if ($config?.default_models) {
-			defaultModelId = $config.default_models.split(',')[0];
-		}
+		// A user's saved default takes precedence over the instance-wide admin
+		// default, matching the new-chat resolution order in Chat.svelte.
+		defaultModelId =
+			$settings?.models?.find((modelId) => modelId) ??
+			$config?.default_models?.split(',').find((modelId) => modelId) ??
+			'';
 
 		backgroundImageUrl = $settings?.backgroundImageUrl ?? null;
 		webSearch = $settings?.webSearch ?? null;
 	});
 </script>
-
-<ManageFloatingActionButtonsModal
-	bind:show={showManageFloatingActionButtonsModal}
-	{floatingActionButtons}
-	onSave={(buttons) => {
-		floatingActionButtons = buttons;
-		saveSettings({ floatingActionButtons });
-	}}
-/>
 
 <ManageImageCompressionModal
 	bind:show={showManageImageCompressionModal}
@@ -281,10 +276,11 @@
 <form
 	id="tab-interface"
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={() => {
-		updateInterfaceHandler();
-		dispatch('save');
-	}}
+	onsubmit={preventDefault(async () => {
+		if ((await updateInterfaceHandler()) !== false) {
+			dispatch('save');
+		}
+	})}
 >
 	<input
 		bind:this={filesInputElement}
@@ -292,7 +288,7 @@
 		type="file"
 		hidden
 		accept="image/*"
-		on:change={() => {
+		onchange={() => {
 			let reader = new FileReader();
 			reader.onload = (event) => {
 				let originalImageUrl = `${event.target.result}`;
@@ -329,7 +325,7 @@
 							ariaLabelledbyId="high-contrast-mode-label"
 							tooltip={true}
 							bind:state={highContrastMode}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ highContrastMode });
 							}}
 						/>
@@ -348,7 +344,7 @@
 							ariaLabelledbyId="use-chat-title-as-tab-title-label"
 							tooltip={true}
 							bind:state={showChatTitleInTab}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ showChatTitleInTab });
 							}}
 						/>
@@ -367,7 +363,7 @@
 							ariaLabelledbyId="notification-sound-label"
 							tooltip={true}
 							bind:state={notificationSound}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ notificationSound });
 							}}
 						/>
@@ -387,7 +383,7 @@
 								ariaLabelledbyId="play-notification-sound-label"
 								tooltip={true}
 								bind:state={notificationSoundAlways}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ notificationSoundAlways });
 								}}
 							/>
@@ -405,7 +401,7 @@
 							ariaLabelledbyId="allow-user-location-label"
 							tooltip={true}
 							bind:state={userLocation}
-							on:change={() => {
+							onchange={() => {
 								toggleUserLocation();
 							}}
 						/>
@@ -424,7 +420,7 @@
 							ariaLabelledbyId="haptic-feedback-label"
 							tooltip={true}
 							bind:state={hapticFeedback}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ hapticFeedback });
 							}}
 						/>
@@ -443,7 +439,7 @@
 							ariaLabelledbyId="copy-formatted-label"
 							tooltip={true}
 							bind:state={copyFormatted}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ copyFormatted });
 							}}
 						/>
@@ -463,7 +459,7 @@
 								ariaLabelledbyId="toast-notifications-label"
 								tooltip={true}
 								bind:state={showUpdateToast}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ showUpdateToast });
 								}}
 							/>
@@ -482,7 +478,7 @@
 								ariaLabelledbyId="whats-new-label"
 								tooltip={true}
 								bind:state={showChangelog}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ showChangelog });
 								}}
 							/>
@@ -502,7 +498,7 @@
 					<button
 						aria-labelledby="chat-direction-label chat-direction-mode"
 						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={toggleChangeChatDirection}
+						onclick={toggleChangeChatDirection}
 						type="button"
 					>
 						<span class="ml-2 self-center" id="chat-direction-mode">
@@ -525,7 +521,7 @@
 					<button
 						aria-labelledby="landing-page-mode-label notification-sound-state"
 						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={() => {
+						onclick={() => {
 							toggleLandingPageMode();
 						}}
 						type="button"
@@ -546,7 +542,7 @@
 					<button
 						aria-labelledby="chat-background-label background-image-url-state"
 						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={() => {
+						onclick={() => {
 							if (backgroundImageUrl !== null) {
 								backgroundImageUrl = null;
 								saveSettings({ backgroundImageUrl });
@@ -574,7 +570,7 @@
 							tooltip={true}
 							ariaLabelledbyId="chat-bubble-ui-label"
 							bind:state={chatBubble}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ chatBubble });
 							}}
 						/>
@@ -594,7 +590,7 @@
 								ariaLabelledbyId="chat-bubble-username-label"
 								tooltip={true}
 								bind:state={showUsername}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ showUsername });
 								}}
 							/>
@@ -614,7 +610,7 @@
 							ariaLabelledbyId="widescreen-mode-label"
 							tooltip={true}
 							bind:state={widescreenMode}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ widescreenMode });
 							}}
 						/>
@@ -633,7 +629,7 @@
 							ariaLabelledbyId="temp-chat-default-label"
 							tooltip={true}
 							bind:state={temporaryChatByDefault}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ temporaryChatByDefault });
 							}}
 						/>
@@ -652,7 +648,7 @@
 							ariaLabelledbyId="fade-streaming-label"
 							tooltip={true}
 							bind:state={chatFadeStreamingText}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ chatFadeStreamingText });
 							}}
 						/>
@@ -671,7 +667,7 @@
 							ariaLabelledbyId="auto-generation-label"
 							tooltip={true}
 							bind:state={titleAutoGenerate}
-							on:change={() => {
+							onchange={() => {
 								toggleTitleAutoGenerate();
 							}}
 						/>
@@ -690,7 +686,7 @@
 							ariaLabelledbyId="follow-up-auto-generation-label"
 							tooltip={true}
 							bind:state={autoFollowUps}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ autoFollowUps });
 							}}
 						/>
@@ -709,7 +705,7 @@
 							ariaLabelledbyId="chat-tags-label"
 							tooltip={true}
 							bind:state={autoTags}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ autoTags });
 							}}
 						/>
@@ -728,7 +724,7 @@
 							ariaLabelledbyId="auto-copy-label"
 							tooltip={true}
 							bind:state={responseAutoCopy}
-							on:change={() => {
+							onchange={() => {
 								toggleResponseAutoCopy();
 							}}
 						/>
@@ -747,7 +743,7 @@
 							ariaLabelledbyId="insert-suggestion-prompt-label"
 							tooltip={true}
 							bind:state={insertSuggestionPrompt}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ insertSuggestionPrompt });
 							}}
 						/>
@@ -766,7 +762,7 @@
 							ariaLabelledbyId="keep-follow-up-prompts-label"
 							tooltip={true}
 							bind:state={keepFollowUpPrompts}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ keepFollowUpPrompts });
 							}}
 						/>
@@ -785,7 +781,7 @@
 							ariaLabelledbyId="insert-follow-up-prompt-label"
 							tooltip={true}
 							bind:state={insertFollowUpPrompt}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ insertFollowUpPrompt });
 							}}
 						/>
@@ -804,7 +800,7 @@
 							ariaLabelledbyId="regenerate-menu-label"
 							tooltip={true}
 							bind:state={regenerateMenu}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ regenerateMenu });
 							}}
 						/>
@@ -823,7 +819,7 @@
 							ariaLabelledbyId="always-collapse-label"
 							tooltip={true}
 							bind:state={collapseCodeBlocks}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ collapseCodeBlocks });
 							}}
 						/>
@@ -842,7 +838,7 @@
 							ariaLabelledbyId="always-expand-label"
 							tooltip={true}
 							bind:state={expandDetails}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ expandDetails });
 							}}
 						/>
@@ -861,7 +857,7 @@
 							ariaLabelledbyId="auto-expand-reasoning-streaming-label"
 							tooltip={true}
 							bind:state={autoExpandReasoningDuringStreaming}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ autoExpandReasoningDuringStreaming });
 							}}
 						/>
@@ -880,7 +876,7 @@
 							ariaLabelledbyId="bundle-agentic-steps-label"
 							tooltip={true}
 							bind:state={bundleAgenticSteps}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ bundleAgenticSteps });
 							}}
 						/>
@@ -900,7 +896,7 @@
 								ariaLabelledbyId="agentic-steps-auto-expand-label"
 								tooltip={true}
 								bind:state={agenticStepsAutoExpand}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ agenticStepsAutoExpand });
 								}}
 							/>
@@ -920,7 +916,7 @@
 							ariaLabelledbyId="keep-followup-prompts-label"
 							tooltip={true}
 							bind:state={displayMultiModelResponsesInTabs}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ displayMultiModelResponsesInTabs });
 							}}
 						/>
@@ -939,7 +935,7 @@
 							ariaLabelledbyId="scroll-on-branch-change-label"
 							tooltip={true}
 							bind:state={scrollOnBranchChange}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ scrollOnBranchChange });
 							}}
 						/>
@@ -958,40 +954,8 @@
 							ariaLabelledbyId="stylized-pdf-export-label"
 							tooltip={true}
 							bind:state={stylizedPdfExport}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ stylizedPdfExport });
-							}}
-						/>
-					</div>
-				</div>
-			</div>
-
-			<div>
-				<div class=" py-0.5 flex w-full justify-between">
-					<label id="floating-action-buttons-label" class=" self-center text-xs">
-						{$i18n.t('Floating Quick Actions')}
-					</label>
-
-					<div class="flex items-center gap-3 p-1">
-						{#if showFloatingActionButtons}
-							<button
-								class="text-xs text-gray-700 dark:text-gray-400 underline"
-								type="button"
-								aria-label={$i18n.t('Open Modal To Manage Floating Quick Actions')}
-								on:click={() => {
-									showManageFloatingActionButtonsModal = true;
-								}}
-							>
-								{$i18n.t('Manage')}
-							</button>
-						{/if}
-
-						<Switch
-							ariaLabelledbyId="floating-action-buttons-label"
-							tooltip={true}
-							bind:state={showFloatingActionButtons}
-							on:change={() => {
-								saveSettings({ showFloatingActionButtons });
 							}}
 						/>
 					</div>
@@ -1007,7 +971,7 @@
 					<button
 						aria-labelledby="web-search-in-chat-label web-search-state"
 						class="p-1 px-3 text-xs flex rounded-sm transition"
-						on:click={() => {
+						onclick={() => {
 							toggleWebSearch();
 						}}
 						type="button"
@@ -1030,7 +994,7 @@
 					<button
 						aria-labelledby="enter-key-behavior-label"
 						class="p-1 px-3 text-xs flex rounded transition"
-						on:click={() => {
+						onclick={() => {
 							togglectrlEnterToSend();
 						}}
 						type="button"
@@ -1055,7 +1019,7 @@
 							tooltip={true}
 							ariaLabelledbyId="rich-input-label"
 							bind:state={richTextInput}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ richTextInput });
 							}}
 						/>
@@ -1075,7 +1039,7 @@
 								ariaLabelledbyId="show-formatting-toolbar-label"
 								tooltip={true}
 								bind:state={showFormattingToolbar}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ showFormattingToolbar });
 								}}
 							/>
@@ -1094,7 +1058,7 @@
 								ariaLabelledbyId="insert-prompt-as-rich-text-label"
 								tooltip={true}
 								bind:state={insertPromptAsRichText}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ insertPromptAsRichText });
 								}}
 							/>
@@ -1114,7 +1078,7 @@
 									ariaLabelledbyId="prompt-autocompletion-label"
 									tooltip={true}
 									bind:state={promptAutocomplete}
-									on:change={() => {
+									onchange={() => {
 										saveSettings({ promptAutocomplete });
 									}}
 								/>
@@ -1135,7 +1099,7 @@
 							tooltip={true}
 							ariaLabelledbyId="paste-large-label"
 							bind:state={largeTextAsFile}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ largeTextAsFile });
 							}}
 						/>
@@ -1156,7 +1120,7 @@
 							ariaLabelledbyId="detect-artifacts-label"
 							tooltip={true}
 							bind:state={detectArtifacts}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ detectArtifacts });
 							}}
 						/>
@@ -1175,7 +1139,7 @@
 							ariaLabelledbyId="iframe-sandbox-allow-same-origin-label"
 							tooltip={true}
 							bind:state={iframeSandboxAllowSameOrigin}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ iframeSandboxAllowSameOrigin });
 							}}
 						/>
@@ -1194,7 +1158,7 @@
 							ariaLabelledbyId="iframe-sandbox-allow-forms-label"
 							tooltip={true}
 							bind:state={iframeSandboxAllowForms}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ iframeSandboxAllowForms });
 							}}
 						/>
@@ -1215,7 +1179,7 @@
 							ariaLabelledbyId="allow-voice-interruption-in-call-label"
 							tooltip={true}
 							bind:state={voiceInterruption}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ voiceInterruption });
 							}}
 						/>
@@ -1234,7 +1198,7 @@
 							ariaLabelledbyId="display-emoji-label"
 							tooltip={true}
 							bind:state={showEmojiInCall}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ showEmojiInCall });
 							}}
 						/>
@@ -1256,7 +1220,7 @@
 								class="text-xs text-gray-700 dark:text-gray-400 underline"
 								type="button"
 								aria-label={$i18n.t('Open Modal To Manage Image Compression')}
-								on:click={() => {
+								onclick={() => {
 									showManageImageCompressionModal = true;
 								}}
 							>
@@ -1268,7 +1232,7 @@
 							ariaLabelledbyId="image-compression-label"
 							tooltip={true}
 							bind:state={imageCompression}
-							on:change={() => {
+							onchange={() => {
 								saveSettings({ imageCompression });
 							}}
 						/>
@@ -1288,7 +1252,7 @@
 								ariaLabelledbyId="image-compression-in-channels-label"
 								tooltip={true}
 								bind:state={imageCompressionInChannels}
-								on:change={() => {
+								onchange={() => {
 									saveSettings({ imageCompressionInChannels });
 								}}
 							/>

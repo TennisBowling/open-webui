@@ -1,17 +1,15 @@
 <script lang="ts">
-	import Sortable from 'sortablejs';
-
-	import { createEventDispatcher, getContext, onMount } from 'svelte';
+	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import { models } from '$lib/stores';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import EllipsisVertical from '$lib/components/icons/EllipsisVertical.svelte';
 
-	export let modelIds = [];
+	let { modelIds = $bindable([]) } = $props();
 
 	let sortable = null;
-	let modelListElement = null;
+	let modelListElement = $state(null);
 
 	const positionChangeHandler = () => {
 		const modelList = Array.from(modelListElement.children).map((child) =>
@@ -21,16 +19,13 @@
 		modelIds = modelList;
 	};
 
-	$: if (modelIds) {
-		init();
-	}
-
-	const init = () => {
+	const init = async () => {
 		if (sortable) {
 			sortable.destroy();
 		}
 
 		if (modelListElement) {
+			const { default: Sortable } = await import('sortablejs');
 			sortable = new Sortable(modelListElement, {
 				animation: 150,
 				handle: '.model-item-handle',
@@ -40,6 +35,11 @@
 			});
 		}
 	};
+	$effect(() => {
+		if (modelIds) {
+			init();
+		}
+	});
 </script>
 
 {#if modelIds.length > 0}

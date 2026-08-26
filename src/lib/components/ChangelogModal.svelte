@@ -15,17 +15,23 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
+	interface Props {
+		show?: boolean;
+	}
 
-	let changelog = null;
+	let { show = $bindable(false) }: Props = $props();
+
+	let changelog = $state(null);
 
 	const init = async () => {
 		changelog = await getChangelog();
 	};
 
-	$: if (show) {
-		init();
-	}
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 </script>
 
 <Modal bind:show size="xl">
@@ -37,8 +43,8 @@
 				<Confetti x={[-1, -0.25]} y={[0, 0.5]} />
 			</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="tap-target self-center"
+				onclick={() => {
 					localStorage.version = $config.version;
 					show = false;
 				}}
@@ -51,7 +57,7 @@
 		</div>
 		<div class="flex items-center mt-1">
 			<div class="text-sm dark:text-gray-200">{$i18n.t('Release Notes')}</div>
-			<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50/50 dark:bg-gray-850/50" />
+			<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50/50 dark:bg-gray-850/50"></div>
 			<div class="text-sm dark:text-gray-200">
 				v{WEBUI_VERSION}
 			</div>
@@ -74,13 +80,13 @@
 								<div class="w-full">
 									<div
 										class="font-semibold uppercase text-xs {section === 'added'
-											? 'bg-blue-500/20 text-blue-700 dark:text-blue-200'
+											? 'bg-book-cloth/15 text-book-cloth dark:text-kraft'
 											: section === 'fixed'
-												? 'bg-green-500/20 text-green-700 dark:text-green-200'
+												? 'bg-success/15 text-success dark:text-success-dark'
 												: section === 'changed'
-													? 'bg-yellow-500/20 text-yellow-700 dark:text-yellow-200'
+													? 'bg-warning/15 text-warning dark:text-warning-dark'
 													: section === 'removed'
-														? 'bg-red-500/20 text-red-700 dark:text-red-200'
+														? 'bg-error-brick/15 text-error-brick dark:text-error-brick-dark'
 														: ''}  w-fit rounded-xl px-2 my-2.5"
 									>
 										{section}
@@ -102,7 +108,7 @@
 		</div>
 		<div class="flex justify-end pt-3 text-sm font-medium">
 			<button
-				on:click={async () => {
+				onclick={async () => {
 					localStorage.version = $config.version;
 					await settings.set({ ...$settings, ...{ version: $config.version } });
 					await updateUserSettings(localStorage.token, { ui: $settings });

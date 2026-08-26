@@ -2,17 +2,31 @@
 	const i18n = getContext('i18n');
 	import { getContext } from 'svelte';
 	import { settings } from '$lib/stores';
-	export let id = 'password-input';
-	export let value: string = '';
-	export let placeholder = '';
-	export let type = 'text';
-	export let required = true;
-	export let readOnly = false;
-	export let outerClassName = 'flex flex-1 bg-transparent';
-	export let inputClassName = 'w-full text-sm py-0.5 bg-transparent';
-	export let showButtonClassName = 'pl-1.5  transition bg-transparent';
+	interface Props {
+		id?: string;
+		value?: string;
+		placeholder?: string;
+		type?: string;
+		required?: boolean;
+		readOnly?: boolean;
+		outerClassName?: string;
+		inputClassName?: string;
+		showButtonClassName?: string;
+	}
 
-	let show = false;
+	let {
+		id = 'password-input',
+		value = $bindable(''),
+		placeholder = '',
+		type = 'text',
+		required = true,
+		readOnly = false,
+		outerClassName = 'flex flex-1 bg-transparent',
+		inputClassName = 'w-full text-sm py-0.5 bg-transparent',
+		showButtonClassName = 'pl-1.5  transition bg-transparent'
+	}: Props = $props();
+
+	let show = $state(false);
 </script>
 
 <div class={outerClassName}>
@@ -25,7 +39,7 @@
 		{value}
 		required={required && !readOnly}
 		disabled={readOnly}
-		on:change={(e) => {
+		onchange={(e) => {
 			value = e.target.value;
 		}}
 		autocomplete="off"
@@ -35,7 +49,7 @@
 		type="button"
 		aria-pressed={show}
 		aria-label={$i18n.t('Make password visible in the user interface')}
-		on:click={(e) => {
+		onclick={(e) => {
 			e.preventDefault();
 			show = !show;
 		}}

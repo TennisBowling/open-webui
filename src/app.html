@@ -27,7 +27,6 @@
 			rel="manifest"
 			href="/manifest.json"
 			crossorigin="use-credentials"
-			crossorigin="use-credentials"
 		/>
 		<meta
 			name="viewport"
@@ -37,10 +36,80 @@
 		<meta name="apple-mobile-web-app-capable" content="yes" />
 		<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 		<meta name="theme-color" content="#FAFAF7" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#262625" />
 		<meta name="robots" content="noindex,nofollow" />
+
+		<!-- iOS PWA launch screens (apple-touch-startup-image). Backend route
+		     /api/splash/{w}x{h}[-dark].png renders a solid bg + centered logo
+		     at the exact physical pixel dims. device-width/device-height below
+		     use CSS logical points (the values iOS actually matches against);
+		     the href uses the physical pixel size for a crisp render. Portrait
+		     only — landscape launch images are optional/skipped. -->
+		<!-- iPhone SE (2nd/3rd gen) / iPhone 8 and earlier — 750x1334 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/750x1334.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/750x1334-dark.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone X / XS / 11 Pro / 12 mini / 13 mini — 1125x2436 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1125x2436.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1125x2436-dark.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone XR / 11 — 828x1792 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/828x1792.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/828x1792-dark.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone XS Max / 11 Pro Max — 1242x2688 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1242x2688.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1242x2688-dark.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 12 mini / 13 mini — 1080x2340 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1080x2340.png" media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1080x2340-dark.png" media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 12 / 13 / 14 — 1170x2532 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1170x2532.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1170x2532-dark.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 12 Pro Max / 13 Pro Max — 1284x2778 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1284x2778.png" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1284x2778-dark.png" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 14 Pro / 15 / 15 Pro — 1179x2556 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1179x2556.png" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1179x2556-dark.png" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 14 Plus / 14 Pro Max / 15 Plus / 15 Pro Max — 1290x2796 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1290x2796.png" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1290x2796-dark.png" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 16 Pro / 17 / 17 Pro — 1206x2622 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1206x2622.png" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1206x2622-dark.png" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPhone 16 Pro Max / 17 Pro Max — 1320x2868 @3x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1320x2868.png" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1320x2868-dark.png" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPad 10.2" — 1620x2160 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1620x2160.png" media="(device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1620x2160-dark.png" media="(device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPad Air 10.9" — 1640x2360 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1640x2360.png" media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1640x2360-dark.png" media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPad Pro 11" — 1668x2388 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/1668x2388.png" media="(device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/1668x2388-dark.png" media="(device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
+		<!-- iPad Pro 12.9" — 2048x2732 @2x -->
+		<link rel="apple-touch-startup-image" href="/api/splash/2048x2732.png" media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: light)" />
+		<link rel="apple-touch-startup-image" href="/api/splash/2048x2732-dark.png" media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait) and (prefers-color-scheme: dark)" />
 
 		<script src="/static/loader.js" defer crossorigin="use-credentials"></script>
 		<link rel="stylesheet" href="/static/custom.css" crossorigin="use-credentials" />
+
+		<!-- Eager Latin subset fonts — preload so the browser starts fetching them
+		     immediately instead of discovering them only after CSS parses. -->
+		<link
+			rel="preload"
+			as="font"
+			type="font/woff2"
+			href="/assets/fonts/Inter-Variable.latin.woff2"
+			crossorigin
+		/>
+		<link
+			rel="preload"
+			as="font"
+			type="font/woff2"
+			href="/assets/fonts/Archivo-Variable.latin.woff2"
+			crossorigin
+		/>
 
 		<script>
 			function resizeIframe(obj) {
@@ -52,6 +121,10 @@
 			// On page load or when changing themes, best to add inline in `head` to avoid FOUC
 			(() => {
 				const metaThemeColorTag = document.querySelector('meta[name="theme-color"]');
+				// The media-gated dark fallback only covers the pre-script instant; once
+				// this script owns theme-color it must not compete (the user's in-app
+				// theme can differ from the OS scheme).
+				document.querySelector('meta[name="theme-color"][media]')?.remove();
 				const prefersDarkTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
 				if (!localStorage?.theme) {

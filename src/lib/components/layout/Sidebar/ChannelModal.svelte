@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { getContext, createEventDispatcher, onMount } from 'svelte';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { getContext, onMount } from 'svelte';
 	import { createNewChannel, deleteChannelById } from '$lib/apis/channels';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -8,26 +10,31 @@
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let onSubmit: Function = () => {};
-	export let onUpdate: Function = () => {};
-
-	export let channel = null;
-	export let edit = false;
-
-	let name = '';
-	let accessControl = {};
-
-	let loading = false;
-
-	$: if (name) {
-		name = name.replace(/\s/g, '-').toLocaleLowerCase();
+	interface Props {
+		show?: boolean;
+		onSubmit?: Function;
+		onUpdate?: Function;
+		channel?: any;
+		edit?: boolean;
 	}
+
+	let {
+		show = $bindable(false),
+		onSubmit = () => {},
+		onUpdate = () => {},
+		channel = null,
+		edit = false
+	}: Props = $props();
+
+	let name = $state('');
+	let accessControl = $state({});
+
+	let loading = $state(false);
 
 	const submitHandler = async () => {
 		loading = true;
@@ -44,15 +51,7 @@
 		accessControl = channel.access_control;
 	};
 
-	$: if (show) {
-		if (channel) {
-			init();
-		}
-	} else {
-		resetHandler();
-	}
-
-	let showDeleteConfirmDialog = false;
+	let showDeleteConfirmDialog = $state(false);
 
 	const deleteHandler = async () => {
 		showDeleteConfirmDialog = false;
@@ -78,6 +77,20 @@
 		accessControl = {};
 		loading = false;
 	};
+	$effect(() => {
+		if (name) {
+			name = name.replace(/\s/g, '-').toLocaleLowerCase();
+		}
+	});
+	$effect(() => {
+		if (show) {
+			if (channel) {
+				init();
+			}
+		} else {
+			resetHandler();
+		}
+	});
 </script>
 
 <Modal size="sm" bind:show>
@@ -91,8 +104,8 @@
 				{/if}
 			</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -104,9 +117,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class="flex flex-col w-full mt-2">
 						<div class=" mb-1 text-xs text-gray-500">{$i18n.t('Channel Name')}</div>
@@ -125,7 +138,7 @@
 					<hr class=" border-gray-100 dark:border-gray-700/10 my-2.5 w-full" />
 
 					<div class="my-2 -mx-2">
-						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 							<AccessControl bind:accessControl accessRoles={['read', 'write']} />
 						</div>
 					</div>
@@ -133,9 +146,9 @@
 					<div class="flex justify-end pt-3 text-sm font-medium gap-1.5">
 						{#if edit}
 							<button
-								class="px-3.5 py-1.5 text-sm font-medium dark:bg-gray-900 dark:hover:bg-gray-800 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
+								class="px-3.5 py-1.5 text-sm font-medium bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition-colors duration-200 ease-paper rounded-full flex flex-row space-x-1 items-center"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									showDeleteConfirmDialog = true;
 								}}
 							>
@@ -144,7 +157,7 @@
 						{/if}
 
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-950 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
+							class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-full flex flex-row space-x-1 items-center {loading
 								? ' cursor-not-allowed'
 								: ''}"
 							type="submit"
@@ -173,7 +186,7 @@
 	bind:show={showDeleteConfirmDialog}
 	message={$i18n.t('Are you sure you want to delete this channel?')}
 	confirmLabel={$i18n.t('Delete')}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteHandler();
 	}}
 />

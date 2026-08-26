@@ -1,6 +1,4 @@
-<script>
-	import Sortable from 'sortablejs';
-
+<script lang="ts">
 	import { onMount } from 'svelte';
 
 	import { chatId, mobile, models, settings, showSidebar } from '$lib/stores';
@@ -8,13 +6,22 @@
 	import { updateUserSettings } from '$lib/apis/users';
 	import PinnedModelItem from './PinnedModelItem.svelte';
 
-	export let selectedChatId = null;
-	export let pendingChatId = null;
-	export let shiftKey = false;
+	interface Props {
+		selectedChatId?: any;
+		pendingChatId?: any;
+		shiftKey?: boolean;
+	}
 
-	const initPinnedModelsSortable = () => {
+	let {
+		selectedChatId = $bindable(null),
+		pendingChatId = $bindable(null),
+		shiftKey = false
+	}: Props = $props();
+
+	const initPinnedModelsSortable = async () => {
 		const pinnedModelsList = document.getElementById('pinned-models-list');
 		if (pinnedModelsList && !$mobile) {
+			const { default: Sortable } = await import('sortablejs');
 			new Sortable(pinnedModelsList, {
 				animation: 150,
 				onUpdate: async (event) => {

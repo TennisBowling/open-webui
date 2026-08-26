@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { goto } from '$app/navigation';
 	import { onMount, tick, getContext } from 'svelte';
@@ -14,14 +14,14 @@
 	const i18n = getContext('i18n');
 
 	let loaded = false;
-	let text = '';
+	let text = $state('');
 
-	let selectedModelId = '';
+	let selectedModelId = $state('');
 
-	let loading = false;
+	let loading = $state(false);
 	let stopResponseFlag = false;
 
-	let textCompletionAreaElement: HTMLTextAreaElement;
+	let textCompletionAreaElement: HTMLTextAreaElement = $state();
 
 	const scrollToBottom = () => {
 		const element = textCompletionAreaElement;
@@ -151,10 +151,9 @@
 						<textarea
 							id="text-completion-textarea"
 							bind:this={textCompletionAreaElement}
-							class="w-full h-full p-3 bg-transparent border border-gray-100 dark:border-gray-850 outline-hidden resize-none rounded-lg text-sm"
+							class="w-full h-full p-3 bg-transparent border-hairline border-gray-100 dark:border-gray-850 outline-hidden resize-none rounded-lg text-sm"
 							bind:value={text}
-							placeholder={$i18n.t("You're a helpful assistant.")}
-						/>
+							placeholder={$i18n.t("You're a helpful assistant.")}></textarea>
 					</div>
 				</div>
 			</div>
@@ -162,8 +161,8 @@
 			<div class="pb-3 flex justify-end">
 				{#if !loading}
 					<button
-						class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:text-white dark:hover:bg-kraft transition-colors duration-200 ease-paper rounded-full"
-						on:click={() => {
+						class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-lg"
+						onclick={() => {
 							submitHandler();
 						}}
 					>
@@ -171,8 +170,8 @@
 					</button>
 				{:else}
 					<button
-						class="px-3 py-1.5 text-sm font-medium bg-gray-300 text-black transition rounded-full"
-						on:click={() => {
+						class="px-3.5 py-1.5 text-sm font-medium bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition-colors duration-200 ease-paper rounded-lg"
+						onclick={() => {
 							stopResponse();
 						}}
 					>

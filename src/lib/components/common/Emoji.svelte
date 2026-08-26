@@ -1,9 +1,13 @@
-<script>
+<script lang="ts">
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { shortCodesToEmojis } from '$lib/stores';
 
-	export let shortCode;
-	export let className = 'size-4';
+	interface Props {
+		shortCode: any;
+		className?: string;
+	}
+
+	let { shortCode, className = 'size-4' }: Props = $props();
 </script>
 
 {#if $shortCodesToEmojis[shortCode]}

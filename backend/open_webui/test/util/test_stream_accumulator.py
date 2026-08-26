@@ -17,6 +17,8 @@ import string
 
 from open_webui.utils.middleware import (
     _StreamTextAccumulator,
+    _append_reasoning_delta,
+    _apply_reasoning_detail_delta,
     _emit_delta_for_blocks,
     _merge_tool_result_body_maps,
 )
@@ -224,16 +226,87 @@ def test_accumulator_contract_fuzz():
         assert len(acc) == len("".join(ref))
 
 
-def test_suffix_matches_full_tail():
+def test_reasoning_delta_append_is_byte_exact_for_incremental_streams():
+    """Regression: the reasoning append must NEVER dedupe partial overlaps.
+    The old suffix-overlap merge silently dropped legitimately repeated text
+    ('bana'+'na' -> 'bana'), corrupting the persisted reasoning and breaking
+    provider prompt-cache reuse on every later turn."""
+    cases = [
+        # (chunks, expected) — every one of these lost chars under the old merge
+        (["bana", "na"], "banana"),
+        (["Hmm..", "."], "Hmm..."),
+        (["count 1", "11"], "count 111"),
+        (["ab", "ba"], "abba"),
+        (["the code ((", "(x))"], "the code (((x))"),
+        (["https://www.airbnb.com/ro", "oms/685384"], "https://www.airbnb.com/rooms/685384"),
+        # 1-char boundary overlap — the most common real-world drop
+        (["I think the answer", "r is"], "I think the answerr is"),
+    ]
+    for chunks, expected in cases:
+        acc = _StreamTextAccumulator()
+        total = 0
+        for c in chunks:
+            total += _append_reasoning_delta(acc, c)
+        assert acc.materialize() == expected, (chunks, acc.materialize())
+        assert total == len(expected)
+
+
+def test_reasoning_delta_append_dedupes_cumulative_resends():
+    """Providers that resend the full reasoning-so-far each chunk (full-prefix
+    resend) must still collapse — the ONLY dedupe case that is unambiguous."""
+    acc = _StreamTextAccumulator()
+    n1 = _append_reasoning_delta(acc, "I think")
+    n2 = _append_reasoning_delta(acc, "I think about X")  # cumulative resend
+    n3 = _append_reasoning_delta(acc, "I think about X")  # no-progress resend
+    n4 = _append_reasoning_delta(acc, ", then Y")  # back to incremental
+    assert acc.materialize() == "I think about X, then Y"
+    assert (n1, n2, n3, n4) == (7, 8, 0, 8)
+
+
+def test_reasoning_delta_append_fuzz_incremental_identity():
+    """For ANY sequence of incremental chunks each shorter than the accumulated
+    content, the result must be the exact concatenation — no heuristic may
+    fire. (Chunks >= current length are the documented cumulative-resend
+    ambiguity window and are exercised separately above.)"""
     for seed in range(2000):
         random.seed(seed + 200000)
-        parts = [_rand(random.randint(1, 6)) for _ in range(random.randint(1, 8))]
+        # Seed enough initial content that subsequent chunks are shorter.
+        parts = [_rand(6)] + [
+            _rand(random.randint(1, 5)) for _ in range(random.randint(1, 20))
+        ]
         acc = _StreamTextAccumulator()
         for p in parts:
-            acc.append(p)
-        full = "".join(parts)
-        for k in (0, 1, 3, len(full) // 2, len(full), len(full) + 5):
-            assert acc.suffix(k) == (full[-k:] if k > 0 else "")
+            _append_reasoning_delta(acc, p)
+        assert acc.materialize() == "".join(parts)
+
+
+def test_reasoning_detail_delta_matching_and_accumulation():
+    details = []
+    # id-less fragments match on (type, index) and accumulate byte-exact.
+    _apply_reasoning_detail_delta(
+        details, {"type": "reasoning.text", "index": 0, "text": "bana"}
+    )
+    _apply_reasoning_detail_delta(
+        details, {"type": "reasoning.text", "index": 0, "text": "na"}
+    )
+    # id arriving on a later chunk adopts the id-less entry (no duplicate).
+    _apply_reasoning_detail_delta(
+        details,
+        {"type": "reasoning.text", "index": 0, "id": "r1", "text": "!", "format": "x"},
+    )
+    assert details == [
+        {"type": "reasoning.text", "index": 0, "id": "r1", "text": "banana!", "format": "x"}
+    ]
+    # A different (type, index) appends a new entry.
+    _apply_reasoning_detail_delta(
+        details, {"type": "reasoning.encrypted", "index": 1, "data": "abc"}
+    )
+    assert len(details) == 2
+    # Subsequent id-keyed fragments keep matching the adopted entry.
+    _apply_reasoning_detail_delta(
+        details, {"type": "reasoning.text", "index": 0, "id": "r1", "text": "!"}
+    )
+    assert details[0]["text"] == "banana!!"
 
 
 def test_tool_result_body_maps_merge_all_authoritative_sources():
@@ -314,5 +387,7 @@ def test_translator_honors_emitted_len_no_round_boundary_dup():
 if __name__ == "__main__":
     test_native_translator_interleaving_reconstructs_exactly()
     test_accumulator_contract_fuzz()
-    test_suffix_matches_full_tail()
+    test_reasoning_delta_append_is_byte_exact_for_incremental_streams()
+    test_reasoning_delta_append_dedupes_cumulative_resends()
+    test_reasoning_delta_append_fuzz_incremental_identity()
     print("all integration tests passed")

@@ -732,8 +732,8 @@ Three subtle properties of the new logic:
   user-defined; if a pipe wraps OpenRouter, the user owns their own payload.
 - **Direct chat completion** (`utils/chat.py:generate_direct_chat_completion`)
   is socket-mediated to a browser-attached model. Never reaches OpenRouter.
-- **`chat_completed` / `chat_action`** run outlet/filter pipelines on existing
-  responses. Do not call `generate_chat_completion`.
+- **`chat_action`** runs outlet/filter pipelines on an existing response. It
+  does not call `generate_chat_completion`.
 
 ---
 
@@ -771,9 +771,9 @@ it. Three sites in `middleware.py` do this — keep them in sync.
 The frontend independently captures the same SSE stream for live UI display.
 Its merge logic in `src/lib/components/chat/Chat.svelte` (~L2293) must mirror
 the backend exactly. Same `(id, type)` matching, same concat semantics for
-`text`/`data`/`summary`, same id-less-with-type fallback. If they diverge, the
-frontend's locally merged copy overwrites the backend's clean copy in the DB
-via the `chatCompleted` POST path, undoing the backend fix.
+`text`/`data`/`summary`, same id-less-with-type fallback. The backend owns
+persistence; matching behavior ensures the live UI does not temporarily show a
+different reasoning sequence from the one that reloads from storage.
 
 Treat the two implementations as one logical merger expressed in two languages.
 Change one, change the other.

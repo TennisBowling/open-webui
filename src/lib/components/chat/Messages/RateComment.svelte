@@ -1,17 +1,27 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { toast } from '$lib/utils/toast';
 
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { onMount, getContext } from 'svelte';
 	import { config, models } from '$lib/stores';
 	import Tags from '$lib/components/common/Tags.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
 	const i18n = getContext('i18n');
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
-	export let message;
-	export let show = false;
+	interface Props {
+		message: any;
+		show?: boolean;
+	}
+
+	let {
+		message = $bindable(),
+		show = $bindable(false),
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
 	let LIKE_REASONS = [
 		'accurate_information',
@@ -33,24 +43,14 @@
 		'other'
 	];
 
-	let tags = [];
+	let tags = $state([]);
 
-	let reasons = [];
-	let selectedReason = null;
-	let comment = '';
+	let reasons = $state([]);
+	let selectedReason = $state(null);
+	let comment = $state('');
 
-	let detailedRating = null;
-	let selectedModel = null;
-
-	$: if (message?.annotation?.rating === 1) {
-		reasons = LIKE_REASONS;
-	} else if (message?.annotation?.rating === -1) {
-		reasons = DISLIKE_REASONS;
-	}
-
-	$: if (message) {
-		init();
-	}
+	let detailedRating = $state(null);
+	let selectedModel = $state(null);
 
 	const init = () => {
 		if (!selectedReason) {
@@ -100,6 +100,18 @@
 		toast.success($i18n.t('Thanks for your feedback!'));
 		show = false;
 	};
+	$effect(() => {
+		if (message?.annotation?.rating === 1) {
+			reasons = LIKE_REASONS;
+		} else if (message?.annotation?.rating === -1) {
+			reasons = DISLIKE_REASONS;
+		}
+	});
+	$effect(() => {
+		if (message) {
+			init();
+		}
+	});
 </script>
 
 {#if message?.arena}
@@ -111,7 +123,7 @@
 {/if}
 
 <div
-	class=" my-2.5 rounded-xl px-4 py-3 border border-gray-100 dark:border-gray-850"
+	class=" my-2.5 rounded-xl px-4 py-3 border-hairline border-gray-100 dark:border-gray-850"
 	id="message-feedback-{message.id}"
 >
 	<div class="flex justify-between items-center">
@@ -120,7 +132,7 @@
 		<!-- <div class=" text-sm">{$i18n.t('Tell us more:')}</div> -->
 
 		<button
-			on:click={() => {
+			onclick={() => {
 				show = false;
 			}}
 		>
@@ -134,11 +146,11 @@
 				<!-- 1-10 scale -->
 				{#each Array.from({ length: 10 }).map((_, i) => i + 1) as rating}
 					<button
-						class="size-7 text-sm border border-gray-100 dark:border-gray-850 hover:bg-gray-50 dark:hover:bg-gray-850 {detailedRating ===
+						class="size-7 text-sm border-hairline border-gray-100 dark:border-gray-850 hover:bg-gray-50 dark:hover:bg-gray-850 {detailedRating ===
 						rating
 							? 'bg-gray-100 dark:bg-gray-800'
 							: ''} transition rounded-full disabled:cursor-not-allowed disabled:text-gray-500 disabled:bg-white dark:disabled:bg-gray-900"
-						on:click={() => {
+						onclick={() => {
 							detailedRating = rating;
 						}}
 						disabled={message?.annotation?.rating === -1 ? rating > 5 : rating < 6}
@@ -167,11 +179,11 @@
 			<div class="flex flex-wrap gap-1.5 text-sm mt-1.5">
 				{#each reasons as reason}
 					<button
-						class="px-3 py-0.5 border border-gray-100 dark:border-gray-850 hover:bg-gray-50 dark:hover:bg-gray-850 {selectedReason ===
+						class="px-3 py-0.5 border-hairline border-gray-100 dark:border-gray-850 hover:bg-gray-50 dark:hover:bg-gray-850 {selectedReason ===
 						reason
 							? 'bg-gray-100 dark:bg-gray-800'
 							: ''} transition rounded-xl"
-						on:click={() => {
+						onclick={() => {
 							selectedReason = reason;
 						}}
 					>
@@ -217,22 +229,21 @@
 			bind:value={comment}
 			class="w-full text-sm px-1 py-2 bg-transparent outline-hidden resize-none rounded-xl"
 			placeholder={$i18n.t('Feel free to add specific details')}
-			rows="3"
-		/>
+			rows="3"></textarea>
 	</div>
 
 	<div class="mt-2 gap-1.5 flex justify-between">
 		<div class="flex items-end group">
 			<Tags
 				{tags}
-				on:delete={(e) => {
+				ondelete={(e) => {
 					tags = tags.filter(
 						(tag) =>
 							tag.name.replaceAll(' ', '_').toLowerCase() !==
 							e.detail.replaceAll(' ', '_').toLowerCase()
 					);
 				}}
-				on:add={(e) => {
+				onadd={(e) => {
 					tags = [...tags, { name: e.detail }];
 				}}
 			/>
@@ -240,7 +251,7 @@
 
 		<button
 			class="px-3.5 py-1.5 text-sm font-medium bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:text-white dark:hover:bg-kraft transition-colors duration-200 ease-paper rounded-full"
-			on:click={() => {
+			onclick={() => {
 				saveHandler();
 			}}
 		>

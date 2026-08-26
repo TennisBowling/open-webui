@@ -1,14 +1,20 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { getContext } from 'svelte';
 	import { tags } from '$lib/stores';
-	import { toast } from 'svelte-sonner';
-	const dispatch = createEventDispatcher();
+	import { toast } from '$lib/utils/toast';
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	export let label = '';
-	let showTagInput = false;
-	let tagName = '';
+	interface Props {
+		label?: string;
+	}
+
+	let { label = '', ...eventProps }: Props & Record<string, unknown> = $props();
+	let showTagInput = $state(false);
+	let tagName = $state('');
 
 	const addTagHandler = async () => {
 		tagName = tagName.trim();
@@ -31,7 +37,7 @@
 				placeholder={$i18n.t('Add a tag')}
 				aria-label={$i18n.t('Add a tag')}
 				list="tagOptions"
-				on:keydown={(event) => {
+				onkeydown={(event) => {
 					if (event.key === 'Enter') {
 						addTagHandler();
 					}
@@ -39,11 +45,11 @@
 			/>
 			<datalist id="tagOptions">
 				{#each $tags as tag}
-					<option value={tag.name} />
+					<option value={tag.name}></option>
 				{/each}
 			</datalist>
 
-			<button type="button" aria-label={$i18n.t('Save Tag')} on:click={addTagHandler}>
+			<button type="button" aria-label={$i18n.t('Save Tag')} onclick={addTagHandler}>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					viewBox="0 0 16 16"
@@ -66,7 +72,7 @@
 		class=" cursor-pointer self-center p-0.5 flex h-fit items-center rounded-full transition border dark:border-gray-600 border-dashed"
 		type="button"
 		aria-label={$i18n.t('Add Tag')}
-		on:click={() => {
+		onclick={() => {
 			showTagInput = !showTagInput;
 		}}
 	>

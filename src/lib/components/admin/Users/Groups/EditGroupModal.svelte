@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -13,71 +13,83 @@
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	export let onSubmit: Function = () => {};
-	export let onDelete: Function = () => {};
+	let selectedTab = $state('general');
+	let loading = $state(false);
+	let showDeleteConfirmDialog = $state(false);
 
-	export let show = false;
-	export let edit = false;
+	interface Props {
+		onSubmit?: Function;
+		onDelete?: Function;
+		show?: boolean;
+		edit?: boolean;
+		users?: any;
+		group?: any;
+		defaultPermissions?: any;
+		custom?: boolean;
+		tabs?: any;
+		name?: string;
+		description?: string;
+		permissions?: any;
+		userIds?: any;
+	}
 
-	export let users = [];
-	export let group = null;
-	export let defaultPermissions = {};
-
-	export let custom = true;
-
-	export let tabs = ['general', 'permissions', 'users'];
-
-	let selectedTab = 'general';
-	let loading = false;
-	let showDeleteConfirmDialog = false;
-
-	export let name = '';
-	export let description = '';
-
-	export let permissions = {
-		workspace: {
-			models: false,
-			prompts: false,
-			tools: false
-		},
-		sharing: {
-			public_models: false,
-			public_prompts: false,
-			public_tools: false
-		},
-		chat: {
-			controls: true,
-			valves: true,
-			system_prompt: true,
-			params: true,
-			file_upload: true,
-			delete: true,
-			delete_message: true,
-			continue_response: true,
-			regenerate_response: true,
-			rate_response: true,
-			edit: true,
-			share: true,
-			export: true,
-			stt: true,
-			tts: true,
-			call: true,
-			multiple_models: true,
-			temporary: true,
-			temporary_enforced: false
-		},
-		features: {
-			direct_tool_servers: true,
-			mcp_remote_custom: true,
-			mcp_static_secrets: true,
-			mcp_stdio_templates: true,
-			mcp_stdio_custom: false,
-			web_search: true,
-			image_generation: true,
-			subagents: true
-		}
-	};
-	export let userIds = [];
+	let {
+		onSubmit = () => {},
+		onDelete = () => {},
+		show = $bindable(false),
+		edit = false,
+		users = [],
+		group = null,
+		defaultPermissions = {},
+		custom = true,
+		tabs = ['general', 'permissions', 'users'],
+		name = $bindable(''),
+		description = $bindable(''),
+		permissions = $bindable({
+			workspace: {
+				models: false,
+				prompts: false,
+				tools: false
+			},
+			sharing: {
+				public_models: false,
+				public_prompts: false,
+				public_tools: false
+			},
+			chat: {
+				controls: true,
+				valves: true,
+				system_prompt: true,
+				params: true,
+				file_upload: true,
+				delete: true,
+				delete_message: true,
+				continue_response: true,
+				regenerate_response: true,
+				rate_response: true,
+				edit: true,
+				share: true,
+				export: true,
+				stt: true,
+				tts: true,
+				call: true,
+				multiple_models: true,
+				temporary: true,
+				temporary_enforced: false
+			},
+			features: {
+				direct_tool_servers: true,
+				mcp_remote_custom: true,
+				mcp_static_secrets: true,
+				mcp_stdio_templates: true,
+				mcp_stdio_custom: false,
+				web_search: true,
+				image_generation: true,
+				subagents: true
+			}
+		}),
+		userIds = $bindable([])
+	}: Props = $props();
 
 	const submitHandler = async () => {
 		loading = true;
@@ -105,9 +117,11 @@
 		}
 	};
 
-	$: if (show) {
-		init();
-	}
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 
 	onMount(() => {
 		selectedTab = tabs[0];
@@ -117,7 +131,7 @@
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	on:confirm={() => {
+	onconfirm={() => {
 		onDelete();
 		show = false;
 	}}
@@ -139,7 +153,7 @@
 			</div>
 			<button
 				class="self-center"
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -151,7 +165,7 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit={(e) => {
+					onsubmit={(e) => {
 						e.preventDefault();
 						submitHandler();
 					}}
@@ -167,7 +181,7 @@
 									'general'
 										? ''
 										: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-									on:click={() => {
+									onclick={() => {
 										selectedTab = 'general';
 									}}
 									type="button"
@@ -196,7 +210,7 @@
 									'permissions'
 										? ''
 										: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-									on:click={() => {
+									onclick={() => {
 										selectedTab = 'permissions';
 									}}
 									type="button"
@@ -214,7 +228,7 @@
 									'users'
 										? ''
 										: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-									on:click={() => {
+									onclick={() => {
 										selectedTab = 'users';
 									}}
 									type="button"
@@ -249,7 +263,7 @@
 								'display'
 									? ' dark:border-white'
 									: 'border-transparent text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'display';
 								}}
 								type="button"
@@ -264,7 +278,7 @@
 								'permissions'
 									? '  dark:border-white'
 									: 'border-transparent text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'permissions';
 								}}
 								type="button"
@@ -279,7 +293,7 @@
 								'users'
 									? ' dark:border-white'
 									: ' border-transparent text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'users';
 								}}
 								type="button"
@@ -292,9 +306,9 @@
 					<div class="flex justify-between pt-3 text-sm font-medium gap-1.5">
 						{#if edit}
 							<button
-								class="px-3.5 py-1.5 text-sm font-medium dark:bg-black dark:hover:bg-gray-900 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
+								class="px-3.5 py-1.5 text-sm font-medium bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition-colors duration-200 ease-paper rounded-full flex flex-row space-x-1 items-center"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									showDeleteConfirmDialog = true;
 								}}
 							>

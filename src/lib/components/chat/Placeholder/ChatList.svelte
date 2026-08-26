@@ -10,9 +10,9 @@
 
 	dayjs.extend(localizedFormat);
 
-	export let chats = [];
+	let { chats = [] } = $props();
 
-	let chatList = null;
+	let chatList = $state(null);
 
 	const init = async () => {
 		if (chats.length === 0) {
@@ -44,12 +44,14 @@
 		init();
 	};
 
-	let orderBy = 'updated_at';
-	let direction = 'desc'; // 'asc' or 'desc'
+	let orderBy = $state('updated_at');
+	let direction = $state('desc'); // 'asc' or 'desc'
 
-	$: if (chats) {
-		init();
-	}
+	$effect(() => {
+		if (chats) {
+			init();
+		}
+	});
 </script>
 
 {#if chatList}
@@ -57,7 +59,7 @@
 		<div class="flex text-xs font-medium mb-1 items-center -mr-0.5">
 			<button
 				class="px-1.5 py-1 cursor-pointer select-none basis-3/5"
-				on:click={() => setSortKey('title')}
+				onclick={() => setSortKey('title')}
 			>
 				<div class="flex gap-1.5 items-center">
 					{$i18n.t('Title')}
@@ -79,7 +81,7 @@
 			</button>
 			<button
 				class="px-1.5 py-1 cursor-pointer select-none hidden sm:flex sm:basis-2/5 justify-end"
-				on:click={() => setSortKey('updated_at')}
+				onclick={() => setSortKey('updated_at')}
 			>
 				<div class="flex gap-1.5 items-center">
 					{$i18n.t('Updated at')}
@@ -144,7 +146,7 @@
 				class=" w-full flex justify-between items-center rounded-lg text-sm py-2 px-3 hover:bg-gray-50 dark:hover:bg-gray-850"
 				draggable="false"
 				href={`/c/${chat.id}`}
-				on:click={() => (show = false)}
+				onclick={() => (show = false)}
 			>
 				<div class="text-ellipsis line-clamp-1 w-full sm:basis-3/5">
 					{chat?.title}
@@ -160,7 +162,7 @@
 
 		<!-- {#if !allChatsLoaded && loadHandler}
 		<Loader
-			on:visible={(e) => {
+			onvisible={(e) => {
 				if (!chatListLoading) {
 					loadHandler();
 				}

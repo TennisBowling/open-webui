@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from fastapi import APIRouter, Depends, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -5,6 +6,8 @@ import aiohttp
 
 from typing import Optional
 
+from open_webui.models.chats import Chats
+from open_webui.utils import chat_embedder as ce
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.config import get_config_async, save_config_async
 from open_webui.config import BannerModel
@@ -144,18 +147,25 @@ class ToolServerConnection(BaseModel):
     auth_type: Optional[str]
     key: Optional[str]
     config: Optional[dict]
+    # Per-tool enable/disable for MCP servers: {"include": [...], "exclude": [...]}.
+    # include is an allowlist (active when non-empty); exclude is a denylist.
+    tool_filters: Optional[dict] = None
 
     model_config = ConfigDict(extra="allow")
 
 
 class ToolServersConfigForm(BaseModel):
     TOOL_SERVER_CONNECTIONS: list[ToolServerConnection]
+    # Default max seconds for MCP tool calls. 0 disables the generic cap. The
+    # runtime always exempts bash/web_search/web_fetch from this generic timeout.
+    MCP_TOOL_CALL_TIMEOUT: Optional[int] = None
 
 
 @router.get("/tool_servers", response_model=ToolServersConfigForm)
 async def get_tool_servers_config(request: Request, user=Depends(get_admin_user)):
     return {
         "TOOL_SERVER_CONNECTIONS": request.app.state.config.TOOL_SERVER_CONNECTIONS,
+        "MCP_TOOL_CALL_TIMEOUT": request.app.state.config.MCP_TOOL_CALL_TIMEOUT,
     }
 
 
@@ -165,9 +175,21 @@ async def set_tool_servers_config(
     form_data: ToolServersConfigForm,
     user=Depends(get_admin_user),
 ):
+    from open_webui.utils.mcp.persistent import admin_mcp_process_key
+
+    previous = request.app.state.config.TOOL_SERVER_CONNECTIONS or []
+    for connection in previous:
+        if connection.get("type") == "mcp" and (connection.get("config") or {}).get("command"):
+            server_id = (connection.get("info") or {}).get("id")
+            if server_id:
+                await request.app.state.persistent_mcp.stop(admin_mcp_process_key(server_id))
     request.app.state.config.TOOL_SERVER_CONNECTIONS = [
         connection.model_dump() for connection in form_data.TOOL_SERVER_CONNECTIONS
     ]
+    if form_data.MCP_TOOL_CALL_TIMEOUT is not None:
+        request.app.state.config.MCP_TOOL_CALL_TIMEOUT = max(
+            0, int(form_data.MCP_TOOL_CALL_TIMEOUT)
+        )
 
     await set_tool_servers(request)
 
@@ -176,6 +198,16 @@ async def set_tool_servers_config(
         if server_type == "mcp":
             server_id = connection.get("info", {}).get("id")
             auth_type = connection.get("auth_type", "none")
+            if server_id and (connection.get("config") or {}).get("command"):
+                try:
+                    connect_kwargs = build_mcp_connect_kwargs(
+                        connection, bearer_token=None, user=user, metadata=None
+                    )
+                    await request.app.state.persistent_mcp.ensure(
+                        admin_mcp_process_key(server_id), connect_kwargs
+                    )
+                except Exception:
+                    log.exception("Failed to start persistent admin MCP server %s", server_id)
             if auth_type == "oauth_2.1" and server_id:
                 try:
                     oauth_client_info = connection.get("info", {}).get(
@@ -193,7 +225,35 @@ async def set_tool_servers_config(
 
     return {
         "TOOL_SERVER_CONNECTIONS": request.app.state.config.TOOL_SERVER_CONNECTIONS,
+        "MCP_TOOL_CALL_TIMEOUT": request.app.state.config.MCP_TOOL_CALL_TIMEOUT,
     }
+
+
+@router.post("/tool_servers/{server_id}/restart")
+async def restart_tool_server(server_id: str, request: Request, user=Depends(get_admin_user)):
+    from open_webui.utils.mcp.persistent import admin_mcp_process_key
+
+    connection = next(
+        (
+            item for item in request.app.state.config.TOOL_SERVER_CONNECTIONS
+            if item.get("type") == "mcp" and (item.get("info") or {}).get("id") == server_id
+        ),
+        None,
+    )
+    if not connection:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if not (connection.get("config") or {}).get("command"):
+        raise HTTPException(status_code=400, detail="Only local stdio MCP servers can be restarted")
+    try:
+        kwargs = build_mcp_connect_kwargs(
+            connection, bearer_token=None, user=user, metadata=None
+        )
+        client = await request.app.state.persistent_mcp.restart(
+            admin_mcp_process_key(server_id), kwargs
+        )
+        return {"status": True, "specs": await client.list_tool_specs() or []}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}")
 
 
 @router.post("/tool_servers/verify")
@@ -507,8 +567,6 @@ class DataVizConfigForm(BaseModel):
     DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT: str
     DATA_VIZ_MODULE_ART_ENABLED: bool
     DATA_VIZ_MODULE_ART_PROMPT: str
-    DATA_VIZ_MODULE_ELICITATION_ENABLED: bool
-    DATA_VIZ_MODULE_ELICITATION_PROMPT: str
     DATA_VIZ_AUTO_REPAIR_ENABLED: bool
     DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS: int
     DATA_VIZ_AUTO_REPAIR_MODEL: str
@@ -528,8 +586,6 @@ def _data_viz_config_response(request: Request) -> dict:
         "DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT": cfg.DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT,
         "DATA_VIZ_MODULE_ART_ENABLED": cfg.DATA_VIZ_MODULE_ART_ENABLED,
         "DATA_VIZ_MODULE_ART_PROMPT": cfg.DATA_VIZ_MODULE_ART_PROMPT,
-        "DATA_VIZ_MODULE_ELICITATION_ENABLED": cfg.DATA_VIZ_MODULE_ELICITATION_ENABLED,
-        "DATA_VIZ_MODULE_ELICITATION_PROMPT": cfg.DATA_VIZ_MODULE_ELICITATION_PROMPT,
         "DATA_VIZ_AUTO_REPAIR_ENABLED": cfg.DATA_VIZ_AUTO_REPAIR_ENABLED,
         "DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS": cfg.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS,
         "DATA_VIZ_AUTO_REPAIR_MODEL": cfg.DATA_VIZ_AUTO_REPAIR_MODEL,
@@ -567,15 +623,194 @@ async def set_data_viz_config(
     )
     cfg.DATA_VIZ_MODULE_ART_ENABLED = form_data.DATA_VIZ_MODULE_ART_ENABLED
     cfg.DATA_VIZ_MODULE_ART_PROMPT = form_data.DATA_VIZ_MODULE_ART_PROMPT
-    cfg.DATA_VIZ_MODULE_ELICITATION_ENABLED = (
-        form_data.DATA_VIZ_MODULE_ELICITATION_ENABLED
-    )
-    cfg.DATA_VIZ_MODULE_ELICITATION_PROMPT = form_data.DATA_VIZ_MODULE_ELICITATION_PROMPT
     cfg.DATA_VIZ_AUTO_REPAIR_ENABLED = form_data.DATA_VIZ_AUTO_REPAIR_ENABLED
-    cfg.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS = form_data.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS
+    # Clamp to the same 1..5 range the tool enforces at runtime, so an API client
+    # can't persist 0 / negative / absurd values that bypass the UI's clamp.
+    try:
+        _attempts = int(form_data.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS)
+    except (TypeError, ValueError):
+        _attempts = 3
+    cfg.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS = max(1, min(_attempts, 5))
     cfg.DATA_VIZ_AUTO_REPAIR_MODEL = form_data.DATA_VIZ_AUTO_REPAIR_MODEL
+    # Whitelist reasoning_effort; anything else (incl. junk) becomes "" = unset.
+    _effort = (form_data.DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT or "").strip().lower()
     cfg.DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT = (
-        form_data.DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT
+        _effort
+        if _effort in ("minimal", "low", "medium", "high", "xhigh", "max")
+        else ""
     )
 
     return _data_viz_config_response(request)
+
+
+############################
+# Chat Semantic Search (message embeddings) Config
+############################
+
+
+class ChatEmbeddingConfigForm(BaseModel):
+    ENABLE_CHAT_SEMANTIC_SEARCH: bool
+    CHAT_EMBED_URL: str
+    CHAT_EMBED_MODEL: str
+    # Deferred-batching knobs (optional so older clients keep working).
+    CHAT_EMBED_SWEEP_INTERVAL: Optional[int] = None
+    CHAT_EMBED_TEXT_BATCH: Optional[int] = None
+
+
+def _chat_embedding_config_response(request: Request) -> dict:
+    cfg = request.app.state.config
+    return {
+        "ENABLE_CHAT_SEMANTIC_SEARCH": cfg.ENABLE_CHAT_SEMANTIC_SEARCH,
+        "CHAT_EMBED_URL": cfg.CHAT_EMBED_URL,
+        "CHAT_EMBED_MODEL": cfg.CHAT_EMBED_MODEL,
+        "CHAT_EMBED_SWEEP_INTERVAL": cfg.CHAT_EMBED_SWEEP_INTERVAL,
+        "CHAT_EMBED_TEXT_BATCH": cfg.CHAT_EMBED_TEXT_BATCH,
+        # Read-only: the vector dimension is pinned to the pgvector column and can't
+        # be changed here (surfaced so the UI can warn if a verified embedder's dim
+        # differs from what the stored index expects).
+        "CHAT_EMBED_DIM": ce.CHAT_EMBED_DIM,
+    }
+
+
+@router.get("/chat_embedding")
+async def get_chat_embedding_config(request: Request, user=Depends(get_admin_user)):
+    return _chat_embedding_config_response(request)
+
+
+@router.post("/chat_embedding")
+async def set_chat_embedding_config(
+    request: Request,
+    form_data: ChatEmbeddingConfigForm,
+    user=Depends(get_admin_user),
+):
+    cfg = request.app.state.config
+    cfg.ENABLE_CHAT_SEMANTIC_SEARCH = form_data.ENABLE_CHAT_SEMANTIC_SEARCH
+    # Normalize the URL (strip trailing slash) so the "{url}/embeddings" join is clean.
+    cfg.CHAT_EMBED_URL = (form_data.CHAT_EMBED_URL or "").strip().rstrip("/")
+    cfg.CHAT_EMBED_MODEL = (form_data.CHAT_EMBED_MODEL or "").strip()
+    # Clamp the batching knobs to the same ranges apply_runtime_config enforces, so an
+    # API client can't persist values that would then silently diverge from runtime.
+    if form_data.CHAT_EMBED_SWEEP_INTERVAL is not None:
+        try:
+            cfg.CHAT_EMBED_SWEEP_INTERVAL = max(
+                10, int(form_data.CHAT_EMBED_SWEEP_INTERVAL)
+            )
+        except (TypeError, ValueError):
+            pass
+    if form_data.CHAT_EMBED_TEXT_BATCH is not None:
+        try:
+            cfg.CHAT_EMBED_TEXT_BATCH = max(
+                1, min(128, int(form_data.CHAT_EMBED_TEXT_BATCH))
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # Bridge the freshly-persisted values into the chat_embedder module's live globals
+    # so the background sweep + query path pick them up immediately (no restart).
+    ce.apply_runtime_config(
+        url=cfg.CHAT_EMBED_URL,
+        model=cfg.CHAT_EMBED_MODEL,
+        enabled=cfg.ENABLE_CHAT_SEMANTIC_SEARCH,
+        sweep_interval=cfg.CHAT_EMBED_SWEEP_INTERVAL,
+        text_batch=cfg.CHAT_EMBED_TEXT_BATCH,
+    )
+
+    return _chat_embedding_config_response(request)
+
+
+class ChatEmbeddingVerifyForm(BaseModel):
+    CHAT_EMBED_URL: str
+    # Probed with the URL: llama-swap routes (and cold-starts) the upstream by the
+    # model field, so verifying with the wrong name fails even on a good URL.
+    CHAT_EMBED_MODEL: Optional[str] = None
+
+
+@router.post("/chat_embedding/verify")
+async def verify_chat_embedding_connection(
+    request: Request,
+    form_data: ChatEmbeddingVerifyForm,
+    user=Depends(get_admin_user),
+):
+    """Probe the embedder URL and confirm it returns a well-formed vector. Reports the
+    detected dimension so the UI can flag a mismatch against the stored CHAT_EMBED_DIM."""
+    url = (form_data.CHAT_EMBED_URL or "").strip().rstrip("/")
+    try:
+        dim = await ce.verify_embedder(url, model=form_data.CHAT_EMBED_MODEL)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{type(e).__name__}: {e}")
+    return {
+        "status": True,
+        "dim": dim,
+        "expected_dim": ce.CHAT_EMBED_DIM,
+        "dim_matches": dim == ce.CHAT_EMBED_DIM,
+    }
+
+
+@router.get("/chat_embedding/stats")
+async def get_chat_embedding_stats(request: Request, user=Depends(get_admin_user)):
+    """Counts of created / failed / pending message embeddings for the admin dashboard."""
+    counts = await Chats.count_message_embeddings()
+    return {
+        **counts,
+        "enabled": request.app.state.config.ENABLE_CHAT_SEMANTIC_SEARCH,
+        "rebuilding": _chat_embedding_rebuild_in_progress,
+    }
+
+
+# Guard so a double-click (or overlapping admin requests) can't spawn several
+# concurrent full-rebuild sweeps. The periodic keep-fresh sweeper is separately
+# idempotent (ON CONFLICT upserts), so at worst they overlap harmlessly.
+_chat_embedding_rebuild_in_progress = False
+
+
+async def _run_rebuild_sweep():
+    global _chat_embedding_rebuild_in_progress
+    try:
+        # run_sweep is a blocking psycopg2 job — run it off the event loop. It reads
+        # the (already-bridged) chat_embedder globals for URL/model, and no-ops if the
+        # embedder is unhealthy (rows stay pending until it recovers).
+        from open_webui.scripts.backfill_chat_embeddings import run_sweep
+
+        await asyncio.to_thread(
+            run_sweep, None, 200, lambda *a: log.info("[chat-embed rebuild] %s", a[0] if a else "")
+        )
+    except Exception:
+        log.exception("chat embedding rebuild sweep failed")
+    finally:
+        _chat_embedding_rebuild_in_progress = False
+
+
+@router.post("/chat_embedding/rebuild")
+async def rebuild_chat_embeddings(request: Request, user=Depends(get_admin_user)):
+    """Throw out ALL stored embeddings and kick an immediate re-embed sweep. Use after
+    changing the embedding model. Returns right away; the sweep runs in the background
+    (poll /chat_embedding/stats to watch 'pending' drain)."""
+    global _chat_embedding_rebuild_in_progress
+
+    deleted = await Chats.delete_all_message_embeddings()
+
+    started = False
+    if not _chat_embedding_rebuild_in_progress:
+        _chat_embedding_rebuild_in_progress = True
+        started = True
+        asyncio.create_task(_run_rebuild_sweep())
+
+    return {"status": True, "deleted": deleted, "sweep_started": started}
+
+
+@router.post("/chat_embedding/retry_failed")
+async def retry_failed_chat_embeddings(request: Request, user=Depends(get_admin_user)):
+    """Clear the permanent-failure markers (embedding IS NULL) and kick a sweep so those
+    messages get another embedding attempt — use after fixing/upgrading a flaky embedder.
+    Non-destructive: it only drops failure markers, never valid vectors."""
+    global _chat_embedding_rebuild_in_progress
+
+    cleared = await Chats.delete_failed_message_embeddings()
+
+    started = False
+    if not _chat_embedding_rebuild_in_progress:
+        _chat_embedding_rebuild_in_progress = True
+        started = True
+        asyncio.create_task(_run_rebuild_sweep())
+
+    return {"status": True, "cleared": cleared, "sweep_started": started}

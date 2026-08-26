@@ -1,17 +1,29 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { getContext } from 'svelte';
 	import Search from '$lib/components/icons/Search.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	const i18n = getContext('i18n');
 
-	export let placeholder = '';
-	export let value = '';
-	export let showClearButton = false;
+	interface Props {
+		placeholder?: string;
+		value?: string;
+		showClearButton?: boolean;
+		onFocus?: () => void;
+		onKeydown?: (e: KeyboardEvent) => void;
+	}
 
-	export let onFocus: () => void = () => {};
-	export let onKeydown: (e: KeyboardEvent) => void = () => {};
+	let {
+		placeholder = '',
+		value = $bindable(''),
+		showClearButton = false,
+		onFocus = () => {},
+		onKeydown = () => {},
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
 	const clearSearchInput = () => {
 		value = '';
@@ -21,8 +33,8 @@
 
 <div class="px-1 mb-1 flex justify-center space-x-2 relative z-10" id="search-container">
 	<div class="flex w-full rounded-xl" id="chat-search">
-		<div class="self-center py-2 rounded-l-xl bg-transparent dark:text-gray-300">
-			<Search />
+		<div class="self-center py-1.5 rounded-l-xl bg-transparent dark:text-gray-300">
+			<Search className="size-4.5" />
 		</div>
 
 		<input
@@ -31,20 +43,20 @@
 			placeholder={placeholder ? placeholder : $i18n.t('Search')}
 			autocomplete="off"
 			bind:value
-			on:input={() => {
+			oninput={() => {
 				dispatch('input');
 			}}
-			on:focus={() => {
+			onfocus={() => {
 				onFocus();
 			}}
-			on:keydown={onKeydown}
+			onkeydown={onKeydown}
 		/>
 
 		{#if showClearButton && value}
-			<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
+			<div class="self-center pl-1.5 rounded-l-xl bg-transparent">
 				<button
-					class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-					on:click={clearSearchInput}
+					class="inline-flex items-center justify-center p-0.5 max-md:p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+					onclick={clearSearchInput}
 				>
 					<XMark className="size-3" strokeWidth="2" />
 				</button>

@@ -84,10 +84,17 @@ def _normalize_jina_response(payload: dict, requested_url: str) -> JinaContentRe
     if not isinstance(images, dict):
         images = {}
 
+    # Strip raw NUL (0x00) from scraped page text at the source — browser-mode
+    # scrapes of binary/garbage content can contain it, and Postgres text/jsonb
+    # cannot store a NUL, so it must never enter the message pipeline.
+    page_text = data.get("content") or data.get("text") or ""
+    if "\x00" in page_text:
+        page_text = page_text.replace("\x00", "")
+
     return JinaContentResult(
         url=data.get("url") or requested_url,
         title=title or requested_url,
-        text=data.get("content") or data.get("text") or "",
+        text=page_text,
         description=description,
         author=data.get("author") or metadata.get("author"),
         published_date=published_date,
@@ -103,11 +110,12 @@ def _jina_headers(api_key: str, timeout_seconds: int) -> dict[str, str]:
         "Content-Type": "application/json",
         "X-Engine": "browser",
         "X-Timeout": str(timeout_seconds),
+        "X-Max-Tokens": "100000",
         "X-Base": "final",
         "X-Remove-Overlay": "true",
         "X-Retain-Links": "all",
         "X-Retain-Images": "all_p",
-        "X-With-Images-Summary": "true",
+        "X-With-Generated-Alt": "true",
         "X-Retain-Media": "link",
         "X-Md-Heading-Style": "atx",
     }
@@ -172,7 +180,7 @@ async def fetch_jina_contents(
     urls: List[str],
     viewport_width: int = 1280,
     viewport_height: int = 12000,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 180,
     max_concurrency: int = 5,
     session: Optional[aiohttp.ClientSession] = None,
     api_base_url: str = DEFAULT_JINA_READER_API_BASE_URL,

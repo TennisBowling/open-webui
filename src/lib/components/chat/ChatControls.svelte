@@ -15,36 +15,48 @@
 		showFilePreview
 	} from '$lib/stores';
 
-	import Controls from './Controls/Controls.svelte';
-	import CallOverlay from './MessageInput/CallOverlay.svelte';
 	import Drawer from '../common/Drawer.svelte';
-	import Artifacts from './Artifacts.svelte';
-	import BrowserPanel from './BrowserPanel.svelte';
-	import Embeds from './ChatControls/Embeds.svelte';
-	import FilePreview from './ChatControls/FilePreview.svelte';
+	// The 6 control overlays (Controls / CallOverlay / Artifacts / BrowserPanel /
+	// Embeds / FilePreview) are lazy-loaded via {#await import()} at their render
+	// sites below — they only ever appear inside {#if $showControls}, never at
+	// first paint, and CallOverlay drags in the heavy kokoro TTS/STT machinery.
 
-	export let history;
-	export let models = [];
+	interface Props {
+		// Keeping them off the static import graph splits ~10-18 KB out of the cold load.
+		history: any;
+		models?: any;
+		chatId?: any;
+		chatFiles?: any;
+		params?: any;
+		eventTarget: EventTarget;
+		submitPrompt: Function;
+		stopResponse: Function;
+		showMessage: Function;
+		files: any;
+		modelId: any;
+		pane: any;
+	}
 
-	export let chatId = null;
-
-	export let chatFiles = [];
-	export let params = {};
-
-	export let eventTarget: EventTarget;
-	export let submitPrompt: Function;
-	export let stopResponse: Function;
-	export let showMessage: Function;
-	export let files;
-	export let modelId;
-
-	export let pane;
+	let {
+		history = $bindable(),
+		models = [],
+		chatId = null,
+		chatFiles = $bindable([]),
+		params = $bindable({}),
+		eventTarget,
+		submitPrompt,
+		stopResponse,
+		showMessage,
+		files = $bindable(),
+		modelId,
+		pane = $bindable()
+	}: Props = $props();
 
 	let mediaQuery;
-	let largeScreen = false;
-	let dragged = false;
+	let largeScreen = $state(false);
+	let dragged = $state(false);
 
-	let minSize = 0;
+	let minSize = $state(0);
 
 	export const openPane = () => {
 		if (parseInt(localStorage?.chatControlsSize)) {
@@ -152,9 +164,11 @@
 		}
 	};
 
-	$: if (!chatId) {
-		closeHandler();
-	}
+	$effect(() => {
+		if (!chatId) {
+			closeHandler();
+		}
+	});
 </script>
 
 {#if !largeScreen}
@@ -166,38 +180,54 @@
 			}}
 		>
 			<div
-				class=" {$showCallOverlay || $showOverview || $showArtifacts || $showEmbeds || $showFilePreview
-					? ' h-screen  w-full'
+				class=" {$showCallOverlay ||
+				$showOverview ||
+				$showArtifacts ||
+				$showBrowserPanel ||
+				$showEmbeds ||
+				$showFilePreview
+					? ' h-screen  w-full pt-safe pl-safe pr-safe pb-safe'
 					: 'px-4 py-3'} h-full"
 			>
 				{#if $showCallOverlay}
 					<div
 						class=" h-full max-h-[100dvh] bg-white text-gray-700 dark:bg-gray-900 dark:text-gray-300 flex justify-center"
 					>
-						<CallOverlay
-							bind:files
-							{submitPrompt}
-							{stopResponse}
-							{modelId}
-							{chatId}
-							{eventTarget}
-							on:close={() => {
-								showControls.set(false);
-							}}
-						/>
+						{#await import('./MessageInput/CallOverlay.svelte') then { default: CallOverlay }}
+							<CallOverlay
+								bind:files
+								{submitPrompt}
+								{stopResponse}
+								{modelId}
+								{chatId}
+								{eventTarget}
+								onclose={() => {
+									showControls.set(false);
+								}}
+							/>
+						{/await}
 					</div>
 				{:else if $showEmbeds}
-					<Embeds />
+					{#await import('./ChatControls/Embeds.svelte') then { default: Embeds }}
+						<Embeds />
+					{/await}
 				{:else if $showFilePreview}
-					<FilePreview />
+					{#await import('./ChatControls/FilePreview.svelte') then { default: FilePreview }}
+						<FilePreview />
+					{/await}
 				{:else if $showBrowserPanel}
-					<BrowserPanel {history} />
+					{#await import('./BrowserPanel.svelte') then { default: BrowserPanel }}
+						<BrowserPanel {history} {chatId} />
+					{/await}
 				{:else if $showArtifacts}
-					<Artifacts {history} {chatId} />
+					{#await import('./Artifacts.svelte') then { default: Artifacts }}
+						<Artifacts {history} {chatId} />
+					{/await}
 				{:else if $showOverview}
 					{#await import('./Overview.svelte') then { default: Overview }}
 						<Overview
 							{history}
+							{chatId}
 							onNodeClick={(e) => {
 								const node = e.node;
 								showMessage(node.data.message, true);
@@ -208,14 +238,16 @@
 						/>
 					{/await}
 				{:else}
-					<Controls
-						on:close={() => {
-							showControls.set(false);
-						}}
-						{models}
-						bind:chatFiles
-						bind:params
-					/>
+					{#await import('./Controls/Controls.svelte') then { default: Controls }}
+						<Controls
+							onclose={() => {
+								showControls.set(false);
+							}}
+							{models}
+							bind:chatFiles
+							bind:params
+						/>
+					{/await}
 				{/if}
 			</div>
 		</Drawer>
@@ -225,12 +257,12 @@
 
 	{#if $showControls}
 		<PaneResizer
-			class="relative flex items-center justify-center group border-l border-gray-50 dark:border-gray-850 hover:border-gray-200 dark:hover:border-gray-800  transition z-20"
+			class="relative flex items-center justify-center group border-l-hairline border-gray-50 dark:border-gray-850 hover:border-gray-200 dark:hover:border-gray-800 transition z-20"
 			id="controls-resizer"
 		>
 			<div
 				class=" absolute -left-1.5 -right-1.5 -top-0 -bottom-0 z-20 cursor-col-resize bg-transparent"
-			/>
+			></div>
 		</PaneResizer>
 	{/if}
 
@@ -261,37 +293,53 @@
 		{#if $showControls}
 			<div class="flex max-h-full min-h-full">
 				<div
-					class="w-full {($showOverview || $showArtifacts || $showEmbeds || $showFilePreview) && !$showCallOverlay
+					class="w-full {($showOverview ||
+						$showArtifacts ||
+						$showBrowserPanel ||
+						$showEmbeds ||
+						$showFilePreview) &&
+					!$showCallOverlay
 						? ' '
 						: 'px-4 py-3 bg-white dark:shadow-lg dark:bg-gray-850 '} z-40 pointer-events-auto overflow-y-auto scrollbar-hidden"
 					id="controls-container"
 				>
 					{#if $showCallOverlay}
 						<div class="w-full h-full flex justify-center">
-							<CallOverlay
-								bind:files
-								{submitPrompt}
-								{stopResponse}
-								{modelId}
-								{chatId}
-								{eventTarget}
-								on:close={() => {
-									showControls.set(false);
-								}}
-							/>
+							{#await import('./MessageInput/CallOverlay.svelte') then { default: CallOverlay }}
+								<CallOverlay
+									bind:files
+									{submitPrompt}
+									{stopResponse}
+									{modelId}
+									{chatId}
+									{eventTarget}
+									onclose={() => {
+										showControls.set(false);
+									}}
+								/>
+							{/await}
 						</div>
 					{:else if $showEmbeds}
-						<Embeds overlay={dragged} />
+						{#await import('./ChatControls/Embeds.svelte') then { default: Embeds }}
+							<Embeds overlay={dragged} />
+						{/await}
 					{:else if $showFilePreview}
-						<FilePreview />
+						{#await import('./ChatControls/FilePreview.svelte') then { default: FilePreview }}
+							<FilePreview />
+						{/await}
 					{:else if $showBrowserPanel}
-						<BrowserPanel {history} />
+						{#await import('./BrowserPanel.svelte') then { default: BrowserPanel }}
+							<BrowserPanel {history} {chatId} />
+						{/await}
 					{:else if $showArtifacts}
-						<Artifacts {history} {chatId} overlay={dragged} />
+						{#await import('./Artifacts.svelte') then { default: Artifacts }}
+							<Artifacts {history} {chatId} overlay={dragged} />
+						{/await}
 					{:else if $showOverview}
 						{#await import('./Overview.svelte') then { default: Overview }}
 							<Overview
 								{history}
+								{chatId}
 								onNodeClick={(e) => {
 									const node = e.node;
 									if (node?.data?.message?.favorite) {
@@ -308,14 +356,16 @@
 							/>
 						{/await}
 					{:else}
-						<Controls
-							on:close={() => {
-								showControls.set(false);
-							}}
-							{models}
-							bind:chatFiles
-							bind:params
-						/>
+						{#await import('./Controls/Controls.svelte') then { default: Controls }}
+							<Controls
+								onclose={() => {
+									showControls.set(false);
+								}}
+								{models}
+								bind:chatFiles
+								bind:params
+							/>
+						{/await}
 					{/if}
 				</div>
 			</div>

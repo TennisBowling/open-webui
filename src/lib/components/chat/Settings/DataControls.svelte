@@ -22,43 +22,138 @@
 	import { getImportOrigin, convertOpenAIChats } from '$lib/utils';
 	import { onMount, getContext } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import ArchivedChatsModal from '$lib/components/layout/ArchivedChatsModal.svelte';
+	import Switch from '$lib/components/common/Switch.svelte';
+	import { purgeAll as purgeOfflineChatData } from '$lib/offline/chatStore';
+	import {
+		offlineChatMeta,
+		refreshOfflineChatMeta,
+		resetOfflineChatMeta,
+		prefetchOfflineChats,
+		purgeOfflineChatsForUser,
+		requestPersistentStorage,
+		scheduleOfflinePrefetch,
+		type PrefetchProgress
+	} from '$lib/offline/manager';
+	import { online } from '$lib/stores';
 
 	const i18n = getContext('i18n');
 
-	export let saveSettings: Function;
+	interface Props {
+		saveSettings: Function;
+	}
+
+	let { saveSettings }: Props = $props();
 
 	// Chats
-	let importFiles;
+	let importFiles = $state();
 
-	let showArchiveConfirm = false;
-	let showDeleteConfirm = false;
-	let showArchivedChatsModal = false;
+	let showArchiveConfirm = $state(false);
+	let showDeleteConfirm = $state(false);
+	let showArchivedChatsModal = $state(false);
 
-	let chatImportInputElement: HTMLInputElement;
+	let chatImportInputElement: HTMLInputElement = $state();
 
-	$: if (importFiles) {
-		console.log(importFiles);
+	// Offline storage
+	let offlineChatStorage = $state(false);
+	let clearingOfflineData = $state(false);
+	let offlineStorageEstimate: { usage?: number; quota?: number } | null = $state(null);
 
-		let reader = new FileReader();
-		reader.onload = (event) => {
-			let chats = JSON.parse(event.target.result);
-			console.log(chats);
-			if (getImportOrigin(chats) == 'openai') {
-				try {
-					chats = convertOpenAIChats(chats);
-				} catch (error) {
-					console.log('Unable to import chats:', error);
-				}
+	const formatBytes = (bytes?: number) => {
+		if (bytes === undefined || bytes === null || Number.isNaN(bytes)) return '';
+		if (bytes < 1024) return `${bytes} B`;
+		const units = ['KB', 'MB', 'GB', 'TB'];
+		let value = bytes;
+		let unitIndex = -1;
+		do {
+			value /= 1024;
+			unitIndex++;
+		} while (value >= 1024 && unitIndex < units.length - 1);
+		return `${value.toFixed(1)} ${units[unitIndex]}`;
+	};
+
+	const refreshOfflineStorageEstimate = async () => {
+		try {
+			if (navigator?.storage?.estimate) {
+				offlineStorageEstimate = await navigator.storage.estimate();
+			} else {
+				offlineStorageEstimate = null;
 			}
-			importChats(chats);
-		};
-
-		if (importFiles.length > 0) {
-			reader.readAsText(importFiles[0]);
+		} catch (e) {
+			// best-effort only; hide the readout if unsupported/fails
+			offlineStorageEstimate = null;
 		}
-	}
+	};
+
+	const toggleOfflineChatStorage = async () => {
+		saveSettings({ offlineChatStorage });
+		if (offlineChatStorage && $user?.id) {
+			requestPersistentStorage();
+			await refreshOfflineChatMeta($user.id);
+			// Start filling the store right away so the toggle has visible effect.
+			scheduleOfflinePrefetch(localStorage.token, $user.id, 1000);
+		}
+	};
+
+	const clearOfflineDataHandler = async () => {
+		clearingOfflineData = true;
+		try {
+			// Scoped to the signed-in account — other accounts on a shared device
+			// keep their own offline copies.
+			if ($user?.id) {
+				await purgeOfflineChatsForUser($user.id);
+			} else {
+				await purgeOfflineChatData();
+			}
+			resetOfflineChatMeta();
+			toast.success($i18n.t('Offline data cleared.'));
+		} catch (e) {
+			toast.error(`${e}`);
+		} finally {
+			clearingOfflineData = false;
+			refreshOfflineStorageEstimate();
+		}
+	};
+
+	// Manual "download now" sweep — same bounded stale-only prefetch the app
+	// runs in the background, but user-initiated with visible progress. Handy
+	// right before going somewhere with no signal.
+	let downloadProgress: PrefetchProgress | null = $state(null);
+	let downloading = $state(false);
+	const downloadRecentHandler = async () => {
+		if (downloading || !$user?.id) return;
+		if (!$online) {
+			toast.error($i18n.t('You are offline.'));
+			return;
+		}
+		downloading = true;
+		downloadProgress = null;
+		try {
+			const result = await prefetchOfflineChats({
+				token: localStorage.token,
+				userId: $user.id,
+				onProgress: (p) => {
+					downloadProgress = p;
+				}
+			});
+			if (result === null) {
+				toast.error($i18n.t('Could not download chats right now.'));
+			} else if (result.total === 0) {
+				toast.success($i18n.t('Offline copies are already up to date.'));
+			} else {
+				toast.success(
+					$i18n.t('{{COUNT}} chats downloaded for offline access.', {
+						COUNT: `${result.downloaded}`
+					})
+				);
+			}
+		} finally {
+			downloading = false;
+			downloadProgress = null;
+			refreshOfflineStorageEstimate();
+		}
+	};
 
 	const importChats = async (_chats) => {
 		for (const chat of _chats) {
@@ -107,9 +202,16 @@
 
 	const deleteAllChatsHandler = async () => {
 		await goto('/');
-		await deleteAllChats(localStorage.token).catch((error) => {
+		const res = await deleteAllChats(localStorage.token).catch((error) => {
 			toast.error(`${error}`);
+			return null;
 		});
+
+		// Purge local offline copies only once the server confirmed the delete —
+		// a failed call (e.g. offline) must not destroy still-readable copies.
+		if (res && $user?.id) {
+			void purgeOfflineChatsForUser($user.id);
+		}
 
 		currentChatPage.set(1);
 		await chats.set(await getChatList(localStorage.token, $currentChatPage));
@@ -122,6 +224,41 @@
 
 		scrollPaginationEnabled.set(true);
 	};
+
+	onMount(() => {
+		offlineChatStorage = $settings?.offlineChatStorage ?? false;
+		refreshOfflineStorageEstimate();
+		if (offlineChatStorage && $user?.id && $offlineChatMeta === null) {
+			void refreshOfflineChatMeta($user.id);
+		}
+	});
+	let offlineChatCount = $derived($offlineChatMeta?.size ?? null);
+	let offlineKeptCount = $derived(
+		$offlineChatMeta ? [...$offlineChatMeta.values()].filter((m) => m.pinned).length : 0
+	);
+	$effect(() => {
+		if (importFiles) {
+			console.log(importFiles);
+
+			let reader = new FileReader();
+			reader.onload = (event) => {
+				let chats = JSON.parse(event.target.result);
+				console.log(chats);
+				if (getImportOrigin(chats) == 'openai') {
+					try {
+						chats = convertOpenAIChats(chats);
+					} catch (error) {
+						console.log('Unable to import chats:', error);
+					}
+				}
+				importChats(chats);
+			};
+
+			if (importFiles.length > 0) {
+				reader.readAsText(importFiles[0]);
+			}
+		}
+	});
 </script>
 
 <ArchivedChatsModal bind:show={showArchivedChatsModal} onUpdate={handleArchivedChatsChange} />
@@ -139,7 +276,7 @@
 			/>
 			<button
 				class=" flex rounded-md py-2 px-3.5 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-				on:click={() => {
+				onclick={() => {
 					chatImportInputElement.click();
 				}}
 			>
@@ -163,7 +300,7 @@
 			{#if $user?.role === 'admin' || ($user.permissions?.chat?.export ?? true)}
 				<button
 					class=" flex rounded-md py-2 px-3.5 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-					on:click={() => {
+					onclick={() => {
 						exportChats();
 					}}
 				>
@@ -191,7 +328,7 @@
 		<div class="flex flex-col">
 			<button
 				class=" flex rounded-md py-2 px-3.5 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-				on:click={() => {
+				onclick={() => {
 					showArchivedChatsModal = true;
 				}}
 			>
@@ -237,7 +374,7 @@
 					<div class="flex space-x-1.5 items-center">
 						<button
 							class="hover:text-white transition"
-							on:click={() => {
+							onclick={() => {
 								archiveAllChatsHandler();
 								showArchiveConfirm = false;
 							}}
@@ -257,7 +394,7 @@
 						</button>
 						<button
 							class="hover:text-white transition"
-							on:click={() => {
+							onclick={() => {
 								showArchiveConfirm = false;
 							}}
 						>
@@ -277,7 +414,7 @@
 			{:else}
 				<button
 					class=" flex rounded-md py-2 px-3.5 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-					on:click={() => {
+					onclick={() => {
 						showArchiveConfirm = true;
 					}}
 				>
@@ -324,7 +461,7 @@
 					<div class="flex space-x-1.5 items-center">
 						<button
 							class="hover:text-white transition"
-							on:click={() => {
+							onclick={() => {
 								deleteAllChatsHandler();
 								showDeleteConfirm = false;
 							}}
@@ -344,7 +481,7 @@
 						</button>
 						<button
 							class="hover:text-white transition"
-							on:click={() => {
+							onclick={() => {
 								showDeleteConfirm = false;
 							}}
 						>
@@ -364,7 +501,7 @@
 			{:else}
 				<button
 					class=" flex rounded-md py-2 px-3.5 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-					on:click={() => {
+					onclick={() => {
 						showDeleteConfirm = true;
 					}}
 				>
@@ -385,6 +522,81 @@
 					<div class=" self-center text-sm font-medium">{$i18n.t('Delete All Chats')}</div>
 				</button>
 			{/if}
+		</div>
+
+		<hr class=" border-gray-100 dark:border-gray-850" />
+
+		<div class="flex flex-col px-3.5 py-1 gap-2">
+			<div class=" py-0.5 flex w-full justify-between">
+				<div id="offline-chat-storage-label" class=" self-center text-sm font-medium">
+					{$i18n.t('Store chats for offline access')}
+				</div>
+
+				<div class="flex items-center gap-2 p-1">
+					<Switch
+						ariaLabelledbyId="offline-chat-storage-label"
+						tooltip={true}
+						bind:state={offlineChatStorage}
+						onchange={toggleOfflineChatStorage}
+					/>
+				</div>
+			</div>
+
+			<div class=" text-xs text-gray-500">
+				{$i18n.t(
+					'Chat messages will be saved on this device, including content. Turn off and clear if this is a shared device.'
+				)}
+			</div>
+
+			{#if offlineChatStorage}
+				<div class="flex items-center justify-between mt-1">
+					<button
+						class=" flex rounded-md py-1.5 px-3 text-xs hover:bg-gray-200 dark:hover:bg-gray-800 transition border border-gray-100 dark:border-gray-850 disabled:opacity-50"
+						disabled={downloading}
+						onclick={downloadRecentHandler}
+					>
+						{#if downloading}
+							{downloadProgress && downloadProgress.total > 0
+								? $i18n.t('Downloading... {{DONE}}/{{TOTAL}}', {
+										DONE: `${downloadProgress.done}`,
+										TOTAL: `${downloadProgress.total}`
+									})
+								: $i18n.t('Checking...')}
+						{:else}
+							{$i18n.t('Download recent chats')}
+						{/if}
+					</button>
+
+					{#if offlineChatCount !== null}
+						<div class=" text-xs text-gray-500">
+							{offlineKeptCount > 0
+								? $i18n.t('{{COUNT}} chats stored · {{KEPT}} kept offline', {
+										COUNT: `${offlineChatCount}`,
+										KEPT: `${offlineKeptCount}`
+									})
+								: $i18n.t('{{COUNT}} chats stored', { COUNT: `${offlineChatCount}` })}
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<div class="flex items-center justify-between mt-1">
+				<button
+					class=" flex rounded-md py-1.5 px-3 text-xs hover:bg-gray-200 dark:hover:bg-gray-800 transition border border-gray-100 dark:border-gray-850 disabled:opacity-50"
+					disabled={clearingOfflineData}
+					onclick={clearOfflineDataHandler}
+				>
+					{clearingOfflineData ? $i18n.t('Clearing...') : $i18n.t('Clear offline data')}
+				</button>
+
+				{#if offlineStorageEstimate?.usage !== undefined}
+					<div class=" text-xs text-gray-500">
+						{$i18n.t('Using approximately {{size}}', {
+							size: formatBytes(offlineStorageEstimate.usage)
+						})}
+					</div>
+				{/if}
+			</div>
 		</div>
 	</div>
 </div>

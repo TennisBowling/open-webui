@@ -1,21 +1,31 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy } from 'svelte';
 	import { fade } from 'svelte/transition';
 
 	import { flyAndScale } from '$lib/utils/transitions';
 	import * as FocusTrap from 'focus-trap';
-	export let show = true;
-	export let size = 'md';
-	export let containerClassName = 'p-3';
-	export let className = 'bg-white dark:bg-gray-850 rounded-2xl';
+	interface Props {
+		show?: boolean;
+		size?: string;
+		containerClassName?: string;
+		className?: string;
+		children?: import('svelte').Snippet;
+	}
 
-	let modalElement = null;
-	let mounted = false;
+	let {
+		show = $bindable(true),
+		size = 'md',
+		containerClassName = 'p-3',
+		className = 'bg-white dark:bg-gray-850 rounded-2xl',
+		children
+	}: Props = $props();
+
+	let modalElement = $state(null);
 	let savedScrollY = 0;
 	// Create focus trap to trap user tabs inside modal
 	// https://www.w3.org/WAI/WCAG21/Understanding/focus-order.html
 	// https://www.w3.org/WAI/WCAG21/Understanding/keyboard.html
-	let focusTrap: FocusTrap.FocusTrap | null = null;
+	let focusTrap: FocusTrap.FocusTrap | null = $state.raw(null);
 
 	const sizeToWidth = (size) => {
 		// max-sm:w-full forces full width below Tailwind's sm breakpoint (640px)
@@ -56,53 +66,80 @@
 
 	const lockBodyScroll = () => {
 		// iOS Safari ignores `overflow:hidden` on body — pin position instead.
+		// But only when there is actually a scroll offset to pin: in this app
+		// <html> is overflow-hidden and all scrolling lives in inner containers,
+		// so scrollY is ~always 0 (nonzero only during the iOS keyboard focus
+		// pan) and toggling position:fixed on <body> would reflow the entire
+		// document on every modal/menu open and close for nothing.
 		savedScrollY = window.scrollY;
-		document.body.style.position = 'fixed';
-		document.body.style.top = `-${savedScrollY}px`;
-		document.body.style.left = '0';
-		document.body.style.right = '0';
+		if (savedScrollY) {
+			document.body.style.position = 'fixed';
+			document.body.style.top = `-${savedScrollY}px`;
+			document.body.style.left = '0';
+			document.body.style.right = '0';
+		}
 		document.body.style.overflow = 'hidden';
 	};
 
-	const unlockBodyScroll = () => {
-		document.body.style.position = '';
-		document.body.style.top = '';
-		document.body.style.left = '';
-		document.body.style.right = '';
+	const unlockBodyScroll = (currentModal = modalElement) => {
+		const hasAnotherOpenModal = [...document.querySelectorAll('[data-modal-root]')].some(
+			(element) => element !== currentModal
+		);
+		if (hasAnotherOpenModal) {
+			document.body.style.overflow = 'hidden';
+			return;
+		}
+
 		document.body.style.overflow = '';
 		if (savedScrollY) {
+			document.body.style.position = '';
+			document.body.style.top = '';
+			document.body.style.left = '';
+			document.body.style.right = '';
 			window.scrollTo(0, savedScrollY);
 			savedScrollY = 0;
 		}
 	};
 
-	onMount(() => {
-		mounted = true;
-	});
+	$effect(() => {
+		if (!show || !modalElement) return;
 
-	$: if (show && modalElement) {
-		document.body.appendChild(modalElement);
-		focusTrap = FocusTrap.createFocusTrap(modalElement, {
+		const element = modalElement;
+		document.body.appendChild(element);
+		const trap = FocusTrap.createFocusTrap(element, {
+			// Returning focus to the trigger on close must NOT scroll it into view
+			// (the gesture-only "don't move the user" rule). focus-trap applies this
+			// to both the initial focus and the return focus.
+			preventScroll: true,
 			allowOutsideClick: (e) => {
 				return e.target.closest('[data-sonner-toast]') !== null;
 			}
 		});
-		focusTrap.activate();
+		focusTrap = trap;
+		trap.activate();
 		window.addEventListener('keydown', handleKeyDown);
 		lockBodyScroll();
-	} else if (modalElement) {
-		focusTrap.deactivate();
-		window.removeEventListener('keydown', handleKeyDown);
-		document.body.removeChild(modalElement);
-		unlockBodyScroll();
-	}
+
+		// Keep teardown in the effect cleanup so it still runs with a reference
+		// to the portal element. During a Svelte 5 `{#if}` teardown, bind:this can
+		// become null before a separate "show is false" effect gets to deactivate
+		// the focus trap, leaving the removed dialog's trap blocking the parent.
+		return () => {
+			trap.deactivate();
+			if (focusTrap === trap) {
+				focusTrap = null;
+			}
+			window.removeEventListener('keydown', handleKeyDown);
+			unlockBodyScroll(element);
+		};
+	});
 
 	onDestroy(() => {
 		show = false;
 		if (focusTrap) {
 			focusTrap.deactivate();
 		}
-		if (modalElement) {
+		if (modalElement?.parentNode === document.body) {
 			document.body.removeChild(modalElement);
 		}
 		unlockBodyScroll();
@@ -110,16 +147,18 @@
 </script>
 
 {#if show}
-	<!-- svelte-ignore a11y-click-events-have-key-events -->
-	<!-- svelte-ignore a11y-no-static-element-interactions -->
-	<!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 	<div
 		bind:this={modalElement}
+		data-modal-root
 		aria-modal="true"
 		role="dialog"
+		tabindex="-1"
 		class="modal fixed top-0 right-0 left-0 bottom-0 bg-[#191919]/30 dark:bg-[#0F0F0F]/60 w-full h-screen max-h-[100dvh] {containerClassName}  flex justify-center z-9999 overflow-y-auto overscroll-contain"
 		in:fade={{ duration: 10 }}
-		on:mousedown={() => {
+		onmousedown={() => {
 			show = false;
 		}}
 	>
@@ -128,11 +167,11 @@
 				? 'mx-2'
 				: ''} shadow-md min-h-fit scrollbar-hidden {className} border-hairline border-gray-200 dark:border-gray-700"
 			in:flyAndScale
-			on:mousedown={(e) => {
+			onmousedown={(e) => {
 				e.stopPropagation();
 			}}
 		>
-			<slot />
+			{@render children?.()}
 		</div>
 	</div>
 {/if}

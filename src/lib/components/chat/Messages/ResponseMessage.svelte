@@ -1,15 +1,32 @@
+<script lang="ts" module>
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	// Shared id->model index. The `model` reactive below re-runs on every
+	// streaming frame (the revision store reassigns `message`), and a linear
+	// $models.find per frame per visible response message adds up on large
+	// model lists. The Map rebuilds only when the models array identity changes.
+	let _modelsIndexRef: any[] | null = null;
+	let _modelsIndex: Map<string, any> | null = null;
+	const lookupModelById = (modelList: any[], id: string) => {
+		if (_modelsIndexRef !== modelList) {
+			_modelsIndexRef = modelList;
+			_modelsIndex = new Map((modelList ?? []).map((m) => [m.id, m]));
+		}
+		return _modelsIndex?.get(id);
+	};
+</script>
+
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import dayjs from 'dayjs';
 
-	import { createEventDispatcher } from 'svelte';
-	import { onMount, tick, getContext } from 'svelte';
+	import { onMount, onDestroy, tick, getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType, t } from 'i18next';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { createNewFeedback, getFeedbackById, updateFeedbackById } from '$lib/apis/evaluations';
 	import { getChatById } from '$lib/apis/chats';
@@ -22,7 +39,8 @@
 		temporaryChatEnabled,
 		TTSWorker,
 		user,
-		getMessageRevisionStore
+		getMessageRevisionStore,
+		messageEditingIds
 	} from '$lib/stores';
 	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
 	import { imageGenerations } from '$lib/apis/images';
@@ -36,7 +54,14 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
+	import {
+		autoGrowEditTextarea,
+		captureEditEntryAnchor,
+		placeEditBoxForKeyboard
+	} from '$lib/utils/editScroll';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { resolveRetryModelId } from '$lib/utils/chatTurn';
+	import { getOrderedChildIds } from '$lib/utils/chatHistoryGraph';
 
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
@@ -65,6 +90,7 @@
 	interface MessageType {
 		id: string;
 		model: string;
+		modelIdx?: number;
 		content: string;
 		content_blocks?: any[];
 		files?: { type: string; url: string }[];
@@ -104,46 +130,11 @@
 			usage?: unknown;
 		};
 		annotation?: { type: string; rating: number };
+		followUps?: string[];
+		userStopped?: boolean;
 	}
 
-	export let chatId = '';
-	export let history;
-	export let messageId;
-	export let selectedModels = [];
-	let messageRevisionStore = getMessageRevisionStore(messageId);
-	$: messageRevisionStore = getMessageRevisionStore(messageId);
-
-	let message: MessageType = history.messages[messageId];
-	$: {
-		$messageRevisionStore;
-		if (history.messages?.[messageId]) {
-			message = history.messages[messageId];
-		}
-	}
-
-	export let siblings;
-
-	export let setInputText: Function = () => {};
-	export let gotoMessage: Function = () => {};
-	export let showPreviousMessage: Function;
-	export let showNextMessage: Function;
-
-	export let updateChat: Function;
-	export let editMessage: Function;
-	export let saveMessage: Function;
-	export let rateMessage: Function;
-	export let actionMessage: Function;
-	export let deleteMessage: Function;
-
-	export let submitMessage: Function;
-	export let continueResponse: Function;
-	export let regenerateResponse: Function;
-	export let retryWithoutProviderRestrictions: Function = () => {};
-	export let markSkipRemainingRetries: Function = () => {};
-	export let regenerateWithModel: Function = () => {};
-
-	let skipRetryClicked = false;
-	$: if (!message?.retrying) skipRetryClicked = false;
+	let skipRetryClicked = $state(false);
 
 	// True when a "done" message actually has something useful to act on. We use
 	// this to hide the post-completion action buttons (edit/copy/speak/continue/
@@ -159,33 +150,152 @@
 		return c != null;
 	};
 
-	export let addMessages: Function;
+	interface Props {
+		chatId?: string;
+		history: any;
+		messageId: any;
+		selectedModels?: any;
+		siblings: any;
+		setInputText?: Function;
+		gotoMessage?: Function;
+		showPreviousMessage: Function;
+		showNextMessage: Function;
+		updateChat: Function;
+		editMessage: Function;
+		saveMessage: Function;
+		rateMessage: Function;
+		actionMessage: Function;
+		deleteMessage: Function;
+		submitMessage: Function;
+		continueResponse: Function;
+		regenerateResponse: Function;
+		rewindAndInsert?: Function;
+		retryWithoutProviderRestrictions?: Function;
+		markSkipRemainingRetries?: Function;
+		regenerateWithModel?: Function;
+		isLastMessage?: boolean;
+		readOnly?: boolean;
+		editCodeBlock?: boolean;
+		topPadding?: boolean;
+	}
 
-	export let isLastMessage = true;
-	export let readOnly = false;
-	export let editCodeBlock = true;
-	export let topPadding = false;
+	let {
+		chatId = '',
+		history = $bindable(),
+		messageId,
+		selectedModels = [],
+		siblings,
+		setInputText = () => {},
+		gotoMessage = () => {},
+		showPreviousMessage,
+		showNextMessage,
+		updateChat,
+		editMessage,
+		saveMessage,
+		rateMessage,
+		actionMessage,
+		deleteMessage,
+		submitMessage,
+		continueResponse,
+		regenerateResponse,
+		rewindAndInsert = () => {},
+		retryWithoutProviderRestrictions = () => {},
+		markSkipRemainingRetries = () => {},
+		regenerateWithModel = () => {},
+		isLastMessage = true,
+		readOnly = false,
+		editCodeBlock = true,
+		topPadding = false,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	let buttonsContainerElement: HTMLDivElement;
-	let showDeleteConfirm = false;
+	let messageRevisionStore = $derived(getMessageRevisionStore(messageId));
+	let message: MessageType = $derived.by(() => {
+		$messageRevisionStore;
+		return history.messages[messageId];
+	});
 
-	let model = null;
-	$: model = $models.find((m) => m.id === message.model);
+	let buttonsContainerElement: HTMLDivElement = $state();
+	let showDeleteConfirm = $state(false);
 
-	let edit = false;
-	let editedContent = '';
-	let editTextAreaElement: HTMLTextAreaElement;
+	let model = $state(null);
 
-	let messageIndexEdit = false;
+	let edit = $state(false);
+	let editedContent = $state('');
+	let editTextAreaElement: HTMLTextAreaElement = $state();
+
+	// Mirror the local edit flag into the shared store so chat-level chrome
+	// (mobile composer/token panels, sidebar edge strip) can stand down while
+	// this message is being edited. Tracks the exact id it registered so a
+	// messageId prop swap mid-edit can't strand a stale entry (which would
+	// keep the composer hidden); onDestroy covers branch/chat teardown.
+	let registeredEditId: string | null = null;
+	const syncEditRegistration = (editing: boolean, id: string) => {
+		const target = editing ? id : null;
+		if (target === registeredEditId) return;
+		messageEditingIds.update((ids) => {
+			const next = new Set(ids);
+			if (registeredEditId !== null) next.delete(registeredEditId);
+			if (target !== null) next.add(target);
+			return next;
+		});
+		registeredEditId = target;
+	};
+
+	let messageIndexEdit = $state(false);
 
 	let audioParts: Record<number, HTMLAudioElement | null> = {};
-	let speaking = false;
+
+	// Blob object URLs pin their decoded audio until revoked; release the parts
+	// of a previous playback whenever a new one starts and on unmount.
+	const releaseAudioParts = () => {
+		for (const audio of Object.values(audioParts)) {
+			if (audio?.src?.startsWith('blob:')) {
+				URL.revokeObjectURL(audio.src);
+			}
+		}
+		audioParts = {};
+	};
+
+	onDestroy(() => {
+		releaseAudioParts();
+		syncEditRegistration(false, messageId);
+	});
+	let speaking = $state(false);
 	let speakingIdx: number | undefined;
 
-	let loadingSpeech = false;
-	let generatingImage = false;
+	let loadingSpeech = $state(false);
+	let generatingImage = $state(false);
 
-	let showRateComment = false;
+	let showRateComment = $state(false);
+
+	// --- Streaming bottom-anchor reserve --------------------------------------
+	// Follow-up prompts are produced by a background task that completes a beat
+	// AFTER the reply finishes streaming, then render in a row beneath the reply.
+	// Without reservation the live reply rests ~150px lower than its settled
+	// height, so completion visibly "jumps up" the moment the follow-up row pushes
+	// it. We reserve that space from the start of the active turn: the streaming
+	// reply already sits at its final height, and the follow-ups fill the reserved
+	// box instead of shoving the reply. It is min-height (not a fixed height) so an
+	// unusually tall row can still grow — but the reply never drops. See
+	// everStreamed below for exactly when it is active. Tune FOLLOW_UP_RESERVE_PX
+	// to match the typical follow-up row height /
+	// preferred streaming reading height.
+	const FOLLOW_UP_RESERVE_PX = 150;
+	// Sticky "this reply streamed live in THIS session" latch. A fresh reply is
+	// born message.done === false, so this flips true the moment it starts
+	// streaming and STAYS true through done / stop / error / follow-up arrival. A
+	// message rehydrated on chat load is born done === true and never flips it, so
+	// it stays false. Gating the reserve on this is what keeps the three states
+	// correct at once:
+	//   • streaming reply gets the reserve, so it already sits at its settled
+	//     height (no jump when the follow-up row later fills the reserve);
+	//   • a stopped/errored LIVE reply keeps the reserve instead of collapsing it
+	//     (collapsing would drop the reply down onto the input);
+	//   • reloaded/old chats and scrolled-back history get NO phantom 150px gap —
+	//     including mid-conversation multi-model groups (which hardcode
+	//     isLastMessage), since their rehydrated columns never streamed here.
+	let everStreamed = $state(false);
 
 	const copyToClipboard = async (text) => {
 		text = removeAllDetails(text);
@@ -246,17 +356,6 @@
 		return '';
 	};
 
-	$: hasStructuredContent =
-		Array.isArray(message?.content_blocks) && message.content_blocks.length > 0;
-	// For structured messages, ContentRenderer renders content_blocks directly.
-	// Keep this as plain assistant text for copy/TTS/edit/image prompts; do not
-	// stringify tool results here or heavy research turns become O(huge) per tick.
-	$: messageTextContent = hasStructuredContent
-		? (message?.done ?? false) || message?.error
-			? getStructuredTextContent(message.content_blocks)
-			: getLatestStructuredTextContent(message.content_blocks)
-		: getMessageTextContent(message?.content);
-
 	const playAudio = (idx: number) => {
 		return new Promise<void>((res) => {
 			speakingIdx = idx;
@@ -306,9 +405,14 @@
 
 		if ($config.audio.tts.engine === '') {
 			let voices = [];
+			// iOS PWAs frequently never populate getVoices() (no voiceschanged in a
+			// standalone context) — without a cap this 100ms interval spun forever.
+			// After ~3s give up waiting and speak with the default voice.
+			let voicesAttempts = 0;
 			const getVoicesLoop = setInterval(() => {
 				voices = speechSynthesis.getVoices();
-				if (voices.length > 0) {
+				voicesAttempts += 1;
+				if (voices.length > 0 || voicesAttempts >= 30) {
 					clearInterval(getVoicesLoop);
 
 					const voice =
@@ -358,6 +462,7 @@
 
 			console.debug('Prepared message content for TTS', messageContentParts);
 
+			releaseAudioParts();
 			audioParts = messageContentParts.reduce(
 				(acc, _sentence, idx) => {
 					acc[idx] = null;
@@ -465,26 +570,35 @@
 
 		editedContent = preprocessForEditing(messageTextContent);
 
+		// Hold the message at its current on-screen position across the
+		// markdown -> textarea swap so edit-entry doesn't shove the viewport.
+		const restoreAnchor = captureEditEntryAnchor(message.id);
+
 		await tick();
 
 		editTextAreaElement.style.height = '';
 		editTextAreaElement.style.height = `${editTextAreaElement.scrollHeight}px`;
+
+		// preventScroll: do NOT let the browser scroll-into-view the freshly
+		// focused (often tall) textarea. Matches UserMessage — on mobile the
+		// composer hides for the edit, so the edit box must become the active
+		// input immediately rather than leaving the user keyboard-less.
+		editTextAreaElement?.focus({ preventScroll: true });
+
+		await tick();
+		restoreAnchor();
+
+		// The focus above summons the iOS keyboard AFTER this handler returns.
+		// When it arrives (or if it is already up from the composer), the edit
+		// box gets top-aligned in the keyboard-shrunk viewport for maximum
+		// editing room; on desktop this expires and the anchor result stands.
+		placeEditBoxForKeyboard(message.id);
 	};
 
 	const editMessageConfirmHandler = async () => {
 		const messageContent = postprocessAfterEditing(editedContent ? editedContent : '');
-		editMessage(message.id, { content: messageContent }, false);
-
-		edit = false;
-		editedContent = '';
-
-		await tick();
-	};
-
-	const saveAsCopyHandler = async () => {
-		const messageContent = postprocessAfterEditing(editedContent ? editedContent : '');
-
-		editMessage(message.id, { content: messageContent });
+		const accepted = await editMessage(message.id, { content: messageContent }, false);
+		if (accepted === false) return;
 
 		edit = false;
 		editedContent = '';
@@ -520,7 +634,7 @@
 		generatingImage = false;
 	};
 
-	let feedbackLoading = false;
+	let feedbackLoading = $state(false);
 
 	const feedbackHandler = async (rating: number | null = null, details: object | null = null) => {
 		feedbackLoading = true;
@@ -543,15 +657,18 @@
 		}
 
 		const messages = createMessagesList(history, message.id);
+		const siblingIds = message.parentId
+			? getOrderedChildIds(history.messages ?? {}, message.parentId)
+			: [];
 
 		let feedbackItem = {
 			type: 'rating',
 			data: {
 				...(updatedMessage?.annotation ? updatedMessage.annotation : {}),
 				model_id: message?.selectedModelId ?? message.model,
-				...(history.messages[message.parentId].childrenIds.length > 1
+				...(siblingIds.length > 1
 					? {
-							sibling_model_ids: history.messages[message.parentId].childrenIds
+							sibling_model_ids: siblingIds
 								.filter((id) => id !== message.id)
 								.map((id) => history.messages[id]?.selectedModelId ?? history.messages[id].model)
 						}
@@ -644,12 +761,6 @@
 		deleteMessage(message.id);
 	};
 
-	$: if (!edit) {
-		(async () => {
-			await tick();
-		})();
-	}
-
 	onMount(async () => {
 		// console.log('ResponseMessage mounted');
 
@@ -670,12 +781,65 @@
 			});
 		}
 	});
+	$effect(() => {
+		if (!message?.retrying) skipRetryClicked = false;
+	});
+	$effect(() => {
+		model = lookupModelById($models, message.model);
+	});
+	$effect(() => {
+		syncEditRegistration(edit, messageId);
+	});
+	$effect(() => {
+		if (message?.done === false) everStreamed = true;
+	});
+	let followUpReserveActive = $derived(
+		isLastMessage &&
+			!readOnly &&
+			everStreamed &&
+			($settings?.autoFollowUps ?? true) &&
+			// Only reserve when a follow-up row will ACTUALLY arrive. autoFollowUps is
+			// just the per-user request toggle; the server still has to have follow-up
+			// generation enabled (ENABLE_FOLLOW_UP_GENERATION / override — surfaced as
+			// this feature flag). Without this, instances with follow-ups disabled
+			// (the out-of-the-box default) would hold the reserve open and never fill
+			// it, leaving a permanent empty gap above the input.
+			($config?.features?.enable_follow_up_generation ?? false) &&
+			// Hold the reserve while streaming, and after completion while follow-ups
+			// are still PENDING (message.followUps stays undefined until the socket
+			// event lands) or a non-empty row has ARRIVED to fill it. Collapse only
+			// when the result is known-empty (followUps === [] — the generation
+			// produced none) so such a reply settles to its natural height instead of
+			// leaving a permanent empty gap. The backend always emits the event (even
+			// []), so this "pending → resolved" transition is reliable.
+			(!message?.done || message?.followUps === undefined || (message?.followUps?.length ?? 0) > 0)
+	);
+	let hasStructuredContent = $derived(
+		Array.isArray(message?.content_blocks) && message.content_blocks.length > 0
+	);
+	// For structured messages, ContentRenderer renders content_blocks directly.
+	// Keep this as plain assistant text for copy/TTS/edit/image prompts; do not
+	// stringify tool results here or heavy research turns become O(huge) per tick.
+	let messageTextContent = $derived(
+		hasStructuredContent
+			? (message?.done ?? false) || message?.error
+				? getStructuredTextContent(message.content_blocks)
+				: getLatestStructuredTextContent(message.content_blocks)
+			: getMessageTextContent(message?.content)
+	);
+	$effect(() => {
+		if (!edit) {
+			(async () => {
+				await tick();
+			})();
+		}
+	});
 </script>
 
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
 	title={$i18n.t('Delete message?')}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteMessageHandler();
 	}}
 />
@@ -699,7 +863,7 @@
 		<div class="flex-auto w-0 pl-1 relative">
 			<Name>
 				<Tooltip content={model?.name ?? message.model} placement="top-start">
-					<span class="line-clamp-1 text-black dark:text-white">
+					<span class="line-clamp-1 text-gray-900 dark:text-gray-100">
 						{model?.name ?? message.model}
 					</span>
 				</Tooltip>
@@ -750,17 +914,19 @@
 						{/if}
 
 						{#if edit === true}
-							<div class="w-full bg-gray-50 dark:bg-gray-800 rounded-3xl px-5 py-3 my-2">
+							<div
+								class="message-edit-box w-full bg-gray-50 dark:bg-gray-800 rounded-2xl px-5 py-3 my-2"
+								data-kb-keep
+							>
 								<textarea
 									id="message-edit-{message.id}"
 									bind:this={editTextAreaElement}
-									class=" bg-transparent outline-hidden w-full resize-none"
+									class="message-edit-scroller block bg-transparent outline-hidden w-full resize-none"
 									bind:value={editedContent}
-									on:input={(e) => {
-										e.target.style.height = '';
-										e.target.style.height = `${e.target.scrollHeight}px`;
+									oninput={(e) => {
+										autoGrowEditTextarea(e.currentTarget);
 									}}
-									on:keydown={(e) => {
+									onkeydown={(e) => {
 										if (e.key === 'Escape') {
 											document.getElementById('close-edit-message-button')?.click();
 										}
@@ -771,27 +937,18 @@
 										if (isCmdOrCtrlPressed && isEnterPressed) {
 											document.getElementById('confirm-edit-message-button')?.click();
 										}
-									}}
-								/>
+									}}></textarea>
 
-								<div class=" mt-2 mb-1 flex justify-between text-sm font-medium">
-									<div>
-										<button
-											id="save-new-message-button"
-											class="px-3.5 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 border border-gray-100 dark:border-gray-700 text-gray-700 dark:text-gray-200 transition rounded-3xl"
-											on:click={() => {
-												saveAsCopyHandler();
-											}}
-										>
-											{$i18n.t('Save As Copy')}
-										</button>
+								<div class="mt-2 flex justify-between text-sm font-medium">
+									<div class="self-center text-xs font-normal text-gray-500 dark:text-gray-400">
+										{$i18n.t('Saved as a new version')}
 									</div>
 
 									<div class="flex space-x-1.5">
 										<button
 											id="close-edit-message-button"
-											class="px-3.5 py-1.5 bg-white dark:bg-gray-900 hover:bg-gray-100 text-gray-800 dark:text-gray-100 transition rounded-3xl"
-											on:click={() => {
+											class="px-3.5 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition rounded-lg"
+											onclick={() => {
 												cancelEditMessage();
 											}}
 										>
@@ -800,8 +957,8 @@
 
 										<button
 											id="confirm-edit-message-button"
-											class="px-3.5 py-1.5 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-gray-800 transition rounded-3xl"
-											on:click={() => {
+											class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-lg"
+											onclick={() => {
 												editMessageConfirmHandler();
 											}}
 										>
@@ -812,7 +969,7 @@
 							</div>
 						{:else}
 							<div class="w-full flex flex-col relative" id="response-content-container">
-								{#if !hasStructuredContent && messageTextContent === '' && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+								{#if !hasStructuredContent && messageTextContent === '' && !message.error && message.done !== true && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
 									<Skeleton />
 								{:else if (messageTextContent || hasStructuredContent) && message.error !== true}
 									<!-- always show message contents even if there's an error -->
@@ -821,8 +978,6 @@
 										id={`${chatId}-${message.id}`}
 										messageId={message.id}
 										{chatId}
-										{history}
-										{selectedModels}
 										content={messageTextContent}
 										content_blocks={Array.isArray(message?.content_blocks)
 											? message.content_blocks
@@ -830,9 +985,6 @@
 										sources={message.sources}
 										sandboxFiles={message.files ?? []}
 										dataVizOverrides={message?.dataVizOverrides ?? {}}
-										floatingButtons={message?.done &&
-											!readOnly &&
-											($settings?.showFloatingActionButtons ?? true)}
 										save={!readOnly}
 										preview={!readOnly}
 										{editCodeBlock}
@@ -848,9 +1000,6 @@
 										onTaskClick={async (e) => {
 											console.log(e);
 										}}
-										onAddMessages={({ modelId, parentId, messages }) => {
-											addMessages({ modelId, parentId, messages });
-										}}
 										onSave={({ raw, oldContent, newContent }) => {
 											history.messages[message.id].content = history.messages[
 												message.id
@@ -858,15 +1007,20 @@
 
 											updateChat();
 										}}
+										onRewind={!readOnly &&
+										message?.done === true &&
+										Array.isArray(message?.content_blocks)
+											? (cutIndex, text) => rewindAndInsert(message, cutIndex, text ?? '')
+											: null}
 									/>
 								{/if}
 
 								{#if message?.retrying && !message?.done}
 									<div
-										class="flex flex-col gap-2 py-3 px-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800"
+										class="flex flex-col gap-2 py-3 px-4 bg-warning/10 rounded-xl border-hairline border-warning/25"
 									>
 										<div
-											class="flex items-center justify-between gap-2 text-sm text-yellow-700 dark:text-yellow-400"
+											class="flex items-center justify-between gap-2 text-sm text-warning dark:text-warning-dark"
 										>
 											<div class="flex items-center gap-2">
 												<svg
@@ -890,8 +1044,12 @@
 													></path>
 												</svg>
 												<span>
-													Attempt {message.retrying.attempt} of {message.retrying.maxAttempts} failed.
-													Retrying in {message.retrying.countdown}s...
+													{#if message.retrying.reason === 'network'}
+														Connection lost — will retry when it returns...
+													{:else}
+														Attempt {message.retrying.attempt} of {message.retrying.maxAttempts} failed.
+														Retrying in {message.retrying.countdown}s...
+													{/if}
 												</span>
 											</div>
 											{#if skipRetryClicked}
@@ -901,8 +1059,8 @@
 											{:else}
 												<button
 													type="button"
-													class="text-xs underline hover:text-yellow-900 dark:hover:text-yellow-200 shrink-0"
-													on:click={() => {
+													class="text-xs underline hover:text-warning dark:hover:text-warning-dark shrink-0"
+													onclick={() => {
 														markSkipRemainingRetries(message.id);
 														skipRetryClicked = true;
 													}}
@@ -911,21 +1069,27 @@
 												</button>
 											{/if}
 										</div>
-										<div class="w-full bg-yellow-200 dark:bg-yellow-800 rounded-full h-1">
+										<div class="w-full bg-warning/20 rounded-full h-1">
 											<div
-												class="bg-yellow-500 h-1 rounded-full transition-all duration-1000"
+												class="bg-warning dark:bg-warning-dark h-1 rounded-full transition-all duration-1000"
 												style="width: {((message.retrying.attempt * 2 -
 													message.retrying.countdown) /
 													(message.retrying.attempt * 2)) *
 													100}%"
-											/>
+											></div>
 										</div>
 									</div>
 								{/if}
 
 								{#if message?.error}
+									<!-- Canonical error shape is {content: str}; legacy error === true keeps
+										the message text in message.content. Any other shape (old persisted
+										rows, raw strings) is handed to Error verbatim — it renders string and
+										object payloads — so a shape mismatch never shows an empty box. -->
 									<Error
-										content={message?.error?.content ?? messageTextContent}
+										content={message?.error === true
+											? messageTextContent
+											: message?.error?.content || message?.error}
 										onRetryWithoutProvider={message?.providerFailed
 											? () => retryWithoutProviderRestrictions(message)
 											: null}
@@ -938,16 +1102,22 @@
 
 				{#if !edit && message?.files && message.files.length > 0}
 					<div class="mt-3 mb-1 flex flex-wrap gap-2">
-						{#each message.files as file}
-							<OutputFileItem item={file} />
+						{#each message.files as file (file?.id ?? file?.url ?? file)}
+							<OutputFileItem item={file} sandboxFiles={message.files} />
 						{/each}
 					</div>
 				{/if}
 
 				{#if !edit}
+					<!-- max-md:-mx-2.5 cancels the buttons' own 10px touch padding so the
+					     icon column lines up with the message text above it — and, because
+					     the row is then as wide as the message, buys back the ~20px that
+					     used to push the last action (usually Delete) onto a second line
+					     on a 390px phone. flex-wrap stays as the graceful fallback for
+					     setups with even more actions (ratings, image generation). -->
 					<div
 						bind:this={buttonsContainerElement}
-						class="flex justify-start overflow-x-auto buttons text-gray-600 dark:text-gray-500 mt-0.5"
+						class="flex justify-start overflow-x-auto buttons text-gray-600 dark:text-gray-500 mt-0.5 max-md:-mx-2.5 max-md:flex-wrap max-md:gap-y-1"
 					>
 						{#if !message.done && !readOnly && isLastMessage}
 							<!-- Model switcher shown during generation -->
@@ -967,8 +1137,8 @@
 								<div class="flex self-center min-w-fit" dir="ltr">
 									<button
 										aria-label={$i18n.t('Previous message')}
-										class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-										on:click={() => {
+										class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+										onclick={() => {
 											showPreviousMessage(message);
 										}}
 									>
@@ -979,7 +1149,7 @@
 											viewBox="0 0 24 24"
 											stroke="currentColor"
 											stroke-width="2.5"
-											class="size-3.5"
+											class="size-4"
 										>
 											<path
 												stroke-linecap="round"
@@ -991,7 +1161,7 @@
 
 									{#if messageIndexEdit}
 										<div
-											class="text-sm flex justify-center font-semibold self-center dark:text-gray-100 min-w-fit"
+											class="text-sm flex justify-center font-semibold self-center dark:text-gray-100 min-w-fit max-md:px-1"
 										>
 											<input
 												id="message-index-input-{message.id}"
@@ -999,14 +1169,14 @@
 												value={siblings.indexOf(message.id) + 1}
 												min="1"
 												max={siblings.length}
-												on:focus={(e) => {
+												onfocus={(e) => {
 													e.target.select();
 												}}
-												on:blur={(e) => {
+												onblur={(e) => {
 													gotoMessage(message, e.target.value - 1);
 													messageIndexEdit = false;
 												}}
-												on:keydown={(e) => {
+												onkeydown={(e) => {
 													if (e.key === 'Enter') {
 														gotoMessage(message, e.target.value - 1);
 														messageIndexEdit = false;
@@ -1016,16 +1186,16 @@
 											/>/{siblings.length}
 										</div>
 									{:else}
-										<!-- svelte-ignore a11y-no-static-element-interactions -->
+										<!-- svelte-ignore a11y_no_static_element_interactions -->
 										<div
-											class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit"
-											on:dblclick={async () => {
+											class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit max-md:px-1"
+											ondblclick={async () => {
 												messageIndexEdit = true;
 
 												await tick();
 												const input = document.getElementById(`message-index-input-${message.id}`);
 												if (input) {
-													input.focus();
+													input.focus({ preventScroll: true });
 													input.select();
 												}
 											}}
@@ -1035,8 +1205,8 @@
 									{/if}
 
 									<button
-										class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-										on:click={() => {
+										class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+										onclick={() => {
 											showNextMessage(message);
 										}}
 										aria-label={$i18n.t('Next message')}
@@ -1048,7 +1218,7 @@
 											viewBox="0 0 24 24"
 											stroke="currentColor"
 											stroke-width="2.5"
-											class="size-3.5"
+											class="size-4"
 										>
 											<path
 												stroke-linecap="round"
@@ -1068,8 +1238,8 @@
 												aria-label={$i18n.t('Edit')}
 												class="{isLastMessage || ($settings?.highContrastMode ?? false)
 													? 'visible'
-													: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-												on:click={() => {
+													: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+												onclick={() => {
 													editMessageHandler();
 												}}
 											>
@@ -1098,8 +1268,8 @@
 										aria-label={$i18n.t('Copy')}
 										class="{isLastMessage || ($settings?.highContrastMode ?? false)
 											? 'visible'
-											: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition copy-response-button"
-										on:click={() => {
+											: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition copy-response-button"
+										onclick={() => {
 											copyToClipboard(messageTextContent);
 										}}
 									>
@@ -1128,8 +1298,8 @@
 											id="speak-button-{message.id}"
 											class="{isLastMessage || ($settings?.highContrastMode ?? false)
 												? 'visible'
-												: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-											on:click={() => {
+												: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+											onclick={() => {
 												if (!loadingSpeech) {
 													toggleSpeakMessage();
 												}
@@ -1211,8 +1381,8 @@
 											aria-label={$i18n.t('Generate Image')}
 											class="{isLastMessage || ($settings?.highContrastMode ?? false)
 												? 'visible'
-												: 'invisible group-hover:visible'}  p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-											on:click={() => {
+												: 'invisible group-hover:visible'}  p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+											onclick={() => {
 												if (!generatingImage) {
 													generateImage(message);
 												}
@@ -1293,7 +1463,7 @@
 											aria-hidden="true"
 											class=" {isLastMessage || ($settings?.highContrastMode ?? false)
 												? 'visible'
-												: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition whitespace-pre-wrap"
+												: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition whitespace-pre-wrap"
 											id="info-{message.id}"
 										>
 											<svg
@@ -1322,18 +1492,18 @@
 												aria-label={$i18n.t('Good Response')}
 												class="{isLastMessage || ($settings?.highContrastMode ?? false)
 													? 'visible'
-													: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg {(
+													: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg {(
 													message?.annotation?.rating ?? ''
 												).toString() === '1'
 													? 'bg-gray-100 dark:bg-gray-800'
 													: ''} dark:hover:text-white hover:text-black transition disabled:cursor-progress disabled:hover:bg-transparent"
 												disabled={feedbackLoading}
-												on:click={async () => {
+												onclick={async () => {
 													await feedbackHandler(1);
 													window.setTimeout(() => {
 														document
 															.getElementById(`message-feedback-${message.id}`)
-															?.scrollIntoView();
+															?.scrollIntoView({ block: 'nearest' });
 													}, 0);
 												}}
 											>
@@ -1360,18 +1530,18 @@
 												aria-label={$i18n.t('Bad Response')}
 												class="{isLastMessage || ($settings?.highContrastMode ?? false)
 													? 'visible'
-													: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg {(
+													: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg {(
 													message?.annotation?.rating ?? ''
 												).toString() === '-1'
 													? 'bg-gray-100 dark:bg-gray-800'
 													: ''} dark:hover:text-white hover:text-black transition disabled:cursor-progress disabled:hover:bg-transparent"
 												disabled={feedbackLoading}
-												on:click={async () => {
+												onclick={async () => {
 													await feedbackHandler(-1);
 													window.setTimeout(() => {
 														document
 															.getElementById(`message-feedback-${message.id}`)
-															?.scrollIntoView();
+															?.scrollIntoView({ block: 'nearest' });
 													}, 0);
 												}}
 											>
@@ -1402,8 +1572,8 @@
 												id="continue-response-button"
 												class="{isLastMessage || ($settings?.highContrastMode ?? false)
 													? 'visible'
-													: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-												on:click={() => {
+													: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+												onclick={() => {
 													continueResponse();
 												}}
 											>
@@ -1436,7 +1606,7 @@
 											<button
 												type="button"
 												class="hidden regenerate-response-button"
-												on:click={() => {
+												onclick={() => {
 													showRateComment = false;
 													regenerateResponse(message);
 
@@ -1452,7 +1622,7 @@
 														});
 													});
 												}}
-											/>
+											></button>
 
 											<RegenerateMenu
 												onRegenerate={(prompt = null) => {
@@ -1476,6 +1646,11 @@
 													regenerateWithModel(message, modelId, preserveToolContext);
 												}}
 												currentModelId={message.model}
+												retryModelId={resolveRetryModelId({
+													selectedModelIds: selectedModels,
+													modelIdx: message.modelIdx,
+													fallbackModelId: message.model
+												}) ?? message.model}
 												hasToolCalls={hasRenderableToolCalls(message, messageTextContent)}
 											>
 												<Tooltip content={$i18n.t('Regenerate')} placement="bottom">
@@ -1483,7 +1658,7 @@
 														aria-label={$i18n.t('Regenerate')}
 														class="{isLastMessage
 															? 'visible'
-															: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+															: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
 													>
 														<svg
 															xmlns="http://www.w3.org/2000/svg"
@@ -1510,8 +1685,8 @@
 													aria-label={$i18n.t('Regenerate')}
 													class="{isLastMessage
 														? 'visible'
-														: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition regenerate-response-button"
-													on:click={() => {
+														: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition regenerate-response-button"
+													onclick={() => {
 														showRateComment = false;
 														regenerateResponse(message);
 
@@ -1557,8 +1732,8 @@
 													id="delete-response-button"
 													class="{isLastMessage || ($settings?.highContrastMode ?? false)
 														? 'visible'
-														: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-													on:click={() => {
+														: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+													onclick={() => {
 														showDeleteConfirm = true;
 													}}
 												>
@@ -1590,8 +1765,8 @@
 													aria-label={action.name}
 													class="{isLastMessage || ($settings?.highContrastMode ?? false)
 														? 'visible'
-														: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-													on:click={() => {
+														: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+													onclick={() => {
 														actionMessage(action.id, message);
 													}}
 												>
@@ -1618,34 +1793,41 @@
 						{/if}
 					</div>
 
-					{#if message.done && showRateComment}
-						<RateComment
-							bind:message
-							bind:show={showRateComment}
-							on:save={async (e) => {
-								await feedbackHandler(null, {
-									...e.detail
-								});
-							}}
-						/>
-					{/if}
-
-					{#if (isLastMessage || ($settings?.keepFollowUpPrompts ?? false)) && message.done && !readOnly && (message?.followUps ?? []).length > 0}
-						<div class="mt-2.5" in:fade={{ duration: 100 }}>
-							<FollowUps
-								followUps={message?.followUps}
-								onClick={(prompt) => {
-									if ($settings?.insertFollowUpPrompt ?? false) {
-										// Insert the follow-up prompt into the input box
-										setInputText(prompt);
-									} else {
-										// Submit the follow-up prompt directly
-										submitMessage(message?.id, prompt);
-									}
+					<!-- Reserve box: holds the post-reply UI (rate comment + follow-up row).
+					     min-height keeps the streaming reply at its settled height so the
+					     follow-ups, which arrive after completion, fill this space instead
+					     of jumping the reply upward. Inert (no min-height) when the reply
+					     isn't the live one expecting follow-ups. -->
+					<div style={followUpReserveActive ? `min-height: ${FOLLOW_UP_RESERVE_PX}px` : ''}>
+						{#if message.done && showRateComment}
+							<RateComment
+								bind:message
+								bind:show={showRateComment}
+								onsave={async (e) => {
+									await feedbackHandler(null, {
+										...e.detail
+									});
 								}}
 							/>
-						</div>
-					{/if}
+						{/if}
+
+						{#if (isLastMessage || ($settings?.keepFollowUpPrompts ?? false)) && message.done && !readOnly && (message?.followUps ?? []).length > 0}
+							<div class="mt-2.5" in:fade={{ duration: 100 }}>
+								<FollowUps
+									followUps={message?.followUps}
+									onClick={(prompt) => {
+										if ($settings?.insertFollowUpPrompt ?? false) {
+											// Insert the follow-up prompt into the input box
+											setInputText(prompt);
+										} else {
+											// Submit the follow-up prompt directly
+											submitMessage(message?.id, prompt);
+										}
+									}}
+								/>
+							</div>
+						{/if}
+					</div>
 				{/if}
 			</div>
 		</div>

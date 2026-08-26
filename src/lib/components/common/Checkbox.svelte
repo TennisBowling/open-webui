@@ -1,44 +1,57 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
-	const dispatch = createEventDispatcher();
+	interface Props {
+		state?: string;
+		indeterminate?: boolean;
+		disabled?: boolean;
+		onchange?: (state: string) => void;
+	}
 
-	export let state = 'unchecked';
-	export let indeterminate = false;
-	export let disabled = false;
+	// NB: the prop is aliased on purpose. A binding literally named `state`
+	// shadows the `$state` rune, so `$state('unchecked')` below silently
+	// compiles to `$state()('unchecked')` — a store subscription on the prop —
+	// and every render throws "state.subscribe is not a function". The compiler
+	// gives no warning for this, so keep the local name off `state`.
+	let {
+		state: checkedState = 'unchecked',
+		indeterminate = false,
+		disabled = false,
+		onchange
+	}: Props = $props();
 
-	let _state = 'unchecked';
-
-	$: _state = state;
+	let internalState = $state('unchecked');
+	$effect.pre(() => {
+		internalState = checkedState;
+	});
 </script>
 
 <button
-	class=" outline -outline-offset-1 outline-[1.5px] outline-gray-200 dark:outline-gray-600 {state !==
+	class=" outline -outline-offset-1 outline-[1.5px] outline-gray-200 dark:outline-gray-600 {checkedState !==
 	'unchecked'
-		? 'bg-black outline-black '
+		? 'bg-book-cloth outline-book-cloth '
 		: 'hover:outline-gray-500 hover:bg-gray-50 dark:hover:bg-gray-800'} text-white transition-all rounded-sm inline-block w-3.5 h-3.5 relative {disabled
 		? 'opacity-50 cursor-not-allowed'
 		: ''}"
-	on:click={() => {
+	onclick={() => {
 		if (disabled) return;
 
-		if (_state === 'unchecked') {
-			_state = 'checked';
-			dispatch('change', _state);
-		} else if (_state === 'checked') {
-			_state = 'unchecked';
+		if (internalState === 'unchecked') {
+			internalState = 'checked';
+			onchange?.(internalState);
+		} else if (internalState === 'checked') {
+			internalState = 'unchecked';
 			if (!indeterminate) {
-				dispatch('change', _state);
+				onchange?.(internalState);
 			}
 		} else if (indeterminate) {
-			_state = 'checked';
-			dispatch('change', _state);
+			internalState = 'checked';
+			onchange?.(internalState);
 		}
 	}}
 	type="button"
 	{disabled}
 >
 	<div class="top-0 left-0 absolute w-full flex justify-center">
-		{#if _state === 'checked'}
+		{#if internalState === 'checked'}
 			<svg
 				class="w-3.5 h-3.5"
 				aria-hidden="true"

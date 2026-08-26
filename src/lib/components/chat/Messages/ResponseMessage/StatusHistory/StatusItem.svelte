@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 	import WebSearchResults from '../WebSearchResults.svelte';
@@ -6,8 +6,12 @@
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import { t } from 'i18next';
 
-	export let status = null;
-	export let done = false;
+	interface Props {
+		status?: any;
+		done?: boolean;
+	}
+
+	let { status = null, done = false }: Props = $props();
 </script>
 
 {#if !status?.hidden}
@@ -120,21 +124,26 @@
 						className="w-full"
 						buttonClassName="text-gray-500 dark:text-gray-500"
 					>
-						<div slot="content" class="mt-2 space-y-2 text-sm px-2">
-							{#if status.vision_prompt}
-								<div><strong>System Prompt:</strong></div>
-								<pre
-									class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-32 whitespace-pre-wrap">{status.vision_prompt}</pre>
-							{/if}
-							{#if status.vision_response}
-								<div><strong>Vision Model Response:</strong></div>
-								<pre
-									class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-48 whitespace-pre-wrap">{status.vision_response}</pre>
-							{/if}
-							{#if status.error}
-								<div class="text-red-600"><strong>Error:</strong> {status.error}</div>
-							{/if}
-						</div>
+						{#snippet content()}
+							<div class="mt-2 space-y-2 text-sm px-2">
+								{#if status.vision_prompt}
+									<div><strong>System Prompt:</strong></div>
+									<pre
+										class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-32 whitespace-pre-wrap">{status.vision_prompt}</pre>
+								{/if}
+								{#if status.vision_response}
+									<div><strong>Vision Model Response:</strong></div>
+									<pre
+										class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-48 whitespace-pre-wrap">{status.vision_response}</pre>
+								{/if}
+								{#if status.error}
+									<div class="text-error-brick dark:text-error-brick-dark">
+										<strong>Error:</strong>
+										{status.error}
+									</div>
+								{/if}
+							</div>
+						{/snippet}
 					</Collapsible>
 				{:else}
 					<div
@@ -155,21 +164,26 @@
 						className="w-full"
 						buttonClassName="text-gray-500 dark:text-gray-500"
 					>
-						<div slot="content" class="mt-2 space-y-2 text-sm px-2">
-							{#if status.vision_prompt}
-								<div><strong>System Prompt:</strong></div>
-								<pre
-									class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-32 whitespace-pre-wrap">{status.vision_prompt}</pre>
-							{/if}
-							{#if status.vision_response}
-								<div><strong>PDF Vision Analysis:</strong></div>
-								<pre
-									class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-64 whitespace-pre-wrap">{status.vision_response}</pre>
-							{/if}
-							{#if status.error}
-								<div class="text-red-600"><strong>Error:</strong> {status.error}</div>
-							{/if}
-						</div>
+						{#snippet content()}
+							<div class="mt-2 space-y-2 text-sm px-2">
+								{#if status.vision_prompt}
+									<div><strong>System Prompt:</strong></div>
+									<pre
+										class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-32 whitespace-pre-wrap">{status.vision_prompt}</pre>
+								{/if}
+								{#if status.vision_response}
+									<div><strong>PDF Vision Analysis:</strong></div>
+									<pre
+										class="p-2 bg-gray-50 dark:bg-gray-850 rounded text-xs overflow-auto max-h-64 whitespace-pre-wrap">{status.vision_response}</pre>
+								{/if}
+								{#if status.error}
+									<div class="text-error-brick dark:text-error-brick-dark">
+										<strong>Error:</strong>
+										{status.error}
+									</div>
+								{/if}
+							</div>
+						{/snippet}
 					</Collapsible>
 				{:else}
 					<div

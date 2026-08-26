@@ -1,8 +1,7 @@
 <script lang="ts">
 	import { marked } from 'marked';
 
-	import { toast } from 'svelte-sonner';
-	import Sortable from 'sortablejs';
+	import { toast } from '$lib/utils/toast';
 
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -42,30 +41,26 @@
 	import ViewSelector from './common/ViewSelector.svelte';
 	import TagSelector from './common/TagSelector.svelte';
 
-	let shiftKey = false;
+	let shiftKey = $state(false);
 
-	let importFiles;
-	let modelsImportInputElement: HTMLInputElement;
-	let tagsContainerElement: HTMLDivElement;
+	let importFiles = $state();
+	let modelsImportInputElement: HTMLInputElement = $state();
+	let tagsContainerElement: HTMLDivElement = $state();
 
-	let loaded = false;
+	let loaded = $state(false);
 
-	let models = [];
-	let tags = [];
+	let models = $state([]);
+	let tags = $state([]);
 
-	let viewOption = '';
-	let selectedTag = '';
+	let viewOption = $state('');
+	let selectedTag = $state('');
 
-	let filteredModels = [];
-	let selectedModel = null;
+	let filteredModels = $state([]);
+	let selectedModel = $state(null);
 
-	let showModelDeleteConfirm = false;
+	let showModelDeleteConfirm = $state(false);
 
-	let group_ids = [];
-
-	$: if (models && query !== undefined && selectedTag !== undefined && viewOption !== undefined) {
-		setFilteredModels();
-	}
+	let group_ids = $state([]);
 
 	const setFilteredModels = async () => {
 		filteredModels = models.filter((m) => {
@@ -84,7 +79,7 @@
 		});
 	};
 
-	let query = '';
+	let query = $state('');
 	const deleteModelHandler = async (model) => {
 		const res = await deleteModelById(localStorage.token, model.id).catch((e) => {
 			toast.error(`${e}`);
@@ -232,6 +227,11 @@
 			window.removeEventListener('blur-sm', onBlur);
 		};
 	});
+	$effect(() => {
+		if (models && query !== undefined && selectedTag !== undefined && viewOption !== undefined) {
+			setFilteredModels();
+		}
+	});
 </script>
 
 <svelte:head>
@@ -243,7 +243,7 @@
 {#if loaded}
 	<ModelDeleteConfirmDialog
 		bind:show={showModelDeleteConfirm}
-		on:confirm={() => {
+		onconfirm={() => {
 			deleteModelHandler(selectedModel);
 		}}
 	/>
@@ -256,7 +256,7 @@
 			type="file"
 			accept=".json"
 			hidden
-			on:change={() => {
+			onchange={() => {
 				console.log(importFiles);
 
 				let reader = new FileReader();
@@ -311,7 +311,7 @@
 				{#if $user?.role === 'admin'}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-						on:click={() => {
+						onclick={() => {
 							modelsImportInputElement.click();
 						}}
 					>
@@ -323,7 +323,7 @@
 					{#if models.length}
 						<button
 							class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-							on:click={async () => {
+							onclick={async () => {
 								downloadModels(models);
 							}}
 						>
@@ -334,7 +334,7 @@
 					{/if}
 				{/if}
 				<a
-					class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+					class=" px-2 py-1.5 max-md:p-2.5 max-md:min-w-9 max-md:min-h-9 max-md:justify-center rounded-full bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper font-medium text-sm flex items-center"
 					href="/workspace/models/create"
 				>
 					<Plus className="size-3" strokeWidth="2.5" />
@@ -346,7 +346,7 @@
 	</div>
 
 	<div
-		class="py-2 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100 dark:border-gray-850"
+		class="py-2 bg-white dark:bg-gray-900 rounded-2xl border-hairline border-gray-100 dark:border-gray-850"
 	>
 		<div class="px-3.5 flex flex-1 items-center w-full space-x-2 py-0.5 pb-2">
 			<div class="flex flex-1 items-center">
@@ -360,14 +360,14 @@
 				/>
 
 				{#if query}
-					<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
+					<div class="self-center pl-1.5 bg-transparent">
 						<button
-							class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-							on:click={() => {
+							class="p-0.5 max-md:p-2 rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-850 transition"
+							onclick={() => {
 								query = '';
 							}}
 						>
-							<XMark className="size-3" strokeWidth="2" />
+							<XMark className="size-3 max-md:size-4" strokeWidth="2" />
 						</button>
 					</div>
 				{/if}
@@ -376,7 +376,7 @@
 
 		<div
 			class="px-3 flex w-full bg-transparent overflow-x-auto scrollbar-none"
-			on:wheel={(e) => {
+			onwheel={(e) => {
 				if (e.deltaY !== 0) {
 					e.preventDefault();
 					e.currentTarget.scrollLeft += e.deltaY;
@@ -411,10 +411,18 @@
 		{#if (filteredModels ?? []).length !== 0}
 			<div class=" px-3 my-2 gap-1 lg:gap-2 grid lg:grid-cols-2" id="model-list">
 				{#each filteredModels as model (model.id)}
-					<button
+					<div
+						role="link"
+						tabindex="0"
 						class="  flex cursor-pointer dark:hover:bg-gray-850/50 hover:bg-gray-50 transition rounded-2xl w-full p-2.5"
 						id="model-item-{model.id}"
-						on:click={() => {
+						onkeydown={(event) => {
+							if (event.key === 'Enter' || event.key === ' ') {
+								event.preventDefault();
+								event.currentTarget.click();
+							}
+						}}
+						onclick={() => {
 							if (
 								$user?.role === 'admin' ||
 								model.user_id === $user?.id ||
@@ -461,15 +469,15 @@
 												>
 													<div class="flex justify-between items-center w-full">
 														<div class=""></div>
-														<div class="flex flex-row gap-0.5 items-center">
+														<div class="flex flex-row gap-0.5 max-md:gap-1 items-center">
 															{#if shiftKey}
 																<Tooltip
 																	content={model?.meta?.hidden ? $i18n.t('Show') : $i18n.t('Hide')}
 																>
 																	<button
-																		class="self-center w-fit text-sm p-1.5 dark:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+																		class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 																		type="button"
-																		on:click={(e) => {
+																		onclick={(e) => {
 																			e.stopPropagation();
 																			hideModelHandler(model);
 																		}}
@@ -484,9 +492,9 @@
 
 																<Tooltip content={$i18n.t('Delete')}>
 																	<button
-																		class="self-center w-fit text-sm p-1.5 dark:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+																		class="self-center w-fit text-sm p-1.5 max-md:p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 																		type="button"
-																		on:click={(e) => {
+																		onclick={(e) => {
 																			e.stopPropagation();
 																			deleteModelHandler(model);
 																		}}
@@ -520,7 +528,7 @@
 																	onClose={() => {}}
 																>
 																	<div
-																		class="self-center w-fit p-1 text-sm dark:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+																		class="self-center w-fit p-1.5 max-md:p-2 text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg transition"
 																	>
 																		<EllipsisHorizontal className="size-5" />
 																	</div>
@@ -531,7 +539,7 @@
 												</div>
 
 												<button
-													on:click={(e) => {
+													onclick={(e) => {
 														e.stopPropagation();
 													}}
 												>
@@ -540,7 +548,7 @@
 													>
 														<Switch
 															bind:state={model.is_active}
-															on:change={async () => {
+															onchange={async () => {
 																toggleModelById(localStorage.token, model.id);
 																_models.set(
 																	await getModels(
@@ -593,7 +601,7 @@
 								</div>
 							</div>
 						</div>
-					</button>
+					</div>
 				{/each}
 			</div>
 		{:else}

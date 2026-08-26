@@ -2,16 +2,41 @@
 	import { getContext, tick } from 'svelte';
 	import Tooltip from '../../common/Tooltip.svelte';
 	import XMark from '../../icons/XMark.svelte';
+	import { isOnScreenKeyboardDevice } from '$lib/utils/device';
+
+	// After finishing (or cancelling) a queued-message edit, hand focus back to
+	// the composer — hardware-keyboard devices only; on touch this made the
+	// keyboard bounce closed-then-open on every ✓/✗ tap.
+	const refocusComposer = () => {
+		if (isOnScreenKeyboardDevice()) return;
+		tick().then(() => document.getElementById('chat-input')?.focus());
+	};
 
 	const i18n: any = getContext('i18n');
 
-	export let queue: any[] = [];
-	export let editQueuedMessage: (id: string, text: string) => void = () => {};
-	export let removeQueuedMessage: (id: string) => void = () => {};
+	// True when items are queued but nothing is generating (e.g. after Stop) — the
+	// queue is paused and will only resume on the next send unless the user hits
 
-	let editingId: string | null = null;
-	let editingText = '';
-	let editingTextarea: HTMLTextAreaElement | null = null;
+	interface Props {
+		queue?: any[];
+		editQueuedMessage?: (id: string, text: string) => void;
+		removeQueuedMessage?: (id: string) => void;
+		sendQueuedNow?: () => void;
+		// "Send now".
+		paused?: boolean;
+	}
+
+	let {
+		queue = [],
+		editQueuedMessage = () => {},
+		removeQueuedMessage = () => {},
+		sendQueuedNow = () => {},
+		paused = false
+	}: Props = $props();
+
+	let editingId: string | null = $state(null);
+	let editingText = $state('');
+	let editingTextarea: HTMLTextAreaElement | null = $state(null);
 
 	const startEdit = async (item: any) => {
 		editingId = item.id;
@@ -29,6 +54,7 @@
 		const text = editingText;
 		editingId = null;
 		editingText = '';
+		refocusComposer();
 		// Cancel if the user emptied the message — that's effectively unqueueing.
 		if (text.trim() === '') {
 			removeQueuedMessage(id);
@@ -40,6 +66,7 @@
 	const cancelEdit = () => {
 		editingId = null;
 		editingText = '';
+		refocusComposer();
 	};
 
 	const onEditorKeydown = (e: KeyboardEvent) => {
@@ -64,6 +91,22 @@
 
 {#if queue.length > 0}
 	<div class="mx-1 mt-2 mb-1 flex flex-col gap-1.5" aria-label={$i18n.t('Queued messages')}>
+		{#if paused}
+			<div
+				class="flex items-center justify-between gap-2 rounded-2xl border-hairline border-warning/25 bg-warning/10 px-3 py-1.5"
+			>
+				<span class="min-w-0 truncate text-xs text-warning dark:text-warning-dark">
+					{$i18n.t('Paused — will resume on your next message')}
+				</span>
+				<button
+					type="button"
+					class="shrink-0 rounded-full bg-book-cloth px-3 py-1 text-xs font-medium text-white hover:bg-kraft transition-colors duration-200 ease-paper"
+					onclick={() => sendQueuedNow()}
+				>
+					{$i18n.t('Send now')}
+				</button>
+			</div>
+		{/if}
 		{#each queue as item, idx (item.id)}
 			<div
 				class="group flex items-start gap-2 rounded-2xl border-hairline border-gray-200 dark:border-gray-800 bg-gray-50/80 dark:bg-gray-850/60 px-3 py-2 text-sm"
@@ -80,23 +123,22 @@
 						<textarea
 							bind:this={editingTextarea}
 							bind:value={editingText}
-							on:keydown={onEditorKeydown}
+							onkeydown={onEditorKeydown}
 							rows="2"
-							class="w-full resize-none bg-transparent text-gray-800 dark:text-gray-100 outline-hidden placeholder-gray-400"
-							placeholder={$i18n.t('Edit queued message')}
-						></textarea>
+							class="w-full resize-none bg-transparent text-gray-800 dark:text-gray-100 outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700"
+							placeholder={$i18n.t('Edit queued message')}></textarea>
 						<div class="mt-1 flex items-center gap-2">
 							<button
 								type="button"
-								class="rounded-full bg-book-cloth px-3 py-1 text-xs font-medium text-white hover:bg-kraft"
-								on:click={commitEdit}
+								class="rounded-full bg-book-cloth px-3 py-1 text-xs font-medium text-white hover:bg-kraft transition-colors duration-200 ease-paper"
+								onclick={commitEdit}
 							>
 								{$i18n.t('Done')}
 							</button>
 							<button
 								type="button"
-								class="rounded-full px-3 py-1 text-xs text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
-								on:click={cancelEdit}
+								class="rounded-full px-3 py-1 text-xs text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors duration-200 ease-paper"
+								onclick={cancelEdit}
 							>
 								{$i18n.t('Cancel')}
 							</button>
@@ -117,7 +159,9 @@
 										fill="currentColor"
 										class="size-2.5"
 									>
-										<path d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z" />
+										<path
+											d="M8 1.5 14.5 8 8 14.5 6.94 13.44l4.3-4.3H1.5v-1.5h9.74l-4.3-4.3L8 1.5Z"
+										/>
 									</svg>
 									{$i18n.t('Steer')}
 								</span>
@@ -134,7 +178,7 @@
 							type="button"
 							class="block w-full text-left text-gray-800 dark:text-gray-100 line-clamp-2 leading-snug hover:underline decoration-dotted underline-offset-2"
 							title={$i18n.t('Click to edit')}
-							on:click={() => startEdit(item)}
+							onclick={() => startEdit(item)}
 						>
 							{preview(item.prompt)}
 						</button>
@@ -147,13 +191,13 @@
 				</div>
 
 				{#if editingId !== item.id}
-					<div class="flex shrink-0 items-center gap-1">
+					<div class="flex shrink-0 items-center gap-1 max-md:gap-2">
 						<Tooltip content={$i18n.t('Edit')}>
 							<button
 								type="button"
-								class="rounded-full p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+								class="rounded-full p-1 max-md:p-2.5 inline-flex items-center justify-center text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
 								aria-label={$i18n.t('Edit queued message')}
-								on:click={() => startEdit(item)}
+								onclick={() => startEdit(item)}
 							>
 								<svg
 									xmlns="http://www.w3.org/2000/svg"
@@ -170,9 +214,9 @@
 						<Tooltip content={$i18n.t('Remove from queue')}>
 							<button
 								type="button"
-								class="rounded-full p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+								class="rounded-full p-1 max-md:p-2.5 inline-flex items-center justify-center text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
 								aria-label={$i18n.t('Remove queued message')}
-								on:click={() => removeQueuedMessage(item.id)}
+								onclick={() => removeQueuedMessage(item.id)}
 							>
 								<XMark className="size-4" />
 							</button>

@@ -1,6 +1,8 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext } from 'svelte';
 	import { addUser } from '$lib/apis/auths';
 
@@ -31,19 +33,29 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
-	export let show = false;
+	interface Props {
+		show?: boolean;
+		type?: string;
+		id?: any;
+		userValves?: boolean;
+	}
 
-	export let type = 'tool';
-	export let id = null;
-	export let userValves = false;
+	let {
+		show = $bindable(false),
+		type = 'tool',
+		id = null,
+		userValves = false,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	let saving = false;
-	let loading = false;
+	let saving = $state(false);
+	let loading = $state(false);
 
-	let valvesSpec = null;
-	let valves = {};
+	let valvesSpec = $state(null);
+	let valves = $state({});
 
 	const submitHandler = async () => {
 		saving = true;
@@ -147,9 +159,11 @@
 		}
 	};
 
-	$: if (show) {
-		initHandler();
-	}
+	$effect(() => {
+		if (show) {
+			initHandler();
+		}
+	});
 </script>
 
 <Modal size="sm" bind:show>
@@ -157,8 +171,8 @@
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-2">
 			<div class=" text-lg font-medium self-center">{$i18n.t('Valves')}</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -170,9 +184,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class="px-1">
 						{#if !loading}

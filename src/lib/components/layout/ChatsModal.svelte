@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext } from 'svelte';
 
 	import dayjs from 'dayjs';
@@ -8,6 +8,8 @@
 	dayjs.extend(localizedFormat);
 
 	import { deleteChatById } from '$lib/apis/chats';
+	import { user } from '$lib/stores';
+	import { removeOfflineChat } from '$lib/offline/manager';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -21,29 +23,43 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
+	let selectedChatId = $state(null);
+	let selectedIdx = $state(0);
+	let showDeleteConfirmDialog = $state(false);
 
-	export let title = 'Chats';
-	export let emptyPlaceholder = '';
-	export let shareUrl = false;
+	interface Props {
+		show?: boolean;
+		title?: string;
+		emptyPlaceholder?: string;
+		shareUrl?: boolean;
+		query?: string;
+		orderBy?: string;
+		direction?: string; // 'asc' or 'desc'
+		chatList?: any;
+		allChatsLoaded?: boolean;
+		chatListLoading?: boolean;
+		onUpdate?: any;
+		loadHandler?: null | Function;
+		unarchiveHandler?: null | Function;
+		footer?: import('svelte').Snippet;
+	}
 
-	export let query = '';
-
-	export let orderBy = 'updated_at';
-	export let direction = 'desc'; // 'asc' or 'desc'
-
-	export let chatList = null;
-	export let allChatsLoaded = false;
-	export let chatListLoading = false;
-
-	let selectedChatId = null;
-	let selectedIdx = 0;
-	let showDeleteConfirmDialog = false;
-
-	export let onUpdate = () => {};
-
-	export let loadHandler: null | Function = null;
-	export let unarchiveHandler: null | Function = null;
+	let {
+		show = $bindable(false),
+		title = 'Chats',
+		emptyPlaceholder = '',
+		shareUrl = false,
+		query = $bindable(''),
+		orderBy = $bindable('updated_at'),
+		direction = $bindable('desc'),
+		chatList = null,
+		allChatsLoaded = false,
+		chatListLoading = false,
+		onUpdate = () => {},
+		loadHandler = null,
+		unarchiveHandler = null,
+		footer
+	}: Props = $props();
 
 	const setSortKey = (key) => {
 		if (orderBy === key) {
@@ -57,7 +73,14 @@
 	const deleteHandler = async (chatId) => {
 		const res = await deleteChatById(localStorage.token, chatId).catch((error) => {
 			toast.error(`${error}`);
+			return null;
 		});
+
+		// The backend's chat:deleted broadcast skips the originating session, so
+		// clean up this device's offline copy directly (mirrors ChatItem).
+		if (res && $user?.id) {
+			void removeOfflineChat($user.id, chatId);
+		}
 
 		onUpdate();
 	};
@@ -65,7 +88,7 @@
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	on:confirm={() => {
+	onconfirm={() => {
 		if (selectedChatId) {
 			deleteHandler(selectedChatId);
 			selectedChatId = null;
@@ -78,8 +101,8 @@
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-1">
 			<div class=" text-lg font-medium self-center">{title}</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="tap-target self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -125,7 +148,7 @@
 						<div class="self-center pl-1.5 pr-1 translate-y-[0.5px] rounded-l-xl bg-transparent">
 							<button
 								class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-								on:click={() => {
+								onclick={() => {
 									query = '';
 									selectedIdx = 0;
 								}}
@@ -144,7 +167,7 @@
 							<div class="flex text-xs font-medium mb-1.5">
 								<button
 									class="px-1.5 py-1 cursor-pointer select-none basis-3/5"
-									on:click={() => setSortKey('title')}
+									onclick={() => setSortKey('title')}
 								>
 									<div class="flex gap-1.5 items-center">
 										{$i18n.t('Title')}
@@ -166,7 +189,7 @@
 								</button>
 								<button
 									class="px-1.5 py-1 cursor-pointer select-none hidden sm:flex sm:basis-2/5 justify-end"
-									on:click={() => setSortKey('updated_at')}
+									onclick={() => setSortKey('updated_at')}
 								>
 									<div class="flex gap-1.5 items-center">
 										{$i18n.t('Updated at')}
@@ -233,7 +256,7 @@
 									<a
 										class=" basis-3/5"
 										href={shareUrl ? `/s/${chat.id}` : `/c/${chat.id}`}
-										on:click={() => (show = false)}
+										onclick={() => (show = false)}
 									>
 										<div class="text-ellipsis line-clamp-1 w-full">
 											{chat?.title}
@@ -250,7 +273,7 @@
 												<Tooltip content={$i18n.t('Unarchive Chat')}>
 													<button
 														class="self-center w-fit px-1 text-sm rounded-xl"
-														on:click={async (e) => {
+														onclick={async (e) => {
 															e.stopImmediatePropagation();
 															e.stopPropagation();
 															unarchiveHandler(chat.id);
@@ -277,7 +300,7 @@
 											<Tooltip content={$i18n.t('Delete Chat')}>
 												<button
 													class="self-center w-fit px-1 text-sm rounded-xl"
-													on:click={async (e) => {
+													onclick={async (e) => {
 														e.stopImmediatePropagation();
 														e.stopPropagation();
 														selectedChatId = chat.id;
@@ -307,7 +330,7 @@
 
 							{#if !allChatsLoaded && loadHandler}
 								<Loader
-									on:visible={(e) => {
+									onvisible={(e) => {
 										if (!chatListLoading) {
 											loadHandler();
 										}
@@ -324,7 +347,7 @@
 						</div>
 
 						{#if query === ''}
-							<slot name="footer"></slot>
+							{@render footer?.()}
 						{/if}
 					</div>
 				{:else}
@@ -378,7 +401,7 @@
 																<Tooltip content={$i18n.t('Unarchive Chat')}>
 																	<button
 																		class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-																		on:click={async () => {
+																		onclick={async () => {
 																			unarchiveHandler(chat.id);
 																		}}
 																	>
@@ -403,7 +426,7 @@
 															<Tooltip content={$i18n.t('Delete Chat')}>
 																<button
 																	class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-																	on:click={async () => {
+																	onclick={async () => {
 																		deleteHandler(chat.id);
 																	}}
 																>
@@ -432,7 +455,7 @@
 								</div>
 							</div>
 
-							<slot name="footer"></slot>
+							{@render footer?.()}
 						</div>
 					{:else}
 						<div class="text-left text-sm w-full mb-8">

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick, getContext } from 'svelte';
+	import { onMount, onDestroy, tick, getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 	import { openDB, deleteDB } from 'idb';
@@ -7,14 +7,15 @@
 	const { saveAs } = fileSaver;
 
 	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
+	import { page } from '$app/state';
+	import { toast } from '$lib/utils/toast';
 	import { fade } from 'svelte/transition';
 
 	import { getModels, getVersionUpdates } from '$lib/apis';
 	import { getTools } from '$lib/apis/tools';
 	import { getBanners } from '$lib/apis/configs';
 	import { getUserSettings } from '$lib/apis/users';
-	import { consumeBootstrap } from '$lib/utils/bootstrap';
+	import { consumeBootstrap, hasBootstrap } from '$lib/utils/bootstrap';
 
 	import { WEBUI_VERSION } from '$lib/constants';
 	import type { Banner } from '$lib/types';
@@ -37,7 +38,9 @@
 		toolServers,
 		toolServersLoaded,
 		showSearch,
-		showSidebar
+		showSidebar,
+		bootstrapRevision,
+		subscriptionUsage
 	} from '$lib/stores';
 
 	import Sidebar from '$lib/components/layout/Sidebar.svelte';
@@ -46,14 +49,19 @@
 	import AccountPending from '$lib/components/layout/Overlay/AccountPending.svelte';
 	import UpdateInfoToast from '$lib/components/layout/UpdateInfoToast.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	interface Props {
+		children?: import('svelte').Snippet;
+	}
+
+	let { children }: Props = $props();
 
 	const i18n: Writable<i18nType> = getContext('i18n');
 
-	let loaded = false;
-	let DB = null;
-	let localDBChats = [];
+	let loaded = $state(false);
+	let DB = $state(null);
+	let localDBChats = $state([]);
 
-	let version;
+	let version = $state();
 	const MODELS_CACHE_KEY = 'models';
 	const STARTUP_CACHE_VERSION = 1;
 	const STARTUP_BANNERS_CACHE_KEY = 'startup:banners';
@@ -62,6 +70,7 @@
 	const BANNERS_CACHE_TTL = 5 * 60 * 1000;
 	const TOOLS_CACHE_TTL = 60 * 1000;
 	let toolServersLoadScheduled = false;
+	let unsubBootstrapRevision: (() => void) | null = null;
 
 	type DirectConnections = {
 		OPENAI_API_BASE_URLS?: string[];
@@ -133,10 +142,19 @@
 		}
 	};
 
-	const getModelRequestDirectConnections = (): DirectConnections | null =>
-		$config?.features?.enable_direct_connections
-			? (($settings?.directConnections as DirectConnections | null) ?? null)
-			: null;
+	const getModelRequestDirectConnections = (): DirectConnections | null => {
+		if (!$config?.features?.enable_direct_connections) {
+			return null;
+		}
+		const dc = ($settings?.directConnections as DirectConnections | null) ?? null;
+		// A saved-but-empty config (no base URLs) fans out to nothing — treat it
+		// as absent so boot keeps the instant bootstrap-delivered model list
+		// instead of refetching /api/models for an identical result.
+		if (!dc || !((dc as any)?.OPENAI_API_BASE_URLS?.length > 0)) {
+			return null;
+		}
+		return dc;
+	};
 
 	const getDirectConnectionsCacheKey = (directConnections: DirectConnections | null) => {
 		if (!directConnections) {
@@ -159,35 +177,49 @@
 			directConnections: getDirectConnectionsCacheKey(directConnections)
 		});
 
-	const hydrateModelsFromCache = () => {
+	// Bootstrap's `models` component is a bare array now (the server unwrapped the
+	// legacy `{ data: [...] }` envelope). Accept BOTH shapes defensively so a
+	// mixed old-server / new-server deploy can't leave the model cache dead.
+	const normalizeModels = (x: any): any[] => (Array.isArray(x) ? x : (x?.data ?? []));
+
+	const computeHydratedModels = (): { models: any[] | null; loaded: boolean } => {
 		try {
 			const cachedModels = JSON.parse(localStorage.getItem(MODELS_CACHE_KEY) ?? 'null');
-			if (cachedModels?.cacheKey === getModelsCacheKey() && Array.isArray(cachedModels?.models)) {
-				models.set(cachedModels.models);
-				modelsLoaded.set(true);
+			if (cachedModels?.cacheKey === getModelsCacheKey() && cachedModels?.models != null) {
+				const normalized = normalizeModels(cachedModels.models);
+				if (normalized.length > 0) {
+					return { models: normalized, loaded: true };
+				}
 			}
 		} catch (e) {
 			console.error('Failed to parse cached models', e);
 			localStorage.removeItem(MODELS_CACHE_KEY);
 		}
+		return { models: null, loaded: false };
 	};
 
-	const hydrateStartupDataFromCache = () => {
+	// Compute (without touching stores) what startup data/models would be
+	// hydrated from cache for the CURRENT user. Used to set each store exactly
+	// once on mount (see onMount below) instead of resetting to empty first and
+	// then re-populating, which produced a visible empty-then-full flash.
+	// Falling back to the empty defaults when no cache entry matches the
+	// current user's cache key still guards against showing stale data left
+	// over from a different user/session, since every cache key above is
+	// user-scoped (getUserCacheKey / getModelsCacheKey both fold in $user?.id).
+	const computeHydratedStartupData = (): { banners: Banner[] | null; tools: any[] | null } => {
 		const cachedBanners = readLocalStorageCache<Banner[]>(
 			STARTUP_BANNERS_CACHE_KEY,
 			getUserCacheKey('banners')
 		);
-		if (Array.isArray(cachedBanners)) {
-			banners.set(cachedBanners);
-		}
-
 		const cachedTools = readLocalStorageCache<any[]>(
 			STARTUP_TOOLS_CACHE_KEY,
 			getUserCacheKey('tools')
 		);
-		if (Array.isArray(cachedTools)) {
-			tools.set(cachedTools);
-		}
+
+		return {
+			banners: Array.isArray(cachedBanners) ? cachedBanners : null,
+			tools: Array.isArray(cachedTools) ? cachedTools : null
+		};
 	};
 
 	const setModels = async () => {
@@ -195,8 +227,9 @@
 		const cacheKey = getModelsCacheKey(directConnections);
 
 		// Bootstrap-delivered models do not include direct-connection fanout; skip when configured.
-		const bootstrapModels = consumeBootstrap<any[]>('models');
-		if (bootstrapModels && !directConnections) {
+		const bootstrapModelsRaw = consumeBootstrap<any>('models');
+		if (bootstrapModelsRaw != null && !directConnections) {
+			const bootstrapModels = normalizeModels(bootstrapModelsRaw);
 			models.set(bootstrapModels);
 			try {
 				localStorage.setItem(
@@ -230,6 +263,24 @@
 		} finally {
 			modelsLoaded.set(true);
 		}
+	};
+
+	const applyBootstrapSubscriptionUsage = () => {
+		const value = consumeBootstrap<Record<string, any>>('subscription_usage');
+		if (value && typeof value === 'object') {
+			subscriptionUsage.set(value);
+		}
+	};
+
+	const applyBootstrapSettings = (): boolean => {
+		const bootstrapSettings = consumeBootstrap<any>('settings');
+		if (bootstrapSettings?.ui) {
+			settings.set(bootstrapSettings.ui);
+			localStorage.setItem('settings', JSON.stringify(bootstrapSettings));
+			scheduleToolServersLoad();
+			return true;
+		}
+		return false;
 	};
 
 	const setBanners = async () => {
@@ -305,6 +356,34 @@
 	};
 
 	onMount(async () => {
+		// Surface the result of an MCP OAuth round-trip (the callback redirects
+		// back here with ?mcp_oauth=connected or ?mcp_oauth_error=<code>). The
+		// page has fully reloaded, so the tools' `authenticated` flag is fresh.
+		try {
+			const params = page.url.searchParams;
+			const connected = params.get('mcp_oauth');
+			const mcpError = params.get('mcp_oauth_error');
+			if (connected || mcpError) {
+				if (mcpError) {
+					toast.error(
+						$i18n.t('MCP authorization failed ({{error}}). Please try reconnecting.', {
+							error: mcpError
+						})
+					);
+				} else if (connected === 'connected') {
+					toast.success($i18n.t('MCP connection authorized.'));
+				}
+				const url = new URL(window.location.href);
+				url.searchParams.delete('mcp_oauth');
+				url.searchParams.delete('mcp_oauth_error');
+				window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+			}
+		} catch (e) {
+			// non-fatal
+		}
+	});
+
+	onMount(async () => {
 		if ($user === undefined || $user === null) {
 			await goto('/auth');
 			return;
@@ -314,35 +393,33 @@
 		}
 
 		clearChatInputStorage();
-		models.set([]);
-		modelsLoaded.set(false);
-		tools.set(null);
-		banners.set([]);
+
+		// Compute cache-hydrated values first, then write each store exactly
+		// once with its final value — either the cache hit for the current
+		// user, or the empty default when there's no matching cache entry
+		// (also the guard against stale cross-user/session data that the old
+		// reset-then-rehydrate sequence provided). This avoids the visible
+		// empty-then-full flash the old two-step reset/hydrate caused.
+		const hydratedModelsResult = computeHydratedModels();
+		const hydratedStartup = computeHydratedStartupData();
+
+		models.set(hydratedModelsResult.models ?? []);
+		modelsLoaded.set(hydratedModelsResult.loaded);
+		tools.set(hydratedStartup.tools ?? null);
+		banners.set(hydratedStartup.banners ?? []);
 		toolServers.set([]);
 		toolServersLoaded.set(false);
 
-		// SWR: Apply cached settings immediately so <slot/> renders without delay
-		try {
-			const cachedSettings = JSON.parse(localStorage.getItem('settings') ?? '{}');
-			if (cachedSettings?.ui) {
-				settings.set(cachedSettings.ui);
-			}
-		} catch (e) {}
-
-		hydrateStartupDataFromCache();
-		hydrateModelsFromCache();
+		// Cached settings are seeded into the store synchronously at module load
+		// (see $lib/stores) — children like Sidebar mount before this onMount
+		// runs, so hydrating here was too late for their mount-time reads.
 
 		loaded = true;
 
 		// Background: fetch fresh settings + everything else in parallel
+		applyBootstrapSubscriptionUsage();
 		const userSettingsTask = (async () => {
-			const bootstrapSettings = consumeBootstrap<any>('settings');
-			if (bootstrapSettings?.ui) {
-				settings.set(bootstrapSettings.ui);
-				localStorage.setItem('settings', JSON.stringify(bootstrapSettings));
-				scheduleToolServersLoad();
-				return;
-			}
+			if (applyBootstrapSettings()) return;
 			try {
 				const userSettings = await getUserSettings(localStorage.token);
 				if (userSettings?.ui) {
@@ -355,13 +432,22 @@
 			}
 		})();
 
-		Promise.all([
-			userSettingsTask,
-			checkLocalDBChats(),
-			setBanners(),
-			setTools(),
-			setModels()
-		]);
+		Promise.all([userSettingsTask, checkLocalDBChats(), setBanners(), setTools(), setModels()]);
+
+		// Stale-while-revalidate boot (Wire item #4): when the root layout's
+		// background bootstrap revalidation delivers changed components, it re-fills
+		// the pending map with ONLY those and bumps bootstrapRevision. Re-consume
+		// just the components that are present (each guarded so it applies from the
+		// bootstrap payload without firing a network fetch). The initial rev === 0
+		// fire is skipped — the normal consume above already handled first mount.
+		unsubBootstrapRevision = bootstrapRevision.subscribe((rev) => {
+			if (rev === 0) return;
+			applyBootstrapSettings();
+			applyBootstrapSubscriptionUsage();
+			if (hasBootstrap('models') && !getModelRequestDirectConnections()) setModels();
+			if (hasBootstrap('banners')) setBanners();
+			if (hasBootstrap('tools')) setTools();
+		});
 
 		const setupKeyboardShortcuts = () => {
 			document.addEventListener('keydown', async function (event) {
@@ -469,7 +555,7 @@
 		}
 
 		if ($user?.role === 'admin' || ($user?.permissions?.chat?.temporary ?? true)) {
-			if ($page.url.searchParams.get('temporary-chat') === 'true') {
+			if (page.url.searchParams.get('temporary-chat') === 'true') {
 				temporaryChatEnabled.set(true);
 			}
 
@@ -495,6 +581,13 @@
 		await tick();
 	});
 
+	onDestroy(() => {
+		if (unsubBootstrapRevision) {
+			unsubBootstrapRevision();
+			unsubBootstrapRevision = null;
+		}
+	});
+
 	const checkForVersionUpdates = async () => {
 		version = await getVersionUpdates(localStorage.token).catch((error) => {
 			return {
@@ -507,13 +600,13 @@
 
 {#if $showSettings}
 	{#await SettingsModal() then Module}
-		<svelte:component this={Module.default} bind:show={$showSettings} />
+		<Module.default bind:show={$showSettings} />
 	{/await}
 {/if}
 
 {#if $showChangelog}
 	{#await ChangelogModal() then Module}
-		<svelte:component this={Module.default} bind:show={$showChangelog} />
+		<Module.default bind:show={$showChangelog} />
 	{/await}
 {/if}
 
@@ -521,7 +614,7 @@
 	<div class=" absolute bottom-8 right-8 z-50" in:fade={{ duration: 100 }}>
 		<UpdateInfoToast
 			{version}
-			on:close={() => {
+			onclose={() => {
 				localStorage.setItem('dismissedUpdateToast', Date.now().toString());
 				version = null;
 			}}
@@ -563,7 +656,7 @@
 									<div class=" mt-6 mx-auto relative group w-fit">
 										<button
 											class="relative z-20 flex px-5 py-2 rounded-full bg-white border border-gray-100 dark:border-none hover:bg-gray-100 transition font-medium text-sm"
-											on:click={async () => {
+											onclick={async () => {
 												let blob = new Blob([JSON.stringify(localDBChats)], {
 													type: 'application/json'
 												});
@@ -582,7 +675,7 @@
 
 										<button
 											class="text-xs text-center w-full mt-2 text-gray-400 underline"
-											on:click={async () => {
+											onclick={async () => {
 												localDBChats = [];
 											}}>{$i18n.t('Close')}</button
 										>
@@ -596,7 +689,7 @@
 				<Sidebar />
 
 				{#if loaded}
-					<slot />
+					{@render children?.()}
 				{:else}
 					<div
 						class="w-full flex-1 h-full flex items-center justify-center {$showSidebar

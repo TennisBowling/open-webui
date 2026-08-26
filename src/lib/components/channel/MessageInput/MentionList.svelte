@@ -8,27 +8,40 @@
 	import Lock from '$lib/components/icons/Lock.svelte';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { searchUsers } from '$lib/apis/users';
+	import { imageFallback } from '$lib/actions/imageFallback';
 
-	export let query = '';
+	interface Props {
+		query?: string;
+		command: (payload: { id: string; label: string }) => void;
+		selectedIndex?: number;
+		label?: string;
+		triggerChar?: string;
+		modelSuggestions?: boolean;
+		userSuggestions?: boolean;
+		channelSuggestions?: boolean;
+	}
 
-	export let command: (payload: { id: string; label: string }) => void;
-	export let selectedIndex = 0;
+	let {
+		query = '',
+		command,
+		selectedIndex = $bindable(0),
+		label = '',
+		triggerChar = '@',
+		modelSuggestions = false,
+		userSuggestions = false,
+		channelSuggestions = false
+	}: Props = $props();
 
-	export let label = '';
-	export let triggerChar = '@';
+	let _models = $state([]);
+	let _users = $state([]);
+	let _channels = $state([]);
 
-	export let modelSuggestions = false;
-	export let userSuggestions = false;
-	export let channelSuggestions = false;
-
-	let _models = [];
-	let _users = [];
-	let _channels = [];
-
-	$: filteredItems = [..._users, ..._models, ..._channels].filter(
-		(u) =>
-			u.label.toLowerCase().includes(query.toLowerCase()) ||
-			u.id.toLowerCase().includes(query.toLowerCase())
+	let filteredItems = $derived(
+		[..._users, ..._models, ..._channels].filter(
+			(u) =>
+				u.label.toLowerCase().includes(query.toLowerCase()) ||
+				u.id.toLowerCase().includes(query.toLowerCase())
+		)
 	);
 
 	const getUserList = async () => {
@@ -44,9 +57,11 @@
 		}
 	};
 
-	$: if (query !== null && userSuggestions) {
-		getUserList();
-	}
+	$effect(() => {
+		if (query !== null && userSuggestions) {
+			getUserList();
+		}
+	});
 
 	const select = (index: number) => {
 		const item = filteredItems[index];
@@ -131,7 +146,7 @@
 
 {#if filteredItems.length}
 	<div
-		class="mention-list text-black dark:text-white rounded-2xl shadow-lg border border-gray-200 dark:border-gray-800 flex flex-col bg-white dark:bg-gray-850 w-72 p-1"
+		class="mention-list text-black dark:text-white rounded-2xl shadow-lg border-hairline border-gray-200 dark:border-gray-800 flex flex-col bg-white dark:bg-gray-850 w-72 p-1"
 		id="suggestions-container"
 	>
 		<div class="overflow-y-auto scrollbar-thin max-h-60">
@@ -151,8 +166,8 @@
 				<Tooltip content={item?.id} placement="top-start">
 					<button
 						type="button"
-						on:click={() => select(i)}
-						on:mousemove={() => {
+						onclick={() => select(i)}
+						onmousemove={() => {
 							selectedIndex = i;
 						}}
 						class="flex items-center justify-between px-2.5 py-1.5 rounded-xl w-full text-left {i ===
@@ -171,10 +186,13 @@
 							</div>
 						{:else if item.type === 'model'}
 							<img
+								use:imageFallback
 								src={item?.data?.info?.meta?.profile_image_url ??
 									`${WEBUI_BASE_URL}/static/favicon.png`}
 								alt={item?.data?.name ?? item.id}
 								class="rounded-full size-5 items-center mr-2"
+								loading="lazy"
+								decoding="async"
 							/>
 						{:else if item.type === 'user'}
 							<img

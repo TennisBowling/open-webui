@@ -15,6 +15,7 @@ Run as a one-shot backfill::  python -m open_webui.scripts.backfill_chat_embeddi
 The same ``run_sweep`` is called periodically by the keep-fresh background task.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -33,11 +34,15 @@ _WS_RE = re.compile(r"\s+")
 
 # Cap text fed to the embedder (model context is 4096 tokens; one vector can't represent a 7MB turn).
 MAX_CHARS = int(os.environ.get("CHAT_EMBED_MAX_CHARS", "6000"))
-# Skip trivial messages (acks like "ok"/"thanks") — useless search targets; the chat
-# stays findable via its substantive turns. Messages with images are always embedded.
-MIN_TEXT_CHARS = int(os.environ.get("CHAT_EMBED_MIN_CHARS", "8"))
-# How many text-only messages to embed per HTTP batch.
-TEXT_BATCH = int(os.environ.get("CHAT_EMBED_TEXT_BATCH", "16"))
+# Min substantive content length to embed. Contentless fragments ("whatever", "which one")
+# form a degenerate centroid that sits closer to typo/OOD queries than any real topic and
+# pollutes semantic search. 14 strips the tight junk (all <=13 chars) while keeping legitimate
+# short USER question-anchors (15+ chars). Mirrors _SEARCH_SEM_MIN_MSG_LEN in models/chats.py
+# (the query-side gate). Messages with images are always embedded.
+MIN_TEXT_CHARS = int(os.environ.get("CHAT_EMBED_MIN_CHARS", "14"))
+# How many text-only messages to embed per HTTP batch: lives in chat_embedder
+# (ce.CHAT_EMBED_TEXT_BATCH) so the admin UI can change it at runtime — read at
+# use-site, not captured here, so a change applies to the very next sweep.
 
 # Source-content hash used to detect edits — must match the SQL expression below.
 _SRC_HASH_SQL = "md5(coalesce(cm.content,'') || coalesce((cm.meta->'files')::text,''))"
@@ -97,6 +102,43 @@ def extract_images(files) -> list[str]:
     ]
 
 
+# Message image "urls" come in two flavors: inline data-URLs / raw base64 (older or
+# pasted images — usable as-is), and internal file references like
+# ``/api/v1/files/<uuid>/content`` (uploaded images). The embedder needs actual image
+# bytes, so a file ref MUST be resolved to base64 from the ``file`` table before use —
+# otherwise the literal path string is sent as "image data" and the server 500s. This
+# was the cause of the bulk of image-embedding failures.
+_FILE_REF_RE = re.compile(r"/api/v1/files/([0-9a-fA-F-]{36})(?:/content)?")
+
+
+def _resolve_image_b64(cur, url):
+    """Return raw base64 image bytes for one image ``url`` (or None if unresolvable).
+    Data-URLs / raw base64 pass through unchanged; ``/api/v1/files/<id>`` refs are looked
+    up in the ``file`` table — the ``data`` (BYTEA) column first, then the on-disk path."""
+    if not isinstance(url, str) or not url:
+        return None
+    m = _FILE_REF_RE.search(url)
+    if not m:
+        return url  # already an inline data-URL / raw base64 — _prepare_image handles it
+    cur.execute("SELECT data, path FROM file WHERE id = %s", (m.group(1),))
+    row = cur.fetchone()
+    if not row:
+        return None  # file was deleted — nothing to embed
+    data, path = row
+    if data is not None:
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(data)).decode()
+        if isinstance(data, str):
+            return data  # already base64 / data-URL
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                return base64.b64encode(fh.read()).decode()
+        except OSError:
+            return None
+    return None
+
+
 def extract(role: str, content, content_is_json, files):
     """Return (embeddable_text, image_urls) for one message. Handles content_is_json=1
     messages (multimodal JSON content) by parsing out the text/image parts instead of
@@ -149,11 +191,11 @@ def _fetch_batch(cur, limit: int, last_chat: str, last_msg: str) -> list:
 
 
 _UPSERT = """
-INSERT INTO chat_message_embedding (chat_id, message_id, user_id, content_hash, embedding, updated_at)
-VALUES (%s, %s, %s, %s, %s::vector, %s)
+INSERT INTO chat_message_embedding (chat_id, message_id, user_id, content_hash, embedding, updated_at, msg_len)
+VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
 ON CONFLICT (chat_id, message_id) DO UPDATE SET
     user_id = EXCLUDED.user_id, content_hash = EXCLUDED.content_hash,
-    embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at
+    embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at, msg_len = EXCLUDED.msg_len
 """
 
 
@@ -184,21 +226,31 @@ def run_sweep(limit: int | None = None, batch: int = 200, log=print) -> int:
             fetched += len(rows)
 
             text_jobs, img_jobs = [], []  # (meta, text) ; (meta, text, images)
-            for chat_id, message_id, user_id, role, content, content_is_json, files, src_hash in rows:
-                text, images = extract(role, content, content_is_json, files)
-                meta = (chat_id, message_id, user_id, src_hash)
-                if images:
-                    img_jobs.append((meta, text, images))
-                elif len(text) >= MIN_TEXT_CHARS:
-                    text_jobs.append((meta, text))
-                # else: nothing embeddable — keyset has already moved past it
+            with conn.cursor() as rcur:
+                for chat_id, message_id, user_id, role, content, content_is_json, files, src_hash in rows:
+                    text, images = extract(role, content, content_is_json, files)
+                    # Resolve file-ref image urls to actual base64 bytes (drop any that
+                    # can't be resolved, e.g. a since-deleted file). Done BEFORE msg_len
+                    # so a message whose images all vanished reclassifies as text-only.
+                    images = [b for b in (_resolve_image_b64(rcur, u) for u in images) if b]
+                    # msg_len gates the semantic search arm (skip contentless fragments). Image
+                    # messages are always eligible -> sentinel high value so the filter never drops them.
+                    msg_len = 10000 if images else len(text)
+                    meta = (chat_id, message_id, user_id, src_hash, msg_len)
+                    if images:
+                        img_jobs.append((meta, text, images))
+                    elif len(text) >= MIN_TEXT_CHARS:
+                        text_jobs.append((meta, text))
+                    # else: nothing embeddable — keyset has already moved past it
 
             now = int(time.time())
             results = []  # (meta, vec_or_None)
 
-            # text-only: batch through /v1/embeddings
-            for i in range(0, len(text_jobs), TEXT_BATCH):
-                chunk = text_jobs[i : i + TEXT_BATCH]
+            # Text-only: grouped into sequential /v1/embeddings requests (one vector
+            # per item — texts are never fused). Batch size is admin-configurable.
+            text_batch = max(1, int(ce.CHAT_EMBED_TEXT_BATCH))
+            for i in range(0, len(text_jobs), text_batch):
+                chunk = text_jobs[i : i + text_batch]
                 vecs = ce.embed_texts_sync([t for _, t in chunk])
                 for (meta, _), vec in zip(chunk, vecs):
                     results.append((meta, vec))
@@ -243,11 +295,11 @@ def run_sweep(limit: int | None = None, batch: int = 200, log=print) -> int:
             batch_healthy = any(ce.is_valid_vector(v) for _, v in results) or ce.embedder_healthy_sync()
             upserts = []
             for meta, vec in results:
-                cid, mid, uid, sh = meta
+                cid, mid, uid, sh, mlen = meta
                 if ce.is_valid_vector(vec):
-                    upserts.append((cid, mid, uid, sh, ce.to_pgvector_literal(vec), now))
+                    upserts.append((cid, mid, uid, sh, ce.to_pgvector_literal(vec), now, mlen))
                 elif batch_healthy or meta == poison_meta:
-                    upserts.append((cid, mid, uid, sh, None, now))  # permanent failure marker
+                    upserts.append((cid, mid, uid, sh, None, now, mlen))  # permanent failure marker
                 # else: embedder down mid-sweep — leave unrowed, retry next sweep
 
             if upserts:

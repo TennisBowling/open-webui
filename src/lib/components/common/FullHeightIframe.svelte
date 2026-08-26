@@ -1,47 +1,40 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
 
-	// Props
-	export let src: string | null = null; // URL or raw HTML (auto-detected)
-	export let title = 'Embedded Content';
-	export let initialHeight: number | null = null; // initial height in px, null = auto
-
-	export let iframeClassName = 'w-full rounded-2xl';
-
-	export let args = null;
-
-	export let allowScripts = true;
-	export let allowForms = false;
-
-	export let allowSameOrigin = false; // set to true only when you trust the content
-	export let allowPopups = false;
-	export let allowDownloads = true;
-
-	export let referrerPolicy: HTMLIFrameElement['referrerPolicy'] =
-		'strict-origin-when-cross-origin';
-	export let allowFullscreen = true;
-
-	let iframe: HTMLIFrameElement | null = null;
-	let iframeSrc: string | null = null;
-	let iframeDoc: string | null = null;
-
-	// Derived: build sandbox attribute from flags
-	$: sandbox =
-		[
-			allowScripts && 'allow-scripts',
-			allowForms && 'allow-forms',
-			allowSameOrigin && 'allow-same-origin',
-			allowPopups && 'allow-popups',
-			allowDownloads && 'allow-downloads'
-		]
-			.filter(Boolean)
-			.join(' ') || undefined;
-
-	// Detect URL vs raw HTML and prep src/srcdoc
-	$: isUrl = typeof src === 'string' && /^(https?:)?\/\//i.test(src);
-	$: if (src) {
-		setIframeSrc();
+	interface Props {
+		// Props
+		src?: string | null; // URL or raw HTML (auto-detected)
+		title?: string;
+		initialHeight?: number | null; // initial height in px, null = auto
+		iframeClassName?: string;
+		args?: any;
+		allowScripts?: boolean;
+		allowForms?: boolean;
+		allowSameOrigin?: boolean; // set to true only when you trust the content
+		allowPopups?: boolean;
+		allowDownloads?: boolean;
+		referrerPolicy?: HTMLIFrameElement['referrerPolicy'];
+		allowFullscreen?: boolean;
 	}
+
+	let {
+		src = null,
+		title = 'Embedded Content',
+		initialHeight = null,
+		iframeClassName = 'w-full rounded-2xl',
+		args = null,
+		allowScripts = true,
+		allowForms = false,
+		allowSameOrigin = false,
+		allowPopups = false,
+		allowDownloads = true,
+		referrerPolicy = 'strict-origin-when-cross-origin',
+		allowFullscreen = true
+	}: Props = $props();
+
+	let iframe: HTMLIFrameElement | null = $state(null);
+	let iframeSrc: string | null = $state(null);
+	let iframeDoc: string | null = $state(null);
 
 	const setIframeSrc = async () => {
 		await tick();
@@ -133,7 +126,6 @@ window.Chart = parent.Chart; // Chart previously assigned on parent
 		if (!iframe) return;
 		try {
 			const doc = iframe.contentDocument || iframe.contentWindow?.document;
-			console.log('iframe doc:', doc);
 			if (!doc) return;
 			const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
 			if (h > 0) iframe.style.height = h + 20 + 'px';
@@ -169,6 +161,25 @@ window.Chart = parent.Chart; // Chart previously assigned on parent
 	onDestroy(() => {
 		window.removeEventListener('message', onMessage);
 	});
+	// Derived: build sandbox attribute from flags
+	let sandbox = $derived(
+		[
+			allowScripts && 'allow-scripts',
+			allowForms && 'allow-forms',
+			allowSameOrigin && 'allow-same-origin',
+			allowPopups && 'allow-popups',
+			allowDownloads && 'allow-downloads'
+		]
+			.filter(Boolean)
+			.join(' ') || undefined
+	);
+	// Detect URL vs raw HTML and prep src/srcdoc
+	let isUrl = $derived(typeof src === 'string' && /^(https?:)?\/\//i.test(src));
+	$effect(() => {
+		if (src) {
+			setIframeSrc();
+		}
+	});
 </script>
 
 {#if iframeDoc}
@@ -182,8 +193,8 @@ window.Chart = parent.Chart; // Chart previously assigned on parent
 		frameborder="0"
 		{sandbox}
 		{allowFullscreen}
-		on:load={onLoad}
-	/>
+		onload={onLoad}
+	></iframe>
 {:else if iframeSrc}
 	<iframe
 		bind:this={iframe}
@@ -196,6 +207,6 @@ window.Chart = parent.Chart; // Chart previously assigned on parent
 		{sandbox}
 		referrerpolicy={referrerPolicy}
 		{allowFullscreen}
-		on:load={onLoad}
-	/>
+		onload={onLoad}
+	></iframe>
 {/if}

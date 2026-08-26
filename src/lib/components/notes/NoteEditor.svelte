@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { getContext, onDestroy, onMount, tick } from 'svelte';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { getContext, onDestroy, onMount, tick, untrack } from 'svelte';
 	import { v4 as uuidv4 } from 'uuid';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -7,11 +9,11 @@
 	const i18n = getContext('i18n');
 
 	import { marked } from 'marked';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { goto } from '$app/navigation';
 
-	import dayjs from '$lib/dayjs';
+	import dayjs, { setDayjsLocale } from '$lib/dayjs';
 	import calendar from 'dayjs/plugin/calendar';
 	import duration from 'dayjs/plugin/duration';
 	import relativeTime from 'dayjs/plugin/relativeTime';
@@ -45,19 +47,10 @@
 
 	import AccessControlModal from '$lib/components/workspace/common/AccessControlModal.svelte';
 
-	async function loadLocale(locales) {
-		for (const locale of locales) {
-			try {
-				dayjs.locale(locale);
-				break; // Stop after successfully loading the first available locale
-			} catch (error) {
-				console.error(`Could not load locale '${locale}':`, error);
-			}
-		}
-	}
-
 	// Assuming $i18n.languages is an array of language codes
-	$: loadLocale($i18n.languages);
+	$effect(() => {
+		setDayjsLocale($i18n.languages);
+	});
 
 	import { deleteNoteById, getNoteById, updateNoteById } from '$lib/apis/notes';
 
@@ -89,10 +82,14 @@
 	import AiMenu from './AIMenu.svelte';
 	import AdjustmentsHorizontalOutline from '../icons/AdjustmentsHorizontalOutline.svelte';
 
-	export let id: null | string = null;
+	interface Props {
+		id?: null | string;
+	}
 
-	let editor = null;
-	let note = null;
+	let { id = null }: Props = $props();
+
+	let editor = $state(null);
+	let note = $state(null);
 
 	const newNote = {
 		title: '',
@@ -110,46 +107,50 @@
 		access_control: {}
 	};
 
-	let files = [];
-	let messages = [];
+	let files = $state([]);
+	let messages = $state([]);
 
-	let wordCount = 0;
-	let charCount = 0;
+	let wordCount = $state(0);
+	let charCount = $state(0);
 
-	let versionIdx = null;
-	let selectedModelId = null;
+	let versionIdx = $state(null);
+	let selectedModelId = $state(null);
 
-	let recording = false;
-	let displayMediaRecord = false;
+	let recording = $state(false);
+	let displayMediaRecord = $state(false);
 
-	let showPanel = false;
-	let selectedPanel = 'chat';
+	let showPanel = $state(false);
+	let selectedPanel = $state('chat');
 
-	let selectedContent = null;
+	let selectedContent = $state(null);
 
-	let showDeleteConfirm = false;
-	let showAccessControlModal = false;
+	let showDeleteConfirm = $state(false);
+	let showAccessControlModal = $state(false);
 
-	let ignoreBlur = false;
-	let titleInputFocused = false;
-	let titleGenerating = false;
+	let ignoreBlur = $state(false);
+	let titleInputFocused = $state(false);
+	let titleGenerating = $state(false);
 
-	let dragged = false;
-	let loading = false;
+	let dragged = $state(false);
+	let loading = $state(false);
 
-	let editing = false;
-	let streaming = false;
+	let editing = $state(false);
+	let streaming = $state(false);
 
-	let stopResponseFlag = false;
+	let stopResponseFlag = $state(false);
 
-	let inputElement = null;
+	let inputElement = $state(null);
 
-	const init = async () => {
+	let initGeneration = 0;
+
+	const init = async (targetId: string) => {
+		const generation = ++initGeneration;
 		loading = true;
-		const res = await getNoteById(localStorage.token, id).catch((error) => {
+		const res = await getNoteById(localStorage.token, targetId).catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
+		if (generation !== initGeneration || id !== targetId) return;
 
 		messages = [];
 
@@ -184,9 +185,14 @@
 		}, 200);
 	};
 
-	$: if (id) {
-		init();
-	}
+	$effect(() => {
+		const targetId = id;
+		if (targetId) {
+			untrack(() => {
+				void init(targetId);
+			});
+		}
+	});
 
 	function areContentsEqual(a, b) {
 		return JSON.stringify(a) === JSON.stringify(b);
@@ -930,6 +936,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 	});
 
 	onDestroy(() => {
+		initGeneration += 1;
 		console.log('destroy');
 		$socket?.off('note-events', noteEventHandler);
 
@@ -967,7 +974,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
 	title={$i18n.t('Delete note?')}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteNoteHandler(note.id);
 		showDeleteConfirm = false;
 	}}
@@ -1002,7 +1009,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 										<button
 											id="sidebar-toggle-button"
 											class=" cursor-pointer flex rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition cursor-"
-											on:click={() => {
+											onclick={() => {
 												showSidebar.set(!$showSidebar);
 											}}
 										>
@@ -1022,10 +1029,10 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 								disabled={(note?.user_id !== $user?.id && $user?.role !== 'admin') ||
 									titleGenerating}
 								required
-								on:focus={() => {
+								onfocus={() => {
 									titleInputFocused = true;
 								}}
-								on:blur={(e) => {
+								onblur={(e) => {
 									// check if target is generate button
 									if (ignoreBlur) {
 										ignoreBlur = false;
@@ -1047,10 +1054,13 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 											id="generate-title-button"
 											disabled={(note?.user_id !== $user?.id && $user?.role !== 'admin') ||
 												titleGenerating}
-											on:mouseenter={() => {
+											onmouseenter={() => {
 												ignoreBlur = true;
 											}}
-											on:click={(e) => {
+											onpointerdown={preventDefault(() => {
+												ignoreBlur = true;
+											})}
+											onclick={(e) => {
 												e.preventDefault();
 												e.stopImmediatePropagation();
 												e.stopPropagation();
@@ -1065,13 +1075,16 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 								</div>
 							{/if}
 
-							<div class="flex items-center gap-0.5 translate-x-1">
+							<div class="flex items-center gap-0.5 max-md:gap-1 translate-x-1">
 								{#if editor}
 									<div>
-										<div class="flex items-center gap-0.5 self-center min-w-fit" dir="ltr">
+										<div
+											class="flex items-center gap-0.5 max-md:gap-1 self-center min-w-fit"
+											dir="ltr"
+										>
 											<button
-												class="self-center p-1 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
-												on:click={() => {
+												class="self-center p-1 max-md:p-2 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
+												onclick={() => {
 													editor.chain().focus().undo().run();
 													// versionNavigateHandler('prev');
 												}}
@@ -1081,8 +1094,8 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 											</button>
 
 											<button
-												class="self-center p-1 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
-												on:click={() => {
+												class="self-center p-1 max-md:p-2 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
+												onclick={() => {
 													editor.chain().focus().redo().run();
 													// versionNavigateHandler('next');
 												}}
@@ -1096,8 +1109,8 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 
 								<Tooltip placement="top" content={$i18n.t('Chat')} className="cursor-pointer">
 									<button
-										class="p-1.5 bg-transparent hover:bg-white/5 transition rounded-lg"
-										on:click={() => {
+										class="p-1.5 max-md:p-2 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 transition rounded-lg"
+										onclick={() => {
 											if (showPanel && selectedPanel === 'chat') {
 												showPanel = false;
 											} else {
@@ -1114,8 +1127,8 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 
 								<Tooltip placement="top" content={$i18n.t('Controls')} className="cursor-pointer">
 									<button
-										class="p-1.5 bg-transparent hover:bg-white/5 transition rounded-lg"
-										on:click={() => {
+										class="p-1.5 max-md:p-2 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 transition rounded-lg"
+										onclick={() => {
 											if (showPanel && selectedPanel === 'settings') {
 												showPanel = false;
 											} else {
@@ -1162,7 +1175,9 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 										showDeleteConfirm = true;
 									}}
 								>
-									<div class="p-1 bg-transparent hover:bg-white/5 transition rounded-lg">
+									<div
+										class="p-1 max-md:p-2 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 transition rounded-lg"
+									>
 										<EllipsisHorizontal className="size-5" />
 									</div>
 								</NoteMenu>
@@ -1173,7 +1188,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 					<div class="  px-2.5">
 						<div
 							class=" flex w-full bg-transparent overflow-x-auto scrollbar-none"
-							on:wheel={(e) => {
+							onwheel={(e) => {
 								if (e.deltaY !== 0) {
 									e.preventDefault();
 									e.currentTarget.scrollLeft += e.deltaY;
@@ -1211,7 +1226,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 
 								<button
 									class=" flex items-center gap-1 w-fit py-1 px-1.5 rounded-lg min-w-fit"
-									on:click={() => {
+									onclick={() => {
 										showAccessControlModal = true;
 									}}
 									disabled={note?.user_id !== $user?.id && $user?.role !== 'admin'}
@@ -1315,7 +1330,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 								});
 							}}
 							onFilePaste={() => {}}
-							on:paste={async (e) => {
+							onpaste={async (e) => {
 								e = e.detail.event || e;
 								const clipboardData = e.clipboardData || window.clipboardData;
 								console.log('Clipboard data:', clipboardData);
@@ -1428,46 +1443,42 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 					>
 						<Tooltip content={$i18n.t('Record')} placement="top">
 							<div
-								class="cursor-pointer p-2.5 flex rounded-full border border-gray-50 bg-white dark:border-none dark:bg-gray-850 hover:bg-gray-50 dark:hover:bg-gray-800 transition shadow-xl"
+								class="cursor-pointer p-2.5 flex rounded-full border-hairline border-gray-50 bg-white dark:border-none dark:bg-gray-850 hover:bg-gray-50 dark:hover:bg-gray-800 transition shadow-xl"
 							>
 								<MicSolid className="size-4.5" />
 							</div>
 						</Tooltip>
 					</RecordMenu>
 
-					<div
-						class="cursor-pointer flex gap-0.5 rounded-full border border-gray-50 dark:border-gray-850 dark:bg-gray-850 transition shadow-xl"
-					>
-						<Tooltip content={$i18n.t('AI')} placement="top">
-							{#if editing}
-								<button
-									class="p-2 flex justify-center items-center hover:bg-gray-50 dark:hover:bg-gray-800 rounded-full transition shrink-0"
-									on:click={() => {
-										stopResponseHandler();
-									}}
-									type="button"
+					<Tooltip content={$i18n.t('AI')} placement="top">
+						{#if editing}
+							<button
+								class="cursor-pointer p-2.5 flex justify-center items-center rounded-full border-hairline border-gray-50 bg-white dark:border-none dark:bg-gray-850 hover:bg-gray-50 dark:hover:bg-gray-800 transition shadow-xl shrink-0"
+								onclick={() => {
+									stopResponseHandler();
+								}}
+								type="button"
+							>
+								<Spinner className="size-5" />
+							</button>
+						{:else}
+							<AiMenu
+								onEdit={() => {
+									enhanceNoteHandler();
+								}}
+								onChat={() => {
+									showPanel = true;
+									selectedPanel = 'chat';
+								}}
+							>
+								<div
+									class="cursor-pointer p-2.5 flex rounded-full border-hairline border-gray-50 bg-white dark:border-none dark:bg-gray-850 hover:bg-gray-50 dark:hover:bg-gray-800 transition shadow-xl"
 								>
-									<Spinner className="size-5" />
-								</button>
-							{:else}
-								<AiMenu
-									onEdit={() => {
-										enhanceNoteHandler();
-									}}
-									onChat={() => {
-										showPanel = true;
-										selectedPanel = 'chat';
-									}}
-								>
-									<div
-										class="cursor-pointer p-2.5 flex rounded-full border border-gray-50 bg-white dark:border-none dark:bg-gray-850 hover:bg-gray-50 dark:hover:bg-gray-800 transition shadow-xl"
-									>
-										<SparklesSolid />
-									</div>
-								</AiMenu>
-							{/if}
-						</Tooltip>
-					</div>
+									<SparklesSolid />
+								</div>
+							</AiMenu>
+						{/if}
+					</Tooltip>
 				{/if}
 			</div>
 		</div>

@@ -110,6 +110,52 @@ def test_missing_chat_is_none():
     assert SyncChats.get_question_answer_by_id("does-not-exist", "tc1") is None
 
 
+def test_question_states_survive_stale_full_chat_save(chat_id):
+    # Regression: a committed ask_user answer lives in the chat blob's
+    # question_states key, but update_chat_by_id is a WHOLE-column write driven by
+    # a snapshot the PATCH handler took at request start. If that snapshot predates
+    # the answer commit, the flush would roll the answer back — leaving the blocked
+    # generation polling forever. update_chat_by_id must treat question_states as
+    # server-owned (force the LIVE value in under its row lock), exactly like queue
+    # and draining.
+    SyncChats.set_question_state_by_id(
+        chat_id, "tcZ", {"answer": {"0": {"selected": ["keep me"]}}, "submitted_at": 99}
+    )
+    assert SyncChats.get_question_answer_by_id(chat_id, "tcZ")["answer"]["0"][
+        "selected"
+    ] == ["keep me"]
+
+    # (a) Stale snapshot LACKS question_states entirely (the common case: the
+    #     snapshot was taken before the user answered).
+    SyncChats.update_chat_by_id(
+        chat_id,
+        {
+            "title": "edited title",
+            "history": {"currentId": "m1", "messages": {}},
+        },
+    )
+    result = SyncChats.get_question_answer_by_id(chat_id, "tcZ")
+    assert result is not None, "stale full-chat save rolled back the committed answer"
+    assert result["answer"]["0"]["selected"] == ["keep me"]
+
+    # (b) Stale snapshot CARRIES an out-of-date question_states; the live committed
+    #     value must win (and a draft committed in between must also survive).
+    SyncChats.set_question_state_by_id(
+        chat_id, "tcZ", {"draft": {"0": {"selected": ["draft-keep"]}}}
+    )
+    SyncChats.update_chat_by_id(
+        chat_id,
+        {
+            "title": "edited again",
+            "history": {"currentId": "m1", "messages": {}},
+            "question_states": {"tcZ": {"answer": {"0": {"selected": ["STALE"]}}}},
+        },
+    )
+    entry = SyncChats.get_question_state_by_id(chat_id, "tcZ")
+    assert entry["answer"]["0"]["selected"] == ["keep me"]
+    assert entry["draft"]["0"]["selected"] == ["draft-keep"]
+
+
 # --- pure tool logic ---------------------------------------------------------
 
 

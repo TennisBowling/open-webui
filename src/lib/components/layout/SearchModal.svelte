@@ -33,44 +33,48 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let onClose = () => {};
+	interface Props {
+		show?: boolean;
+		onClose?: any;
+	}
+
+	let { show = $bindable(false), onClose = () => {} }: Props = $props();
 
 	// ── Inputs ────────────────────────────────────────────────────────────
-	let query = '';
+	let query = $state('');
 
 	// Filter chip state
-	let archived: boolean | null = null;
-	let pinned: boolean | null = null;
-	let folderIds: string[] = [];
-	let tagIds: string[] = [];
+	let archived: boolean | null = $state(null);
+	let pinned: boolean | null = $state(null);
+	let folderIds: string[] = $state([]);
+	let tagIds: string[] = $state([]);
 	let modelIds: string[] = [];
-	let datePreset: 'all' | 'today' | '7d' | '30d' | 'year' = 'all';
-	let sort: 'relevance' | 'recent' = 'relevance';
+	let datePreset: 'all' | 'today' | '7d' | '30d' | 'year' = $state('all');
+	let sort: 'relevance' | 'recent' = $state('relevance');
 
 	// ── Results ───────────────────────────────────────────────────────────
-	let response: ChatSearchResponse | null = null;
-	$: hits = (response?.hits ?? []) as ChatSearchHit[];
-	$: facets = (response?.facets ?? null) as ChatSearchFacets | null;
-	$: usedFuzzy = response?.used_fuzzy ?? false;
-	$: totalCount = response?.total ?? 0;
+	let response: ChatSearchResponse | null = $state(null);
 
-	let optimisticHits: ChatSearchHit[] = [];
-	$: displayHits = hits.length > 0 ? hits : optimisticHits;
+	let optimisticHits: ChatSearchHit[] = $state([]);
 
-	let loading = false;
-	let chatCount: number | null = null;
+	let loading = $state(false);
+	let loadingMore = $state(false);
+	let searchError = $state(false);
+	let page = $state(1);
+	let chatCount: number | null = $state(null);
+	const PAGE_SIZE = 30;
 
-	let recentSearchesRef: { reload: () => void } | undefined;
+	let recentSearchesRef: { reload: () => void } | undefined = $state();
 
 	// ── Debounce / abort plumbing ──────────────────────────────────────────
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 	let firstCharFired = false;
 	let inFlightController: AbortController | null = null;
+	let searchRequestId = 0;
 
 	// ── Keyboard nav ──────────────────────────────────────────────────────
-	let actions: { label: string; onClick: () => Promise<void>; icon: any }[] = [];
-	let selectedIdx: number | null = null;
+	let actions: { label: string; onClick: () => Promise<void>; icon: any }[] = $state([]);
+	let selectedIdx: number | null = $state(null);
 
 	// ── Preview pane ──────────────────────────────────────────────────────
 	// The preview shows only the matched message + a few ancestors (fetched via
@@ -78,10 +82,10 @@
 	// the full renderer — that froze/crashed the tab on big agentic chats.
 	const PREVIEW_LIMIT = 6;
 	const PREVIEW_CACHE_MAX = 30;
-	let selectedHit: ChatSearchHit | null = null;
-	let selectedModels = [''];
-	let history: any = null;
-	let messages: any[] | null = null;
+	let selectedHit: ChatSearchHit | null = $state(null);
+	let selectedModels = $state(['']);
+	let history: any = $state(null);
+	let messages: any[] | null = $state(null);
 	let chatCache: Map<string, any> = new Map();
 	let previewDebounce: ReturnType<typeof setTimeout> | null = null;
 	let previewRequestId = 0;
@@ -139,24 +143,47 @@
 		}
 	};
 
-	const runSearch = async (immediate = false) => {
+	const runSearch = (immediate = false, append = false) => {
 		if (!show) return;
+		if (append && (loading || loadingMore || !response || response.hits.length >= response.total)) {
+			return;
+		}
 		if (debounceTimer) {
 			clearTimeout(debounceTimer);
 			debounceTimer = null;
 		}
-		const fire = async () => {
-			if (inFlightController) inFlightController.abort();
-			inFlightController = new AbortController();
-			const { updated_after, updated_before } = computeDateRange();
+		inFlightController?.abort();
+		inFlightController = null;
+		const requestId = ++searchRequestId;
+		const requestedPage = append ? page + 1 : 1;
+
+		if (append) {
+			loadingMore = true;
+		} else {
+			// Never leave results from the previous query clickable during the
+			// debounce window. The small sidebar-title result set below fills that
+			// gap instantly for the first character.
+			response = null;
+			page = 1;
 			loading = true;
+			searchError = false;
+			selectedIdx = null;
+			selectedHit = null;
+			messages = null;
+			history = null;
+		}
+
+		const fire = async () => {
+			const controller = new AbortController();
+			inFlightController = controller;
+			const { updated_after, updated_before } = computeDateRange();
 			try {
 				const res = await searchChats(
 					localStorage.token,
 					{
 						text: query,
-						page: 1,
-						limit: 30,
+						page: requestedPage,
+						limit: PAGE_SIZE,
 						folder_ids: folderIds,
 						tag_ids: tagIds,
 						pinned,
@@ -165,17 +192,34 @@
 						updated_before,
 						sort
 					},
-					inFlightController.signal
+					controller.signal
 				);
-				response = res;
-				selectedIdx = res.hits.length > 0 ? actions.length : null;
-				schedulePreview(selectedIdx);
-				optimisticHits = [];
+				if (requestId !== searchRequestId) return;
+				if (append) {
+					const existing = response?.hits ?? [];
+					const seen = new Set(existing.map((hit) => hit.id));
+					response = {
+						...res,
+						hits: [...existing, ...res.hits.filter((hit) => !seen.has(hit.id))],
+						facets: response?.facets ?? res.facets
+					};
+					page = requestedPage;
+				} else {
+					response = res;
+					selectedIdx = res.hits.length > 0 ? actions.length : null;
+					schedulePreview(selectedIdx);
+					optimisticHits = [];
+				}
 			} catch (err: any) {
 				if (err?.name === 'AbortError') return;
 				console.error(err);
+				if (requestId === searchRequestId) searchError = true;
 			} finally {
-				loading = false;
+				if (requestId === searchRequestId) {
+					loading = false;
+					loadingMore = false;
+				}
+				if (inFlightController === controller) inFlightController = null;
 			}
 		};
 
@@ -185,7 +229,7 @@
 		// 50ms backend request on the first character — the cheapest, least useful
 		// query was hammering the DB on every search session.)
 		const text = query.trim();
-		if (text.length > 0 && !firstCharFired) {
+		if (text.length > 0) {
 			firstCharFired = true;
 			const loaded = ($chatsStore ?? []) as { id: string; title: string; updated_at: number }[];
 			const lower = text.toLowerCase();
@@ -206,6 +250,7 @@
 					matched_role: null,
 					score: 0
 				}));
+			if (optimisticHits.length > 0) selectedIdx = actions.length;
 		}
 
 		if (text.length === 0) {
@@ -214,9 +259,9 @@
 		}
 
 		if (immediate) {
-			fire();
+			void fire();
 		} else {
-			debounceTimer = setTimeout(fire, 220);
+			debounceTimer = setTimeout(() => void fire(), 220);
 		}
 	};
 
@@ -324,6 +369,7 @@
 			return;
 		}
 		if (e.code === 'Enter') {
+			e.preventDefault();
 			const el = document.querySelector(`[data-arrow-selected="true"]`) as HTMLElement | null;
 			if (el) {
 				if (query.trim()) searchHistoryAdd(query.trim());
@@ -333,12 +379,14 @@
 			return;
 		}
 		if (e.code === 'ArrowDown') {
+			e.preventDefault();
 			const total = actions.length + displayHits.length;
 			selectedIdx = Math.min((selectedIdx ?? -1) + 1, total - 1);
 			schedulePreview(selectedIdx);
 			const el = document.querySelector(`[data-arrow-selected="true"]`) as HTMLElement | null;
 			el?.scrollIntoView({ block: 'center', behavior: 'instant' });
 		} else if (e.code === 'ArrowUp') {
+			e.preventDefault();
 			selectedIdx = Math.max((selectedIdx ?? 0) - 1, 0);
 			schedulePreview(selectedIdx);
 			const el = document.querySelector(`[data-arrow-selected="true"]`) as HTMLElement | null;
@@ -355,6 +403,13 @@
 	};
 
 	const inputKeydown = (e: KeyboardEvent) => {
+		if (e.code === 'Enter' || e.code === 'ArrowDown' || e.code === 'ArrowUp') {
+			// The modal also has document-level navigation for when focus is on a
+			// result row. Stop this input event from bubbling there and applying the
+			// same key twice.
+			e.stopPropagation();
+			e.preventDefault();
+		}
 		if (e.code === 'Enter' && displayHits.length > 0) {
 			const el = document.querySelector(`[data-arrow-selected="true"]`) as HTMLElement | null;
 			if (el) {
@@ -368,8 +423,6 @@
 			selectedIdx = Math.min((selectedIdx ?? -1) + 1, actions.length + displayHits.length - 1);
 		} else if (e.code === 'ArrowUp') {
 			selectedIdx = Math.max((selectedIdx ?? 0) - 1, 0);
-		} else {
-			selectedIdx = actions.length;
 		}
 		schedulePreview(selectedIdx);
 		const el = document.querySelector(`[data-arrow-selected="true"]`) as HTMLElement | null;
@@ -381,10 +434,6 @@
 		runSearch(true);
 	};
 
-	$: if (show) {
-		void initOpen();
-	}
-
 	const initOpen = async () => {
 		await tick();
 		// Reset transient state on each open
@@ -395,10 +444,17 @@
 		history = null;
 		selectedIdx = null;
 		firstCharFired = false;
+		page = 1;
+		searchError = false;
 		// Drop cached preview histories so the modal doesn't hold large message
 		// maps across opens.
 		chatCache.clear();
-		chatCount = await getChatCount(localStorage.token).catch(() => null);
+		// Counting the library is decorative; it must never delay the first useful
+		// result request or replay a query the user already started typing.
+		void getChatCount(localStorage.token).then(
+			(count) => (chatCount = count),
+			() => (chatCount = null)
+		);
 		recentSearchesRef?.reload();
 		// Initial: fetch with whatever query/filters are set (usually empty)
 		runSearch(true);
@@ -434,11 +490,31 @@
 	});
 
 	onDestroy(() => {
+		searchRequestId += 1;
 		if (debounceTimer) clearTimeout(debounceTimer);
 		if (previewDebounce) clearTimeout(previewDebounce);
 		if (inFlightController) inFlightController.abort();
 		if (previewController) previewController.abort();
 		document.removeEventListener('keydown', onKeyDown);
+	});
+	let hits = $derived((response?.hits ?? []) as ChatSearchHit[]);
+	let facets = $derived((response?.facets ?? null) as ChatSearchFacets | null);
+	let usedFuzzy = $derived(response?.used_fuzzy ?? false);
+	let totalCount = $derived(response?.total ?? 0);
+	let displayHits = $derived(hits.length > 0 ? hits : optimisticHits);
+	let hasMore = $derived(Boolean(response && response.hits.length < response.total));
+	$effect(() => {
+		if (show) {
+			void initOpen();
+		} else {
+			searchRequestId += 1;
+			if (debounceTimer) clearTimeout(debounceTimer);
+			debounceTimer = null;
+			inFlightController?.abort();
+			inFlightController = null;
+			loading = false;
+			loadingMore = false;
+		}
 	});
 </script>
 
@@ -447,8 +523,8 @@
 		<div class="px-4 pb-1.5">
 			<SearchInput
 				bind:value={query}
-				on:input={onSearchInput}
-				placeholder={$i18n.t('Search')}
+				oninput={onSearchInput}
+				placeholder={$i18n.t('Search conversations and messages')}
 				showClearButton={true}
 				onFocus={() => {
 					selectedIdx = null;
@@ -466,16 +542,16 @@
 			bind:datePreset
 			bind:sort
 			{facets}
-			on:change={onChipsChange}
+			onchange={onChipsChange}
 		/>
 
 		{#if !query && response && hits.length === 0}
-			<RecentSearches bind:this={recentSearchesRef} on:pick={onRecentPick} />
+			<RecentSearches bind:this={recentSearchesRef} onpick={onRecentPick} />
 		{/if}
 
 		{#if usedFuzzy && response?.did_you_mean}
 			<div
-				class="mx-4 mb-2 px-3 py-1.5 text-xs rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300"
+				class="mx-4 mb-2 px-3 py-1.5 text-xs rounded-lg bg-warning/10 border-hairline border-warning/25 text-warning dark:text-warning-dark"
 			>
 				{$i18n.t('No exact matches for')} <strong>{response.did_you_mean}</strong>.
 				{$i18n.t('Showing similar matches.')}
@@ -515,17 +591,17 @@
 								? 'bg-gray-50 dark:bg-gray-850'
 								: ''}"
 							data-arrow-selected={selectedIdx === idx ? 'true' : undefined}
-							on:mouseenter={() => {
+							onmouseenter={() => {
 								selectedIdx = idx;
 								schedulePreview(idx);
 							}}
-							on:click={async () => {
+							onclick={async () => {
 								await action.onClick();
 							}}
 							type="button"
 						>
 							<div class="pr-2">
-								<svelte:component this={action.icon} />
+								<action.icon />
 							</div>
 							<div class="flex-1 text-left text-ellipsis line-clamp-1">
 								{action.label}
@@ -534,7 +610,16 @@
 					{/each}
 				{/if}
 
-				{#if response || optimisticHits.length > 0}
+				{#if searchError}
+					<div class="text-xs text-gray-500 dark:text-gray-400 text-center px-5 py-8">
+						<div>{$i18n.t('Search failed. Please try again.')}</div>
+						<button
+							class="mt-2 px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700"
+							type="button"
+							onclick={() => runSearch(true)}>{$i18n.t('Retry')}</button
+						>
+					</div>
+				{:else if response || optimisticHits.length > 0}
 					<hr class="border-gray-50 dark:border-gray-850 my-3" />
 					{#if displayHits.length === 0 && !loading}
 						<div class="text-xs text-gray-500 dark:text-gray-400 text-center px-5 py-4">
@@ -545,11 +630,11 @@
 							<ResultRow
 								{hit}
 								selected={selectedIdx === idx + actions.length}
-								on:mouseenter={() => {
+								onmouseenter={() => {
 									selectedIdx = idx + actions.length;
 									schedulePreview(selectedIdx);
 								}}
-								on:click={async () => {
+								onclick={async () => {
 									if (query.trim()) searchHistoryAdd(query.trim());
 									await goto(`/c/${hit.id}`);
 									show = false;
@@ -557,6 +642,16 @@
 								}}
 							/>
 						{/each}
+						{#if hasMore}
+							<button
+								class="mx-2 mt-2 mb-4 rounded-xl py-2 text-xs font-medium text-gray-600 dark:text-gray-300 bg-gray-50 dark:bg-gray-850 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-60"
+								type="button"
+								disabled={loadingMore}
+								onclick={() => runSearch(true, true)}
+							>
+								{loadingMore ? $i18n.t('Loading...') : $i18n.t('Load more')}
+							</button>
+						{/if}
 					{/if}
 				{:else}
 					<div class="w-full h-full flex justify-center items-center">
@@ -604,7 +699,7 @@
 	}
 	@keyframes search-match-flash {
 		0% {
-			background-color: rgba(250, 204, 21, 0.35);
+			background-color: rgba(204, 120, 92, 0.28);
 		}
 		100% {
 			background-color: transparent;

@@ -13,8 +13,31 @@ echo "============================================================"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Build frontend if build directory doesn't exist or if src files are newer
-if [ ! -d "build" ] || [ "src" -nt "build" ]; then
+# Build the frontend when it is absent or any real frontend input is newer than
+# the generated shell. Comparing only the `src` directory mtime misses edits to
+# files nested below it, which can restart the backend while continuing to serve
+# an old JavaScript bundle.
+FRONTEND_BUILD_NEEDED=false
+if [ ! -f "build/index.html" ]; then
+    FRONTEND_BUILD_NEEDED=true
+elif find src static -type f -newer "build/index.html" -print -quit | grep -q .; then
+    FRONTEND_BUILD_NEEDED=true
+else
+    for FRONTEND_INPUT in \
+        package.json \
+        package-lock.json \
+        svelte.config.js \
+        vite.config.ts \
+        tailwind.config.js \
+        postcss.config.js; do
+        if [ -f "$FRONTEND_INPUT" ] && [ "$FRONTEND_INPUT" -nt "build/index.html" ]; then
+            FRONTEND_BUILD_NEEDED=true
+            break
+        fi
+    done
+fi
+
+if [ "$FRONTEND_BUILD_NEEDED" = "true" ]; then
     echo "📦 Building frontend (first time or source files changed)..."
 
     # Check if node_modules exists, if not run npm install
@@ -41,10 +64,15 @@ fi
 # high-throughput reasoning models. Opt in explicitly if needed:
 #   ENABLE_API_DEBUG_LOGGING=true ./start_modified.sh
 export ENABLE_API_DEBUG_LOGGING="${ENABLE_API_DEBUG_LOGGING:-false}"
+export ENABLE_AUTOMATIONS="${ENABLE_AUTOMATIONS:-true}"
 export VECTOR_DB="${VECTOR_DB:-pgvector}"
 export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://tennisbowling:tennispass@192.168.10.2:5432/openllm}"
 export DATABASE_POOL_SIZE="${DATABASE_POOL_SIZE:-20}"
 export DATABASE_POOL_MAX_OVERFLOW="${DATABASE_POOL_MAX_OVERFLOW:-20}"
+
+# Instance display name — replaces "Open WebUI" everywhere a user/crawler sees it
+# (tab title, UI, share-link embeds, PWA, etc.). Override by exporting WEBUI_NAME.
+export WEBUI_NAME="${WEBUI_NAME:-OpenLLM}"
 
 if [ -z "${DATABASE_URL:-}" ]; then
     echo "❌ DATABASE_URL is required for the Postgres-only runtime."
@@ -90,4 +118,10 @@ echo "Press Ctrl+C to stop the server"
 echo "============================================================"
 echo ""
 
-exec "$PYTHON_BIN" -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 75 --loop uvloop --http httptools
+# Trust X-Forwarded-* from the local reverse proxy (Caddy) so uvicorn sees the
+# real client scheme/IP (correct https redirects, WS upgrades, rate limits) when
+# fronted for HTTP/2+3. Safe here because the proxy is co-located on loopback.
+# Added conditionally so an existing override in FORWARDED_ALLOW_IPS is respected.
+FORWARDED_ALLOW_IPS_FLAG="--forwarded-allow-ips=${FORWARDED_ALLOW_IPS:-*}"
+
+exec "$PYTHON_BIN" -m uvicorn open_webui.main:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 75 --loop uvloop --http httptools "$FORWARDED_ALLOW_IPS_FLAG"

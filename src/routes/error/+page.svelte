@@ -1,11 +1,14 @@
 <script>
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import { WEBUI_NAME, config } from '$lib/stores';
 	import { onMount, getContext } from 'svelte';
 
 	const i18n = getContext('i18n');
 
-	let loaded = false;
+	let loaded = $state(false);
+
+	let isOffline = $derived($page.url.searchParams.get('offline') === '1');
 
 	onMount(async () => {
 		if ($config) {
@@ -21,38 +24,63 @@
 		<div class="absolute rounded-xl w-full h-full backdrop-blur-sm flex justify-center">
 			<div class="m-auto pb-44 flex flex-col justify-center">
 				<div class="max-w-md">
-					<div class="text-center text-2xl font-medium z-50">
-						{$i18n.t('{{webUIName}} Backend Required', { webUIName: $WEBUI_NAME })}
-					</div>
+					{#if isOffline}
+						<div class="text-center text-2xl font-medium z-50">
+							{$i18n.t("You're offline")}
+						</div>
 
-					<div class=" mt-4 text-center text-sm w-full">
-						{$i18n.t(
-							"Oops! You're using an unsupported method (frontend only). Please serve the WebUI from the backend."
-						)}
+						<div class=" mt-4 text-center text-sm w-full">
+							{$i18n.t(
+								"You're offline and this device doesn't have any saved data yet. Connect to the internet and try again."
+							)}
+						</div>
 
-						<br class=" " />
-						<br class=" " />
-						<a
-							class=" font-semibold underline"
-							href="https://github.com/open-webui/open-webui#how-to-install-"
-							target="_blank">{$i18n.t('See readme.md for instructions')}</a
-						>
-						{$i18n.t('or')}
-						<a class=" font-semibold underline" href="https://discord.gg/5rJgQTnV4s" target="_blank"
-							>{$i18n.t('join our Discord for help.')}</a
-						>
-					</div>
+						<div class=" mt-6 mx-auto relative group w-fit">
+							<button
+								class="relative z-20 flex px-5 py-2 rounded-full bg-book-cloth hover:bg-kraft transition-colors duration-200 ease-paper font-medium text-sm text-white"
+								onclick={() => {
+									location.reload();
+								}}
+							>
+								{$i18n.t('Retry')}
+							</button>
+						</div>
+					{:else}
+						<div class="text-center text-2xl font-medium z-50">
+							{$i18n.t('{{webUIName}} Backend Required', { webUIName: $WEBUI_NAME })}
+						</div>
 
-					<div class=" mt-6 mx-auto relative group w-fit">
-						<button
-							class="relative z-20 flex px-5 py-2 rounded-full bg-gray-100 hover:bg-gray-200 transition font-medium text-sm text-black"
-							on:click={() => {
-								location.href = '/';
-							}}
-						>
-							{$i18n.t('Check Again')}
-						</button>
-					</div>
+						<div class=" mt-4 text-center text-sm w-full">
+							{$i18n.t(
+								"Oops! You're using an unsupported method (frontend only). Please serve the WebUI from the backend."
+							)}
+
+							<br class=" " />
+							<br class=" " />
+							<a
+								class=" font-semibold underline text-book-cloth dark:text-kraft"
+								href="https://github.com/open-webui/open-webui#how-to-install-"
+								target="_blank">{$i18n.t('See readme.md for instructions')}</a
+							>
+							{$i18n.t('or')}
+							<a
+								class=" font-semibold underline text-book-cloth dark:text-kraft"
+								href="https://discord.gg/5rJgQTnV4s"
+								target="_blank">{$i18n.t('join our Discord for help.')}</a
+							>
+						</div>
+
+						<div class=" mt-6 mx-auto relative group w-fit">
+							<button
+								class="relative z-20 flex px-5 py-2 rounded-full bg-book-cloth hover:bg-kraft transition-colors duration-200 ease-paper font-medium text-sm text-white"
+								onclick={() => {
+									location.href = '/';
+								}}
+							>
+								{$i18n.t('Check Again')}
+							</button>
+						</div>
+					{/if}
 				</div>
 			</div>
 		</div>

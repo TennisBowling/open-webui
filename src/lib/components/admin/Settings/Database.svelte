@@ -1,18 +1,24 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
 	import { downloadDatabase, downloadLiteLLMConfig } from '$lib/apis/utils';
 	import { onMount, getContext } from 'svelte';
 	import { config, user } from '$lib/stores';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getAllUserChats } from '$lib/apis/chats';
 	import { getAllUsers } from '$lib/apis/users';
 	import { exportConfig, importConfig } from '$lib/apis/configs';
 
 	const i18n = getContext('i18n');
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
+
+	let { saveHandler }: Props = $props();
 
 	const exportAllUserChats = async () => {
 		let blob = new Blob([JSON.stringify(await getAllUserChats(localStorage.token))], {
@@ -51,9 +57,9 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		<div>
@@ -64,7 +70,7 @@
 				hidden
 				type="file"
 				accept=".json"
-				on:change={(e) => {
+				onchange={(e) => {
 					const file = e.target.files[0];
 					const reader = new FileReader();
 
@@ -88,7 +94,7 @@
 			<button
 				type="button"
 				class=" flex rounded-md py-2 px-3 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-				on:click={async () => {
+				onclick={async () => {
 					document.getElementById('config-json-input').click();
 				}}
 			>
@@ -115,7 +121,7 @@
 			<button
 				type="button"
 				class=" flex rounded-md py-2 px-3 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-				on:click={async () => {
+				onclick={async () => {
 					const config = await exportConfig(localStorage.token);
 					const blob = new Blob([JSON.stringify(config)], {
 						type: 'application/json'
@@ -152,7 +158,7 @@
 					<button
 						class=" flex rounded-md py-1.5 px-3 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
 						type="button"
-						on:click={() => {
+						onclick={() => {
 							// exportAllUserChats();
 
 							downloadDatabase(localStorage.token).catch((error) => {
@@ -181,7 +187,7 @@
 
 				<button
 					class=" flex rounded-md py-2 px-3 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-					on:click={() => {
+					onclick={() => {
 						exportAllUserChats();
 					}}
 				>
@@ -207,7 +213,7 @@
 
 				<button
 					class=" flex rounded-md py-2 px-3 w-full hover:bg-gray-200 dark:hover:bg-gray-800 transition"
-					on:click={() => {
+					onclick={() => {
 						exportUsers();
 					}}
 				>

@@ -1,10 +1,12 @@
 import { sveltekit } from '@sveltejs/kit/vite';
+import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
 export default defineConfig({
 	plugins: [
+		tailwindcss(),
 		sveltekit(),
 		viteStaticCopy({
 			targets: [
@@ -21,14 +23,13 @@ export default defineConfig({
 		APP_BUILD_HASH: JSON.stringify(process.env.APP_BUILD_HASH || 'dev-build')
 	},
 	build: {
-		sourcemap: true
+		// 'hidden' still emits maps for error reporting but stops advertising them
+		// via //# sourceMappingURL in prod chunks — no ~51 MB of maps offered to
+		// clients on metered links.
+		sourcemap: 'hidden'
 	},
 	worker: {
 		format: 'es'
-	},
-	esbuild: {
-		// Temporarily disabled to allow socket debugging logs
-		// pure: process.env.ENV === 'dev' ? [] : ['console.log', 'console.debug', 'console.error']
 	},
 	ssr: {
 		noExternal: [],

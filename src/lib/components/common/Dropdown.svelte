@@ -1,17 +1,33 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import { DropdownMenu } from 'bits-ui';
-	import { createEventDispatcher, getContext } from 'svelte';
+	import { getContext } from 'svelte';
 
 	const i18n = getContext('i18n');
 
 	import { flyAndScale } from '$lib/utils/transitions';
 
-	export let show = false;
-	export let side = 'bottom';
-	export let align = 'start';
-	export let closeOnOutsideClick = true;
+	interface Props {
+		show?: boolean;
+		side?: string;
+		align?: string;
+		closeOnOutsideClick?: boolean;
+		children?: import('svelte').Snippet;
+		content?: import('svelte').Snippet;
+	}
 
-	const dispatch = createEventDispatcher();
+	let {
+		show = $bindable(false),
+		side = 'bottom',
+		align = 'start',
+		closeOnOutsideClick = true,
+		children,
+		content,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 </script>
 
 <DropdownMenu.Root
@@ -24,12 +40,12 @@
 	typeahead={false}
 >
 	<DropdownMenu.Trigger>
-		<slot />
+		{@render children?.()}
 	</DropdownMenu.Trigger>
 
-	<slot name="content">
+	{#if content}{@render content()}{:else}
 		<DropdownMenu.Content
-			class="w-full max-w-[130px] rounded-xl p-1 border-hairline border-gray-200 dark:border-gray-700 z-50 bg-white dark:bg-gray-850 text-gray-800 dark:text-white shadow-sm"
+			class="w-full max-w-[130px] rounded-xl p-1 border-hairline border-gray-200 dark:border-gray-700 z-50 bg-white dark:bg-gray-850 text-gray-800 dark:text-white shadow-lg"
 			sideOffset={8}
 			{side}
 			{align}
@@ -47,5 +63,5 @@
 				<div class="flex items-center">{$i18n.t('Profile')}</div>
 			</DropdownMenu.Item>
 		</DropdownMenu.Content>
-	</slot>
+	{/if}
 </DropdownMenu.Root>

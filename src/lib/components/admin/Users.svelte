@@ -1,6 +1,6 @@
 <script>
 	import { getContext, tick, onMount } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { goto } from '$app/navigation';
 	import { user } from '$lib/stores';
@@ -11,17 +11,7 @@
 
 	const i18n = getContext('i18n');
 
-	let selectedTab;
-	$: {
-		const pathParts = $page.url.pathname.split('/');
-		const tabFromPath = pathParts[pathParts.length - 1];
-		selectedTab = ['overview', 'groups'].includes(tabFromPath) ? tabFromPath : 'overview';
-	}
-
-	$: if (selectedTab) {
-		// scroll to selectedTab
-		scrollToTab(selectedTab);
-	}
+	let selectedTab = $state();
 
 	const scrollToTab = (tabId) => {
 		const tabElement = document.getElementById(tabId);
@@ -53,6 +43,17 @@
 		// Scroll to the selected tab on mount
 		scrollToTab(selectedTab);
 	});
+	$effect(() => {
+		const pathParts = $page.url.pathname.split('/');
+		const tabFromPath = pathParts[pathParts.length - 1];
+		selectedTab = ['overview', 'groups'].includes(tabFromPath) ? tabFromPath : 'overview';
+	});
+	$effect(() => {
+		if (selectedTab) {
+			// scroll to selectedTab
+			scrollToTab(selectedTab);
+		}
+	});
 </script>
 
 <div class="flex flex-col lg:flex-row w-full h-full pb-2 lg:space-x-4">
@@ -66,7 +67,7 @@
 			'overview'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/users/overview');
 			}}
 		>
@@ -91,7 +92,7 @@
 			'groups'
 				? ''
 				: ' text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-			on:click={() => {
+			onclick={() => {
 				goto('/admin/users/groups');
 			}}
 		>

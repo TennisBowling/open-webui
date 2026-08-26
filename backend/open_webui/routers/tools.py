@@ -73,6 +73,10 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
 
     # OpenAPI Tool Servers
     for server in await get_tool_servers(request):
+        # The fetched spec carries no icon — that's connection-level config.
+        server_connection = request.app.state.config.TOOL_SERVER_CONNECTIONS[
+            server.get("idx", 0)
+        ]
         tools.append(
             ToolUserResponse(
                 **{
@@ -85,14 +89,17 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
                         "description": server.get("openapi", {})
                         .get("info", {})
                         .get("description", ""),
+                        "icon": server_connection.get("info", {}).get("icon") or None,
                     },
-                    "access_control": request.app.state.config.TOOL_SERVER_CONNECTIONS[
-                        server.get("idx", 0)
-                    ]
-                    .get("config", {})
-                    .get("access_control", None),
-                    "updated_at": int(time.time()),
-                    "created_at": int(time.time()),
+                    "access_control": server_connection.get("config", {}).get(
+                        "access_control", None
+                    ),
+                    # Stable timestamps: minting time.time() per request churns the
+                    # tools ETag (and the whole bootstrap bundle ETag), forcing every
+                    # boot to re-download instead of 304ing. No consumer reads these
+                    # for server pseudo-tools.
+                    "updated_at": 0,
+                    "created_at": 0,
                 }
             )
         )
@@ -105,9 +112,11 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
 
             session_token = None
             if auth_type == "oauth_2.1":
-                splits = server_id.split(":")
-                server_id = splits[-1] if len(splits) > 1 else server_id
-
+                # Look up the session under the FULL server id — the same key the
+                # client/session were registered under and that middleware/verify
+                # use. Truncating to a trailing colon segment diverged for any
+                # colon-bearing id, wrongly showing an authorized server as
+                # unauthenticated.
                 session_token = (
                     await request.app.state.oauth_client_manager.get_oauth_token(
                         user.id, f"mcp:{server_id}"
@@ -124,6 +133,7 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
                             "description": server.get("info", {}).get(
                                 "description", ""
                             ),
+                            "icon": server.get("info", {}).get("icon") or None,
                             "manifest": {
                                 "config": server.get("config", {}),
                             },
@@ -131,8 +141,9 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
                         "access_control": server.get("config", {}).get(
                             "access_control", None
                         ),
-                        "updated_at": int(time.time()),
-                        "created_at": int(time.time()),
+                        # Stable timestamps — see the OpenAPI-server note above.
+                        "updated_at": 0,
+                        "created_at": 0,
                         **(
                             {
                                 "authenticated": session_token is not None,
@@ -156,6 +167,7 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
                     "name": connection.name,
                     "meta": {
                         "description": connection.description or "",
+                        "icon": (connection.meta or {}).get("icon") or None,
                         "manifest": {
                             "type": "mcp",
                             "scope": "personal",
@@ -188,7 +200,15 @@ async def get_tools(request: Request, user=Depends(get_verified_user)):
             or has_access(user.id, "read", tool.access_control, user_group_ids)
         ]
 
-    content = [item.model_dump() for item in result]
+    # Strip the heavy Python source (`content`) and generated `specs` — these
+    # leak through ToolUserResponse's extra="allow" for local tools but no list
+    # consumer reads them (the editor loads them per-tool via get_tool_by_id).
+    content = []
+    for item in result:
+        data = item.model_dump()
+        data.pop("content", None)
+        data.pop("specs", None)
+        content.append(data)
     return etag_response(content, request)
 
 

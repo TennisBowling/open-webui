@@ -7,9 +7,19 @@
 
 	const i18n = getContext('i18n');
 
-	export let value = '';
-	export let placeholder = $i18n.t('Select view');
-	export let onChange: (value: string) => void = () => {};
+	interface Props {
+		value?: string;
+		placeholder?: any;
+		onChange?: (value: string) => void;
+		children?: import('svelte').Snippet;
+	}
+
+	let {
+		value = $bindable(''),
+		placeholder = $i18n.t('Select view'),
+		onChange = () => {},
+		children
+	}: Props = $props();
 
 	const items = [
 		{ value: '', label: $i18n.t('All') },
@@ -38,11 +48,11 @@
 	</Select.Trigger>
 
 	<Select.Content
-		class="rounded-2xl min-w-[170px] p-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+		class="rounded-2xl min-w-[170px] p-1 border-hairline border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
 		sameWidth={false}
 		align="start"
 	>
-		<slot>
+		{#if children}{@render children()}{:else}
 			{#each items as item}
 				<Select.Item
 					class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
@@ -58,7 +68,7 @@
 					{/if}
 				</Select.Item>
 			{/each}
-		</slot>
+		{/if}
 	</Select.Content>
 </Select.Root>
 
@@ -66,7 +76,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >
@@ -77,7 +87,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >
@@ -88,7 +98,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >

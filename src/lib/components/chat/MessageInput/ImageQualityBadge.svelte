@@ -1,5 +1,8 @@
 <script lang="ts">
-	import { getContext, createEventDispatcher } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { stopPropagation } from '$lib/utils/eventModifiers';
+
+	import { getContext } from 'svelte';
 	import { config, settings, mobile } from '$lib/stores';
 	import { formatFileSize } from '$lib/utils';
 
@@ -8,29 +11,40 @@
 	import Bolt from '$lib/components/icons/Bolt.svelte';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	// `fullQuality === true` ⇒ pinned (no compression). Anything else
 	// (false/undefined/missing) ⇒ optimized. Mirrors the backend's
 	// `f.fullQuality === true` semantics so the UI can never disagree with
-	// what actually gets sent.
-	export let fullQuality: boolean = false;
-	export let size: number | null = null;
-	// `compact` is icon-only, for tiny thumbnails (e.g. message-edit, ~56px).
-	export let compact: boolean = false;
-	// Disable interaction while an image is still uploading.
-	export let disabled: boolean = false;
 
-	$: pinned = fullQuality === true;
+	interface Props {
+		// what actually gets sent.
+		fullQuality?: boolean;
+		size?: number | null;
+		// `compact` is icon-only, for tiny thumbnails (e.g. message-edit, ~56px).
+		compact?: boolean;
+		// Disable interaction while an image is still uploading.
+		disabled?: boolean;
+	}
+
+	let {
+		fullQuality = false,
+		size = null,
+		compact = false,
+		disabled = false,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	let pinned = $derived(fullQuality === true);
 
 	// Match the rest of the composer: controls hide until hover unless the user
 	// is on mobile / high-contrast (no reliable hover), or the state is the
 	// consequential one (pinned), which should always announce itself.
-	$: alwaysVisible =
-		pinned || $mobile || ($settings?.highContrastMode ?? false);
+	let alwaysVisible = $derived(pinned || $mobile || ($settings?.highContrastMode ?? false));
 
-	$: enabledGlobally = $config?.file?.image_provider_compression?.enabled ?? false;
-	$: sizeLabel = typeof size === 'number' && size > 0 ? formatFileSize(size) : '';
+	let enabledGlobally = $derived($config?.file?.image_provider_compression?.enabled ?? false);
+	let sizeLabel = $derived(typeof size === 'number' && size > 0 ? formatFileSize(size) : '');
 
 	const toggle = () => {
 		if (disabled) return;
@@ -51,7 +65,7 @@
 			class="flex items-center gap-1 rounded-full shadow-sm transition-colors {compact
 				? 'p-1'
 				: 'px-1.5 py-1'} {pinned
-				? 'bg-amber-400/95 hover:bg-amber-400 text-amber-950'
+				? 'bg-warning/90 hover:bg-warning text-white'
 				: 'bg-white/90 hover:bg-white text-gray-700 dark:bg-gray-800/90 dark:text-gray-200 dark:hover:bg-gray-800'} {alwaysVisible
 				? ''
 				: 'opacity-0 group-hover:opacity-100'} {disabled ? 'cursor-default' : ''}"
@@ -59,7 +73,7 @@
 			aria-label={pinned
 				? $i18n.t('Image quality: full. Click to optimize.')
 				: $i18n.t('Image quality: optimized. Click to send at full quality.')}
-			on:click|stopPropagation={toggle}
+			onclick={stopPropagation(toggle)}
 		>
 			{#if pinned}
 				<Bolt className="size-3.5" strokeWidth="2" />

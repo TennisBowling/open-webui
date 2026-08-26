@@ -234,6 +234,77 @@ export interface SubagentAnalytics {
 }
 
 /**
+ * Cache Intelligence types
+ */
+export interface CacheBucket {
+	key: string;
+	label: string;
+	lower_seconds: number;
+}
+
+export interface CacheCurvePoint {
+	bucket: string;
+	requests: number;
+	prompt_tokens: number;
+	cache_read_tokens: number;
+	hit_ratio: number; // 0..1
+}
+
+export interface CacheGroupStats {
+	key: string;
+	label: string;
+	kind: 'gateway' | 'vendor' | 'model';
+	prompt_tokens: number;
+	cache_read_tokens: number;
+	total_tokens: number;
+	request_count: number;
+	hit_rate: number; // percent
+	savings_usd: number;
+	unpriced_cache_tokens: number;
+	est_ttl_seconds: number | null;
+	est_ttl_capped: boolean;
+	curve: CacheCurvePoint[]; // conversational
+	curve_agentic: CacheCurvePoint[];
+	conversational_requests: number;
+	agentic_requests: number;
+	conversational_hit_rate: number;
+	agentic_hit_rate: number;
+}
+
+export interface CacheUserStats {
+	user_id: string;
+	name: string | null;
+	email: string | null;
+	prompt_tokens: number;
+	cache_read_tokens: number;
+	hit_rate: number;
+	savings_usd: number;
+}
+
+export interface CacheAnalytics {
+	group_by: 'gateway' | 'vendor' | 'model';
+	start_ts: number;
+	end_ts: number;
+	buckets: CacheBucket[];
+	prompt_tokens: number;
+	cache_read_tokens: number;
+	total_tokens: number;
+	request_count: number;
+	eligible_request_count: number;
+	conversational_request_count: number;
+	agentic_request_count: number;
+	conversational_cache_read_tokens: number;
+	agentic_cache_read_tokens: number;
+	conversational_hit_rate: number;
+	agentic_hit_rate: number;
+	hit_rate: number;
+	savings_usd: number;
+	unpriced_cache_tokens: number;
+	groups: CacheGroupStats[];
+	users: CacheUserStats[];
+}
+
+/**
  * Get token usage stats for a specific chat
  */
 export const getChatTokenStats = async (
@@ -739,6 +810,21 @@ export const getTopChatsByCost = async (
 	const params = _windowParams(year, window);
 	params.append('limit', limit.toString());
 	return await _getJSON(token, `/analytics/global/top-chats-by-cost?${params.toString()}`, []);
+};
+
+/**
+ * Get site-wide cache intelligence (Admin only).
+ * groupBy ∈ 'gateway' | 'vendor' | 'model'.
+ */
+export const getGlobalCacheAnalytics = async (
+	token: string,
+	groupBy: 'gateway' | 'vendor' | 'model' = 'gateway',
+	year?: number,
+	window?: { start_ts?: number; end_ts?: number }
+): Promise<CacheAnalytics | null> => {
+	const params = _windowParams(year, window);
+	params.append('group_by', groupBy);
+	return await _getJSON(token, `/analytics/global/cache?${params.toString()}`, null);
 };
 
 /**

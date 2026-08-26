@@ -1,6 +1,8 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { onMount, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { getSubagentsConfig, updateSubagentsConfig } from '$lib/apis/subagents';
 	import { models } from '$lib/stores';
@@ -8,21 +10,26 @@
 
 	const i18n: any = getContext('i18n');
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
 
-	let enableSubagents = false;
-	let defaultModel = '';
-	let parentPrompt = '';
-	let systemPromptAppend = '';
-	let defaultReasoningEffort = '';
-	let defaultServiceTier = '';
-	let allowExternalTools = false;
-	let externalToolsPrompt = '';
+	let { saveHandler }: Props = $props();
+
+	let enableSubagents = $state(false);
+	let defaultModel = $state('');
+	let contextFallbackModel = $state('');
+	let parentPrompt = $state('');
+	let systemPromptAppend = $state('');
+	let defaultReasoningEffort = $state('');
+	let defaultServiceTier = $state('');
+	let allowExternalTools = $state(false);
+	let externalToolsPrompt = $state('');
 
 	// Cached default so the "Reset" button works without a round-trip.
-	let initialParentPrompt = '';
-	let initialSystemPromptAppend = '';
-	let initialExternalToolsPrompt = '';
+	let initialParentPrompt = $state('');
+	let initialSystemPromptAppend = $state('');
+	let initialExternalToolsPrompt = $state('');
 
 	// Common reasoning_effort values. The backend just passes the string
 	// through to the provider, so a custom value works too — admin can edit
@@ -52,6 +59,7 @@
 			const res = await updateSubagentsConfig(localStorage.token, {
 				ENABLE_SUBAGENTS: enableSubagents,
 				SUBAGENT_DEFAULT_MODEL: defaultModel,
+				SUBAGENT_CONTEXT_FALLBACK_MODEL: contextFallbackModel,
 				SUBAGENT_SYSTEM_PROMPT_APPEND: systemPromptAppend,
 				SUBAGENT_PARENT_PROMPT: parentPrompt,
 				SUBAGENT_DEFAULT_REASONING_EFFORT: defaultReasoningEffort,
@@ -79,6 +87,7 @@
 			if (res) {
 				enableSubagents = !!res.ENABLE_SUBAGENTS;
 				defaultModel = res.SUBAGENT_DEFAULT_MODEL ?? '';
+				contextFallbackModel = res.SUBAGENT_CONTEXT_FALLBACK_MODEL ?? '';
 				parentPrompt = res.SUBAGENT_PARENT_PROMPT ?? '';
 				initialParentPrompt = parentPrompt;
 				systemPromptAppend = res.SUBAGENT_SYSTEM_PROMPT_APPEND ?? '';
@@ -97,10 +106,10 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		await submitHandler();
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		<div>
@@ -149,9 +158,9 @@
 								<button
 									type="button"
 									class="ml-auto text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-									on:click|preventDefault={() => {
+									onclick={preventDefault(() => {
 										externalToolsPrompt = initialExternalToolsPrompt;
-									}}
+									})}
 								>
 									{$i18n.t('Reset')}
 								</button>
@@ -165,8 +174,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Append when subagents have external tools…')}
-								bind:value={externalToolsPrompt}
-							></textarea>
+								bind:value={externalToolsPrompt}></textarea>
 						</div>
 					{/if}
 
@@ -184,6 +192,26 @@
 							bind:value={defaultModel}
 						>
 							<option value="">{$i18n.t('— Use parent model —')}</option>
+							{#each $models ?? [] as m}
+								<option value={m.id}>{m.name ?? m.id}</option>
+							{/each}
+						</select>
+					</div>
+
+					<div class="mb-2.5 flex w-full flex-col">
+						<div class=" self-center text-xs font-medium mb-1 mr-auto">
+							{$i18n.t('Long-context fallback model')}
+						</div>
+						<div class=" text-xs text-gray-500 dark:text-gray-400 mb-1">
+							{$i18n.t(
+								'When the active subagent model runs out of input context, retry only that failed turn with this model and keep using it for the rest of the subagent conversation. Empty disables automatic fallback. Output-token limits and unrelated errors do not trigger a switch.'
+							)}
+						</div>
+						<select
+							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+							bind:value={contextFallbackModel}
+						>
+							<option value="">{$i18n.t('— Disabled —')}</option>
 							{#each $models ?? [] as m}
 								<option value={m.id}>{m.name ?? m.id}</option>
 							{/each}
@@ -236,24 +264,23 @@
 							<button
 								type="button"
 								class="ml-auto text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-								on:click|preventDefault={() => {
+								onclick={preventDefault(() => {
 									systemPromptAppend = initialSystemPromptAppend;
-								}}
+								})}
 							>
 								{$i18n.t('Reset')}
 							</button>
 						</div>
 						<div class=" text-xs text-gray-500 dark:text-gray-400 mb-1">
 							{$i18n.t(
-								'Appended to every subagent\'s system prompt after the model\'s own prompt. Use this for global instructions like citation style, output format, or domain rules you want ALL subagents to follow. Leave empty to skip.'
+								"Appended to every subagent's system prompt after the model's own prompt. Use this for global instructions like citation style, output format, or domain rules you want ALL subagents to follow. Leave empty to skip."
 							)}
 						</div>
 						<textarea
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 							rows="6"
 							placeholder={$i18n.t('Append to subagent system prompt…')}
-							bind:value={systemPromptAppend}
-						></textarea>
+							bind:value={systemPromptAppend}></textarea>
 					</div>
 
 					<div class="mb-2.5 flex w-full flex-col">
@@ -264,9 +291,9 @@
 							<button
 								type="button"
 								class="ml-auto text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-								on:click|preventDefault={() => {
+								onclick={preventDefault(() => {
 									parentPrompt = initialParentPrompt;
-								}}
+								})}
 							>
 								{$i18n.t('Reset')}
 							</button>
@@ -280,8 +307,7 @@
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 							rows="8"
 							placeholder={$i18n.t('Parent chat instructions…')}
-							bind:value={parentPrompt}
-						></textarea>
+							bind:value={parentPrompt}></textarea>
 					</div>
 				{/if}
 			</div>

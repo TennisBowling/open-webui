@@ -178,7 +178,7 @@ class AskUserTools:
     ) -> str:
         """Ask the user one or more questions and PAUSE until they answer. Use only at genuine decision points where their input changes what you do next; never to narrate progress or for things you can decide yourself.
 
-        :param questions: 1-4 questions. Each: {question, header?, options?: [{label, description?}], multiSelect?, allowOther?}. Omit options for a free-form text question. Keep options distinct; put a recommended option first.
+        :param questions: 1-4 questions, in order. Put a recommended option first if any.
         :return: The user's answer(s) as text, or a notice if they skipped or didn't answer in time.
         """
         normalized = _coerce_questions(questions)

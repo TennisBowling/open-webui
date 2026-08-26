@@ -1,17 +1,16 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext, onMount } from 'svelte';
-	import {
-		searchHistoryGet,
-		searchHistoryClear,
-		type ChatSearchHistoryEntry
-	} from '$lib/utils';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { getContext, onMount } from 'svelte';
+	import { searchHistoryGet, searchHistoryClear, type ChatSearchHistoryEntry } from '$lib/utils';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import ClockRotateRight from '$lib/components/icons/ClockRotateRight.svelte';
 
-	const dispatch = createEventDispatcher();
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 	const i18n = getContext('i18n');
 
-	let history: ChatSearchHistoryEntry[] = [];
+	let history: ChatSearchHistoryEntry[] = $state([]);
 
 	const refresh = () => {
 		history = searchHistoryGet();
@@ -40,7 +39,7 @@
 			</div>
 			<button
 				class="text-[10px] text-gray-400 hover:text-gray-700 dark:hover:text-white"
-				on:click={clearAll}
+				onclick={clearAll}
 				type="button"
 			>
 				{$i18n.t('Clear')}
@@ -50,7 +49,7 @@
 			{#each history as entry (entry.timestamp)}
 				<button
 					class="flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-gray-50 dark:bg-gray-850 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
-					on:click={() => pick(entry.query)}
+					onclick={() => pick(entry.query)}
 					type="button"
 				>
 					<span class="line-clamp-1 max-w-[180px]">{entry.query}</span>

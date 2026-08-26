@@ -1,25 +1,15 @@
 from open_webui.utils.tool_calling import (
-    merge_streamed_tool_call_field,
+    dedupe_repeated_tool_name,
+    merge_streamed_field,
     mcp_model_facing_tool_name,
     parse_tool_call_arguments,
 )
 
 
-def _dedupe_repeated_tool_name(name: str | None) -> str:
-    if not name:
-        return ""
-    for unit_len in range(1, (len(name) // 2) + 1):
-        if len(name) % unit_len == 0:
-            unit = name[:unit_len]
-            if unit and unit * (len(name) // unit_len) == name:
-                return unit
-    return name
-
-
 def _merge_tool_call_fragments(chunks):
     value = ""
     for chunk in chunks:
-        value = merge_streamed_tool_call_field(value, chunk)
+        value = merge_streamed_field(value, chunk)
     return value
 
 
@@ -117,12 +107,12 @@ def test_streamed_tool_call_field_accepts_cumulative_prefix_resends():
 def test_streamed_tool_call_names_merge_without_argument_overlap_rules():
     name = ""
     for chunk in ["web_", "web_search", "web_search"]:
-        name = _dedupe_repeated_tool_name(merge_streamed_tool_call_field(name, chunk))
+        name = dedupe_repeated_tool_name(merge_streamed_field(name, chunk))
     assert name == "web_search"
 
     name = ""
     for chunk in ["web_", "search"]:
-        name = _dedupe_repeated_tool_name(merge_streamed_tool_call_field(name, chunk))
+        name = dedupe_repeated_tool_name(merge_streamed_field(name, chunk))
     assert name == "web_search"
 
 

@@ -1,15 +1,50 @@
 @reference "./tailwind.css";
 
+/*
+ * Fonts are subset to woff2 by scripts/subset-fonts.mjs (prebuild). Each family
+ * ships a small Latin "core" face (eager) plus on-demand faces for other scripts,
+ * split by non-overlapping unicode-range so a cold paint only pulls the glyphs it
+ * needs. The variable weight axis is preserved (font-weight: 100 900).
+ */
+
+/* Inter — Latin core (eager body font) */
 @font-face {
 	font-family: 'Inter';
-	src: url('/assets/fonts/Inter-Variable.ttf');
+	src: url('/assets/fonts/Inter-Variable.latin.woff2') format('woff2');
+	font-weight: 100 900;
 	font-display: swap;
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+		U+02DC, U+0300-0304, U+0308-0309, U+0323, U+0329, U+2000-206F, U+2074, U+20AC,
+		U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD, U+0100-024F;
+}
+/* Inter — Greek / Cyrillic / Vietnamese (on demand) */
+@font-face {
+	font-family: 'Inter';
+	src: url('/assets/fonts/Inter-Variable.ext.woff2') format('woff2');
+	font-weight: 100 900;
+	font-display: swap;
+	unicode-range: U+0250-02AF, U+0370-03FF, U+0400-052F, U+0590-05FF, U+1E00-1EFF,
+		U+1F00-1FFF, U+2C60-2C7F, U+A720-A7FF, U+FB00-FB06;
 }
 
+/* Archivo — Latin core (eager; .font-primary sidebar/auth labels) */
 @font-face {
 	font-family: 'Archivo';
-	src: url('/assets/fonts/Archivo-Variable.ttf');
+	src: url('/assets/fonts/Archivo-Variable.latin.woff2') format('woff2');
+	font-weight: 100 900;
 	font-display: swap;
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+		U+02DC, U+0300-0304, U+0308-0309, U+0323, U+0329, U+2000-206F, U+2074, U+20AC,
+		U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD, U+0100-024F;
+}
+/* Archivo — extended scripts (on demand) */
+@font-face {
+	font-family: 'Archivo';
+	src: url('/assets/fonts/Archivo-Variable.ext.woff2') format('woff2');
+	font-weight: 100 900;
+	font-display: swap;
+	unicode-range: U+0250-02AF, U+0370-03FF, U+0400-052F, U+0590-05FF, U+1E00-1EFF,
+		U+1F00-1FFF, U+2C60-2C7F, U+A720-A7FF, U+FB00-FB06;
 }
 
 @font-face {
@@ -18,17 +53,27 @@
 	font-display: swap;
 }
 
+/* InstrumentSerif — Latin only (.font-display landing greeting) */
 @font-face {
 	font-family: 'InstrumentSerif';
-	src: url('/assets/fonts/InstrumentSerif-Regular.ttf');
+	src: url('/assets/fonts/InstrumentSerif-Regular.latin.woff2') format('woff2');
+	font-weight: 400;
 	font-display: swap;
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+		U+02DC, U+0300-0304, U+0308-0309, U+0323, U+0329, U+2000-206F, U+2074, U+20AC,
+		U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD, U+0100-024F;
 }
 
+/* Vazirmatn — Arabic/Persian (on demand; RTL fallback after Inter) */
 @font-face {
 	font-family: 'Vazirmatn';
-	src: url('/assets/fonts/Vazirmatn-Variable.ttf');
+	src: url('/assets/fonts/Vazirmatn-Variable.arabic.woff2') format('woff2');
+	font-weight: 100 900;
 	font-display: swap;
+	unicode-range: U+0600-06FF, U+0750-077F, U+08A0-08FF, U+200C-200F, U+FB50-FDFF,
+		U+FE70-FEFF;
 }
+
 
 html {
 	word-break: break-word;
@@ -212,6 +257,47 @@ select {
 	}
 }
 
+/* Block-level loading placeholder. `.shimmer` above clips its gradient to TEXT
+ * (-webkit-background-clip: text), so it renders nothing on an empty div —
+ * skeleton bars need their own sweep that paints the box itself. */
+@keyframes skeleton-sweep {
+	0% {
+		background-position: 180% 0;
+	}
+	100% {
+		background-position: -80% 0;
+	}
+}
+
+.skeleton {
+	background-color: var(--color-gray-200, #e5e4df);
+	background-image: linear-gradient(
+		90deg,
+		transparent 20%,
+		rgba(255, 255, 255, 0.85) 50%,
+		transparent 80%
+	);
+	background-size: 200% 100%;
+	background-repeat: no-repeat;
+	animation: skeleton-sweep 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.dark .skeleton {
+	background-color: var(--color-gray-800, #33332e);
+	background-image: linear-gradient(
+		90deg,
+		transparent 20%,
+		rgba(255, 255, 255, 0.06) 50%,
+		transparent 80%
+	);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.skeleton {
+		animation: none;
+	}
+}
+
 .shimmer {
 	background: linear-gradient(90deg, #91918D 25%, #262625 50%, #91918D 75%);
 	background-size: 200% 100%;
@@ -222,7 +308,7 @@ select {
 	color: #91918D; /* Cloud Medium fallback */
 }
 
-:global(.dark) .shimmer {
+.dark .shimmer {
 	background: linear-gradient(90deg, #666663 25%, #F0F0EB 50%, #666663 75%);
 	background-size: 200% 100%;
 	background-clip: text;
@@ -396,11 +482,9 @@ input[type='number'] {
 .ProseMirror p.is-editor-empty:first-child::before {
 	content: attr(data-placeholder);
 	float: left;
-	/* Cloud Dark — secondary text */
-	color: #666663;
 	pointer-events: none;
 
-	@apply line-clamp-1 absolute;
+	@apply line-clamp-1 absolute text-gray-400;
 }
 
 .tiptap ul[data-type='taskList'] {
@@ -559,12 +643,6 @@ input[type='number'] {
 				align-items: initial;
 			}
 		}
-	}
-}
-
-@media (prefers-color-scheme: dark) {
-	.ProseMirror p.is-editor-empty:first-child::before {
-		color: #757575;
 	}
 }
 
@@ -890,6 +968,30 @@ body {
 	[contenteditable='true'] {
 		font-size: max(16px, 1em);
 	}
+
+	/* Kill the iOS long-press callout menu (save image / copy / etc.) and text
+	   selection on UI chrome — nav/sidebar/buttons/drag regions — while leaving
+	   message content and other text-selectable areas untouched. */
+	:where(nav, aside, button, [role='button'], .drag-region) {
+		-webkit-touch-callout: none;
+		user-select: none;
+	}
+
+	/* Lightweight native-feel press feedback. Touch-only: desktop mouse clicks
+	   shouldn't get an opacity flash. */
+	:where(button, [role='button']):active {
+		opacity: 0.7;
+		transition: opacity 80ms;
+	}
+}
+
+/* Subtle SvelteKit view-transition on route navigation (see
+   src/routes/+layout.svelte onNavigate). Kept short so it reads as a native
+   nav-push rather than a flashy effect; skipped entirely under
+   prefers-reduced-motion at the call site. */
+::view-transition-old(root),
+::view-transition-new(root) {
+	animation-duration: 150ms;
 }
 
 /* Expanded hit-target via ::after pseudo, without affecting layout/size.
@@ -925,6 +1027,21 @@ body {
 	margin-bottom: env(safe-area-inset-bottom);
 }
 
+/* Bottom clearance under the COMPOSER specifically. .pb-safe (0.5rem + the
+   FULL inset) is the right rule for a panel that must clear the home indicator
+   completely, but under the chat input it reads as the box floating off the
+   bottom of the screen: 42px of empty band on a notched iPhone, where the
+   indicator itself only occupies the bottom ~13px.
+   The composer does not need the whole inset, because its own toolbar row
+   already keeps every tappable control 10px inside the bubble's border — the
+   clearance only has to keep that border off the indicator. A rem less than
+   the inset lands at 18px on an iPhone (still clear of the indicator and of
+   the system swipe-up zone) and the 0.75rem floor covers every browser that
+   reports no safe area at all: desktop, Android, Safari in-tab. */
+.pb-composer {
+	padding-bottom: max(env(safe-area-inset-bottom) - 1rem, 0.75rem);
+}
+
 /* Allow mobile body to size to visualViewport when keyboard is open
    (input above keyboard). 100dvh handles dynamic viewport, fallback for older. */
 .h-screen-dvh {
@@ -936,7 +1053,252 @@ body {
 	min-height: 100dvh;
 }
 
+/* Keyboard-open state, set on <html> by keyboardViewport.ts on touch devices
+   where the on-screen keyboard overlays the page instead of resizing it (iOS
+   Safari / iOS PWA). --app-height is the visualViewport height — the pixels
+   actually visible above the keyboard. Anything sized to the screen shrinks
+   to it so the header stays on screen and the composer sits flush on the
+   keyboard; bottom safe-area padding is dropped because the keyboard covers
+   the home indicator. */
+/* Safari's focus-reveal pan can leave the visual viewport offset below the
+   layout viewport's top, and script cannot clear that offset (the document
+   is unscrollable, so scrollTo(0,0) is a same-position no-op — see
+   keyboardViewport.ts). Without compensation the app renders that many px
+   above the visible area: composer floating above the keyboard, dead strip
+   under it. Glue the app to the visible pixels instead: shift <body> down to
+   the visible area's top edge. position:relative rather than transform so
+   position:fixed overlays (modals, sidebar, toasts) keep the layout viewport
+   as their containing block. */
+/* !important because melt-ui's scroll lock (every dropdown, menu and popover
+   runs it) writes `position: fixed; top: 0` INLINE on <body> on iOS, which
+   silently defeats the glue for as long as any menu is open — the app detaches
+   from the visible band again the moment you open a picker while typing. The
+   lock is pointless here anyway: <html> is overflow-hidden and the document
+   never scrolls, so nothing is being held in place. */
+html.keyboard-open body {
+	position: relative !important;
+	top: var(--app-offset-top, 0px) !important;
+}
+html.keyboard-open .h-screen,
+html.keyboard-open .h-screen-dvh {
+	height: var(--app-height, 100dvh) !important;
+}
+html.keyboard-open .min-h-screen-dvh {
+	min-height: var(--app-height, 100dvh) !important;
+}
+html.keyboard-open .max-h-screen,
+html.keyboard-open .max-h-dvh,
+html.keyboard-open .max-h-\[100dvh\] {
+	max-height: var(--app-height, 100dvh) !important;
+}
+html.keyboard-open .pb-safe,
+html.keyboard-open .pb-composer {
+	padding-bottom: 0;
+}
+html.keyboard-open .mb-safe {
+	margin-bottom: 0;
+}
+
+/* ---- Typing mode -------------------------------------------------------
+   While the on-screen keyboard is up, spend the remaining ~500px on the
+   conversation instead of chrome. Everything keys off the same
+   keyboard-open class (touch-only, set by keyboardViewport.ts), so desktop
+   and hardware-keyboard devices never see it, and it all restores on blur. */
+
+/* Generic hide-hook for chrome with no job mid-typing: navbar content, the
+   full token-usage panel (a one-line .kb-only meter stands in for it), and
+   peak-hours notices. Composer CONTROLS deliberately stay visible — attach /
+   web-search / effort / dictate are reached for mid-typing. */
+html.keyboard-open .kb-hide {
+	display: none !important;
+}
+
+/* Inverse hook: elements that exist ONLY while the keyboard is up (the
+   one-line token meter standing in for the kb-hidden panel). */
+.kb-only {
+	display: none;
+}
+html.keyboard-open .kb-only {
+	display: flex;
+}
+
+/* The navbar collapses to a slim status-bar shade: children hidden, the
+   -mb-8 content overlap cancelled, and the fade redrawn on the nav itself
+   so messages stay legible as they scroll under the iOS clock. */
+html.keyboard-open #chat-navbar:not(:has([data-state='open'])) {
+	margin-bottom: 0;
+	padding-bottom: 0;
+	background: linear-gradient(to bottom, rgb(255 255 255 / 0.95) 35%, rgb(255 255 255 / 0));
+}
+html.dark.keyboard-open #chat-navbar:not(:has([data-state='open'])) {
+	background: linear-gradient(to bottom, rgb(17 24 39 / 0.95) 35%, rgb(17 24 39 / 0));
+}
+/* ...unless one of the navbar's own dropdowns is open. The model picker's
+   trigger lives here and is the popper's anchor element; display:none'ing it
+   collapses the anchor to a 0x0 box at the origin and floating-ui promptly
+   flings the open menu into the top-left corner. Skipping the collapse (rather
+   than overriding `display`) leaves each child's own layout value intact. */
+html.keyboard-open #chat-navbar:not(:has([data-state='open'])) > :not(.kb-expand) {
+	display: none;
+}
+/* Discoverable exit: the shade IS a button (.kb-expand in Navbar.svelte) — a
+   full-width strip with a chevron that dismisses the keyboard and restores
+   the full bar. A real element (not a ::after) because iOS needs an actual
+   tap target: the old pointer-events:none pseudo-chevron over a ~0-height
+   strip was effectively untappable. Tapping the conversation also dismisses
+   (pointer-tap detection in keyboardViewport.ts). */
+.kb-expand {
+	display: none;
+}
+html.keyboard-open #chat-navbar:not(:has([data-state='open'])) > .kb-expand {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	min-height: 30px;
+	-webkit-tap-highlight-color: transparent;
+}
+html.keyboard-open #chat-navbar:not(:has([data-state='open'])) > .kb-expand::after {
+	content: '';
+	width: 10px;
+	height: 10px;
+	margin-top: -5px;
+	border-right: 1.5px solid rgb(156 163 175 / 0.9);
+	border-bottom: 1.5px solid rgb(156 163 175 / 0.9);
+	transform: rotate(45deg);
+}
+
+/* Composer toolbar keeps its controls but sheds vertical margin. */
+html.keyboard-open .kb-row {
+	margin-top: 0;
+	margin-bottom: 0.375rem;
+}
+
+/* A long draft must not starve the conversation: cap the input at ~6 lines
+   (or 35% of the visible area on short screens) instead of the resting
+   max-h-96 (384px) and let it scroll internally. */
+html.keyboard-open #chat-input-container {
+	max-height: min(9rem, calc(var(--app-height, 100dvh) * 0.35));
+}
+
+/* The draft area is the one scroller inside the composer, so it is also the one
+   place a drag there is allowed to move something (keyboardViewport.ts cancels
+   the rest). Keep its ends local: without this, flicking a long draft past its
+   last line chains the scroll out to the page, which on iOS means a
+   visual-viewport pan — the same wobble the containment exists to remove. */
+#chat-input-container {
+	overscroll-behavior: contain;
+}
+
+/* Composer toolbar rail: the controls are one scrollable line and on a phone
+   they are wider than the row, so fade whichever edge the content continues
+   past (data-fade is maintained in MessageInput.svelte). Without it the last
+   control is simply guillotined behind the mic — nothing says the rest is a
+   swipe away, which is how the service-tier pill managed to be invisible.
+   A mask rather than a gradient overlay: it needs no knowledge of the
+   composer's background (which differs light/dark and while focused), and
+   unlike clip-path it does not affect hit-testing. Keep the ends short — this
+   is a hint at the edge of a 36px-tall row, not a vignette. */
+.toolbar-rail {
+	--rail-fade: 1.75rem;
+}
+.toolbar-rail[data-fade='end'] {
+	-webkit-mask-image: linear-gradient(to right, #000 calc(100% - var(--rail-fade)), transparent);
+	mask-image: linear-gradient(to right, #000 calc(100% - var(--rail-fade)), transparent);
+}
+.toolbar-rail[data-fade='start'] {
+	-webkit-mask-image: linear-gradient(to right, transparent, #000 var(--rail-fade));
+	mask-image: linear-gradient(to right, transparent, #000 var(--rail-fade));
+}
+.toolbar-rail[data-fade='both'] {
+	-webkit-mask-image: linear-gradient(
+		to right,
+		transparent,
+		#000 var(--rail-fade),
+		#000 calc(100% - var(--rail-fade)),
+		transparent
+	);
+	mask-image: linear-gradient(
+		to right,
+		transparent,
+		#000 var(--rail-fade),
+		#000 calc(100% - var(--rail-fade)),
+		transparent
+	);
+}
+
+/* Same principle for the in-place message-edit box: cap the editing surface
+   at half the visible area so its Save/Cancel/Send row always stays on
+   screen (editScroll.ts top-aligns the box; this bounds it from below).
+   UserMessage carries the class on its scroll wrapper, ResponseMessage on
+   the textarea itself — either way long content scrolls internally instead
+   of running under the keyboard. */
+html.keyboard-open .message-edit-scroller {
+	max-height: min(24rem, calc(var(--app-height, 100dvh) * 0.5));
+	overflow-y: auto;
+}
+
+/* The new-chat block is vertically centred, which is the right resting position
+   on a tall phone. While typing it is not: the keyboard takes two-thirds of the
+   viewport and a centred block would slide the composer up under your thumb as
+   it opens. Pin it back to the top for the duration. */
+html.keyboard-open .chat-placeholder {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+/* Model picker list. 16rem sits nicely under a desktop navbar, but on a phone
+   it spends 40% of the screen on a dropdown and makes a 30-model list feel like
+   a peephole. Grow it to the visible viewport instead — --app-height is the
+   keyboard-aware visible height (keyboardViewport.ts, falling back to 100dvh),
+   so the list also shrinks correctly when the search keyboard is up rather than
+   running underneath it. The reserve covers the navbar the menu is anchored
+   below plus its own search + filter header. */
+.model-picker-list {
+	max-height: 16rem;
+}
+@media (max-width: 767px) {
+	.model-picker-list {
+		max-height: max(14rem, calc(var(--app-height, 100dvh) - 12rem));
+	}
+}
+
+/* While typing, the sidebar edge-swipe strip stands down: it hit-tests above
+   the leftmost 24px of the screen, so it would swallow caret/selection taps
+   near the left edge of whatever is being typed into. */
+html.keyboard-open #sidebar-edge-strip {
+	display: none;
+}
+
 /* Pointer-fine-only tap-highlight (desktop browsers can keep their default). */
 @media (pointer: fine) {
 	/* No-op — default behavior preserved. */
+}
+
+/* iOS Safari re-rasterizes a backdrop-filter region on every frame the content
+   behind it changes — for the composer that means continuously while tokens
+   stream or the list scrolls underneath. On touch devices swap the frosted
+   glass for a near-opaque paper tint (matches body bg) and drop the filter;
+   desktop keeps the blur. */
+@media (hover: none) {
+	#message-input-container {
+		backdrop-filter: none !important;
+		-webkit-backdrop-filter: none !important;
+		background-color: rgba(250, 250, 247, 0.96) !important;
+	}
+	.dark #message-input-container {
+		background-color: rgba(38, 38, 37, 0.96) !important;
+	}
+
+	/* Same iOS re-raster cost for every other frosted bar (route navs, banner).
+	   These are in-flow or transparent surfaces where the blur contributes
+	   nothing visually on phones — but iOS still keeps a live backdrop-filter
+	   layer for each. Smaller tiers (xs/sm/2xl pills, tooltips) are tiny
+	   regions and keep their blur, and .keep-backdrop-blur opts out (e.g. the
+	   call-overlay camera button, where the blur is the only thing separating
+	   a white glyph from a live bright camera feed). */
+	.backdrop-blur-xl:not(.keep-backdrop-blur) {
+		backdrop-filter: none !important;
+		-webkit-backdrop-filter: none !important;
+	}
 }

@@ -8,21 +8,26 @@
 	import { models, socket } from '$lib/stores';
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import { imageFallback } from '$lib/actions/imageFallback';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	export let chatId: string;
-	export let messageId: string;
-	export let taskId: string | null = null;
-	export let currentModelId: string;
-	export let onSwitch: (modelId: string) => void = () => {};
+	interface Props {
+		chatId: string;
+		messageId: string;
+		taskId?: string | null;
+		currentModelId: string;
+		onSwitch?: (modelId: string) => void;
+	}
 
-	let show = false;
-	let pendingSwitch: string | null = null;
+	let { chatId, messageId, taskId = null, currentModelId, onSwitch = () => {} }: Props = $props();
+
+	let show = $state(false);
+	let pendingSwitch: string | null = $state(null);
 
 	// Filter to only show available models (exclude current)
-	$: availableModels = $models.filter(
-		(m) => m.id !== currentModelId && !(m?.info?.meta?.hidden ?? false)
+	let availableModels = $derived(
+		$models.filter((m) => m.id !== currentModelId && !(m?.info?.meta?.hidden ?? false))
 	);
 
 	const switchModel = async (modelId: string) => {
@@ -44,7 +49,7 @@
 <Dropdown bind:show align="end">
 	<Tooltip content={$i18n.t('Switch Model')} placement="bottom">
 		<button
-			class="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition animate-pulse"
+			class="p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition animate-pulse"
 			aria-label={$i18n.t('Switch Model')}
 		>
 			<svg
@@ -64,67 +69,78 @@
 		</button>
 	</Tooltip>
 
-	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[280px] rounded-2xl px-1 py-1 border border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition max-h-80 overflow-y-auto"
-			sideOffset={4}
-			side="top"
-			align="end"
-			transition={flyAndScale}
-		>
-			<div
-				class="px-3 py-2 text-xs font-semibold text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-gray-800 mb-1"
+	{#snippet content()}
+		<div>
+			<DropdownMenu.Content
+				class="w-full max-w-[280px] rounded-2xl px-1 py-1 border-hairline border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition max-h-80 overflow-y-auto"
+				sideOffset={4}
+				side="top"
+				align="end"
+				transition={flyAndScale}
 			>
-				{$i18n.t('Switch to another model')}
-			</div>
-
-			{#if pendingSwitch}
-				<div class="px-3 py-2 text-sm text-amber-600 dark:text-amber-400 flex items-center gap-2">
-					<svg
-						class="w-4 h-4 animate-spin"
-						xmlns="http://www.w3.org/2000/svg"
-						fill="none"
-						viewBox="0 0 24 24"
-					>
-						<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"
-						></circle>
-						<path
-							class="opacity-75"
-							fill="currentColor"
-							d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-						></path>
-					</svg>
-					{$i18n.t('Switching...')}
+				<div
+					class="px-3 py-2 text-xs font-semibold text-gray-500 dark:text-gray-400 border-b-hairline border-gray-100 dark:border-gray-800 mb-1"
+				>
+					{$i18n.t('Switch to another model')}
 				</div>
-			{:else}
-				{#each availableModels as model}
-					<DropdownMenu.Item
-						class="flex gap-2 items-center px-3 py-2 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
-						on:click={() => switchModel(model.id)}
-					>
-						{#if model?.info?.meta?.profile_image_url}
-							<img
-								src={model.info.meta.profile_image_url}
-								class="w-5 h-5 rounded-full"
-								alt={model.name}
-							/>
-						{:else}
-							<div
-								class="w-5 h-5 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs"
-							>
-								{model.name?.charAt(0) ?? 'M'}
-							</div>
-						{/if}
-						<span class="truncate">{model.name ?? model.id}</span>
-					</DropdownMenu.Item>
-				{/each}
 
-				{#if availableModels.length === 0}
-					<div class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">
-						{$i18n.t('No other models available')}
+				{#if pendingSwitch}
+					<div class="px-3 py-2 text-sm text-book-cloth dark:text-kraft flex items-center gap-2">
+						<svg
+							class="w-4 h-4 animate-spin"
+							xmlns="http://www.w3.org/2000/svg"
+							fill="none"
+							viewBox="0 0 24 24"
+						>
+							<circle
+								class="opacity-25"
+								cx="12"
+								cy="12"
+								r="10"
+								stroke="currentColor"
+								stroke-width="4"
+							></circle>
+							<path
+								class="opacity-75"
+								fill="currentColor"
+								d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+							></path>
+						</svg>
+						{$i18n.t('Switching...')}
 					</div>
+				{:else}
+					{#each availableModels as model}
+						<DropdownMenu.Item
+							class="flex gap-2 items-center px-3 py-2 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+							onclick={() => switchModel(model.id)}
+						>
+							{#if model?.info?.meta?.profile_image_url}
+								<img
+									use:imageFallback
+									src={model.info.meta.profile_image_url}
+									class="w-5 h-5 rounded-full"
+									alt={model.name}
+									loading="lazy"
+									decoding="async"
+								/>
+							{:else}
+								<div
+									class="w-5 h-5 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs"
+								>
+									{model.name?.charAt(0) ?? 'M'}
+								</div>
+							{/if}
+							<span class="truncate">{model.name ?? model.id}</span>
+						</DropdownMenu.Item>
+					{/each}
+
+					{#if availableModels.length === 0}
+						<div class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">
+							{$i18n.t('No other models available')}
+						</div>
+					{/if}
 				{/if}
-			{/if}
-		</DropdownMenu.Content>
-	</div>
+			</DropdownMenu.Content>
+		</div>
+	{/snippet}
 </Dropdown>

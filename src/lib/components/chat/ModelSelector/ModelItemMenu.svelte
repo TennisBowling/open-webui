@@ -12,13 +12,23 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let model;
+	interface Props {
+		show?: boolean;
+		model: any;
+		pinModelHandler?: (modelId: string) => void;
+		copyLinkHandler?: Function;
+		onClose?: Function;
+		children?: import('svelte').Snippet;
+	}
 
-	export let pinModelHandler: (modelId: string) => void = () => {};
-	export let copyLinkHandler: Function = () => {};
-
-	export let onClose: Function = () => {};
+	let {
+		show = $bindable(false),
+		model,
+		pinModelHandler = () => {},
+		copyLinkHandler = () => {},
+		onClose = () => {},
+		children
+	}: Props = $props();
 </script>
 
 <DropdownMenu.Root
@@ -38,7 +48,7 @@
 				? ''
 				: 'group-hover/item:opacity-100 opacity-0'}
 		>
-			<slot />
+			{@render children?.()}
 		</Tooltip>
 	</DropdownMenu.Trigger>
 
@@ -53,8 +63,8 @@
 		<DropdownMenu.Item
 			type="button"
 			aria-pressed={($settings?.pinnedModels ?? []).includes(model?.id)}
-			class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition items-center gap-2"
-			on:click={(e) => {
+			class="flex rounded-xl py-1.5 max-md:py-2.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition items-center gap-2"
+			onclick={(e) => {
 				e.stopPropagation();
 				e.preventDefault();
 
@@ -79,8 +89,8 @@
 
 		<DropdownMenu.Item
 			type="button"
-			class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition items-center gap-2"
-			on:click={(e) => {
+			class="flex rounded-xl py-1.5 max-md:py-2.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition items-center gap-2"
+			onclick={(e) => {
 				e.stopPropagation();
 				e.preventDefault();
 

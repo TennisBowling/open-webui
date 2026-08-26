@@ -1,4 +1,4 @@
-<script lang="ts" context="module">
+<script lang="ts" module>
 	const MARKDOWN_TOKEN_CACHE_MAX_ENTRIES = 128;
 	const MARKDOWN_TOKEN_CACHE_MAX_CHARS = 2_000_000;
 	const markdownTokenCache = new Map<string, { tokens: any[]; cost: number }>();
@@ -15,7 +15,7 @@
 
 	const markdownCacheKey = (content: string) => `${content.length}:${hashString(content)}`;
 
-	const getCachedMarkdownTokens = (content: string) => {
+	export const getCachedMarkdownTokens = (content: string) => {
 		const key = markdownCacheKey(content);
 		const entry = markdownTokenCache.get(key);
 		if (!entry) return null;
@@ -24,7 +24,7 @@
 		return entry.tokens;
 	};
 
-	const setCachedMarkdownTokens = (content: string, tokens: any[]) => {
+	export const setCachedMarkdownTokens = (content: string, tokens: any[]) => {
 		const cost = content.length;
 		if (cost > MARKDOWN_TOKEN_CACHE_MAX_CHARS) return tokens;
 		const key = markdownCacheKey(content);
@@ -49,11 +49,11 @@
 	};
 </script>
 
-<script>
+<script lang="ts">
 	import { marked } from 'marked';
 	import { replaceTokens, processResponseContent } from '$lib/utils';
 	import { user } from '$lib/stores';
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, untrack } from 'svelte';
 
 	import markedExtension from '$lib/utils/marked/extension';
 	import markedKatexExtension from '$lib/utils/marked/katex-extension';
@@ -62,33 +62,52 @@
 
 	import MarkdownTokens from './Markdown/MarkdownTokens.svelte';
 
-	export let id = '';
-	export let content;
-	export let done = true;
-	export let model = null;
-	export let save = false;
-	export let preview = false;
-	export let parseImmediately = false;
+	interface Props {
+		id?: string;
+		content: any;
+		done?: boolean;
+		model?: any;
+		save?: boolean;
+		preview?: boolean;
+		parseImmediately?: boolean;
+		chatId?: string;
+		messageId?: string;
+		dataVizOverrides?: any;
+		sandboxFiles?: any;
+		editCodeBlock?: boolean;
+		topPadding?: boolean;
+		sourceIds?: any;
+		onSave?: any;
+		onUpdate?: any;
+		onPreview?: any;
+		onSourceClick?: any;
+		onTaskClick?: any;
+	}
 
-	export let chatId = '';
-	export let messageId = '';
-	export let dataVizOverrides = {};
-	export let sandboxFiles = [];
+	let {
+		id = '',
+		content,
+		done = true,
+		model = null,
+		save = false,
+		preview = false,
+		parseImmediately = false,
+		chatId = '',
+		messageId = '',
+		dataVizOverrides = {},
+		sandboxFiles = [],
+		editCodeBlock = true,
+		topPadding = false,
+		sourceIds = [],
+		onSave = () => {},
+		onUpdate = () => {},
+		onPreview = () => {},
+		onSourceClick = () => {},
+		onTaskClick = () => {}
+	}: Props = $props();
 
-	export let editCodeBlock = true;
-	export let topPadding = false;
-
-	export let sourceIds = [];
-
-	export let onSave = () => {};
-	export let onUpdate = () => {};
-
-	export let onPreview = () => {};
-	export let onSourceClick = () => {};
-	export let onTaskClick = () => {};
-
-	let tokens = [];
-	let pendingContent = null;
+	let tokens = $state([]);
+	let pendingContent = $state(null);
 	let parseTimeout = null;
 	let parseIdle = null;
 	let lastParsedContent = '';
@@ -97,6 +116,15 @@
 	const STREAMING_THROTTLE = 100; // 10 updates per second max during streaming
 	const DONE_DELAY = 50; // Small delay when done to ensure final parse
 	const DONE_IDLE_PARSE_CHARS = 80_000;
+
+	// Scale the streaming re-parse throttle up for very large in-flight blocks
+	// (e.g. a huge generated document) so re-lexing the whole thing doesn't
+	// dominate CPU during streaming. Small/typical messages are unaffected.
+	const getStreamingThrottleMs = (contentLength) => {
+		if (contentLength > 60_000) return 400;
+		if (contentLength > 20_000) return 200;
+		return STREAMING_THROTTLE;
+	};
 
 	const clearScheduledParse = () => {
 		if (parseTimeout) {
@@ -183,16 +211,25 @@
 			return;
 		}
 
-		parseTimeout = setTimeout(runPendingParse, STREAMING_THROTTLE);
+		parseTimeout = setTimeout(runPendingParse, getStreamingThrottleMs(pendingContent?.length ?? 0));
 	};
 
 	// Use a reactive statement that just schedules parsing instead of doing it immediately
-	$: {
-		if (content) {
-			pendingContent = content;
-			scheduleParse();
+	$effect(() => {
+		const nextContent = content;
+		// These are deliberate parse triggers. The scheduler and parser also
+		// read/write their own queue, token, timeout, and cache state; keep those
+		// implementation details out of this effect's dependency set so an eager
+		// parse cannot recursively schedule itself.
+		void done;
+		void parseImmediately;
+		if (nextContent) {
+			untrack(() => {
+				pendingContent = nextContent;
+				scheduleParse();
+			});
 		}
-	}
+	});
 
 	onDestroy(() => {
 		clearScheduledParse();

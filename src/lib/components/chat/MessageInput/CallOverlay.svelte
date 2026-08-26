@@ -1,14 +1,16 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
 	import { config, models, settings, showCallOverlay, TTSWorker } from '$lib/stores';
-	import { onMount, tick, getContext, onDestroy, createEventDispatcher } from 'svelte';
+	import { onMount, tick, getContext, onDestroy } from 'svelte';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { blobToFile } from '$lib/utils';
 	import { generateEmoji } from '$lib/apis';
 	import { synthesizeOpenAISpeech, transcribeAudio } from '$lib/apis/audio';
 
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import VideoInputMenu from './CallOverlay/VideoInputMenu.svelte';
@@ -16,35 +18,47 @@
 
 	const i18n = getContext('i18n');
 
-	export let eventTarget: EventTarget;
-	export let submitPrompt: Function;
-	export let stopResponse: Function;
-	export let files;
-	export let chatId;
-	export let modelId;
+	interface Props {
+		eventTarget: EventTarget;
+		submitPrompt: Function;
+		stopResponse: Function;
+		files: any;
+		chatId: any;
+		modelId: any;
+	}
+
+	let {
+		eventTarget,
+		submitPrompt,
+		stopResponse,
+		files = $bindable(),
+		chatId,
+		modelId,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
 	let wakeLock = null;
 
-	let model = null;
+	let model = $state(null);
 
-	let loading = false;
+	let loading = $state(false);
 	let confirmed = false;
 	let interrupted = false;
-	let assistantSpeaking = false;
+	let assistantSpeaking = $state(false);
 
-	let emoji = null;
-	let camera = false;
-	let cameraStream = null;
+	let emoji = $state(null);
+	let camera = $state(false);
+	let cameraStream = $state(null);
 
 	let chatStreaming = false;
-	let rmsLevel = 0;
+	let rmsLevel = $state(0);
 	let hasStartedSpeaking = false;
 	let mediaRecorder;
-	let audioStream = null;
+	let audioStream = $state(null);
 	let audioChunks = [];
 
-	let videoInputDevices = [];
-	let selectedVideoInputDeviceId = null;
+	let videoInputDevices = $state([]);
+	let selectedVideoInputDeviceId = $state(null);
 
 	const getVideoInputDevices = async () => {
 		const devices = await navigator.mediaDevices.enumerateDevices();
@@ -366,9 +380,14 @@
 		if ($showCallOverlay) {
 			return new Promise((resolve) => {
 				let voices = [];
+				// Capped: iOS PWAs can leave getVoices() empty forever — without a cap
+				// each call-turn leaked a permanent 100ms interval AND never resolved
+				// this promise. Falls back to the default voice after ~3s.
+				let voicesAttempts = 0;
 				const getVoicesLoop = setInterval(async () => {
 					voices = await speechSynthesis.getVoices();
-					if (voices.length > 0) {
+					voicesAttempts += 1;
+					if (voices.length > 0 || voicesAttempts >= 30) {
 						clearInterval(getVoicesLoop);
 
 						const voice =
@@ -686,6 +705,16 @@
 		await tick();
 
 		await stopAllAudio();
+
+		// Release the synthesized audio: each cached Audio holds a blob object
+		// URL that pins its decoded audio in memory until explicitly revoked.
+		for (const audio of audioCache.values()) {
+			if (audio instanceof Audio && audio.src?.startsWith('blob:')) {
+				URL.revokeObjectURL(audio.src);
+			}
+		}
+		audioCache.clear();
+		emojiCache.clear();
 	});
 </script>
 
@@ -695,7 +724,7 @@
 			<button
 				type="button"
 				class="flex justify-center items-center w-full h-20 min-h-20"
-				on:click={() => {
+				onclick={() => {
 					if (assistantSpeaking) {
 						stopAllAudio();
 					}
@@ -767,7 +796,7 @@
 						'/static/favicon.png'
 							? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 							: ''}
-					/>
+					></div>
 				{/if}
 				<!-- navbar -->
 			</button>
@@ -777,7 +806,7 @@
 			{#if !camera}
 				<button
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						if (assistantSpeaking) {
 							stopAllAudio();
 						}
@@ -849,26 +878,26 @@
 							'/static/favicon.png'
 								? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 								: ''}
-						/>
+						></div>
 					{/if}
 				</button>
 			{:else}
 				<div class="relative flex video-container w-full max-h-full pt-2 pb-4 md:py-6 px-2 h-full">
-					<!-- svelte-ignore a11y-media-has-caption -->
+					<!-- svelte-ignore a11y_media_has_caption -->
 					<video
 						id="camera-feed"
 						autoplay
 						class="rounded-2xl h-full min-w-full object-cover object-center"
 						playsinline
-					/>
+					></video>
 
-					<canvas id="camera-canvas" style="display:none;" />
+					<canvas id="camera-canvas" style="display:none;"></canvas>
 
 					<div class=" absolute top-4 md:top-8 left-4">
 						<button
 							type="button"
-							class="p-1.5 text-white cursor-pointer backdrop-blur-xl bg-black/10 rounded-full"
-							on:click={() => {
+							class="p-1.5 text-white cursor-pointer backdrop-blur-xl keep-backdrop-blur bg-black/10 rounded-full"
+							onclick={() => {
 								stopCamera();
 							}}
 						>
@@ -893,7 +922,7 @@
 				{#if camera}
 					<VideoInputMenu
 						devices={videoInputDevices}
-						on:change={async (e) => {
+						onchange={async (e) => {
 							console.log(e.detail);
 							selectedVideoInputDeviceId = e.detail;
 							await stopVideoStream();
@@ -920,7 +949,7 @@
 						<button
 							class=" p-3 rounded-full bg-gray-50 dark:bg-gray-900"
 							type="button"
-							on:click={async () => {
+							onclick={async () => {
 								await navigator.mediaDevices.getUserMedia({ video: true });
 								startCamera();
 							}}
@@ -952,7 +981,7 @@
 			<div>
 				<button
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						if (assistantSpeaking) {
 							stopAllAudio();
 						}
@@ -973,7 +1002,7 @@
 			<div>
 				<button
 					class=" p-3 rounded-full bg-gray-50 dark:bg-gray-900"
-					on:click={async () => {
+					onclick={async () => {
 						await stopAudioStream();
 						await stopVideoStream();
 

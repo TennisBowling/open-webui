@@ -1,33 +1,53 @@
 <script lang="ts">
 	import { Select } from 'bits-ui';
+	import { getContext } from 'svelte';
+	import { get, type Writable } from 'svelte/store';
+	import type { i18n as I18n } from 'i18next';
 
 	import { flyAndScale } from '$lib/utils/transitions';
 
-	import { createEventDispatcher } from 'svelte';
 	import ChevronDown from '../icons/ChevronDown.svelte';
 	import Check from '../icons/Check.svelte';
 	import Search from '../icons/Search.svelte';
 
-	const dispatch = createEventDispatcher();
+	interface Item {
+		value: string;
+		label: string;
+		[key: string]: unknown;
+	}
 
-	export let value = '';
-	export let placeholder = $i18n.t('Select a model');
-	export let searchEnabled = true;
-	export let searchPlaceholder = $i18n.t('Search a model');
+	interface Props {
+		value?: string;
+		placeholder?: string;
+		searchEnabled?: boolean;
+		searchPlaceholder?: string;
+		items?: Item[];
+		children?: import('svelte').Snippet;
+	}
 
-	export let items = [
-		{ value: 'mango', label: 'Mango' },
-		{ value: 'watermelon', label: 'Watermelon' },
-		{ value: 'apple', label: 'Apple' },
-		{ value: 'pineapple', label: 'Pineapple' },
-		{ value: 'orange', label: 'Orange' }
-	];
+	const i18n = getContext<Writable<I18n>>('i18n');
+	let {
+		value = $bindable(''),
+		placeholder = get(i18n).t('Select a model'),
+		searchEnabled = true,
+		searchPlaceholder = get(i18n).t('Search a model'),
+		items = [
+			{ value: 'mango', label: 'Mango' },
+			{ value: 'watermelon', label: 'Watermelon' },
+			{ value: 'apple', label: 'Apple' },
+			{ value: 'pineapple', label: 'Pineapple' },
+			{ value: 'orange', label: 'Orange' }
+		],
+		children
+	}: Props = $props();
 
-	let searchValue = '';
+	let searchValue = $state('');
 
-	$: filteredItems = searchValue
-		? items.filter((item) => item.value.toLowerCase().includes(searchValue.toLowerCase()))
-		: items;
+	let filteredItems = $derived(
+		searchValue
+			? items.filter((item) => item.value.toLowerCase().includes(searchValue.toLowerCase()))
+			: items
+	);
 </script>
 
 <Select.Root
@@ -48,11 +68,13 @@
 		<ChevronDown className="absolute end-2 top-1/2 -translate-y-[45%] size-3.5" strokeWidth="2.5" />
 	</Select.Trigger>
 	<Select.Content
-		class="w-full rounded-lg  bg-white dark:bg-gray-900 dark:text-white shadow-lg border border-gray-300/30 dark:border-gray-700/40  outline-hidden"
+		class="w-full rounded-lg  bg-white dark:bg-gray-850 dark:text-white shadow-lg border-hairline border-gray-200 dark:border-gray-700  outline-hidden"
 		transition={flyAndScale}
 		sideOffset={4}
 	>
-		<slot>
+		{#if children}
+			{@render children()}
+		{:else}
 			{#if searchEnabled}
 				<div class="flex items-center gap-2.5 px-5 mt-3.5 mb-3">
 					<Search className="size-4" strokeWidth="2.5" />
@@ -70,7 +92,7 @@
 			<div class="px-3 my-2 max-h-80 overflow-y-auto">
 				{#each filteredItems as item}
 					<Select.Item
-						class="flex w-full font-medium line-clamp-1 select-none items-center rounded-button py-2 pl-3 pr-1.5 text-sm  text-gray-700 dark:text-gray-100  outline-hidden transition-all duration-75 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg cursor-pointer data-highlighted:bg-muted"
+						class="flex w-full font-medium line-clamp-1 select-none items-center rounded-button py-2 pl-3 pr-1.5 text-sm  text-gray-700 dark:text-gray-100  outline-hidden transition-all duration-75 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg cursor-pointer data-highlighted:bg-muted"
 						value={item.value}
 						label={item.label}
 					>
@@ -90,6 +112,6 @@
 					</div>
 				{/each}
 			</div>
-		</slot>
+		{/if}
 	</Select.Content>
 </Select.Root>

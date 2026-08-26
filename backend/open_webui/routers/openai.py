@@ -31,8 +31,10 @@ from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
     AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ,
+    AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     BYPASS_MODEL_ACCESS_CONTROL,
+    REASONING_CONTEXT_MODE,
 )
 from open_webui.models.users import UserModel
 
@@ -41,10 +43,19 @@ from open_webui.env import SRC_LOG_LEVELS
 
 
 from open_webui.utils.messages import blocks_to_api_messages
+from open_webui.utils.compaction import (
+    capture_compaction_envelope,
+    record_sent_envelope,
+    strip_compaction_carry,
+)
 from open_webui.utils.payload import (
+    ENABLE_CACHE_PREFIX_FP,
+    ENABLE_WIRE_CANONICALIZATION,
     apply_ephemeral_cache_control_to_last_message,
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
+    cache_prefix_fingerprint,
+    canonicalize_wire_key_order,
 )
 from open_webui.utils.misc import (
     convert_logit_bias_input_to_json,
@@ -52,6 +63,8 @@ from open_webui.utils.misc import (
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
+from open_webui.utils import openrouter_reasoning, reasoning_context
+from open_webui.utils.context_window import resolve_context_length
 from open_webui.socket.main import broadcast_sidebar_event, process_token_usage
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
@@ -83,7 +96,9 @@ def _provider_stream_override(metadata: dict | None) -> Optional[bool]:
     return None
 
 
-def _apply_provider_stream_override(payload: dict, metadata: dict | None) -> Optional[bool]:
+def _apply_provider_stream_override(
+    payload: dict, metadata: dict | None
+) -> Optional[bool]:
     provider_stream = _provider_stream_override(metadata)
     if provider_stream is None:
         return None
@@ -91,7 +106,6 @@ def _apply_provider_stream_override(payload: dict, metadata: dict | None) -> Opt
     if not provider_stream:
         payload.pop("stream_options", None)
     return provider_stream
-
 
 
 def _chat_row_payload(chat) -> dict:
@@ -129,6 +143,56 @@ def user_can_read_file(file, user: UserModel) -> bool:
 
 def image_input_error(message: str) -> HTTPException:
     return HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(message))
+
+
+def video_input_error(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(message))
+
+
+# Formats OpenRouter documents as accepted for `video_url` parts.
+_PROVIDER_VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/mpeg",
+    "video/mov",
+    "video/quicktime",
+    "video/webm",
+}
+
+
+async def _resolve_local_file_video_data_url(request: Request, file) -> str:
+    """Inline a stored video as a base64 ``data:`` URL for the provider.
+
+    Cached per request for the same reason images are: an agentic turn re-sends
+    the whole message list every tool round, and base64-encoding several MB of
+    video on the event loop once per round would stall every other chat on the
+    worker. The read and the encode both run in a thread.
+    """
+    cache = _image_conversion_cache(request)
+    key = ("video", getattr(file, "id", None) or file.path)
+    if key in cache:
+        return cache[key]
+
+    content_type = (file.meta or {}).get("content_type") or "video/mp4"
+    if content_type == "video/quicktime":
+        content_type = "video/mov"
+    if content_type not in _PROVIDER_VIDEO_MIME_TYPES:
+        # Everything this app produces is h264/mp4; anything else came in by
+        # another route and is far more likely to be mislabeled than genuinely
+        # exotic, so claim mp4 rather than fail the request.
+        content_type = "video/mp4"
+
+    file_path = Storage.get_file(file.path)
+
+    def _work() -> str:
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            raise video_input_error("Attached video file is empty")
+        return f"data:{content_type};base64,{base64.b64encode(raw).decode('utf-8')}"
+
+    data_url = await asyncio.to_thread(_work)
+    cache[key] = data_url
+    return data_url
 
 
 async def send_get_request(url, key=None, user: UserModel = None):
@@ -397,6 +461,16 @@ async def update_config(
         form_data.ENABLE_API_DEBUG_LOGGING
     )
 
+    # A connection may have just been flagged/unflagged `subscription_usage`
+    # (or its usage_url changed) — refresh the snapshot now instead of waiting
+    # out the poller interval, so the admin sees the bar react immediately.
+    try:
+        from open_webui.utils.subscription_usage import maybe_schedule_refresh
+
+        maybe_schedule_refresh()
+    except Exception:
+        log.exception("subscription usage refresh scheduling failed")
+
     return {
         "ENABLE_OPENAI_API": request.app.state.config.ENABLE_OPENAI_API,
         "OPENAI_API_BASE_URLS": request.app.state.config.OPENAI_API_BASE_URLS,
@@ -474,7 +548,11 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
             raise HTTPException(
                 status_code=r.status_code if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                detail=(
+                    detail
+                    if detail
+                    else f"{request.app.state.WEBUI_NAME}: Server Connection Error"
+                ),
             )
 
     except ValueError:
@@ -607,9 +685,13 @@ async def get_filtered_models(models, user):
     return filtered_models
 
 
+def _get_all_models_cache_key(_, __, user: UserModel = None):
+    return f"openai_all_models_{user.id}" if user else "openai_all_models"
+
+
 @cached(
     ttl=MODELS_CACHE_TTL,
-    key=lambda _, user: f"openai_all_models_{user.id}" if user else "openai_all_models",
+    key_builder=_get_all_models_cache_key,
 )
 async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
     log.info("get_all_models()")
@@ -642,6 +724,20 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
                             "openai": model,
                             "connection_type": model.get("connection_type", "external"),
                             "urlIdx": idx,
+                            # Canonical context window under ONE key, whatever this
+                            # connection happened to call it. The window belongs to
+                            # the (model, connection) pair — the same slug is 272k on
+                            # the ChatGPT-plan proxy and 1.05M on OpenRouter — so it
+                            # is resolved here, per connection, rather than looked up
+                            # by model id later. Absent when the connection declares
+                            # none (e.g. llama-swap); absent must stay distinguishable
+                            # from small. See utils/context_window.py.
+                            **(
+                                {"context_length": _ctx_len}
+                                if (_ctx_len := resolve_context_length(model))
+                                is not None
+                                else {}
+                            ),
                         }
                         for model in models
                         if (model.get("id") or model.get("name"))
@@ -667,6 +763,15 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
 
     models = {"data": merge_models_lists(map(extract_data, responses))}
     log.debug(f"models: {models}")
+
+    # Enrich OpenRouter models with a live discovered reasoning-effort descriptor
+    # so the chat effort selector reflects real capabilities without any manual
+    # per-model curation. Best-effort; never raises.
+    _enrich_openrouter_reasoning(request, models["data"])
+    # Same idea for input modalities, so video-capable models are discoverable
+    # even on connections that use a model_ids allowlist (which otherwise yields
+    # bare stubs with no `architecture`).
+    _enrich_openrouter_modalities(request, models["data"])
 
     request.app.state.OPENAI_MODELS = {model["id"]: model for model in models["data"]}
     return models
@@ -715,11 +820,20 @@ async def get_models(
                         ssl=AIOHTTP_CLIENT_SESSION_SSL,
                     ) as r:
                         if r.status != 200:
-                            # Extract response error details if available
+                            # Extract response error details if available.
+                            # The endpoint may not return JSON (e.g. a 404 with
+                            # a text/plain body), so parse defensively.
                             error_detail = f"HTTP Error: {r.status}"
-                            res = await r.json()
-                            if "error" in res:
-                                error_detail = f"External Error: {res['error']}"
+                            try:
+                                res = await r.json()
+                                if isinstance(res, dict) and "error" in res:
+                                    error_detail = f"External Error: {res['error']}"
+                            except Exception:
+                                body = await r.text()
+                                if body:
+                                    error_detail = (
+                                        f"HTTP Error: {r.status} - {body[:200]}"
+                                    )
                             raise Exception(error_detail)
 
                         response_data = await r.json()
@@ -748,7 +862,8 @@ async def get_models(
                 # ClientError covers all aiohttp requests issues
                 log.exception(f"Client error: {str(e)}")
                 raise HTTPException(
-                    status_code=500, detail="Open WebUI: Server Connection Error"
+                    status_code=500,
+                    detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
                 )
             except Exception as e:
                 log.exception(f"Unexpected error: {e}")
@@ -759,6 +874,126 @@ async def get_models(
         models["data"] = await get_filtered_models(models, user)
 
     return models
+
+
+def _conn_url_and_config(request: Request, idx: int):
+    """Return ``(url, api_config)`` for a connection index (legacy-key aware)."""
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+    return url, api_config
+
+
+def _openrouter_bare_slug(model_id: str, url: str, api_config: dict):
+    """Bare OpenRouter slug (``vendor/model``) for a model, or ``None``.
+
+    ``None`` when the connection isn't OpenRouter or the id isn't a routed slug.
+    Mirrors the prefix_id stripping the model-list build applies.
+    """
+    if not url or "openrouter.ai" not in url:
+        return None
+    bare = model_id or ""
+    prefix_id = (
+        api_config.get("prefix_id", None) if isinstance(api_config, dict) else None
+    )
+    if prefix_id and bare.startswith(f"{prefix_id}."):
+        bare = bare[len(f"{prefix_id}.") :]
+    if "/" not in bare:
+        return None
+    return bare
+
+
+def _resolve_openai_model(request: Request, model_id: str):
+    """Look up a model in OPENAI_MODELS with prefix/suffix fallback.
+
+    Returns ``(model_dict, resolved_id)`` or ``(None, model_id)``.
+    """
+    model = request.app.state.OPENAI_MODELS.get(model_id)
+    if model:
+        return model, model_id
+    # prefix_id may have been prepended to the stored id
+    for key, val in request.app.state.OPENAI_MODELS.items():
+        if key.endswith(f".{model_id}") or key == model_id:
+            return val, key
+    return None, model_id
+
+
+def _enrich_openrouter_reasoning(request: Request, models_data: list) -> None:
+    """Attach a live discovered ``reasoning`` descriptor to OpenRouter models.
+
+    Best-effort and non-blocking: reads the process-wide discovery cache (warming
+    it in the background if stale) and sets a top-level ``model["reasoning"]``
+    only when a mapping exists. Admin-authored per-model config
+    (``info.meta.reasoning``) is applied later and always takes precedence in the
+    frontend resolver, so this never overrides an override.
+    """
+    try:
+        if not request.app.state.config.ENABLE_OPENROUTER_REASONING_DISCOVERY:
+            return
+    except Exception:
+        return
+
+    openrouter_reasoning.ensure_warm_background()
+    cache = openrouter_reasoning.get_cached_reasoning_map()
+    if not cache:
+        return
+
+    for model in models_data:
+        try:
+            idx = model.get("urlIdx")
+            if idx is None:
+                continue
+            url, api_config = _conn_url_and_config(request, int(idx))
+            slug = _openrouter_bare_slug(model.get("id", ""), url, api_config)
+            if not slug:
+                continue
+            mapped = openrouter_reasoning.map_openrouter_reasoning(cache.get(slug))
+            if mapped:
+                model["reasoning"] = mapped
+        except Exception:
+            # A single malformed model must never break the whole list.
+            continue
+
+
+def _enrich_openrouter_modalities(request: Request, models_data: list) -> None:
+    """Attach discovered ``input_modalities`` to OpenRouter models.
+
+    A connection configured with a ``model_ids`` allowlist never fetches the
+    real provider list — Open WebUI synthesizes ``{id, name, owned_by}`` stubs
+    instead — so ``architecture`` is missing from every model on that connection
+    and nothing downstream can tell whether a model accepts video. This fills
+    that gap from the same cached catalog the reasoning discovery already uses,
+    at no extra request.
+
+    Only ever *adds* the field: a real provider payload that already carries
+    ``architecture`` is left untouched.
+    """
+    cache = openrouter_reasoning.get_cached_modalities_map()
+    if not cache:
+        return
+
+    for model in models_data:
+        try:
+            if model.get("input_modalities"):
+                continue
+            architecture = model.get("architecture")
+            if isinstance(architecture, dict) and architecture.get("input_modalities"):
+                continue
+            idx = model.get("urlIdx")
+            if idx is None:
+                continue
+            url, api_config = _conn_url_and_config(request, int(idx))
+            slug = _openrouter_bare_slug(model.get("id", ""), url, api_config)
+            if not slug:
+                continue
+            modalities = cache.get(slug)
+            if modalities:
+                model["input_modalities"] = list(modalities)
+        except Exception:
+            # A single malformed model must never break the whole list.
+            continue
 
 
 @router.get("/models/{model_id:path}/endpoints")
@@ -773,34 +1008,13 @@ async def get_model_endpoints(
     """
     await get_all_models(request, user=user)
 
-    model = request.app.state.OPENAI_MODELS.get(model_id)
-    if not model:
-        # Try to find model by suffix match (in case prefix_id was prepended)
-        for key, val in request.app.state.OPENAI_MODELS.items():
-            if key.endswith(f".{model_id}") or key == model_id:
-                model = val
-                model_id = key
-                break
+    model, model_id = _resolve_openai_model(request, model_id)
     if not model:
         return {"data": {"endpoints": []}}
 
-    idx = model["urlIdx"]
-    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        str(idx),
-        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
-    )
-
-    if "openrouter.ai" not in url:
-        return {"data": {"endpoints": []}}
-
-    # Strip prefix_id to get the bare OpenRouter model slug
-    bare_model_id = model_id
-    prefix_id = api_config.get("prefix_id", None)
-    if prefix_id and bare_model_id.startswith(f"{prefix_id}."):
-        bare_model_id = bare_model_id[len(f"{prefix_id}.") :]
-
-    if "/" not in bare_model_id:
+    url, api_config = _conn_url_and_config(request, model["urlIdx"])
+    bare_model_id = _openrouter_bare_slug(model_id, url, api_config)
+    if not bare_model_id:
         return {"data": {"endpoints": []}}
 
     try:
@@ -818,6 +1032,42 @@ async def get_model_endpoints(
     except Exception as e:
         log.exception(f"Error fetching OpenRouter endpoints: {e}")
         return {"data": {"endpoints": []}}
+
+
+@router.get("/models/{model_id:path}/reasoning")
+async def get_model_reasoning(
+    request: Request,
+    model_id: str,
+    refresh: bool = False,
+    user=Depends(get_verified_user),
+):
+    """Discovered reasoning-effort support for an OpenRouter model.
+
+    Reads OpenRouter's catalog (cached) and returns the normalized reasoning
+    descriptor for the model, or ``null`` when the model isn't an OpenRouter
+    model / has no reasoning object. ``?refresh=true`` forces a cache refresh
+    (used by the admin "re-discover" button).
+    """
+    await get_all_models(request, user=user)
+
+    model, model_id = _resolve_openai_model(request, model_id)
+    if not model:
+        return {"data": {"reasoning": None, "slug": None}}
+
+    url, api_config = _conn_url_and_config(request, model["urlIdx"])
+    slug = _openrouter_bare_slug(model_id, url, api_config)
+    if not slug:
+        return {"data": {"reasoning": None, "slug": None}}
+
+    try:
+        mapped = await openrouter_reasoning.discover_reasoning_for_slug_async(
+            slug, force=refresh
+        )
+    except Exception as e:
+        log.warning(f"reasoning discovery failed for {slug}: {e}")
+        mapped = openrouter_reasoning.discover_reasoning_for_slug(slug)
+
+    return {"data": {"reasoning": mapped, "slug": slug}}
 
 
 class ConnectionVerificationForm(BaseModel):
@@ -904,12 +1154,14 @@ async def verify_connection(
             # ClientError covers all aiohttp requests issues
             log.exception(f"Client error: {str(e)}")
             raise HTTPException(
-                status_code=500, detail="Open WebUI: Server Connection Error"
+                status_code=500,
+                detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
             )
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
             raise HTTPException(
-                status_code=500, detail="Open WebUI: Server Connection Error"
+                status_code=500,
+                detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
             )
 
 
@@ -1186,10 +1438,29 @@ async def generate_chat_completion(
     # pure (builds a fresh list, copy-on-write hydration), and `payload` is local to
     # this request, so there is no shared-state race. Co-located with the offloaded
     # json.dumps below.
+    # ``model_id`` is threaded through so blocks_to_api_messages can neutralize any
+    # `$ref` key in a tool result body for Gemini-family models (see
+    # sanitize_gemini_tool_result — Gemini 400s INVALID_ARGUMENT on a stray OpenAPI
+    # schema $ref smuggled into function_response text, e.g. a web-fetched Swagger doc).
     if isinstance(payload.get("messages"), list):
         payload["messages"] = await asyncio.to_thread(
-            blocks_to_api_messages, payload["messages"]
+            blocks_to_api_messages, payload["messages"], payload.get("model")
         )
+        # THE HTTP boundary for the compaction carrier. `blocks_to_api_messages`
+        # runs twice on the assemble → gate path and deliberately preserves the
+        # private key across both so a mid-turn second compaction can still see
+        # the mechanical lists it inherits (utils/compaction.py). This is the
+        # last place before the bytes go on the wire, so this is where it dies —
+        # and, for the same reason, the only place the envelope can be recorded
+        # as SENT rather than as something re-derived later and assumed equal.
+        _envelope_capture = capture_compaction_envelope(payload["messages"])
+        payload["messages"] = strip_compaction_carry(payload["messages"])
+        if _envelope_capture and isinstance(metadata, dict):
+            # Detached: a write-back must never add latency to, or fail, the
+            # request whose bytes it is recording.
+            asyncio.create_task(
+                record_sent_envelope(metadata.get("chat_id"), _envelope_capture)
+            )
 
     has_pdf_files = False
 
@@ -1360,6 +1631,58 @@ async def generate_chat_completion(
                             )
                             raise image_input_error(
                                 "Image URL is not accessible to the provider"
+                            )
+
+                    elif part.get("type") == "video_url":
+                        # Same local-file problem as images: a provider cannot
+                        # reach /api/v1/files/..., so the clip must be inlined as
+                        # a base64 data URL. OpenRouter documents this as the
+                        # required form for anything that isn't a YouTube link.
+                        video_url = part.get("video_url") or {}
+                        url = video_url.get("url")
+                        if not isinstance(url, str) or not url:
+                            raise video_input_error(
+                                "Video input is missing a valid URL"
+                            )
+                        if url.startswith("data:"):
+                            continue
+
+                        match = re.search(
+                            r"/api/v1/files/([^/]+)(?:/content)?(?:\?|$)", url
+                        )
+                        if not match:
+                            match = re.search(r"/api/v1/files/([a-f0-9-]+)", url)
+                        if match:
+                            file_id = match.group(1)
+                            file = await Files.get_file_by_id(file_id)
+                            if not file:
+                                raise video_input_error(
+                                    "Attached video file was not found"
+                                )
+                            if not user_can_read_file(file, user):
+                                raise video_input_error(
+                                    "Attached video file is not accessible"
+                                )
+                            try:
+                                part["video_url"]["url"] = (
+                                    await _resolve_local_file_video_data_url(
+                                        request, file
+                                    )
+                                )
+                            except FileNotFoundError:
+                                raise video_input_error(
+                                    "Attached video file was not found in storage"
+                                )
+                            except Exception as e:
+                                if isinstance(e, HTTPException):
+                                    raise
+                                log.error(f"Error resolving video URL: {e}")
+                                raise video_input_error(
+                                    "Could not prepare the video for the provider"
+                                )
+                        elif not url.startswith(("http://", "https://")):
+                            raise video_input_error(
+                                "Video URL is not accessible to the provider"
                             )
                 # Process file parts (separate loop after image processing).
                 # Tri-modal dispatch:
@@ -1687,6 +2010,15 @@ async def generate_chat_completion(
     elif "reasoning_effort" in payload:
         payload["reasoning"] = {"effort": payload.pop("reasoning_effort")}
 
+    # Permit the model to actually USE the reasoning_details we replay from
+    # earlier turns. Without this, gpt-5.4/5.5 default to `current_turn` and
+    # silently discard every encrypted block the history carries. Models that
+    # reject the field (gpt-5.2 and older) are discovered by the probe below and
+    # skipped from then on. See utils/reasoning_context.py.
+    reasoning_context_probed = reasoning_context.apply_to_payload(
+        payload, payload.get("model"), REASONING_CONTEXT_MODE
+    )
+
     # Convert the modified body back to JSON
     if "logit_bias" in payload:
         payload["logit_bias"] = json.loads(
@@ -1760,6 +2092,32 @@ async def generate_chat_completion(
     else:
         request_url = f"{url}/chat/completions"
 
+    # Byte-stable prefixes: rebuild messages/tools dicts in canonical (jsonb)
+    # key order so identical values always serialize to identical bytes,
+    # whether they came from the live agentic loop (provider wire order) or a
+    # DB replay (jsonb order). Without this, every turn boundary silently
+    # rewrote history bytes and broke the provider prompt cache. See
+    # canonicalize_wire_key_order. Env-gated for A/B diagnosis.
+    if ENABLE_WIRE_CANONICALIZATION:
+        if payload.get("messages"):
+            payload["messages"] = canonicalize_wire_key_order(payload["messages"])
+        if payload.get("tools"):
+            payload["tools"] = canonicalize_wire_key_order(payload["tools"])
+
+    # One line per upstream chat request: hash chain of the wire segments a
+    # provider prompt-cache keys on. On a suspicious cache miss, compare this
+    # request's chain with the previous one for the same chat — the first
+    # differing hash names the segment we changed; identical chains put the
+    # miss on the provider. Task requests (title/tags/...) are skipped.
+    if ENABLE_CACHE_PREFIX_FP and payload.get("messages") and task_type is None:
+        log.info(
+            "[cache-fp] chat=%s msg=%s model=%s %s",
+            chat_id,
+            (metadata or {}).get("message_id"),
+            payload.get("model"),
+            cache_prefix_fingerprint(payload),
+        )
+
     debug_enabled = request.app.state.config.ENABLE_API_DEBUG_LOGGING
 
     if debug_enabled:
@@ -1777,7 +2135,7 @@ async def generate_chat_completion(
     # doing it inline blocks the single loop and starves the socket delta
     # flush between rounds. The dict is fully built and not mutated after this
     # point on this path, so it is safe to hand to a worker thread.
-    payload = await asyncio.to_thread(json.dumps, payload)
+    payload_body = await asyncio.to_thread(json.dumps, payload)
 
     r = None
     session = None
@@ -1787,14 +2145,55 @@ async def generate_chat_completion(
     try:
         session = request.app.state.http_session
 
+        # Per-request timeout shape. Never use a total wall-clock cap for model
+        # generation. sock_read is opt-in via env; by default it is None too, so
+        # there is no hidden "no bytes for N seconds" cutoff during long reasoning
+        # or non-streaming subagent synthesis rounds.
+        _sock_read = (
+            AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ
+            if provider_payload_stream
+            else AIOHTTP_CLIENT_TIMEOUT_NONSTREAM_SOCK_READ
+        )
+        _req_timeout = aiohttp.ClientTimeout(total=None, sock_read=_sock_read)
+
         r = await session.request(
             method="POST",
             url=request_url,
-            data=payload,
+            data=payload_body,
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            timeout=_req_timeout,
         )
+
+        # `reasoning.context` capability probe. No provider catalog says which
+        # models accept the field, so the only way to find out is to send it and
+        # read the rejection. This costs one extra request the FIRST time a model
+        # refuses it and nothing afterwards — mark_unsupported means every later
+        # request for that model is built without it.
+        #
+        # Safe to re-issue: nothing has been consumed or emitted yet (both the
+        # SSE and JSON branches below are still ahead), and a 400 here means
+        # upstream did no work.
+        if reasoning_context_probed and r.status == 400:
+            try:
+                error_body = await r.text()
+            except Exception:
+                error_body = None
+            if reasoning_context.is_rejection(r.status, error_body):
+                reasoning_context.mark_unsupported(payload.get("model"))
+                reasoning_context.strip_from_payload(payload)
+                await cleanup_response(r, None)
+                payload_body = await asyncio.to_thread(json.dumps, payload)
+                r = await session.request(
+                    method="POST",
+                    url=request_url,
+                    data=payload_body,
+                    headers=headers,
+                    cookies=cookies,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    timeout=_req_timeout,
+                )
 
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
@@ -1861,7 +2260,21 @@ async def generate_chat_completion(
                                             continue
 
                                         data = json.loads(line[6:])
-                                        if "usage" in data:
+                                        if "usage" in data and not (
+                                            isinstance(metadata, dict)
+                                            and metadata.get("subagent_inner")
+                                            and (
+                                                provider_stream_override is False
+                                                or provider_payload_stream
+                                            )
+                                        ):
+                                            # C16: skip for an inner subagent stream —
+                                            # the agentic loop's stream_body_handler
+                                            # re-parses this same chunk's usage and
+                                            # accounts it WITH attribution (authoritative).
+                                            # Mirrors the non-streaming branch guard below;
+                                            # without it subagent usage is double-counted in
+                                            # the rate-limit token groups + model aggregate.
                                             await process_token_usage(
                                                 model_id, data["usage"]
                                             )
@@ -1908,10 +2321,7 @@ async def generate_chat_completion(
                 and not (
                     isinstance(metadata, dict)
                     and metadata.get("subagent_inner")
-                    and (
-                        provider_stream_override is False
-                        or provider_payload_stream
-                    )
+                    and (provider_stream_override is False or provider_payload_stream)
                 )
             ):
                 await process_token_usage(model_id, response["usage"])
@@ -1922,7 +2332,7 @@ async def generate_chat_completion(
 
         raise HTTPException(
             status_code=r.status if r else 500,
-            detail="Open WebUI: Server Connection Error",
+            detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
         )
     finally:
         if not streaming:
@@ -2028,7 +2438,7 @@ async def embeddings(request: Request, form_data: dict, user):
         log.exception(e)
         raise HTTPException(
             status_code=r.status if r else 500,
-            detail="Open WebUI: Server Connection Error",
+            detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
         )
     finally:
         if not streaming:
@@ -2100,9 +2510,8 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             trust_env=True,
             # No `total` cap: long reasoning answers / deep-research subagents
             # legitimately stream for many minutes, and aiohttp's built-in 5-min
-            # `total` default would cancel them mid-generation. Guard only against
-            # a genuinely dead/stalled connection via `sock_read` (max gap between
-            # received bytes) — an actively-generating model never trips it.
+            # `total` default would cancel them mid-generation. sock_read is also
+            # unbounded by default; operators can opt into a gap guard via env.
             timeout=aiohttp.ClientTimeout(
                 total=None,
                 sock_read=AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ,
@@ -2210,7 +2619,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         log.exception(e)
         raise HTTPException(
             status_code=r.status if r else 500,
-            detail="Open WebUI: Server Connection Error",
+            detail=f"{request.app.state.WEBUI_NAME}: Server Connection Error",
         )
     finally:
         if not streaming:

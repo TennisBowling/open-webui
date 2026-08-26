@@ -10,19 +10,22 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
 
-	export let onChange: Function = () => {};
-
-	export let accessRoles = ['read'];
-	export let accessControl = {};
-
-	export let allowPublic = true;
-
-	let selectedGroupId = '';
-	let groups = [];
-
-	$: if (!allowPublic && accessControl === null) {
-		initPublicAccess();
+	interface Props {
+		onChange?: Function;
+		accessRoles?: any;
+		accessControl?: any;
+		allowPublic?: boolean;
 	}
+
+	let {
+		onChange = () => {},
+		accessRoles = ['read'],
+		accessControl = $bindable({}),
+		allowPublic = true
+	}: Props = $props();
+
+	let selectedGroupId = $state('');
+	let groups = $state([]);
 
 	const initPublicAccess = () => {
 		if (!allowPublic && accessControl === null) {
@@ -56,6 +59,11 @@
 					user_ids: accessControl?.write?.user_ids ?? []
 				}
 			};
+		}
+	});
+	$effect(() => {
+		if (!allowPublic && accessControl === null) {
+			initPublicAccess();
 		}
 	});
 </script>
@@ -106,7 +114,7 @@
 					id="models"
 					class="outline-hidden bg-transparent text-sm font-medium rounded-lg block w-fit pr-10 max-w-full placeholder-gray-400"
 					value={accessControl !== null ? 'private' : 'public'}
-					on:change={(e) => {
+					onchange={(e) => {
 						if (e.target.value === 'public') {
 							accessControl = null;
 						} else {
@@ -161,7 +169,7 @@
 									{selectedGroupId ? '' : 'text-gray-500'}
 									dark:placeholder-gray-500"
 									bind:value={selectedGroupId}
-									on:change={() => {
+									onchange={() => {
 										if (selectedGroupId !== '') {
 											accessControl.read.group_ids = [
 												...(accessControl?.read?.group_ids ?? []),
@@ -186,7 +194,7 @@
 									<button
 										class=" p-1 rounded-xl bg-transparent dark:hover:bg-white/5 hover:bg-black/5 transition font-medium text-sm flex items-center space-x-1"
 										type="button"
-										on:click={() => {}}
+										onclick={() => {}}
 									>
 										<Plus className="size-3.5" />
 									</button>
@@ -216,7 +224,7 @@
 									<button
 										class=""
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											if (accessRoles.includes('write')) {
 												if ((accessControl?.write?.group_ids ?? []).includes(group.id)) {
 													accessControl.write.group_ids = (
@@ -242,7 +250,7 @@
 									<button
 										class=" rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
 										type="button"
-										on:click={() => {
+										onclick={() => {
 											accessControl.read.group_ids = (accessControl?.read?.group_ids ?? []).filter(
 												(id) => id !== group.id
 											);

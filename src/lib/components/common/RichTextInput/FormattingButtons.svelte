@@ -1,8 +1,7 @@
-<script>
+<script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
-
-	export let editor = null;
 
 	import Bold from '$lib/components/icons/Bold.svelte';
 	import CodeBracket from '$lib/components/icons/CodeBracket.svelte';
@@ -19,17 +18,23 @@
 	import CheckBox from '$lib/components/icons/CheckBox.svelte';
 	import ArrowLeftTag from '$lib/components/icons/ArrowLeftTag.svelte';
 	import ArrowRightTag from '$lib/components/icons/ArrowRightTag.svelte';
+	interface Props {
+		editor?: any;
+	}
+
+	let { editor = null }: Props = $props();
 </script>
 
 <div
-	class="flex gap-0.5 p-0.5 rounded-xl shadow-lg bg-white text-gray-800 dark:text-white dark:bg-gray-850 min-w-fit border border-gray-100 dark:border-gray-800"
+	class="flex gap-0.5 max-md:flex-wrap p-0.5 rounded-xl shadow-lg bg-white text-gray-800 dark:text-white dark:bg-gray-850 min-w-fit border-hairline border-gray-200 dark:border-gray-800"
 >
 	<Tooltip placement="top" content={$i18n.t('H1')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
 			class="{editor?.isActive('heading', { level: 1 })
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<H1 />
@@ -38,10 +43,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('H2')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
 			class="{editor?.isActive('heading', { level: 2 })
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<H2 />
@@ -50,10 +56,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('H3')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
 			class="{editor?.isActive('heading', { level: 3 })
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<H3 />
@@ -63,10 +70,11 @@
 	{#if editor?.isActive('bulletList') || editor?.isActive('orderedList') || editor?.isActive('taskList')}
 		<Tooltip placement="top" content={$i18n.t('Lift List')}>
 			<button
-				on:click={() => {
+				onmousedown={preventDefault()}
+				onclick={() => {
 					editor?.commands.liftListItem(editor?.isActive('taskList') ? 'taskItem' : 'listItem');
 				}}
-				class="hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				class="hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 				type="button"
 			>
 				<ArrowLeftTag />
@@ -74,9 +82,10 @@
 		</Tooltip>
 		<Tooltip placement="top" content={$i18n.t('Sink List')}>
 			<button
-				on:click={() =>
+				onmousedown={preventDefault()}
+				onclick={() =>
 					editor?.commands.sinkListItem(editor?.isActive('taskList') ? 'taskItem' : 'listItem')}
-				class="hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				class="hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 				type="button"
 			>
 				<ArrowRightTag />
@@ -86,10 +95,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Bullet List')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleBulletList().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleBulletList().run()}
 			class="{editor?.isActive('bulletList')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<ListBullet />
@@ -98,10 +108,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Ordered List')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleOrderedList().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleOrderedList().run()}
 			class="{editor?.isActive('orderedList')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<NumberedList />
@@ -110,10 +121,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Task List')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleTaskList().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleTaskList().run()}
 			class="{editor?.isActive('taskList')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<CheckBox />
@@ -122,10 +134,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Bold')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleBold().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleBold().run()}
 			class="{editor?.isActive('bold')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<Bold />
@@ -134,10 +147,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Italic')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleItalic().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleItalic().run()}
 			class="{editor?.isActive('italic')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<Italic />
@@ -146,10 +160,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Underline')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleUnderline().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleUnderline().run()}
 			class="{editor?.isActive('underline')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<Underline />
@@ -158,10 +173,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Strikethrough')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleStrike().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleStrike().run()}
 			class="{editor?.isActive('strike')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<Strikethrough />
@@ -170,10 +186,11 @@
 
 	<Tooltip placement="top" content={$i18n.t('Code Block')}>
 		<button
-			on:click={() => editor?.chain().focus().toggleCodeBlock().run()}
+			onmousedown={preventDefault()}
+			onclick={() => editor?.chain().focus().toggleCodeBlock().run()}
 			class="{editor?.isActive('codeBlock')
 				? 'bg-gray-50 dark:bg-gray-700'
-				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 transition-all"
+				: ''} hover:bg-gray-50 dark:hover:bg-gray-700 rounded-lg p-1.5 max-md:p-2 transition-all"
 			type="button"
 		>
 			<CodeBracket />

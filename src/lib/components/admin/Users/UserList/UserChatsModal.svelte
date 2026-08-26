@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext } from 'svelte';
 
 	import dayjs from 'dayjs';
@@ -16,29 +16,24 @@
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-	export let user;
-
-	let chatList = null;
-	let page = 1;
-
-	let query = '';
-	let orderBy = 'updated_at';
-	let direction = 'desc';
-
-	let filter = {};
-	$: filter = {
-		...(query ? { query } : {}),
-		...(orderBy ? { order_by: orderBy } : {}),
-		...(direction ? { direction } : {})
-	};
-
-	$: if (filter !== null) {
-		searchHandler();
+	interface Props {
+		show?: boolean;
+		user: any;
 	}
 
-	let allChatsLoaded = false;
-	let chatListLoading = false;
+	let { show = $bindable(false), user }: Props = $props();
+
+	let chatList = $state(null);
+	let page = $state(1);
+
+	let query = $state('');
+	let orderBy = $state('updated_at');
+	let direction = $state('desc');
+
+	let filter = $state({});
+
+	let allChatsLoaded = $state(false);
+	let chatListLoading = $state(false);
 
 	let searchDebounceTimeout;
 
@@ -91,15 +86,29 @@
 		chatList = await getChatListByUserId(localStorage.token, user.id, page, filter);
 	};
 
-	$: if (show) {
-		init();
-	} else {
-		chatList = null;
-		page = 1;
+	$effect(() => {
+		filter = {
+			...(query ? { query } : {}),
+			...(orderBy ? { order_by: orderBy } : {}),
+			...(direction ? { direction } : {})
+		};
+	});
+	$effect(() => {
+		if (filter !== null) {
+			searchHandler();
+		}
+	});
+	$effect(() => {
+		if (show) {
+			init();
+		} else {
+			chatList = null;
+			page = 1;
 
-		allChatsLoaded = false;
-		chatListLoading = false;
-	}
+			allChatsLoaded = false;
+			chatListLoading = false;
+		}
+	});
 </script>
 
 <ChatsModal

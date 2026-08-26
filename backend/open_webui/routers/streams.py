@@ -14,9 +14,11 @@ from open_webui.socket.main import (
     get_stream_state,
     get_tool_results,
     set_stream_state,
+    stream_run_get,
     stream_version_get,
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.response_durability import content_blocks_from_message
 from open_webui.utils.stream_state import terminal_status_from_message
 
 
@@ -67,17 +69,13 @@ async def _find_chat_id_for_message(message_id: str, user_id: str) -> Optional[s
     return None
 
 
-@router.get("/chat/{chat_id}/active")
-async def get_active_streams(
-    chat_id: str,
-    user=Depends(get_verified_user),
-):
-    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-    if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found",
-        )
+async def collect_active_streams(chat_id: str) -> list[dict]:
+    """Active streams for a chat, stale-pruned against persisted terminal
+    state. Single source for BOTH the /active endpoint and the chat-open
+    embed (routers/chats.py bundles this into the open response so the
+    client doesn't pay a second round-trip for it). Idle chats cost zero DB
+    reads here — the per-stream persisted lookup only runs for reported
+    streams."""
     streams = []
     for stream in get_active_streams_for_chat(chat_id):
         message_id = stream.get("message_id")
@@ -89,7 +87,21 @@ async def get_active_streams(
         if message_id and _clear_stale_active_stream(chat_id, message_id, persisted):
             continue
         streams.append(stream)
-    return {"streams": streams}
+    return streams
+
+
+@router.get("/chat/{chat_id}/active")
+async def get_active_streams(
+    chat_id: str,
+    user=Depends(get_verified_user),
+):
+    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found",
+        )
+    return {"streams": await collect_active_streams(chat_id)}
 
 
 @router.get("/{message_id}/snapshot")
@@ -147,7 +159,16 @@ async def get_stream_snapshot(
 
     content_blocks = in_flight_state.get("content_blocks")
     if content_blocks is None:
-        content_blocks = (persisted or {}).get("content_blocks") or []
+        content_blocks = content_blocks_from_message(persisted)
+    elif (
+        not content_blocks
+        and in_flight_state.get("status") != "in_progress"
+        and persisted
+    ):
+        # Non-streaming/legacy completions may have reached storage before
+        # content_blocks existed. A terminal snapshot must still carry the
+        # durable answer instead of turning it into an empty finished bubble.
+        content_blocks = content_blocks_from_message(persisted)
 
     tool_results = get_tool_results(message_id)
 
@@ -186,12 +207,26 @@ async def get_stream_snapshot(
     # tab's current selection.
     model = (persisted or {}).get("model") or in_flight_state.get("model")
 
+    # The assistant row's true parent (the user message it answers). Lets a client
+    # materializing a not-yet-loaded assistant (e.g. attaching to a server-drained
+    # generation, or one whose `chat:user-message` event was missed) parent it
+    # under the right user node instead of the tab's stale `history.currentId`.
+    parent_id = (persisted or {}).get("parentId") or in_flight_state.get("parentId")
+
     response: dict = {
         "version": version,
         "status": msg_status,
         "content_blocks": content_blocks,
         "tool_results": tool_results,
     }
+    # Run id (epoch) of the run this snapshot describes. Lets the client decide
+    # authority exactly: a snapshot from a NEWER run always replaces the local
+    # mirror (retry/continue reset the version space); same-run snapshots
+    # compare by version. Omitted when unknown (e.g. terminal DB fallback after
+    # cleanup) — clients then fall back to version comparison.
+    snapshot_run = in_flight_state.get("run") or stream_run_get(message_id)
+    if snapshot_run:
+        response["run"] = int(snapshot_run)
     if usage is not None:
         response["usage"] = usage
     if error is not None:
@@ -202,6 +237,8 @@ async def get_stream_snapshot(
         response["selected_model_id"] = selected_model_id
     if model is not None:
         response["model"] = model
+    if parent_id is not None:
+        response["parentId"] = parent_id
     return response
 
 
@@ -210,6 +247,7 @@ async def get_stream_deltas(
     message_id: str,
     chat_id: Optional[str] = None,
     after_version: int = 0,
+    run: Optional[int] = None,
     user=Depends(get_verified_user),
 ):
     resolved_chat_id = chat_id
@@ -242,7 +280,7 @@ async def get_stream_deltas(
             detail="Message not found",
         )
 
-    return await get_stream_replay_events(message_id, after_version)
+    return await get_stream_replay_events(message_id, after_version, run=run)
 
 
 @router.get("/browser/{message_id}/frame")
@@ -263,7 +301,8 @@ async def get_browser_frame(
     Response carries BOTH a top-level single frame (the default/most-recent session
     — back-compat for callers that only read one) AND a ``sessions`` array of every
     active tab so the panel can restore all of them. Returns 204 when nothing is
-    available.
+    available. Payloads come from ``browser_live_payload`` (same shape as the SSE
+    ``browser:frame`` event — including the verification handoff surface).
     """
     from open_webui.utils.container_workspace import read_browser_live_sessions
 
@@ -287,30 +326,52 @@ async def get_browser_frame(
     if not data_root:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    sessions = await read_browser_live_sessions(data_root, resolved_chat_id)
-    # Build a per-session payload list; only include sessions that have a frame.
-    session_payloads: list[dict] = []
-    for session_id_key, live in sessions.items():
-        if not live or not live.get("frame"):
-            continue
-        state = live.get("state") or {}
-        # A daemon that restarted (idle-reap / crash) marks the leftover state from
-        # a previous turn done+stale. Report it terminal so a reloading tab freezes
-        # it instead of showing a months-old "Navigating…" as if it were live.
-        is_done = bool(state.get("done")) or bool(state.get("stale"))
-        session_payloads.append(
-            {
-                "session": state.get("session") or session_id_key,
-                "frame": live.get("frame"),
-                "url": state.get("url", ""),
-                "title": state.get("title", ""),
-                "phase": "done" if is_done else state.get("phase", ""),
-                "action": state.get("action", ""),
-                "elapsedMs": state.get("elapsedMs", 0),
-                "startedAt": state.get("startedAt", 0),
-                "done": is_done,
-            }
+    return await _browser_live_response(data_root, resolved_chat_id)
+
+
+@router.get("/browser/live")
+async def get_browser_live(
+    request: Request,
+    chat_id: str,
+    user=Depends(get_verified_user),
+):
+    """Lightweight live browser state for the panel's verification poller.
+
+    The panel polls this while a human-verification handoff is armed so it can
+    watch for the daemon's auto-clear signal WITHOUT round-tripping a POST
+    handoff through the container (the old 1.5s POST-snapshot loop contended on
+    the daemon's per-session mutex with the user's own clicks and re-ran
+    detection on every refresh). Reads host files only — zero container cost.
+
+    Response is the same browser_live_payload shape as the reattach endpoint
+    (top-level single frame + ``sessions`` for every tab). 204 when nothing is
+    available.
+    """
+    from open_webui.utils.container_workspace import read_browser_live_sessions
+
+    chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found"
         )
+    data_root = str(
+        getattr(request.app.state.config, "CONTAINER_DATA_ROOT", "") or ""
+    )
+    if not data_root:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return await _browser_live_response(data_root, chat_id)
+
+
+async def _browser_live_response(data_root: str, chat_id: str) -> Response:
+    """Shared tail for the reattach + live endpoints: read every session's live
+    pair and shape it through browser_live_payloads (ONE builder, no drift)."""
+    from open_webui.utils.container_workspace import (
+        browser_live_payloads,
+        read_browser_live_sessions,
+    )
+
+    sessions = await read_browser_live_sessions(data_root, chat_id)
+    session_payloads = browser_live_payloads(sessions)
 
     if not session_payloads:
         return Response(status_code=status.HTTP_204_NO_CONTENT)

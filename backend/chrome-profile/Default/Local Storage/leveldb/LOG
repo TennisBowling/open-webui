@@ -1,0 +1,5 @@
+2026/07/18-02:58:41.687 5 Creating DB /home/tennisbowling/open-webui/backend/chrome-profile/Default/Local Storage/leveldb since it was missing.
+2026/07/18-02:58:41.692 5 Reusing MANIFEST /home/tennisbowling/open-webui/backend/chrome-profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/07/18-03:04:18.659 7 Level-0 table #5: started
+2026/07/18-03:04:18.661 7 Level-0 table #5: 210437 bytes OK
+2026/07/18-03:04:18.662 7 Delete type=0 #3

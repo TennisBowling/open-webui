@@ -10,15 +10,16 @@
 
 	const i18n = getContext('i18n');
 
-	export let year: number | undefined = undefined;
+	interface Props {
+		year?: number | undefined;
+	}
 
-	let loading = true;
-	let error: string | null = null;
-	let wrapped: GlobalWrappedSummary | null = null;
-	let modelUsage: ModelUsage[] = [];
+	let { year = undefined }: Props = $props();
 
-	// Colors for model leaderboard
-	const MEDAL_COLORS = ['#FFD700', '#C0C0C0', '#CD7F32'];
+	let loading = $state(true);
+	let error: string | null = $state(null);
+	let wrapped: GlobalWrappedSummary | null = $state(null);
+	let modelUsage: ModelUsage[] = $state([]);
 
 	onMount(async () => {
 		await loadGlobalData();
@@ -56,9 +57,11 @@
 		return parts[parts.length - 1] || modelId;
 	}
 
-	$: if (year !== undefined) {
-		loadGlobalData();
-	}
+	$effect(() => {
+		if (year !== undefined) {
+			loadGlobalData();
+		}
+	});
 </script>
 
 <div class="w-full">
@@ -66,31 +69,37 @@
 		<div class="flex items-center justify-center py-24">
 			<div class="flex flex-col items-center gap-4">
 				<div
-					class="w-16 h-16 border-4 border-[#ff003c] border-t-transparent rounded-full animate-spin"
+					class="w-12 h-12 border-2 border-book-cloth border-t-transparent rounded-full animate-spin"
 				></div>
-				<div class="text-[#ff003c] font-mono animate-pulse">ACCESSING_GLOBAL_MAINFRAME...</div>
+				<div class="text-sm text-gray-500 dark:text-gray-400 animate-pulse">
+					Loading global data…
+				</div>
 			</div>
 		</div>
 	{:else if error}
-		<div class="text-center py-24 border border-red-500/50 bg-red-500/10">
-			<div class="text-red-500 font-bold text-xl mb-2">SYSTEM_FAILURE</div>
-			<div class="text-red-400 font-mono">{error}</div>
+		<div
+			class="text-center py-16 rounded-2xl border-hairline border-error-brick/20 bg-error-brick/10"
+		>
+			<div class="text-error-brick dark:text-error-brick-dark font-semibold text-lg mb-1">
+				Something went wrong
+			</div>
+			<div class="text-sm text-error-brick dark:text-error-brick-dark">{error}</div>
 		</div>
 	{:else if wrapped}
 		<!-- Hero Stats -->
-		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
+		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
 			<!-- Total Tokens -->
 			<div
-				class="group relative bg-black border border-white/20 p-6 hover:border-[#ff003c] transition-colors overflow-hidden"
+				class="group relative bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-6 overflow-hidden transition-colors duration-200 ease-paper hover:border-book-cloth/40"
 			>
 				<div
-					class="absolute top-0 right-0 p-2 opacity-20 group-hover:opacity-100 transition-opacity"
+					class="absolute top-0 right-0 p-3 text-book-cloth/25 dark:text-kraft/25 group-hover:text-book-cloth/50 dark:group-hover:text-kraft/50 transition-colors duration-200"
 				>
 					<svg
 						xmlns="http://www.w3.org/2000/svg"
 						viewBox="0 0 24 24"
 						fill="currentColor"
-						class="w-12 h-12 text-[#ff003c]"
+						class="w-11 h-11"
 					>
 						<path
 							fill-rule="evenodd"
@@ -99,31 +108,26 @@
 						/>
 					</svg>
 				</div>
-				<div class="text-xs text-gray-500 uppercase tracking-widest mb-2">Global_Token_Volume</div>
-				<div
-					class="text-4xl md:text-5xl font-bold text-white group-hover:text-[#ff003c] transition-colors font-['Koulen']"
-				>
-					{formatTokenCount(wrapped.total_tokens)}
+				<div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+					{$i18n.t('Global request tokens')}
 				</div>
-				<div class="mt-4 h-1 w-full bg-white/10">
-					<div
-						class="h-full bg-[#ff003c] w-full origin-left scale-x-0 group-hover:scale-x-100 transition-transform duration-500"
-					></div>
+				<div class="font-display text-5xl md:text-6xl leading-none text-gray-900 dark:text-white">
+					{formatTokenCount(wrapped.total_tokens)}
 				</div>
 			</div>
 
 			<!-- Active Users -->
 			<div
-				class="group relative bg-black border border-white/20 p-6 hover:border-[#ff003c] transition-colors overflow-hidden"
+				class="group relative bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-6 overflow-hidden transition-colors duration-200 ease-paper hover:border-book-cloth/40"
 			>
 				<div
-					class="absolute top-0 right-0 p-2 opacity-20 group-hover:opacity-100 transition-opacity"
+					class="absolute top-0 right-0 p-3 text-book-cloth/25 dark:text-kraft/25 group-hover:text-book-cloth/50 dark:group-hover:text-kraft/50 transition-colors duration-200"
 				>
 					<svg
 						xmlns="http://www.w3.org/2000/svg"
 						viewBox="0 0 24 24"
 						fill="currentColor"
-						class="w-12 h-12 text-[#ff003c]"
+						class="w-11 h-11"
 					>
 						<path
 							fill-rule="evenodd"
@@ -132,31 +136,26 @@
 						/>
 					</svg>
 				</div>
-				<div class="text-xs text-gray-500 uppercase tracking-widest mb-2">Active_Personnel</div>
-				<div
-					class="text-4xl md:text-5xl font-bold text-white group-hover:text-[#ff003c] transition-colors font-['Koulen']"
-				>
-					{wrapped.total_users_active.toLocaleString()}
+				<div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+					{$i18n.t('Active users')}
 				</div>
-				<div class="mt-4 h-1 w-full bg-white/10">
-					<div
-						class="h-full bg-[#ff003c] w-full origin-left scale-x-0 group-hover:scale-x-100 transition-transform duration-500 delay-75"
-					></div>
+				<div class="font-display text-5xl md:text-6xl leading-none text-gray-900 dark:text-white">
+					{wrapped.total_users_active.toLocaleString()}
 				</div>
 			</div>
 
 			<!-- Conversations -->
 			<div
-				class="group relative bg-black border border-white/20 p-6 hover:border-[#ff003c] transition-colors overflow-hidden"
+				class="group relative bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-6 overflow-hidden transition-colors duration-200 ease-paper hover:border-book-cloth/40"
 			>
 				<div
-					class="absolute top-0 right-0 p-2 opacity-20 group-hover:opacity-100 transition-opacity"
+					class="absolute top-0 right-0 p-3 text-book-cloth/25 dark:text-kraft/25 group-hover:text-book-cloth/50 dark:group-hover:text-kraft/50 transition-colors duration-200"
 				>
 					<svg
 						xmlns="http://www.w3.org/2000/svg"
 						viewBox="0 0 24 24"
 						fill="currentColor"
-						class="w-12 h-12 text-[#ff003c]"
+						class="w-11 h-11"
 					>
 						<path
 							fill-rule="evenodd"
@@ -165,31 +164,26 @@
 						/>
 					</svg>
 				</div>
-				<div class="text-xs text-gray-500 uppercase tracking-widest mb-2">Total_Conversations</div>
-				<div
-					class="text-4xl md:text-5xl font-bold text-white group-hover:text-[#ff003c] transition-colors font-['Koulen']"
-				>
-					{wrapped.total_conversations.toLocaleString()}
+				<div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+					{$i18n.t('Conversations')}
 				</div>
-				<div class="mt-4 h-1 w-full bg-white/10">
-					<div
-						class="h-full bg-[#ff003c] w-full origin-left scale-x-0 group-hover:scale-x-100 transition-transform duration-500 delay-150"
-					></div>
+				<div class="font-display text-5xl md:text-6xl leading-none text-gray-900 dark:text-white">
+					{wrapped.total_conversations.toLocaleString()}
 				</div>
 			</div>
 
 			<!-- Messages -->
 			<div
-				class="group relative bg-black border border-white/20 p-6 hover:border-[#ff003c] transition-colors overflow-hidden"
+				class="group relative bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-6 overflow-hidden transition-colors duration-200 ease-paper hover:border-book-cloth/40"
 			>
 				<div
-					class="absolute top-0 right-0 p-2 opacity-20 group-hover:opacity-100 transition-opacity"
+					class="absolute top-0 right-0 p-3 text-book-cloth/25 dark:text-kraft/25 group-hover:text-book-cloth/50 dark:group-hover:text-kraft/50 transition-colors duration-200"
 				>
 					<svg
 						xmlns="http://www.w3.org/2000/svg"
 						viewBox="0 0 24 24"
 						fill="currentColor"
-						class="w-12 h-12 text-[#ff003c]"
+						class="w-11 h-11"
 					>
 						<path
 							fill-rule="evenodd"
@@ -198,70 +192,70 @@
 						/>
 					</svg>
 				</div>
-				<div class="text-xs text-gray-500 uppercase tracking-widest mb-2">Total_Messages</div>
-				<div
-					class="text-4xl md:text-5xl font-bold text-white group-hover:text-[#ff003c] transition-colors font-['Koulen']"
-				>
-					{wrapped.total_messages.toLocaleString()}
+				<div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+					{$i18n.t('Messages')}
 				</div>
-				<div class="mt-4 h-1 w-full bg-white/10">
-					<div
-						class="h-full bg-[#ff003c] w-full origin-left scale-x-0 group-hover:scale-x-100 transition-transform duration-500 delay-200"
-					></div>
+				<div class="font-display text-5xl md:text-6xl leading-none text-gray-900 dark:text-white">
+					{wrapped.total_messages.toLocaleString()}
 				</div>
 			</div>
 		</div>
 
 		<!-- Busiest Day -->
 		{#if wrapped.busiest_day}
-			<div class="mb-12">
-				<div class="relative group">
-					<div
-						class="absolute -inset-0.5 bg-gradient-to-r from-[#ff003c] to-orange-600 opacity-20 group-hover:opacity-100 transition duration-500 blur"
-					></div>
-					<div class="relative bg-black border border-white/10 p-8">
-						<div class="flex items-center justify-between mb-6">
-							<div>
-								<h4 class="text-sm text-gray-500 uppercase tracking-widest mb-1">
-									{$i18n.t('System_Peak_Load')}
-								</h4>
-								<div class="text-3xl font-bold text-white font-['Koulen']">
-									{wrapped.busiest_day.day_of_week}
-								</div>
-							</div>
-							<div class="p-3 bg-[#ff003c]/10 border border-[#ff003c]/20 text-[#ff003c]">
-								<svg
-									xmlns="http://www.w3.org/2000/svg"
-									viewBox="0 0 24 24"
-									fill="currentColor"
-									class="size-6"
-								>
-									<path
-										fill-rule="evenodd"
-										d="M12.963 2.286a.75.75 0 0 0-1.071-.136 9.742 9.742 0 0 0-3.539 6.176 7.547 7.547 0 0 1-1.705-1.715.75.75 0 0 0-1.152-.082A9 9 0 1 0 15.68 4.534a7.46 7.46 0 0 1-2.717-2.248ZM15.75 14.25a3.75 3.75 0 1 1-7.313-1.172c.628.465 1.35.81 2.133 1a5.99 5.99 0 0 1 1.925-3.546 3.75 3.75 0 0 1 3.255 3.718Z"
-										clip-rule="evenodd"
-									/>
-								</svg>
+			<div class="mb-10">
+				<div
+					class="bg-manilla/30 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-8"
+				>
+					<div class="flex items-center justify-between mb-6">
+						<div>
+							<h4 class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+								{$i18n.t('Busiest day')}
+							</h4>
+							<div class="font-display text-3xl text-gray-900 dark:text-white">
+								{wrapped.busiest_day.day_of_week}
 							</div>
 						</div>
+						<div
+							class="p-3 rounded-xl bg-book-cloth/15 border-hairline border-book-cloth/20 text-book-cloth dark:text-kraft"
+						>
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 24 24"
+								fill="currentColor"
+								class="size-6"
+							>
+								<path
+									fill-rule="evenodd"
+									d="M12.963 2.286a.75.75 0 0 0-1.071-.136 9.742 9.742 0 0 0-3.539 6.176 7.547 7.547 0 0 1-1.705-1.715.75.75 0 0 0-1.152-.082A9 9 0 1 0 15.68 4.534a7.46 7.46 0 0 1-2.717-2.248ZM15.75 14.25a3.75 3.75 0 1 1-7.313-1.172c.628.465 1.35.81 2.133 1a5.99 5.99 0 0 1 1.925-3.546 3.75 3.75 0 0 1 3.255 3.718Z"
+									clip-rule="evenodd"
+								/>
+							</svg>
+						</div>
+					</div>
 
-						<div class="grid grid-cols-1 md:grid-cols-2 gap-8">
-							<div class="flex justify-between items-end border-b border-white/10 pb-2">
-								<span class="text-xs text-gray-500 uppercase">Date</span>
-								<span class="font-mono text-[#ff003c]">
-									{new Date(wrapped.busiest_day.date).toLocaleDateString(undefined, {
-										year: 'numeric',
-										month: 'long',
-										day: 'numeric'
-									})}
-								</span>
-							</div>
-							<div class="flex justify-between items-end border-b border-white/10 pb-2">
-								<span class="text-xs text-gray-500 uppercase">Token_Throughput</span>
-								<span class="font-mono text-[#ff003c]">
-									{formatTokenCount(wrapped.busiest_day.tokens)}
-								</span>
-							</div>
+					<div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+						<div
+							class="flex justify-between items-end border-b-hairline border-gray-200 dark:border-gray-800 pb-2"
+						>
+							<span class="text-xs text-gray-500 dark:text-gray-400 uppercase">Date</span>
+							<span class="text-sm font-medium text-gray-900 dark:text-white">
+								{new Date(wrapped.busiest_day.date).toLocaleDateString(undefined, {
+									year: 'numeric',
+									month: 'long',
+									day: 'numeric'
+								})}
+							</span>
+						</div>
+						<div
+							class="flex justify-between items-end border-b-hairline border-gray-200 dark:border-gray-800 pb-2"
+						>
+							<span class="text-xs text-gray-500 dark:text-gray-400 uppercase"
+								>{$i18n.t('Total tokens')}</span
+							>
+							<span class="text-sm font-medium text-book-cloth dark:text-kraft">
+								{formatTokenCount(wrapped.busiest_day.tokens)}
+							</span>
 						</div>
 					</div>
 				</div>
@@ -271,48 +265,46 @@
 		<!-- Model Leaderboard -->
 		{#if modelUsage.length > 0}
 			<div>
-				<div class="flex items-center gap-4 mb-8">
-					<div class="w-3 h-3 bg-[#ff003c]"></div>
-					<h3 class="text-2xl font-bold uppercase tracking-widest text-white">
-						{$i18n.t('Model_Performance_Ranking')}
+				<div class="flex items-center gap-3 mb-6">
+					<span class="w-2 h-2 rounded-full bg-book-cloth"></span>
+					<h3 class="text-base font-semibold text-gray-900 dark:text-white">
+						{$i18n.t('Model leaderboard')}
 					</h3>
-					<div class="h-px flex-1 bg-white/10"></div>
+					<div class="h-px flex-1 bg-gray-200 dark:bg-gray-800"></div>
 				</div>
 
-				<div class="space-y-4">
+				<div class="space-y-3">
 					{#each modelUsage as model, index}
 						<div
-							class="group relative bg-black border border-white/10 p-4 hover:border-[#ff003c] transition-colors"
+							class="group bg-gray-50 dark:bg-gray-850 border-hairline border-gray-200 dark:border-gray-800 rounded-2xl p-4 transition-colors duration-200 ease-paper hover:border-book-cloth/40"
 						>
 							<div class="flex items-center gap-6">
 								<div
-									class="text-4xl font-['Koulen'] w-12 text-center {index < 3
-										? 'text-[#ff003c]'
-										: 'text-gray-700'}"
+									class="font-display text-4xl w-12 text-center {index < 3
+										? 'text-book-cloth dark:text-kraft'
+										: 'text-gray-400 dark:text-gray-600'}"
 								>
 									#{index + 1}
 								</div>
 
 								<div class="flex-1 min-w-0">
 									<div class="flex items-center justify-between mb-2">
-										<div class="font-bold text-white truncate text-lg">
+										<div class="font-semibold text-gray-900 dark:text-white truncate text-base">
 											{getModelDisplayName(model.model_id)}
 										</div>
-										<div class="font-mono text-[#ff003c]">
+										<div class="text-sm font-medium text-book-cloth dark:text-kraft">
 											{model.percentage.toFixed(1)}%
 										</div>
 									</div>
 
-									<div class="h-2 bg-white/5 w-full overflow-hidden">
+									<div class="h-2 bg-gray-100 dark:bg-gray-800 w-full overflow-hidden rounded-full">
 										<div
-											class="h-full bg-[#ff003c] transition-all duration-1000 ease-out"
+											class="h-full bg-book-cloth transition-all duration-1000 ease-out rounded-full"
 											style="width: {model.percentage}%"
 										></div>
 									</div>
 
-									<div
-										class="flex justify-between mt-2 text-xs text-gray-500 uppercase tracking-wider"
-									>
+									<div class="flex justify-between mt-2 text-xs text-gray-500 dark:text-gray-400">
 										<span>{model.conversation_count.toLocaleString()} Conversations</span>
 										<span>{formatTokenCount(model.total_tokens)} Tokens</span>
 									</div>
@@ -329,8 +321,10 @@
 			<!-- Already showing model leaderboard above -->
 		{/if}
 	{:else}
-		<div class="text-center py-24 border border-white/10 bg-white/5">
-			<div class="text-gray-500 font-mono">NO_GLOBAL_DATA_AVAILABLE</div>
+		<div
+			class="text-center py-16 rounded-2xl border-hairline border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-850"
+		>
+			<div class="text-sm text-gray-500 dark:text-gray-400">No global data available.</div>
 		</div>
 	{/if}
 </div>

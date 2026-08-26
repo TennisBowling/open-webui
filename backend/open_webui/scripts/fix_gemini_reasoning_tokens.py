@@ -43,7 +43,11 @@ def _exact_schema(u) -> bool:
     )
 
 
-def is_broken(usage: dict) -> int:
+def _legacy_is_broken(usage: dict) -> int:
+    """LEGACY "C" format (pre-2026-06): reasoning nested under
+    completion_tokens_details but EXCLUDED from completion_tokens. Returns the
+    reasoning delta to add, or 0. (No such rows remain in the DB, but kept so the
+    script stays correct if any resurface.)"""
     if not _exact_schema(usage):
         return 0
     try:
@@ -54,6 +58,56 @@ def is_broken(usage: dict) -> int:
     except Exception:
         return 0
     return r if r > 0 and t == p + c + r and t != p + c else 0
+
+
+def _fold_top_level_reasoning(usage: dict):
+    """NEW "C" format (current): reasoning at the TOP LEVEL, EXCLUDED from
+    completion_tokens, with no completion_tokens_details. Returns
+    (canonical_usage, delta) reshaped exactly like a canonical payload (reasoning
+    folded into completion_tokens, mirrored into the nested slot, top-level key
+    dropped), or (None, 0). Mirrors socket.main.normalize_provider_usage so the
+    backfill produces the same shape the live path now writes."""
+    if not isinstance(usage, dict):
+        return None, 0
+    top_r = int(usage.get("reasoning_tokens") or 0)
+    if top_r <= 0:
+        return None, 0
+    cd = usage.get("completion_tokens_details") or {}
+    if int(cd.get("reasoning_tokens") or 0) > 0:
+        return None, 0
+    p = int(usage.get("prompt_tokens") or 0)
+    c = int(usage.get("completion_tokens") or 0)
+    t = int(usage.get("total_tokens") or 0)
+    if not (t and t == p + c + top_r and t != p + c):
+        return None, 0
+    fixed = dict(usage)
+    fixed["completion_tokens"] = c + top_r
+    details = dict(cd)
+    details["reasoning_tokens"] = top_r
+    fixed["completion_tokens_details"] = details
+    fixed.pop("reasoning_tokens", None)
+    return fixed, top_r
+
+
+def repair_usage(usage: dict):
+    """Return (canonical_usage, delta) if `usage` is a broken "C" payload in
+    EITHER format, else (None, 0). Idempotent: a canonical/already-fixed payload
+    yields (None, 0)."""
+    fixed, delta = _fold_top_level_reasoning(usage)
+    if delta:
+        return fixed, delta
+    delta = _legacy_is_broken(usage)
+    if delta:
+        fixed = dict(usage)
+        fixed["completion_tokens"] = int(usage.get("completion_tokens") or 0) + delta
+        return fixed, delta
+    return None, 0
+
+
+def is_broken(usage: dict) -> int:
+    """Reasoning delta for a broken payload in either format (0 if not broken)."""
+    _, delta = repair_usage(usage)
+    return delta
 
 
 def _json(value):
@@ -79,6 +133,7 @@ async def scan(db):
                        completion_tokens, raw_usage, created_at
                 FROM token_usage_event
                 WHERE model_id = ANY(:models)
+                   OR raw_usage ? 'reasoning_tokens'
                 """
             ),
             {"models": list(BROKEN_MODELS)},
@@ -87,11 +142,13 @@ async def scan(db):
 
     for row in rows:
         usage = _json(row["raw_usage"])
-        delta = is_broken(usage)
+        new_usage, delta = repair_usage(usage)
         if not delta:
             continue
         old_c = int(row["completion_tokens"] or 0)
-        new_usage = dict(usage)
+        # Keep the stored blob's completion in lockstep with the event column,
+        # which is what the analytics read path actually sums.
+        new_usage = dict(new_usage)
         new_usage["completion_tokens"] = old_c + delta
         ev_fixes.append(
             {
@@ -130,7 +187,7 @@ async def scan(db):
                 {"chat_id": chat_id},
             )
         ).mappings().first()
-        if not last or last["model_id"] not in BROKEN_MODELS:
+        if not last:
             continue
         delta = is_broken(_json(last["raw_usage"]))
         if not delta:
@@ -157,7 +214,9 @@ async def scan(db):
                 """
                 SELECT chat_id, message_id, meta
                 FROM chat_message
-                WHERE model = ANY(:models) AND meta ? 'usage'
+                WHERE (model = ANY(:models)
+                       OR meta #> '{usage,reasoning_tokens}' IS NOT NULL)
+                  AND meta ? 'usage'
                 """
             ),
             {"models": list(BROKEN_MODELS)},
@@ -166,12 +225,10 @@ async def scan(db):
     for row in rows:
         meta = _json(row["meta"])
         usage = meta.get("usage") or {}
-        delta = is_broken(usage)
+        new_usage, delta = repair_usage(usage)
         if not delta:
             continue
         new_meta = dict(meta)
-        new_usage = dict(usage)
-        new_usage["completion_tokens"] = int(new_usage.get("completion_tokens") or 0) + delta
         new_meta["usage"] = new_usage
         msg_fixes.append(
             {

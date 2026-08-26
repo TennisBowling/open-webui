@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import {
 		banners,
@@ -16,9 +16,9 @@
 
 	import { goto } from '$app/navigation';
 
-	import ShareChatModal from '../chat/ShareChatModal.svelte';
 	import ModelSelector from '../chat/ModelSelector.svelte';
 	import ChatTokenStats from '../chat/ChatTokenStats.svelte';
+	import SyncStatus from '../chat/SyncStatus.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Menu from '$lib/components/layout/Navbar/Menu.svelte';
 	import UserMenu from '$lib/components/layout/Sidebar/UserMenu.svelte';
@@ -37,45 +37,83 @@
 
 	import { shareChatById } from '$lib/apis/chats';
 	import { copyToClipboard } from '$lib/utils';
+	import { dismissKeyboard } from '$lib/utils/keyboardViewport';
 
 	const i18n = getContext('i18n');
 
-	export let initNewChat: Function;
-	export let shareEnabled: boolean = false;
+	interface Props {
+		initNewChat: Function;
+		shareEnabled?: boolean;
+		chat: any;
+		history: any;
+		selectedModels: string[];
+		showModelSelector?: boolean;
+		onModelsChange?: (modelIds: string[]) => void;
+		onSaveTempChat: () => {};
+		archiveChatHandler: (id: string) => void;
+		moveChatHandler: (id: string, folderId: string) => void;
+	}
 
-	export let chat;
-	export let history;
-	export let selectedModels;
-	export let showModelSelector = true;
+	let {
+		initNewChat,
+		shareEnabled = false,
+		chat,
+		history,
+		selectedModels,
+		showModelSelector = true,
+		onModelsChange = () => {},
+		onSaveTempChat,
+		archiveChatHandler,
+		moveChatHandler
+	}: Props = $props();
 
-	export let onSaveTempChat: () => {};
-	export let archiveChatHandler: (id: string) => void;
-	export let moveChatHandler: (id: string, folderId: string) => void;
+	let closedBannerIds = $state([]);
 
-	let closedBannerIds = [];
+	let showShareChatModal = $state(false);
+	let currentChatId = $state('');
+	let hasPersistentChat = $state(false);
+	let isTemporaryLocalChat = $state(false);
 
-	let showShareChatModal = false;
-	let currentChatId = '';
-	let hasPersistentChat = false;
-	let isTemporaryLocalChat = false;
-
-	$: currentChatId = chat?.id ?? '';
-	$: hasPersistentChat = Boolean(currentChatId) && !currentChatId.startsWith('local:');
-	$: isTemporaryLocalChat = $temporaryChatEnabled && currentChatId.startsWith('local:');
+	$effect(() => {
+		currentChatId = chat?.id ?? '';
+	});
+	$effect(() => {
+		hasPersistentChat = Boolean(currentChatId) && !currentChatId.startsWith('local:');
+	});
+	$effect(() => {
+		isTemporaryLocalChat = $temporaryChatEnabled && currentChatId.startsWith('local:');
+	});
 </script>
 
-<ShareChatModal bind:show={showShareChatModal} chatId={currentChatId} />
+{#if showShareChatModal}
+	{#await import('../chat/ShareChatModal.svelte') then { default: ShareChatModal }}
+		<ShareChatModal bind:show={showShareChatModal} chatId={currentChatId} />
+	{/await}
+{/if}
 
 <button
 	id="new-chat-button"
 	class="hidden"
-	on:click={() => {
+	onclick={() => {
 		initNewChat();
 	}}
 	aria-label="New Chat"
-/>
+></button>
 
-<nav class="sticky top-0 z-30 w-full py-1 pt-safe -mb-8 flex flex-col items-center drag-region">
+<nav
+	id="chat-navbar"
+	class="sticky top-0 z-30 w-full py-1 pt-safe -mb-8 flex flex-col items-center drag-region"
+>
+	<!-- Typing-mode exit: only visible while html.keyboard-open collapses the
+	     bar to a status shade (see .kb-expand rules in app.css). Dismisses the
+	     keyboard directly instead of relying on blur→viewport-resize. -->
+	<button
+		type="button"
+		class="kb-expand"
+		aria-label={$i18n.t('Show header')}
+		onclick={dismissKeyboard}
+	></button>
+
 	<div class="flex items-center w-full pl-1.5 pr-1">
 		<div
 			class=" bg-linear-to-b via-40% to-97% from-white via-white to-transparent dark:from-gray-900 dark:via-gray-900 dark:to-transparent pointer-events-none absolute inset-0 -bottom-7 z-[-1]"
@@ -90,7 +128,7 @@
 						<Tooltip content={$showSidebar ? $i18n.t('Close Sidebar') : $i18n.t('Open Sidebar')}>
 							<button
 								class=" cursor-pointer flex rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition"
-								on:click={() => {
+								onclick={() => {
 									showSidebar.set(!$showSidebar);
 								}}
 								aria-label={$showSidebar ? $i18n.t('Close Sidebar') : $i18n.t('Open Sidebar')}
@@ -109,9 +147,15 @@
 			"
 				>
 					{#if showModelSelector}
-						<ModelSelector bind:selectedModels showSetDefault={!shareEnabled} />
+						<ModelSelector {selectedModels} {onModelsChange} showSetDefault={!shareEnabled} />
 					{/if}
 				</div>
+
+				<!-- Freshness mark: syncing / offline / settled — replaces the old
+				     desktop-only red Offline pill (off-palette, and invisible on
+				     mobile where it mattered most). Sits between the flex-1 model
+				     selector and the fixed right cluster, so it never shifts layout. -->
+				<SyncStatus />
 
 				<!-- Token stats display - shows input/output/total tokens for current chat -->
 				{#if hasPersistentChat && !$temporaryChatEnabled}
@@ -127,9 +171,9 @@
 						{#if !chat?.id}
 							<Tooltip content={$i18n.t(`Temporary Chat`)}>
 								<button
-									class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+									class="flex cursor-pointer px-2 py-2 max-md:px-2.5 max-md:py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
 									id="temporary-chat-button"
-									on:click={async () => {
+									onclick={async () => {
 										if (($settings?.temporaryChatByDefault ?? false) && $temporaryChatEnabled) {
 											// for proper initNewChat handling
 											await temporaryChatEnabled.set(null);
@@ -165,9 +209,9 @@
 						{:else if $temporaryChatEnabled}
 							<Tooltip content={$i18n.t(`Save Chat`)}>
 								<button
-									class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+									class="flex cursor-pointer px-2 py-2 max-md:px-2.5 max-md:py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
 									id="save-temporary-chat-button"
-									on:click={async () => {
+									onclick={async () => {
 										onSaveTempChat();
 									}}
 								>
@@ -184,8 +228,8 @@
 							<button
 								class=" flex {$showSidebar
 									? 'md:hidden'
-									: ''} cursor-pointer px-2 py-2 rounded-xl text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-850 transition"
-								on:click={() => {
+									: ''} cursor-pointer px-2 py-2 max-md:px-2.5 max-md:py-2.5 rounded-xl text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+								onclick={() => {
 									initNewChat();
 								}}
 								aria-label="New Chat"
@@ -198,10 +242,10 @@
 					{/if}
 
 					{#if shareEnabled && chat && hasPersistentChat}
-						<Tooltip content={$i18n.t('Share')}>
+						<Tooltip content={$i18n.t('Share')} className="max-md:hidden">
 							<button
-								class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
-								on:click={async () => {
+								class="flex max-md:hidden cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+								onclick={async () => {
 									const chatId = chat.id;
 									const sharedChat = await shareChatById(localStorage.token, chatId);
 									const shareUrl = `${window.location.origin}/s/${sharedChat.id}`;
@@ -241,7 +285,7 @@
 							{moveChatHandler}
 						>
 							<button
-								class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+								class="flex cursor-pointer px-2 py-2 max-md:px-2.5 max-md:py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
 								id="chat-context-menu-button"
 							>
 								<div class=" m-auto self-center">
@@ -254,8 +298,8 @@
 					{#if $user?.role === 'admin' || ($user?.permissions?.chat?.controls ?? true)}
 						<Tooltip content={$i18n.t('Controls')}>
 							<button
-								class=" flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
-								on:click={async () => {
+								class=" flex cursor-pointer px-2 py-2 max-md:px-2.5 max-md:py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+								onclick={async () => {
 									await showControls.set(!$showControls);
 								}}
 								aria-label="Controls"
@@ -272,7 +316,7 @@
 							className="max-w-[240px]"
 							role={$user?.role}
 							help={true}
-							on:show={(e) => {
+							onshow={(e) => {
 								if (e.detail === 'archived-chat') {
 									showArchivedChats.set(true);
 								}
@@ -304,7 +348,7 @@
 			<button
 				type="button"
 				class="ml-1 underline underline-offset-2 hover:text-gray-700 dark:hover:text-gray-300 transition cursor-pointer"
-				on:click={() => onSaveTempChat?.()}
+				onclick={() => onSaveTempChat?.()}
 			>
 				{$i18n.t('Save chat')}
 			</button>
@@ -342,7 +386,7 @@
 					{#each $banners.filter((b) => ![...JSON.parse(localStorage.getItem('dismissedBannerIds') ?? '[]'), ...closedBannerIds].includes(b.id)) as banner (banner.id)}
 						<Banner
 							{banner}
-							on:dismiss={(e) => {
+							ondismiss={(e) => {
 								const bannerId = e.detail;
 
 								if (banner.dismissible) {

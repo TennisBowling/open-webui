@@ -1,28 +1,43 @@
-<script>
+<script lang="ts">
 	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import StatusItem from './StatusHistory/StatusItem.svelte';
-	export let statusHistory = [];
-	export let expand = false;
-
-	let showHistory = true;
-
-	$: if (expand) {
-		showHistory = true;
-	} else {
-		showHistory = false;
+	interface Props {
+		statusHistory?: any;
+		expand?: boolean;
 	}
 
-	let history = [];
-	let status = null;
+	let { statusHistory = [], expand = false }: Props = $props();
+
+	let showHistory = $state(true);
+
+	$effect(() => {
+		if (expand) {
+			showHistory = true;
+		} else {
+			showHistory = false;
+		}
+	});
+
+	let history = $state([]);
+	let status = $state(null);
 	const EXPANDED_STATUS_LIMIT = 50;
 
-	$: history = Array.isArray(statusHistory) ? statusHistory : [];
-	$: status = history.length > 0 ? history.at(-1) : null;
-	$: expandedHistory = showHistory
-		? history.slice(Math.max(0, history.length - EXPANDED_STATUS_LIMIT), Math.max(0, history.length - 1))
-		: [];
+	$effect(() => {
+		history = Array.isArray(statusHistory) ? statusHistory : [];
+	});
+	$effect(() => {
+		status = history.length > 0 ? history.at(-1) : null;
+	});
+	let expandedHistory = $derived(
+		showHistory
+			? history.slice(
+					Math.max(0, history.length - EXPANDED_STATUS_LIMIT),
+					Math.max(0, history.length - 1)
+				)
+			: []
+	);
 </script>
 
 {#if history && history.length > 0}
@@ -35,8 +50,8 @@
 							{#each expandedHistory as status}
 								{#if status}
 									<div class="flex items-stretch gap-2 mb-1">
-										<div class=" ">
-											<div class="pt-3 px-1 mb-1.5">
+										<div class="flex flex-col items-center px-1">
+											<div class="pt-3 mb-1.5">
 												<span
 													class="relative flex size-1.5 rounded-full justify-center items-center"
 												>
@@ -46,9 +61,7 @@
 												</span>
 											</div>
 
-											<div
-												class="w-[0.5px] ml-[6.5px] h-[calc(100%-14px)] bg-gray-300 dark:bg-gray-700"
-											/>
+											<div class="w-[0.5px] h-[calc(100%-14px)] bg-gray-300 dark:bg-gray-700"></div>
 										</div>
 
 										<StatusItem {status} done={true} />
@@ -62,7 +75,7 @@
 
 			<button
 				class="w-full"
-				on:click={() => {
+				onclick={() => {
 					showHistory = !showHistory;
 				}}
 			>

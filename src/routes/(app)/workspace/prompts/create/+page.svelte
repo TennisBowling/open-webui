@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { goto } from '$app/navigation';
 	import { prompts } from '$lib/stores';
 	import { onMount, tick, getContext } from 'svelte';
@@ -14,9 +14,9 @@
 		command: string;
 		content: string;
 		access_control: any | null;
-	} | null = null;
+	} | null = $state(null);
 
-	let clone = false;
+	let clone = $state(false);
 
 	const onSubmit = async (_prompt) => {
 		const res = await createNewPrompt(localStorage.token, _prompt).catch((error) => {

@@ -1,27 +1,39 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
-	const dispatch = createEventDispatcher();
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import RecursiveFolder from './RecursiveFolder.svelte';
 
-	export let folderRegistry = {};
+	interface Props {
+		folderRegistry?: any;
+		folders?: any;
+		shiftKey?: boolean;
+		activeChatId?: string | null;
+		onDelete?: any;
+	}
 
-	export let folders = {};
-	export let shiftKey = false;
-	export let activeChatId: string | null = null;
+	let {
+		folderRegistry = $bindable({}),
+		folders = {},
+		shiftKey = false,
+		activeChatId = null,
+		onDelete = (folderId) => {},
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
-	export let onDelete = (folderId) => {};
-
-	let folderList = [];
+	let folderList = $state([]);
 	// Get the list of folders that have no parent, sorted by name alphabetically
-	$: folderList = Object.keys(folders)
-		.filter((key) => folders[key].parent_id === null)
-		.sort((a, b) =>
-			folders[a].name.localeCompare(folders[b].name, undefined, {
-				numeric: true,
-				sensitivity: 'base'
-			})
-		);
+	$effect(() => {
+		folderList = Object.keys(folders)
+			.filter((key) => folders[key].parent_id === null)
+			.sort((a, b) =>
+				folders[a].name.localeCompare(folders[b].name, undefined, {
+					numeric: true,
+					sensitivity: 'base'
+				})
+			);
+	});
 
 	const onItemMove = (e) => {
 		if (e.originFolderId) {
@@ -40,16 +52,16 @@
 		{activeChatId}
 		{onDelete}
 		{onItemMove}
-		on:activate={(e) => {
+		onactivate={(e) => {
 			dispatch('activate', e.detail);
 		}}
-		on:import={(e) => {
+		onimport={(e) => {
 			dispatch('import', e.detail);
 		}}
-		on:update={(e) => {
+		onupdate={(e) => {
 			dispatch('update', e.detail);
 		}}
-		on:change={(e) => {
+		onchange={(e) => {
 			dispatch('change', e.detail);
 		}}
 	/>

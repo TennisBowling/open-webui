@@ -33,7 +33,13 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_SANDBOX_WORKSPACE_RE = re.compile(r"sandbox:/workspace/([^\s)\]]+)")
+# Matches a model's sandbox reference to a workspace file in assistant text.
+# `sandbox:` has no registered authority, so the slash count after the colon is
+# not meaningful — accept every variant a model may emit (sandbox:/workspace/,
+# sandbox://workspace/, sandbox:///workspace/, sandbox:workspace/). The captured
+# group is the path under /workspace; outputs/-confinement + resolved-path checks
+# downstream in _sandbox_linked_files keep the scan safe regardless.
+_SANDBOX_WORKSPACE_RE = re.compile(r"sandbox:/*workspace/([^\s)\]]+)")
 _MAX_CHAT_ID_LEN = 128
 _CHUNK_SIZE = 1024 * 1024
 _PREVIEW_MAX_BYTES = 2 * 1024 * 1024
@@ -248,15 +254,22 @@ async def _current_user_message(chat_id: str, assistant_message_id: str | None) 
     return None, None
 
 
-def _build_workspace_prompt(system_prompt: str, output_paths: list[str]) -> str:
-    lines = [system_prompt.strip()] if system_prompt.strip() else []
-    if output_paths:
-        lines.append("Existing output files available for modification:")
-        for path in output_paths[:50]:
-            lines.append(f"- /workspace/{path}")
-        if len(output_paths) > 50:
-            lines.append(f"- ... {len(output_paths) - 50} more output file(s)")
-    return "\n".join(line for line in lines if line)
+def _build_workspace_prompt(system_prompt: str) -> str:
+    """Return the STABLE container system-prompt fragment.
+
+    This lands in ``messages[0]`` (middleware feeds it to
+    ``add_or_update_system_message``), so it must not vary turn to turn. It
+    previously embedded a live listing of ``/workspace/outputs``, which meant
+    every file the model produced mutated the head system message and
+    invalidated the prompt cache for the WHOLE conversation — on exactly the
+    multi-turn document builds where the cache is worth the most.
+
+    The live outputs listing now rides on the bash tool result instead: tool
+    results are appended to the conversation and never rewritten, so the model
+    still learns what exists in outputs/ at the moment it changes, without
+    disturbing the cached prefix.
+    """
+    return system_prompt.strip()
 
 
 def _xml_attr(value: Any) -> str:
@@ -267,6 +280,128 @@ def _xml_attr(value: Any) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+# Reference-doc pointers, keyed by file extension. The model is told to READ the
+# matching file rather than being handed its contents: the docs are large and
+# mostly irrelevant to any one task, and at injection time we don't yet know what
+# the user actually wants done with the file ("how many words is this" needs
+# none of it). See docker/sandbox/files/env-docs/ in container-agent-middleware.
+#
+# _DOCS_MOUNT must match CAM's ``container_docs_path`` setting, the same way
+# CONTAINER_DATA_ROOT must match CAM's ``data_root``.
+_DOCS_MOUNT = "/opt/env"
+_DOC_TYPE_REFERENCES: dict[str, str] = {
+    "pptx": f"{_DOCS_MOUNT}/pptx/SKILL.md",
+    "potx": f"{_DOCS_MOUNT}/pptx/SKILL.md",
+    "ppt": f"{_DOCS_MOUNT}/pptx/SKILL.md",
+    "docx": f"{_DOCS_MOUNT}/docx.md",
+    "doc": f"{_DOCS_MOUNT}/docx.md",
+    "odt": f"{_DOCS_MOUNT}/docx.md",
+    "xlsx": f"{_DOCS_MOUNT}/xlsx.md",
+    "xls": f"{_DOCS_MOUNT}/xlsx.md",
+    "xlsm": f"{_DOCS_MOUNT}/xlsx.md",
+    "ods": f"{_DOCS_MOUNT}/xlsx.md",
+    "pdf": f"{_DOCS_MOUNT}/pdf.md",
+}
+
+
+def _doc_type_of(name: str | None) -> Optional[str]:
+    """Return the lowercase extension of ``name`` when it has a reference doc."""
+    ext = Path(str(name or "")).suffix.lower().lstrip(".")
+    return ext if ext in _DOC_TYPE_REFERENCES else None
+
+
+def _build_doc_type_hints(names: list[str]) -> str:
+    """Point the model at the reference doc for each distinct document type.
+
+    Deduped by TYPE, not by file: three .docx and one .xlsx produce two lines,
+    not four. Order follows first appearance so the block is deterministic for a
+    given turn (an unstable ordering would be gratuitous prompt-cache churn).
+
+    Returns "" when nothing matches, so non-document turns pay nothing.
+    """
+    seen: list[str] = []
+    for name in names:
+        ext = _doc_type_of(name)
+        if ext and ext not in seen:
+            seen.append(ext)
+    if not seen:
+        return ""
+
+    # Collapse types that share a reference (doc/docx/odt) to one line.
+    paths: list[str] = []
+    by_path: dict[str, list[str]] = {}
+    for ext in seen:
+        path = _DOC_TYPE_REFERENCES[ext]
+        if path not in by_path:
+            by_path[path] = []
+            paths.append(path)
+        by_path[path].append(f".{ext}")
+
+    if len(paths) == 1:
+        path = paths[0]
+        types = "/".join(by_path[path])
+        return (
+            f"<system>Working with {types}: read {path} in full first "
+            "(strongly recommended).</system>"
+        )
+
+    lines = [
+        "<system>Read the relevant file in full before working with these types "
+        "(strongly recommended):"
+    ]
+    lines.extend(f"{'/'.join(by_path[path])} -> {path}" for path in paths)
+    return "\n".join(lines) + "</system>"
+
+
+def build_bash_result_suffix(
+    data_root: str, chat_id: str, since: float, limit: int = 20
+) -> str:
+    """Report files a bash call just wrote to outputs/, plus their reference docs.
+
+    Appended to the bash tool RESULT rather than injected into the system prompt.
+    Tool results are appended to the conversation and never rewritten, so this is
+    prompt-cache-safe; the live outputs listing used to sit in ``messages[0]``,
+    where every new file invalidated the whole conversation's cached prefix.
+
+    ``since`` is the wall-clock time captured immediately before the bash call, so
+    only files this call touched are reported. Returns "" when nothing changed,
+    which is the overwhelmingly common case (most bash calls write nothing to
+    outputs/), so the hook costs nothing on ordinary turns.
+    """
+    safe_chat = _safe_chat_id(chat_id)
+    if not data_root or not safe_chat:
+        return ""
+    try:
+        outputs_dir = _workspace_root(data_root, safe_chat) / "outputs"
+        changed: list[str] = []
+        for path in _output_files(outputs_dir):
+            try:
+                if path.stat().st_mtime >= since:
+                    changed.append(path.relative_to(outputs_dir).as_posix())
+            except OSError:
+                continue
+            if len(changed) > limit:
+                break
+    except Exception as exc:  # noqa: BLE001 - never break a tool call over this
+        log.debug("container bash result suffix failed: %s", exc)
+        return ""
+
+    if not changed:
+        return ""
+
+    truncated = len(changed) > limit
+    shown = sorted(changed)[:limit]
+    lines = ["", "Files now in /workspace/outputs from this command:"]
+    lines.extend(f"- /workspace/outputs/{rel}" for rel in shown)
+    if truncated:
+        lines.append(f"- ... and more (use `ls /workspace/outputs` for the full list)")
+
+    hints = _build_doc_type_hints(shown)
+    if hints:
+        lines.extend(["", hints])
+    return "\n".join(lines)
 
 
 def _build_input_location_context(input_records: list[dict]) -> str:
@@ -336,11 +471,28 @@ async def prepare_container_workspace_for_turn(
     user_message_id, user_message = await _current_user_message(
         chat_id, _workspace_message_id(metadata)
     )
-    attached_files = []
+
+    # Files attached to THIS user message are the genuinely-new attachments and
+    # the ONLY ones the model may be told about this turn ("Uploaded to
+    # location ..."). The send payload's `files` can also carry the chat-wide
+    # sticky set (the frontend re-sends every historical chat file so the
+    # container always has access to them). Those must stay AVAILABLE in
+    # /workspace/inputs — but re-announcing them every turn is exactly the
+    # phantom "<document> Uploaded to ..." injection users see on messages they
+    # sent with nothing attached.
+    message_files: list[dict] = []
     if isinstance(user_message, dict) and isinstance(user_message.get("files"), list):
-        attached_files = user_message.get("files") or []
+        message_files = [
+            item for item in (user_message.get("files") or []) if isinstance(item, dict)
+        ]
+    announce_ids = {_file_id_from_item(item) for item in message_files}
+    announce_ids.discard(None)
+
+    attached_files: list[dict] = []
+    if message_files:
+        attached_files = message_files
     elif isinstance(metadata.get("files"), list):
-        attached_files = metadata.get("files") or []
+        attached_files = [item for item in (metadata.get("files") or []) if isinstance(item, dict)]
 
     existing_input_records = []
     if isinstance(user_message, dict) and isinstance(
@@ -358,6 +510,11 @@ async def prepare_container_workspace_for_turn(
     if not reuse_existing_inputs:
         used_names = {p.name for p in inputs_dir.iterdir() if p.exists()}
         seen_file_ids: set[str] = set()
+        existing_by_id = {
+            str(record.get("file_id")): record
+            for record in existing_input_records
+            if isinstance(record, dict) and record.get("file_id")
+        }
 
         for item in attached_files:
             if not isinstance(item, dict):
@@ -366,6 +523,15 @@ async def prepare_container_workspace_for_turn(
             if not file_id or file_id in seen_file_ids:
                 continue
             seen_file_ids.add(file_id)
+
+            # Sticky re-send: a previous turn already copied this (immutable)
+            # file into the inputs dir. Reuse that record instead of copying
+            # again — no "Strava Activity Data_9.zip" counter proliferation on
+            # every turn, and no duplicate records.
+            prior = existing_by_id.get(file_id)
+            if prior:
+                input_records.append(prior)
+                continue
 
             file_record = await Files.get_file_by_id(file_id)
             if not file_record or not _user_can_read_file(file_record, user):
@@ -412,30 +578,57 @@ async def prepare_container_workspace_for_turn(
         "inputs": input_records,
     }
 
-    if input_records and user_message_id and not reuse_existing_inputs:
-        await Chats.upsert_message_to_chat_by_id_and_message_id(
-            chat_id,
-            user_message_id,
-            {"container_workspace_inputs": [*existing_input_records, *input_records]}, return_model=False
-        )
+    if user_message_id and not reuse_existing_inputs and input_records:
+        merged = list(existing_input_records)
+        merged_by_id = {
+            str(record.get("file_id")): record
+            for record in merged
+            if isinstance(record, dict) and record.get("file_id")
+        }
+        changed = False
+        for record in input_records:
+            file_id = str(record.get("file_id") or "")
+            if not file_id or file_id in merged_by_id:
+                continue
+            merged.append(record)
+            merged_by_id[file_id] = record
+            changed = True
+        if changed:
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id,
+                user_message_id,
+                {"container_workspace_inputs": merged},
+                return_model=False,
+            )
 
-    input_context = _build_input_location_context(input_records)
-    if input_context:
+    # Announce ONLY this message's own attachments. Sticky chat files stay
+    # available on disk (and in metadata["container_workspace"]["inputs"]) for
+    # the agent to use, but the conversation is not re-notified about them.
+    announced_records = [
+        record
+        for record in input_records
+        if str(record.get("file_id") or "") in announce_ids
+    ]
+    input_context = _build_input_location_context(announced_records)
+    # Point at the reference docs for whatever document types this turn brought
+    # in. Rides on the SAME user-message append rather than the system prompt:
+    # messages[0] is the cached prefix for the whole conversation, so anything
+    # turn-varying there invalidates everything behind it. Scoped to the
+    # announced (this-message) records for the same reason as the location
+    # context — sticky chat files must not re-announce their doc hints either.
+    doc_hints = _build_doc_type_hints(
+        [str(record.get("original_name") or "") for record in announced_records]
+    )
+    combined = "\n\n".join(part for part in (input_context, doc_hints) if part)
+    if combined:
         form_data["messages"] = await _append_to_last_user_message(
-            form_data.get("messages", []), input_context
+            form_data.get("messages", []), combined
         )
-
-    output_paths = []
-    for output in _output_files(workspace / "outputs"):
-        try:
-            output_paths.append(output.relative_to(workspace).as_posix())
-        except Exception:
-            continue
 
     system_prompt = str(
         getattr(request.app.state.config, "CONTAINER_SYSTEM_PROMPT", "") or ""
     )
-    return _build_workspace_prompt(system_prompt, output_paths)
+    return _build_workspace_prompt(system_prompt)
 
 
 async def _container_connection_url(request: Request, server_id: str) -> Optional[str]:
@@ -468,7 +661,11 @@ async def _reclaim_outputs(request: Request, chat_id: str, server_id: str) -> No
 
 
 def _output_files(outputs_dir: Path) -> list[Path]:
-    if not outputs_dir.is_dir():
+    # A symlinked outputs dir could be repointed (by the in-container process, on
+    # the shared bind mount) at an external location; resolving it would then walk
+    # files outside the workspace. Refuse to treat a symlinked outputs dir as the
+    # outputs subtree at all.
+    if outputs_dir.is_symlink() or not outputs_dir.is_dir():
         return []
     root = outputs_dir.resolve()
     files: list[Path] = []
@@ -505,6 +702,16 @@ def _sandbox_linked_files(
     workspace: Path, content: str | None, content_blocks: list | None
 ) -> list[Path]:
     root = workspace.resolve()
+    # Resolved confinement boundary: the generated-files contract is /workspace/outputs
+    # ONLY. We confine to this RESOLVED subtree (not just a string prefix) so neither a
+    # traversal ("outputs/../secret") nor a symlinked parent can smuggle a file from
+    # elsewhere in the workspace into the chat.
+    outputs_dir = root / "outputs"
+    # If the outputs dir itself is a symlink, the in-container process could have
+    # repointed it outside the workspace; refuse the whole sandbox-link scan.
+    if outputs_dir.is_symlink():
+        return []
+    outputs_root = outputs_dir.resolve()
     texts = []
     if content:
         texts.append(content)
@@ -516,13 +723,19 @@ def _sandbox_linked_files(
     for text in texts:
         for match in _SANDBOX_WORKSPACE_RE.finditer(text):
             rel = unquote(match.group(1)).lstrip("/")
-            if not rel or rel.startswith("inputs/"):
+            # Cheap early reject: must name the outputs subtree at the string level.
+            # (outputs/ files are already imported unconditionally by the outputs
+            # scan, so this branch only ever ADDS a not-yet-seen path; restricting it
+            # to outputs/ loses no intended behavior. inputs/ stays excluded implicitly.)
+            if not rel or not (rel == "outputs" or rel.startswith("outputs/")):
                 continue
             try:
                 path = root / rel
                 if path.is_symlink() or not path.is_file():
                     continue
-                path.resolve().relative_to(root)
+                # Authoritative check: the RESOLVED path must live under outputs/.
+                # Rejects outputs/../escape and any symlinked-parent escape.
+                path.resolve().relative_to(outputs_root)
                 key = str(path.resolve())
                 if key in seen:
                     continue
@@ -558,15 +771,70 @@ def _unique_display_name(rel_path: str, used_names: set[str]) -> str:
     return candidate
 
 
+def _file_content_key(item: Any) -> Optional[str]:
+    """Stable content identity for a container output descriptor: its
+    workspace path + content hash. Two descriptors with the SAME (workspace_path,
+    sha256) are the same logical file at the same content version even if their
+    randomly-minted ``id`` differs (which happens whenever the same file is
+    imported twice — e.g. a ledger-lost re-import or a concurrent fanout-rerun
+    import). Deduping on this guarantees one card per (path, content) regardless
+    of how many times the importer ran. Non-container files (user uploads, other
+    tool results) have no container_workspace block and fall back to id-only."""
+    if not isinstance(item, dict):
+        return None
+    cw = item.get("container_workspace")
+    if not isinstance(cw, dict):
+        return None
+    workspace_path = cw.get("workspace_path")
+    sha256 = cw.get("sha256")
+    if workspace_path and sha256:
+        return f"cw\x00{workspace_path}\x00{sha256}"
+    return None
+
+
+def _file_identity_key(item: Any) -> Optional[str]:
+    """Stable identity for file dedup, mirroring the frontend mergeMessageFiles
+    precedence (id ?? url ?? content ?? JSON) so the backend and the live frontend
+    collapse the SAME set of descriptors. Container outputs always carry an id, so
+    they dedup by id on both sides; this fallback only matters for id-less
+    non-container attachments (e.g. an MCP image or OpenAPI data-uri emitted twice
+    with the same url/content), which would otherwise duplicate on reload."""
+    if not isinstance(item, dict):
+        return None
+    key = item.get("id") or item.get("url") or item.get("content")
+    if key:
+        return str(key)
+    try:
+        return "json\x00" + json.dumps(item, sort_keys=True, default=str)
+    except Exception:
+        return None
+
+
 def _merge_files(existing: Any, new_files: list[dict]) -> list[dict]:
     merged = list(existing) if isinstance(existing, list) else []
-    seen = {str(item.get("id")) for item in merged if isinstance(item, dict) and item.get("id")}
+    seen = {
+        key
+        for item in merged
+        if (key := _file_identity_key(item)) is not None
+    }
+    seen_content = {
+        key
+        for item in merged
+        if (key := _file_content_key(item)) is not None
+    }
     for item in new_files:
-        file_id = str(item.get("id") or "")
-        if file_id and file_id in seen:
+        identity = _file_identity_key(item)
+        content_key = _file_content_key(item)
+        if identity is not None and identity in seen:
             continue
-        if file_id:
-            seen.add(file_id)
+        # Idempotent re-import: same file content at the same workspace path is
+        # never shown twice, even when the importer re-ran with a fresh file_id.
+        if content_key is not None and content_key in seen_content:
+            continue
+        if identity is not None:
+            seen.add(identity)
+        if content_key is not None:
+            seen_content.add(content_key)
         merged.append(item)
     return merged
 
@@ -818,7 +1086,7 @@ async def import_changed_container_outputs(
     used_display_names = _used_output_display_names(outputs_state)
 
     imported: list[dict] = []
-    changed = False
+    changed_keys: set[str] = set()
 
     candidates: list[tuple[str, str, Path]] = []
     seen_candidate_paths: set[str] = set()
@@ -876,7 +1144,7 @@ async def import_changed_container_outputs(
                         "stat_size": cur_size,
                         "stat_mtime_ns": cur_mtime,
                     }
-                    changed = True
+                    changed_keys.add(state_key)
                 continue
 
             version = int(state.get("version") or 0) + 1
@@ -926,16 +1194,26 @@ async def import_changed_container_outputs(
                 "versions": versions,
             }
             imported.append(descriptor)
-            changed = True
+            changed_keys.add(state_key)
         except Exception as exc:
             log.warning("failed to import container output %s: %s", path, exc)
 
-    if changed:
-        container_meta["outputs"] = outputs_state
-        container_meta["data_root"] = data_root
-        container_meta["server_id"] = server_id
-        chat_meta["container_workspace"] = container_meta
-        await Chats.update_chat_meta_by_id(chat_id, chat_meta)
+    if changed_keys:
+        # Persist the ledger updates ATOMICALLY under a chat-row lock instead of a
+        # full-meta read-modify-write. The snapshot we read at the top of this call
+        # may be stale (a concurrent import — e.g. a fanout rerun importing to the
+        # same parent message — can run between our read and write). A blind
+        # full-replace would clobber the other import's just-written ledger entry,
+        # dropping a file's dedup record and re-importing it as a duplicate next
+        # turn. merge_container_workspace_outputs re-reads the live ledger under the
+        # lock and merges only the keys we changed (first-writer-wins for an
+        # identical content hash), so concurrent imports converge instead of racing.
+        await Chats.merge_container_workspace_outputs(
+            chat_id,
+            {key: outputs_state[key] for key in changed_keys},
+            data_root,
+            server_id,
+        )
 
     if imported:
         message = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
@@ -1081,6 +1359,81 @@ async def read_browser_live_sessions(data_root: str, chat_id: str) -> dict[str, 
     return out
 
 
+def browser_live_payload(
+    state: dict,
+    frame: Optional[str],
+    *,
+    session: str,
+    done: bool = False,
+) -> dict:
+    """Build the ONE panel-facing shape for a browser live frame.
+
+    Single source of truth used by the SSE poller (``_emit_frame``) AND the
+    reattach/live GET endpoints in routers/streams.py — a reloaded tab gets
+    exactly the same fields as a streamed frame, including the verification
+    handoff surface. (The old reattach path dropped requiresHuman/verification,
+    so a tab reloaded mid-challenge silently lost the solving UI.)
+
+    ``done`` is the caller's terminal knowledge; a verification handoff is
+    deliberately non-terminal (the panel stays interactive for the human), and
+    an auto-clear/dismiss stamps ``verificationCleared`` so the panel can toast
+    without the model acting first.
+    """
+    requires_human = bool(state.get("requiresHuman"))
+    is_stale = bool(state.get("stale"))
+    if is_stale:
+        # A daemon that restarted (idle-reap / crash) stamps the leftover state
+        # done+stale. Nothing is actually armed anymore — a stale requiresHuman
+        # must NOT keep the panel interactive or trigger the re-open guard.
+        requires_human = False
+    return {
+        "session": state.get("session") or session,
+        "url": state.get("url", ""),
+        "title": state.get("title", ""),
+        "phase": (
+            "verification_required"
+            if requires_human
+            else ("done" if done else state.get("phase", ""))
+        ),
+        "action": state.get("action", ""),
+        "elapsedMs": state.get("elapsedMs", 0),
+        "startedAt": state.get("startedAt", 0),
+        # A verification handoff outlives the MCP call that discovered it.
+        # Keep the panel interactive when the tool-call poller is cancelled.
+        "done": False if requires_human else done,
+        "requiresHuman": requires_human,
+        "verification": state.get("verification"),
+        "verificationCleared": bool(state.get("verificationCleared")),
+    }
+
+
+def browser_live_payloads(sessions: dict[str, dict]) -> list[dict]:
+    """Shape EVERY session's live pair into panel payloads.
+
+    Used by the reattach/live GET endpoints. Normally only sessions WITH a frame
+    are included, but an armed verification handoff is BLOCKING — its state must
+    be visible even if the final frame write was lost (the panel re-open guard
+    and the solving UI depend on it; a missing frame just shows the "waiting for
+    first frame" placeholder until a Refresh re-shoots). Stale state (a daemon
+    that restarted stamps done+stale) reports as terminal.
+    """
+    payloads: list[dict] = []
+    for session_id_key, live in sessions.items():
+        if not live:
+            continue
+        state = live.get("state") or {}
+        if not live.get("frame") and not state.get("requiresHuman"):
+            continue
+        is_done = bool(state.get("done")) or bool(state.get("stale"))
+        payload = browser_live_payload(
+            state, live.get("frame"), session=session_id_key, done=is_done
+        )
+        if live.get("frame"):
+            payload["frame"] = live.get("frame")
+        payloads.append(payload)
+    return payloads
+
+
 async def browser_progress_poller(
     *,
     data_root: str,
@@ -1124,19 +1477,7 @@ async def browser_progress_poller(
     last_stat: Optional[tuple[int, int]] = None
 
     async def _emit_frame(state: dict, frame: Optional[str], *, done: bool) -> None:
-        payload = {
-            # The session id this frame belongs to. The UI keys its browser panel
-            # tabs by this. The daemon stamps `session` into state, so prefer that
-            # (authoritative for which tab wrote it); else the poll session.
-            "session": state.get("session") or poll_session,
-            "url": state.get("url", ""),
-            "title": state.get("title", ""),
-            "phase": "done" if done else state.get("phase", ""),
-            "action": state.get("action", ""),
-            "elapsedMs": state.get("elapsedMs", 0),
-            "startedAt": state.get("startedAt", 0),
-            "done": done,
-        }
+        payload = browser_live_payload(state, frame, session=poll_session, done=done)
         if frame:
             payload["frame"] = frame
         try:
@@ -1177,9 +1518,8 @@ async def browser_progress_poller(
 
             await asyncio.sleep(effective_interval)
     except asyncio.CancelledError:
-        # The tool call returned. Do ONE final read and emit a terminal frame
-        # (done:true) for this session. Shielded so cancellation still completes
-        # promptly. The terminal frame freezes the live panel on the final view.
+        # The tool call returned. Do ONE final read. Normal actions become
+        # terminal; a human-verification handoff remains interactive.
         try:
             live = await asyncio.shield(
                 asyncio.to_thread(

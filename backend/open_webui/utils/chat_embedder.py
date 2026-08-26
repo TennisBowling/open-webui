@@ -4,9 +4,13 @@ A standalone multimodal embedder (4096-dim) reached over HTTP, used by two paths
 - the backfill / keep-fresh sweep (sync, ``requests``) to embed stored messages, and
 - the search query path (async, ``aiohttp``) to embed the user's query text.
 
-Text-only content uses the OpenAI-compatible ``/v1/embeddings`` endpoint; messages that
-carry image(s) are fused (text + images -> one vector) via the native ``/embeddings``
-endpoint with one ``<__media__>`` token per image. Raw base64 only (no data-URL prefix).
+All content — text-only and image-bearing — goes through the OpenAI-compatible
+``/v1/embeddings`` endpoint (the only one llama-swap routes, via the ``model`` body
+field). ``input`` items are either plain strings or ``{prompt_string, multimodal_data}``
+objects; image messages are fused (text + images -> one vector) with EXACTLY one
+``<__media__>`` token per image (marker count must equal multimodal_data length).
+Raw base64 only (no ``data:image/...;base64,`` prefix). Response is the OpenAI shape:
+``{"data": [{"index": N, "embedding": [flat floats]}]}``.
 """
 
 import math
@@ -16,7 +20,8 @@ from typing import Optional
 import aiohttp
 import requests
 
-# Config (env-overridable; defaults to the local VL embedder).
+# Config (env-overridable; defaults to the local llama-swap, which routes to the
+# right upstream by the ``model`` field in each /v1/embeddings request body).
 CHAT_EMBED_URL = os.environ.get("CHAT_EMBED_URL", "http://127.0.0.1:8085").rstrip("/")
 CHAT_EMBED_MODEL = os.environ.get("CHAT_EMBED_MODEL", "qwen3-vl-embedding-8b")
 CHAT_EMBED_DIM = int(os.environ.get("CHAT_EMBED_DIM", "4096"))
@@ -24,14 +29,111 @@ CHAT_EMBED_DIM = int(os.environ.get("CHAT_EMBED_DIM", "4096"))
 CHAT_SEMANTIC_ENABLED = os.environ.get("ENABLE_CHAT_SEMANTIC_SEARCH", "true").lower() in ("1", "true", "yes")
 # Cap images fused into one message vector (89% of image msgs have 1; max seen 45).
 CHAT_EMBED_MAX_IMAGES = int(os.environ.get("CHAT_EMBED_MAX_IMAGES", "4"))
+# How often (seconds) the deferred keep-fresh sweep runs when the embedder is healthy.
+# New messages are NOT embedded at write time — they accumulate until the next sweep,
+# which sends them in one sequential burst (easier on the inference server).
+CHAT_EMBED_SWEEP_INTERVAL = int(os.environ.get("CHAT_EMBED_SWEEP_INTERVAL", "120"))
+# How many text-only messages go into one HTTP request body during a sweep (the server
+# returns one vector per item; texts are never fused). Concurrency is always 1 —
+# requests within a sweep are strictly sequential.
+CHAT_EMBED_TEXT_BATCH = int(os.environ.get("CHAT_EMBED_TEXT_BATCH", "16"))
 
 
-def _media_prompt(text: str, n_images: int) -> str:
-    media = "\n".join(["<__media__>"] * n_images)
+def apply_runtime_config(
+    url: Optional[str] = None,
+    model: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    sweep_interval: Optional[int] = None,
+    text_batch: Optional[int] = None,
+) -> None:
+    """Update the live embedder settings at runtime (the admin-config bridge).
+
+    Both the sync backfill sweep (``ce.CHAT_EMBED_URL`` etc.) and the async query
+    path read these module globals at *call* time, so reassigning them here takes
+    effect immediately — no restart. Called once at startup with the persisted
+    PersistentConfig values, and again whenever an admin saves the config.
+    URL/model/enable plus the deferred-sweep knobs (interval + per-request text batch)
+    are runtime-mutable; CHAT_EMBED_DIM is pinned to the pgvector column dimension and
+    can't be changed without a schema migration.
+    """
+    global CHAT_EMBED_URL, CHAT_EMBED_MODEL, CHAT_SEMANTIC_ENABLED
+    global CHAT_EMBED_SWEEP_INTERVAL, CHAT_EMBED_TEXT_BATCH
+    if url is not None:
+        CHAT_EMBED_URL = url.rstrip("/")
+    if model is not None:
+        CHAT_EMBED_MODEL = model
+    if enabled is not None:
+        CHAT_SEMANTIC_ENABLED = bool(enabled)
+    if sweep_interval is not None:
+        # Floor of 10s: below that the "deferred batch" degrades into a hot loop of
+        # near-continuous scans, defeating the point of batching.
+        CHAT_EMBED_SWEEP_INTERVAL = max(10, int(sweep_interval))
+    if text_batch is not None:
+        CHAT_EMBED_TEXT_BATCH = max(1, min(128, int(text_batch)))
+
+
+async def verify_embedder(url: str, model: Optional[str] = None, timeout: int = 60) -> int:
+    """Probe an embedder URL by requesting a vector for a known-good string via the
+    OpenAI-compatible ``/v1/embeddings`` endpoint. Returns the vector dimension on
+    success; raises on failure (unreachable, non-2xx, or a malformed vector). Does NOT
+    mutate the live config — it's a read-only reachability check for the admin 'Verify
+    connection' button. Probes with the given model name (falls back to the live one)
+    since llama-swap routes — and may cold-start — the upstream by that field."""
+    base = (url or "").rstrip("/")
+    if not base:
+        raise ValueError("embedder URL is empty")
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            f"{base}/v1/embeddings",
+            json={
+                "model": (model or "").strip() or CHAT_EMBED_MODEL,
+                "input": _build_prompt(_HEALTHCHECK_TEXT, 0),
+            },
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            resp.raise_for_status()
+            j = await resp.json()
+    try:
+        vec = j["data"][0]["embedding"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError("embedder response was not in the expected shape") from e
+    if not (
+        isinstance(vec, list)
+        and vec
+        and all(isinstance(x, (int, float)) and math.isfinite(x) for x in vec)
+    ):
+        raise ValueError("embedder returned a malformed vector")
+    return len(vec)
+
+
+# Instruction prefix required by qwen3-vl-embedding-8b. It grounds the sequence in
+# high-probability retrieval tokens so the tokenizer doesn't start on code/formatting
+# markers that break numerical stability (the cause of the all-``None`` vectors we saw
+# on bare code-like inputs). Query AND stored documents use the SAME prefix so their
+# vectors stay comparable — changing it requires a full index rebuild.
+INSTRUCT_PREFIX = "Represent the user's input. "
+# Natural-language health probe (NOT a bare code token like "__healthcheck__", which
+# is exactly the kind of input that returns a null vector on this model).
+_HEALTHCHECK_TEXT = "semantic search health check probe"
+
+
+def _build_prompt(text: str, n_images: int) -> str:
+    """Build the ``prompt_string`` for one item per the model's required schema:
+
+      text only    -> "Represent the user's input. \\nQuery: {text}"
+      text + image -> "Represent the user's input. <__media__>\\nQuery: {text}"
+      image only   -> "Represent the user's input. <__media__>"
+
+    One ``<__media__>`` marker per image (marker count MUST equal multimodal_data
+    length). A naked ``<__media__>`` with no prefix is rejected, hence the prefix is
+    always present. Text is placed on a ``\\nQuery:`` line after any media tokens."""
     text = (text or "").strip()
-    if n_images and text:
-        return f"{media}\n{text}"
-    return media or text
+    prompt = INSTRUCT_PREFIX
+    if n_images:
+        prompt += " ".join(["<__media__>"] * n_images)
+    if text:
+        prompt += f"\nQuery: {text}"
+    return prompt
 
 
 def _strip_data_url(b64: str) -> str:
@@ -64,9 +166,14 @@ def _prepare_image(b64: str, max_px: int = 512) -> str:
 
 # ── Sync (backfill / keep-fresh sweep) ──────────────────────────────────────
 def _post_texts(texts: list[str], timeout: int) -> list[list[float]]:
+    # Every text goes through the instruction prefix (text-only shape: no
+    # multimodal_data). Batches remain one request, one vector per item.
     r = requests.post(
         f"{CHAT_EMBED_URL}/v1/embeddings",
-        json={"model": CHAT_EMBED_MODEL, "input": texts},
+        json={
+            "model": CHAT_EMBED_MODEL,
+            "input": [_build_prompt(t, 0) for t in texts],
+        },
         timeout=timeout,
     )
     r.raise_for_status()
@@ -86,7 +193,7 @@ def embedder_healthy_sync(timeout: int = 15) -> bool:
     distinguish 'embedder is down/garbage' (skip, retry later) from 'this specific
     message is permanently unembeddable' (e.g. a bad image — mark and move on)."""
     try:
-        vecs = _post_texts(["__embedder_healthcheck__"], timeout)
+        vecs = _post_texts([_HEALTHCHECK_TEXT], timeout)
         return bool(vecs) and is_valid_vector(vecs[0])
     except Exception:
         return False
@@ -95,18 +202,26 @@ def embedder_healthy_sync(timeout: int = 15) -> bool:
 def _embed_one_resilient(text: str, timeout: int) -> Optional[list[float]]:
     """Embed a single text, progressively truncating if it exceeds the model context.
     Returns None (never raises) when it overflows even truncated — so one bad text
-    can't abort the whole backfill batch."""
+    can't abort the whole backfill batch.
+
+    Context overflow shows up TWO ways from this model and both must trigger the
+    shrink-and-retry ladder: (a) an HTTP 400, or (b) — the common case — an HTTP 200
+    carrying an all-``None`` vector. Treating only the 400 case (as we used to) left
+    long messages permanently marked failed even though a truncated version embeds fine."""
     t = text
-    for _ in range(5):
+    for _ in range(6):
         try:
-            return _post_texts([t or " "], timeout)[0]
+            vec = _post_texts([t or " "], timeout)[0]
         except requests.exceptions.HTTPError as e:
-            if _is_context_error(e):
-                if len(t) > 200:
-                    t = t[: max(200, (len(t) * 2) // 3)]  # shrink ~33% and retry
-                    continue
-                return None  # can't shrink further and still overflows — give up
-            raise  # genuine non-context error
+            if not _is_context_error(e):
+                raise  # genuine non-context error
+            vec = None  # 400 overflow — fall through to the shrink logic below
+        if is_valid_vector(vec):
+            return vec
+        if len(t) > 200:
+            t = t[: max(200, (len(t) * 2) // 3)]  # shrink ~33% and retry
+            continue
+        return None  # can't shrink further and still returns garbage — give up
     return None
 
 
@@ -117,7 +232,7 @@ def embed_texts_sync(texts: list[str], timeout: int = 600) -> list[Optional[list
     if not texts:
         return []
     try:
-        return _post_texts(texts, timeout)  # fast path: whole batch fits
+        vecs = _post_texts(texts, timeout)  # fast path: whole batch fits
     except requests.exceptions.HTTPError as e:
         if not _is_context_error(e):
             raise
@@ -125,31 +240,55 @@ def embed_texts_sync(texts: list[str], timeout: int = 600) -> list[Optional[list
             return [_embed_one_resilient(texts[0], timeout)]
         mid = len(texts) // 2  # split and recurse so one long text can't fail the batch
         return embed_texts_sync(texts[:mid], timeout) + embed_texts_sync(texts[mid:], timeout)
+    # The batch HTTP call can still return 200 with an all-None vector for individual
+    # over-long texts (the model doesn't 400). Keep the good ones, repair only the bad
+    # ones per-text (truncating) so one long message doesn't cost the whole batch.
+    if all(is_valid_vector(v) for v in vecs):
+        return vecs
+    return [
+        v if is_valid_vector(v) else _embed_one_resilient(t, timeout)
+        for t, v in zip(texts, vecs)
+    ]
 
 
 def embed_fused_sync(text: str, images: list[str], timeout: int = 300) -> Optional[list[float]]:
     """Embed one message that has image(s): fuse text + (capped) images -> one vector.
-    On context overflow, truncate the text, then drop images, until it fits."""
+    On context overflow, truncate the text, then drop images, until it fits. Overflow
+    arrives as either an HTTP 400 or a 200 with an all-``None`` vector — both trigger
+    the same shed-and-retry ladder."""
     imgs = [_prepare_image(b) for b in images[:CHAT_EMBED_MAX_IMAGES]]
     t = (text or "").strip()
     for attempt in range(5):
         try:
             r = requests.post(
-                f"{CHAT_EMBED_URL}/embeddings",
-                json={"content": [{"prompt_string": _media_prompt(t, len(imgs)), "multimodal_data": imgs}]},
+                f"{CHAT_EMBED_URL}/v1/embeddings",
+                json={
+                    "model": CHAT_EMBED_MODEL,
+                    # Invariant: _build_prompt emits exactly len(imgs) <__media__>
+                    # markers — the endpoint requires marker count == image count.
+                    "input": [
+                        {
+                            "prompt_string": _build_prompt(t, len(imgs)),
+                            "multimodal_data": imgs,
+                        }
+                    ],
+                },
                 timeout=timeout,
             )
             r.raise_for_status()
-            return r.json()[0]["embedding"][0]
+            vec = r.json()["data"][0]["embedding"]
         except requests.exceptions.HTTPError as e:
             if not _is_context_error(e):
                 raise
-            if len(t) > 100:
-                t = t[: max(0, (len(t) * 1) // 2)]  # halve the text first
-            elif len(imgs) > 1:
-                imgs = imgs[:-1]  # then shed images
-            else:
-                return None
+            vec = None  # 400 overflow — shed content below and retry
+        if is_valid_vector(vec):
+            return vec
+        if len(t) > 100:
+            t = t[: max(0, (len(t) * 1) // 2)]  # halve the text first
+        elif len(imgs) > 1:
+            imgs = imgs[:-1]  # then shed images
+        else:
+            return None
     return None
 
 
@@ -164,7 +303,9 @@ async def aembed_query(text: str, timeout: int = 20) -> Optional[list[float]]:
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"{CHAT_EMBED_URL}/v1/embeddings",
-                json={"model": CHAT_EMBED_MODEL, "input": text},
+                # Same instruction prefix as the stored documents — the query and the
+                # index MUST share the convention or cosine similarity is meaningless.
+                json={"model": CHAT_EMBED_MODEL, "input": _build_prompt(text, 0)},
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
@@ -222,15 +363,23 @@ async def embedding_sweeper_loop(up_interval: int = 120, down_interval: int = 45
     import logging
 
     log = logging.getLogger(__name__)
-    if not CHAT_SEMANTIC_ENABLED:
-        return
     # Lazy import to avoid a circular import (the script imports this module).
     from open_webui.scripts.backfill_chat_embeddings import run_sweep
 
     was_up: Optional[bool] = None
     while True:
         try:
-            healthy = (await aembed_query("__embedder_healthcheck__")) is not None
+            # Re-check the flag every pass (NOT once before the loop): it's runtime-
+            # toggleable from the admin UI now, so a boot-disabled instance must still
+            # come alive when the admin flips it on — and vice versa.
+            if not CHAT_SEMANTIC_ENABLED:
+                await asyncio.sleep(down_interval)
+                continue
+            # Read the live interval each pass so an admin change to the sweep cadence
+            # applies from the very next cycle (`up_interval` is superseded by the
+            # runtime-configurable global; kept in the signature for compatibility).
+            interval = CHAT_EMBED_SWEEP_INTERVAL
+            healthy = (await aembed_query(_HEALTHCHECK_TEXT)) is not None
             if healthy:
                 if was_up is False:
                     log.info("chat embedder recovered — backfilling pending embeddings")
@@ -240,7 +389,7 @@ async def embedding_sweeper_loop(up_interval: int = 120, down_interval: int = 45
                 n = await asyncio.to_thread(run_sweep, None, 200, lambda *a: None)
                 if n:
                     log.info("chat embedding sweep: embedded %d pending message(s)", n)
-                await asyncio.sleep(up_interval)
+                await asyncio.sleep(interval)
             else:
                 if was_up is not False:
                     log.warning(
@@ -252,5 +401,5 @@ async def embedding_sweeper_loop(up_interval: int = 120, down_interval: int = 45
             break
         except Exception:
             log.exception("chat embedding keep-fresh sweep failed")
-            await asyncio.sleep(up_interval)
+            await asyncio.sleep(CHAT_EMBED_SWEEP_INTERVAL)
 

@@ -23,6 +23,7 @@ from open_webui.config import CACHE_DIR
 from open_webui.constants import ERROR_MESSAGES
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.cache import etag_response
 from open_webui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel, HttpUrl
 
@@ -38,9 +39,13 @@ router = APIRouter()
 ############################
 
 
-@router.get("/", response_model=list[FunctionResponse])
-async def get_functions(user=Depends(get_verified_user)):
-    return await Functions.get_functions()
+@router.get("/")
+async def get_functions(request: Request, user=Depends(get_verified_user)):
+    functions = await Functions.get_functions()
+    content = [
+        FunctionResponse(**function.model_dump()).model_dump() for function in functions
+    ]
+    return etag_response(content, request)
 
 
 @router.get("/list", response_model=list[FunctionUserResponse])

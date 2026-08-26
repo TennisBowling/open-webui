@@ -229,6 +229,21 @@ export const setToolServerConnections = async (token: string, connections: objec
 	return res;
 };
 
+export const restartToolServerConnection = async (token: string, serverId: string) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/tool_servers/${encodeURIComponent(serverId)}/restart`,
+		{
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				Authorization: `Bearer ${token}`
+			}
+		}
+	);
+	if (!res.ok) throw await res.json().catch(() => ({ detail: res.statusText }));
+	return res.json();
+};
+
 export const verifyToolServerConnection = async (token: string, connection: object) => {
 	let error = null;
 

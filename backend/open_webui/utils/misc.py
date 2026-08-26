@@ -46,14 +46,26 @@ def get_message_list(messages_map, message_id):
     if not current_message:
         return []  # Return empty list instead of None to prevent iteration errors
 
-    # Reconstruct the chain by following the parentId links
+    # Reconstruct the chain by following the parentId links.
+    # Cycle guard: a corrupted tree (e.g. a message persisted with
+    # parentId == its own id) would otherwise spin this loop forever ON THE
+    # EVENT LOOP — wedging the entire server at 100% CPU (observed live:
+    # background_tasks_handler -> get_message_list on a self-parented row).
     message_list = []
+    seen_ids = set()
 
     while current_message:
+        current_id = current_message.get("id")
+        if current_id is not None:
+            if current_id in seen_ids:
+                break
+            seen_ids.add(current_id)
         message_list.insert(
             0, current_message
         )  # Insert the message at the beginning of the list
         parent_id = current_message.get("parentId")  # Use .get() for safety
+        if parent_id == current_id:
+            break
         current_message = messages_map.get(parent_id) if parent_id else None
 
     return message_list

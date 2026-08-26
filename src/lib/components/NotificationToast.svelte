@@ -1,20 +1,32 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { settings, playingNotificationSound, isLastActiveTab } from '$lib/stores';
 	import DOMPurify from 'dompurify';
 
 	import { marked } from 'marked';
-	import { createEventDispatcher, onMount } from 'svelte';
+	import { onMount } from 'svelte';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
-	export let onClick: Function = () => {};
-	export let title: string = 'HI';
-	export let content: string;
+	interface Props {
+		onClick?: Function;
+		title?: string;
+		content: string;
+	}
+
+	let {
+		onClick = () => {},
+		title = 'HI',
+		content,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
 	let startX = 0,
 		startY = 0;
-	let moved = false;
+	let moved = $state(false);
 	const DRAG_THRESHOLD_PX = 6;
 
 	const clickHandler = () => {
@@ -68,16 +80,16 @@
 	});
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<!-- svelte-ignore a11y-no-static-element-interactions -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	class="flex gap-2.5 text-left min-w-[var(--width)] w-full dark:bg-gray-850 dark:text-white bg-white text-black border-hairline border-gray-200 dark:border-gray-700 rounded-2xl px-4 py-3.5 cursor-pointer select-none shadow-sm"
-	on:dragstart|preventDefault
-	on:pointerdown={onPointerDown}
-	on:pointermove={onPointerMove}
-	on:pointerup={onPointerUp}
-	on:pointercancel={() => (moved = true)}
-	on:keydown={(e) => {
+	ondragstart={preventDefault()}
+	onpointerdown={onPointerDown}
+	onpointermove={onPointerMove}
+	onpointerup={onPointerUp}
+	onpointercancel={() => (moved = true)}
+	onkeydown={(e) => {
 		if (e.key === 'Enter' || e.key === ' ') {
 			e.preventDefault();
 			clickHandler();

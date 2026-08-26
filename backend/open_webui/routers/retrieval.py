@@ -39,7 +39,11 @@ from open_webui.storage.provider import Storage
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
 # Document loaders
-from open_webui.retrieval.loaders.main import Loader
+from open_webui.retrieval.loaders.main import (
+    Loader,
+    PDF_RETRIEVAL_REMOVED_MESSAGE,
+    is_pdf_file,
+)
 from open_webui.retrieval.loaders.youtube import YoutubeLoader
 from open_webui.utils.file_extraction import _build_loader_from_request_config
 
@@ -413,7 +417,6 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         "HYBRID_BM25_WEIGHT": request.app.state.config.HYBRID_BM25_WEIGHT,
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
-        "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -434,7 +437,6 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         "DOCLING_FORCE_OCR": request.app.state.config.DOCLING_FORCE_OCR,
         "DOCLING_OCR_ENGINE": request.app.state.config.DOCLING_OCR_ENGINE,
         "DOCLING_OCR_LANG": request.app.state.config.DOCLING_OCR_LANG,
-        "DOCLING_PDF_BACKEND": request.app.state.config.DOCLING_PDF_BACKEND,
         "DOCLING_TABLE_MODE": request.app.state.config.DOCLING_TABLE_MODE,
         "DOCLING_PIPELINE": request.app.state.config.DOCLING_PIPELINE,
         "DOCLING_DO_PICTURE_DESCRIPTION": request.app.state.config.DOCLING_DO_PICTURE_DESCRIPTION,
@@ -443,7 +445,6 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         "DOCLING_PICTURE_DESCRIPTION_API": request.app.state.config.DOCLING_PICTURE_DESCRIPTION_API,
         "DOCUMENT_INTELLIGENCE_ENDPOINT": request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
         "DOCUMENT_INTELLIGENCE_KEY": request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
-        "MISTRAL_OCR_API_KEY": request.app.state.config.MISTRAL_OCR_API_KEY,
         # MinerU settings
         "MINERU_API_MODE": request.app.state.config.MINERU_API_MODE,
         "MINERU_API_URL": request.app.state.config.MINERU_API_URL,
@@ -529,7 +530,6 @@ class ConfigForm(BaseModel):
 
     # Content extraction settings
     CONTENT_EXTRACTION_ENGINE: Optional[str] = None
-    PDF_EXTRACT_IMAGES: Optional[bool] = None
 
     DATALAB_MARKER_API_KEY: Optional[str] = None
     DATALAB_MARKER_API_BASE_URL: Optional[str] = None
@@ -553,7 +553,6 @@ class ConfigForm(BaseModel):
     DOCLING_FORCE_OCR: Optional[bool] = None
     DOCLING_OCR_ENGINE: Optional[str] = None
     DOCLING_OCR_LANG: Optional[str] = None
-    DOCLING_PDF_BACKEND: Optional[str] = None
     DOCLING_TABLE_MODE: Optional[str] = None
     DOCLING_PIPELINE: Optional[str] = None
     DOCLING_DO_PICTURE_DESCRIPTION: Optional[bool] = None
@@ -562,7 +561,6 @@ class ConfigForm(BaseModel):
     DOCLING_PICTURE_DESCRIPTION_API: Optional[dict] = None
     DOCUMENT_INTELLIGENCE_ENDPOINT: Optional[str] = None
     DOCUMENT_INTELLIGENCE_KEY: Optional[str] = None
-    MISTRAL_OCR_API_KEY: Optional[str] = None
 
     # MinerU settings
     MINERU_API_MODE: Optional[str] = None
@@ -650,11 +648,6 @@ async def update_rag_config(
         form_data.CONTENT_EXTRACTION_ENGINE
         if form_data.CONTENT_EXTRACTION_ENGINE is not None
         else request.app.state.config.CONTENT_EXTRACTION_ENGINE
-    )
-    request.app.state.config.PDF_EXTRACT_IMAGES = (
-        form_data.PDF_EXTRACT_IMAGES
-        if form_data.PDF_EXTRACT_IMAGES is not None
-        else request.app.state.config.PDF_EXTRACT_IMAGES
     )
     request.app.state.config.DATALAB_MARKER_API_KEY = (
         form_data.DATALAB_MARKER_API_KEY
@@ -756,11 +749,6 @@ async def update_rag_config(
         if form_data.DOCLING_OCR_LANG is not None
         else request.app.state.config.DOCLING_OCR_LANG
     )
-    request.app.state.config.DOCLING_PDF_BACKEND = (
-        form_data.DOCLING_PDF_BACKEND
-        if form_data.DOCLING_PDF_BACKEND is not None
-        else request.app.state.config.DOCLING_PDF_BACKEND
-    )
     request.app.state.config.DOCLING_TABLE_MODE = (
         form_data.DOCLING_TABLE_MODE
         if form_data.DOCLING_TABLE_MODE is not None
@@ -803,12 +791,6 @@ async def update_rag_config(
         if form_data.DOCUMENT_INTELLIGENCE_KEY is not None
         else request.app.state.config.DOCUMENT_INTELLIGENCE_KEY
     )
-    request.app.state.config.MISTRAL_OCR_API_KEY = (
-        form_data.MISTRAL_OCR_API_KEY
-        if form_data.MISTRAL_OCR_API_KEY is not None
-        else request.app.state.config.MISTRAL_OCR_API_KEY
-    )
-
     # MinerU settings
     request.app.state.config.MINERU_API_MODE = (
         form_data.MINERU_API_MODE
@@ -1087,7 +1069,6 @@ async def update_rag_config(
         "HYBRID_BM25_WEIGHT": request.app.state.config.HYBRID_BM25_WEIGHT,
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
-        "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -1107,7 +1088,6 @@ async def update_rag_config(
         "DOCLING_FORCE_OCR": request.app.state.config.DOCLING_FORCE_OCR,
         "DOCLING_OCR_ENGINE": request.app.state.config.DOCLING_OCR_ENGINE,
         "DOCLING_OCR_LANG": request.app.state.config.DOCLING_OCR_LANG,
-        "DOCLING_PDF_BACKEND": request.app.state.config.DOCLING_PDF_BACKEND,
         "DOCLING_TABLE_MODE": request.app.state.config.DOCLING_TABLE_MODE,
         "DOCLING_PIPELINE": request.app.state.config.DOCLING_PIPELINE,
         "DOCLING_DO_PICTURE_DESCRIPTION": request.app.state.config.DOCLING_DO_PICTURE_DESCRIPTION,
@@ -1116,7 +1096,6 @@ async def update_rag_config(
         "DOCLING_PICTURE_DESCRIPTION_API": request.app.state.config.DOCLING_PICTURE_DESCRIPTION_API,
         "DOCUMENT_INTELLIGENCE_ENDPOINT": request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
         "DOCUMENT_INTELLIGENCE_KEY": request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
-        "MISTRAL_OCR_API_KEY": request.app.state.config.MISTRAL_OCR_API_KEY,
         # MinerU settings
         "MINERU_API_MODE": request.app.state.config.MINERU_API_MODE,
         "MINERU_API_URL": request.app.state.config.MINERU_API_URL,
@@ -1393,6 +1372,12 @@ async def process_file(
         file = await Files.get_file_by_id_and_user_id(form_data.file_id, user.id)
 
     if file:
+        if is_pdf_file(file.filename, (file.meta or {}).get("content_type")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=PDF_RETRIEVAL_REMOVED_MESSAGE,
+            )
+
         try:
 
             collection_name = form_data.collection_name
@@ -2025,6 +2010,9 @@ async def process_files_batch(
     all_docs: List[Document] = []
     for file in form_data.files:
         try:
+            if is_pdf_file(file.filename, (file.meta or {}).get("content_type")):
+                raise ValueError(PDF_RETRIEVAL_REMOVED_MESSAGE)
+
             text_content = file.data.get("content", "")
 
             docs: List[Document] = [

@@ -26,7 +26,16 @@ export default {
 				kraft: '#D4A27F',
 				manilla: '#EBDBBC',
 				'manilla-dark': '#33332E',
-				'error-brick': '#BF4D43'
+				'error-brick': '#BF4D43',
+				// Warm semantic status tokens. Light/dark pairs are drawn from the
+				// app's own hljs code palette so they read as "ink on paper" rather
+				// than default-Tailwind neon. Use via the shared map in
+				// src/lib/utils/statusColors.ts — never raw green-*/yellow-*/blue-*.
+				'error-brick-dark': '#D88577',
+				success: '#5C7048',
+				'success-dark': '#9CB07F',
+				warning: '#A8783E',
+				'warning-dark': '#E2B873'
 			},
 			borderWidth: {
 				hairline: '0.5px'

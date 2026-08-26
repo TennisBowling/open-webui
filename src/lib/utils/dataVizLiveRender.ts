@@ -31,6 +31,14 @@ export type WidgetRenderResponse = {
 
 const HARD_TIMEOUT_MS = 12_000;
 
+// How long we keep the error listener alive after the frame looks visually
+// settled (5 stable rAF frames). Wide enough to catch errors thrown during a
+// typical chart entry animation (~1s) before we report success, but bounded so
+// the model isn't blocked waiting on the verification iframe. Errors thrown even
+// later (e.g. a slow fetch().then) are necessarily missed here; the VISIBLE
+// widget catches those and shows a "Render error" chip.
+const POST_RENDER_GRACE_MS = 1_200;
+
 const escapeForJsString = (s: string) => JSON.stringify(s);
 
 /**
@@ -96,6 +104,12 @@ const buildLiveDoc = (fragment: string, widgetId: string, dark: boolean): string
 		let posted = false;
 		const send = (payload) => { if (posted) return; posted = true; try { parent.postMessage(payload, '*'); } catch (e) {} };
 		window.addEventListener('error', function (e) {
+			// Ignore RESOURCE-load errors (a CDN <script>/<img>/<link> that 404s or
+			// is blocked fires a window 'error' whose target is the element, not
+			// window, with no .error object). They don't mean the widget code is
+			// broken, so reporting them would trigger a needless repair loop. Only
+			// genuine script runtime errors target window.
+			if (e && e.target && e.target !== window && e.target.tagName) return;
 			send({
 				__dataVizError: true, id: ID,
 				msg: truncate((e && e.message) || 'Error', 500),
@@ -142,7 +156,9 @@ export function liveRenderWidget(req: WidgetRenderRequest): Promise<WidgetRender
 		const iframe = document.createElement('iframe');
 		iframe.style.cssText =
 			'position:absolute;top:-99999px;left:-99999px;width:800px;height:600px;border:0;visibility:hidden;pointer-events:none;';
-		iframe.setAttribute('sandbox', 'allow-scripts allow-downloads');
+		// Verification only — no allow-downloads (a malicious widget could
+		// otherwise force a silent drive-by download during this no-gesture render).
+		iframe.setAttribute('sandbox', 'allow-scripts');
 		iframe.setAttribute('aria-hidden', 'true');
 		iframe.setAttribute('tabindex', '-1');
 		iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
@@ -213,7 +229,7 @@ export function liveRenderWidget(req: WidgetRenderRequest): Promise<WidgetRender
 					if (loadGrace) clearTimeout(loadGrace);
 					loadGrace = setTimeout(() => {
 						finish({ status: 'ok' });
-					}, 500);
+					}, POST_RENDER_GRACE_MS);
 				} else {
 					rAFId = requestAnimationFrame(checkFrame);
 				}
@@ -224,11 +240,14 @@ export function liveRenderWidget(req: WidgetRenderRequest): Promise<WidgetRender
 			// don't wait forever. Fall through to the grace window.
 			rAFTimeout = setTimeout(() => {
 				if (resolved || stableFrames >= RENDER_FRAMES) return;
-				if (rAFId) { cancelAnimationFrame(rAFId); rAFId = null; }
+				if (rAFId) {
+					cancelAnimationFrame(rAFId);
+					rAFId = null;
+				}
 				if (loadGrace) clearTimeout(loadGrace);
 				loadGrace = setTimeout(() => {
 					finish({ status: 'ok' });
-				}, 500);
+				}, POST_RENDER_GRACE_MS);
 			}, 5000);
 		});
 

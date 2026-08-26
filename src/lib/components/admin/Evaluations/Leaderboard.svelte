@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, getContext } from 'svelte';
-	import { models } from '$lib/stores';
+	import { models, mobile } from '$lib/stores';
 
 	import ModelModal from './LeaderboardModal.svelte';
 
@@ -19,18 +19,18 @@
 	let tokenizer = null;
 	let model = null;
 
-	export let feedbacks = [];
+	let { feedbacks = [] } = $props();
 
-	let rankedModels = [];
+	let rankedModels = $state([]);
 
-	let query = '';
+	let query = $state('');
 
 	let tagEmbeddings = new Map();
-	let loadingLeaderboard = true;
+	let loadingLeaderboard = $state(true);
 	let debounceTimer;
 
-	let orderBy: string = 'rating'; // default sort column
-	let direction: 'asc' | 'desc' = 'desc'; // default sort order
+	let orderBy: string = $state('rating'); // default sort column
+	let direction: 'asc' | 'desc' = $state('desc'); // default sort order
 
 	type Feedback = {
 		id: string;
@@ -70,8 +70,8 @@
 	//
 	//////////////////////
 
-	let showLeaderboardModal = false;
-	let selectedModel = null;
+	let showLeaderboardModal = $state(false);
+	let selectedModel = $state(null);
 
 	const openLeaderboardModelModal = (model) => {
 		showLeaderboardModal = true;
@@ -300,33 +300,37 @@
 		}, 1500); // Debounce for 1.5 seconds
 	};
 
-	$: (query, debouncedQueryHandler());
+	$effect(() => {
+		(query, debouncedQueryHandler());
+	});
 
 	onMount(async () => {
 		rankHandler();
 	});
 
-	$: sortedModels = [...rankedModels].sort((a, b) => {
-		let aVal, bVal;
-		if (orderBy === 'name') {
-			aVal = a.name;
-			bVal = b.name;
-			return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-		} else if (orderBy === 'rating') {
-			aVal = a.rating === '-' ? -Infinity : a.rating;
-			bVal = b.rating === '-' ? -Infinity : b.rating;
-			return direction === 'asc' ? aVal - bVal : bVal - aVal;
-		} else if (orderBy === 'won') {
-			aVal = a.stats.won === '-' ? -Infinity : Number(a.stats.won);
-			bVal = b.stats.won === '-' ? -Infinity : Number(b.stats.won);
-			return direction === 'asc' ? aVal - bVal : bVal - aVal;
-		} else if (orderBy === 'lost') {
-			aVal = a.stats.lost === '-' ? -Infinity : Number(a.stats.lost);
-			bVal = b.stats.lost === '-' ? -Infinity : Number(b.stats.lost);
-			return direction === 'asc' ? aVal - bVal : bVal - aVal;
-		}
-		return 0;
-	});
+	let sortedModels = $derived(
+		[...rankedModels].sort((a, b) => {
+			let aVal, bVal;
+			if (orderBy === 'name') {
+				aVal = a.name;
+				bVal = b.name;
+				return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+			} else if (orderBy === 'rating') {
+				aVal = a.rating === '-' ? -Infinity : a.rating;
+				bVal = b.rating === '-' ? -Infinity : b.rating;
+				return direction === 'asc' ? aVal - bVal : bVal - aVal;
+			} else if (orderBy === 'won') {
+				aVal = a.stats.won === '-' ? -Infinity : Number(a.stats.won);
+				bVal = b.stats.won === '-' ? -Infinity : Number(b.stats.won);
+				return direction === 'asc' ? aVal - bVal : bVal - aVal;
+			} else if (orderBy === 'lost') {
+				aVal = a.stats.lost === '-' ? -Infinity : Number(a.stats.lost);
+				bVal = b.stats.lost === '-' ? -Infinity : Number(b.stats.lost);
+				return direction === 'asc' ? aVal - bVal : bVal - aVal;
+			}
+			return 0;
+		})
+	);
 </script>
 
 <ModelModal
@@ -344,7 +348,7 @@
 			{$i18n.t('Leaderboard')}
 		</div>
 
-		<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850" />
+		<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850"></div>
 
 		<span class="text-lg font-medium text-gray-500 dark:text-gray-300 mr-1.5"
 			>{rankedModels.length}</span
@@ -361,7 +365,7 @@
 					class=" w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
 					bind:value={query}
 					placeholder={$i18n.t('Search')}
-					on:focus={() => {
+					onfocus={() => {
 						loadEmbeddingModel();
 					}}
 				/>
@@ -393,7 +397,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none w-3"
-						on:click={() => setSortKey('rating')}
+						onclick={() => setSortKey('rating')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('RK')}
@@ -415,7 +419,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('name')}
+						onclick={() => setSortKey('name')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Model')}
@@ -437,7 +441,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 text-right cursor-pointer select-none w-fit"
-						on:click={() => setSortKey('rating')}
+						onclick={() => setSortKey('rating')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('Rating')}
@@ -459,7 +463,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 text-right cursor-pointer select-none w-5"
-						on:click={() => setSortKey('won')}
+						onclick={() => setSortKey('won')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('Won')}
@@ -481,7 +485,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 text-right cursor-pointer select-none w-5"
-						on:click={() => setSortKey('lost')}
+						onclick={() => setSortKey('lost')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('Lost')}
@@ -506,7 +510,7 @@
 				{#each sortedModels as model, modelIdx (model.id)}
 					<tr
 						class="bg-white dark:bg-gray-900 dark:border-gray-850 text-xs group cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-850/50 transition"
-						on:click={() => openLeaderboardModelModal(model)}
+						onclick={() => openLeaderboardModelModal(model)}
 					>
 						<td class="px-3 py-1.5 text-left font-medium text-gray-900 dark:text-white w-fit">
 							<div class=" line-clamp-1">
@@ -532,10 +536,12 @@
 							{model.rating}
 						</td>
 
-						<td class=" px-3 py-1.5 text-right font-semibold text-green-500">
+						<td class=" px-3 py-1.5 text-right font-semibold text-success dark:text-success-dark">
 							<div class=" w-10">
 								{#if model.stats.won === '-'}
 									-
+								{:else if $mobile}
+									{model.stats.won} ({((model.stats.won / model.stats.count) * 100).toFixed(1)}%)
 								{:else}
 									<span class="hidden group-hover:inline"
 										>{((model.stats.won / model.stats.count) * 100).toFixed(1)}%</span
@@ -545,10 +551,14 @@
 							</div>
 						</td>
 
-						<td class="px-3 py-1.5 text-right font-semibold text-red-500">
+						<td
+							class="px-3 py-1.5 text-right font-semibold text-error-brick dark:text-error-brick-dark"
+						>
 							<div class=" w-10">
 								{#if model.stats.lost === '-'}
 									-
+								{:else if $mobile}
+									{model.stats.lost} ({((model.stats.lost / model.stats.count) * 100).toFixed(1)}%)
 								{:else}
 									<span class="hidden group-hover:inline"
 										>{((model.stats.lost / model.stats.count) * 100).toFixed(1)}%</span

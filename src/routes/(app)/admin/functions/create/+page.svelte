@@ -1,5 +1,5 @@
 <script>
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 
@@ -12,9 +12,9 @@
 
 	const i18n = getContext('i18n');
 
-	let mounted = false;
-	let clone = false;
-	let func = null;
+	let mounted = $state(false);
+	let clone = $state(false);
+	let func = $state(null);
 
 	const saveHandler = async (data) => {
 		console.log(data);
@@ -24,7 +24,7 @@
 			console.log('Version is lower than required');
 			toast.error(
 				$i18n.t(
-					'Open WebUI version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
+					'{{WEBUI_NAME}} version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
 					{
 						OPEN_WEBUI_VERSION: WEBUI_VERSION,
 						REQUIRED_VERSION: manifest?.required_open_webui_version ?? '0.0.0'

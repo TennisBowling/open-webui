@@ -344,6 +344,57 @@ def test_poller_emits_no_status_for_fast_navigate():
     asyncio.run(run())
 
 
+def test_poller_keeps_human_verification_interactive_on_cancel():
+    async def run():
+        tmp = Path(tempfile.mkdtemp())
+        live_dir = _live_dir(tmp, "chat1")
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        _write(
+            live_dir,
+            b"\xff\xd8\xff\xe0VERIFY",
+            {
+                "action": "navigate",
+                "url": "https://example.com/challenge",
+                "phase": "verification_required",
+                "startedAt": 1,
+                "elapsedMs": 500,
+                "done": False,
+                "requiresHuman": True,
+                "verification": {
+                    "required": True,
+                    "provider": "Cloudflare",
+                    "message": "Human verification required.",
+                },
+            },
+        )
+        task = asyncio.create_task(
+            cw.browser_progress_poller(
+                data_root=str(tmp),
+                chat_id="chat1",
+                message_id="m1",
+                session_id="s1",
+                event_emitter=emitter,
+                interval=0.2,
+            )
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await task
+
+        frames = [e["data"] for e in events if e["type"] == "browser:frame"]
+        assert frames
+        assert all(frame["done"] is False for frame in frames)
+        assert frames[-1]["requiresHuman"] is True
+        assert frames[-1]["phase"] == "verification_required"
+        assert frames[-1]["verification"]["provider"] == "Cloudflare"
+
+    asyncio.run(run())
+
+
 def test_poller_treats_stale_state_as_terminal():
     """A daemon that restarted stamps the leftover state from a previous turn
     done+stale. The poller must emit any frame for it as done:true so a reloading
@@ -567,3 +618,135 @@ def test_subagent_forwarding_emitter_routes_browser_frame_to_parent():
         assert base_events == [], "browser:frame must skip the subagent base emitter"
 
     asyncio.run(run())
+
+
+def test_browser_live_payload_verification_handoff_shape():
+    """The ONE panel-facing builder: an armed handoff is non-terminal and
+    carries the verification object; a cleared one stamps verificationCleared."""
+    state = {
+        "session": "sub-1",
+        "url": "https://example.com/challenge",
+        "title": "Just a moment...",
+        "phase": "acting",
+        "action": "navigate",
+        "elapsedMs": 400,
+        "startedAt": 100,
+        "done": True,
+        "requiresHuman": True,
+        "verification": {
+            "required": True,
+            "provider": "Cloudflare",
+            "message": "Human verification required.",
+        },
+        "verificationCleared": True,
+    }
+    payload = cw.browser_live_payload(
+        state, "data:image/jpeg;base64,AAA", session="main", done=True
+    )
+    # The handoff outlives the tool call: never terminal while armed.
+    assert payload["done"] is False
+    assert payload["requiresHuman"] is True
+    assert payload["phase"] == "verification_required"
+    assert payload["verification"]["provider"] == "Cloudflare"
+    assert payload["verificationCleared"] is True
+    # The daemon's session stamp wins over the caller's fallback key.
+    assert payload["session"] == "sub-1"
+
+
+def test_browser_live_payload_unarmed_done_and_cleared_transition():
+    """After a solve/dismiss the same builder reports done:true, requiresHuman
+    false, and the verificationCleared stamp so the panel can toast."""
+    state = {
+        "session": "main",
+        "url": "https://example.com/after",
+        "title": "Home",
+        "phase": "loaded",
+        "done": True,
+        "requiresHuman": False,
+        "verification": None,
+        "verificationCleared": True,
+    }
+    payload = cw.browser_live_payload(state, None, session="main", done=True)
+    assert payload["done"] is True
+    assert payload["requiresHuman"] is False
+    assert payload["phase"] == "done"
+    assert payload["verificationCleared"] is True
+
+
+def test_browser_live_payload_plain_frame_unchanged_shape():
+    """A normal browsing frame keeps the classic shape (no verification keys
+    that would confuse legacy consumers beyond the extra booleans)."""
+    state = {
+        "session": "main",
+        "url": "https://example.com",
+        "title": "Example",
+        "phase": "navigating",
+        "done": False,
+    }
+    payload = cw.browser_live_payload(state, None, session="main", done=False)
+    assert payload["done"] is False
+    assert payload["requiresHuman"] is False
+    assert payload["phase"] == "navigating"
+    assert payload["verificationCleared"] is False
+
+
+def test_browser_live_payloads_include_frameless_armed_handoff():
+    """An armed verification handoff must be visible to the panel re-open guard
+    even when the final frame write was lost — otherwise closing the panel
+    mid-challenge bricks the chat."""
+    sessions = {
+        "main": {
+            "frame": None,
+            "state": {
+                "session": "main",
+                "url": "https://example.com/challenge",
+                "phase": "verification_required",
+                "done": False,
+                "requiresHuman": True,
+                "verification": {"required": True, "provider": "Cloudflare"},
+            },
+        },
+    }
+    payloads = cw.browser_live_payloads(sessions)
+    assert len(payloads) == 1
+    assert payloads[0]["requiresHuman"] is True
+    assert "frame" not in payloads[0]
+
+
+def test_browser_live_payloads_skip_frameless_idle_sessions():
+    """Frameless sessions with nothing to solve stay hidden (the reattach
+    contract: only sessions with a frame populate the panel)."""
+    sessions = {
+        "main": {
+            "frame": None,
+            "state": {"session": "main", "phase": "navigating", "done": False},
+        },
+        "sub-1": {
+            "frame": "data:image/jpeg;base64,AAA",
+            "state": {"session": "sub-1", "phase": "acting", "done": False},
+        },
+    }
+    payloads = cw.browser_live_payloads(sessions)
+    assert [p["session"] for p in payloads] == ["sub-1"]
+
+
+def test_browser_live_payloads_mark_stale_state_terminal():
+    """A daemon restart stamps done+stale; it must surface as done:true even if
+    the leftover state claimed an armed handoff — a stale requiresHuman must not
+    keep the panel interactive or trigger the re-open guard."""
+    sessions = {
+        "main": {
+            "frame": "data:image/jpeg;base64,STALE",
+            "state": {
+                "session": "main",
+                "phase": "acting",
+                "done": True,
+                "stale": True,
+                "requiresHuman": True,
+            },
+        },
+    }
+    payloads = cw.browser_live_payloads(sessions)
+    assert len(payloads) == 1
+    assert payloads[0]["done"] is True
+    assert payloads[0]["requiresHuman"] is False

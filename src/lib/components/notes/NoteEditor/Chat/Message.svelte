@@ -10,12 +10,7 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import ArrowUpLeft from '$lib/components/icons/ArrowUpLeft.svelte';
 
-	export let message;
-	export let idx;
-
-	export let onDelete;
-	export let onEdit;
-	export let onInsert;
+	let { message = $bindable(), idx, onDelete, onEdit, onInsert } = $props();
 
 	let textAreaElement: HTMLTextAreaElement;
 </script>
@@ -29,8 +24,8 @@
 		<div class="flex items-center gap-2">
 			<Tooltip placement="top" content={$i18n.t('Insert')}>
 				<button
-					class=" text-transparent group-hover:text-gray-500 dark:hover:text-gray-300 transition"
-					on:click={() => {
+					class=" text-transparent group-hover:text-gray-500 dark:group-hover:text-gray-300 transition"
+					onclick={() => {
 						onInsert();
 					}}
 				>
@@ -40,8 +35,8 @@
 
 			<Tooltip placement="top" content={$i18n.t('Edit')}>
 				<button
-					class=" text-transparent group-hover:text-gray-500 dark:hover:text-gray-300 transition"
-					on:click={() => {
+					class=" text-transparent group-hover:text-gray-500 dark:group-hover:text-gray-300 transition"
+					onclick={() => {
 						onEdit();
 					}}
 				>
@@ -51,8 +46,8 @@
 
 			<Tooltip placement="top" content={$i18n.t('Delete')}>
 				<button
-					class=" text-transparent group-hover:text-gray-500 dark:hover:text-gray-300 transition"
-					on:click={() => {
+					class=" text-transparent group-hover:text-gray-500 dark:group-hover:text-gray-300 transition"
+					onclick={() => {
 						onDelete();
 					}}
 				>

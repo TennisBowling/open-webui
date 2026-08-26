@@ -1,65 +1,74 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { getRAGConfig, updateRAGConfig } from '$lib/apis/retrieval';
 	import Switch from '$lib/components/common/Switch.svelte';
 
 	import { onMount, getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 	const DEFAULT_JINA_READER_API_BASE_URL = 'https://r.jina.ai/';
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
 
-	let enableWebSearch = false;
+	let { saveHandler }: Props = $props();
+
+	let enableWebSearch = $state(false);
 
 	// Exa powers search result discovery.
-	let exaApiKey = '';
-	let exaApiKey2 = '';
+	let exaApiKey = $state('');
+	let exaApiKey2 = $state('');
 	// Per-key health from the backend: { "1": { error, at }, "2": {...} }.
 	// An absent slot means the key is healthy. Editing/clearing a key locally
 	// drops its slot so the badge disappears immediately; the backend also clears
 	// a slot when its key value changes on save.
-	let exaKeyStatus: Record<string, { error?: string; at?: number }> = {};
-	let exaNumResults = 10;
-	let exaSearchType = 'auto';
-	let exaIncludeDomains = '';
-	let exaExcludeDomains = '';
+	let exaKeyStatus: Record<string, { error?: string; at?: number }> = $state({});
+	let exaNumResults = $state(10);
+	let exaSearchType = $state('auto');
+	let exaIncludeDomains = $state('');
+	let exaExcludeDomains = $state('');
 
 	// Jina Reader powers full-content fetches from URLs.
-	let jinaApiKey = '';
-	let jinaReaderApiBaseUrl = DEFAULT_JINA_READER_API_BASE_URL;
-	let jinaReaderTokenUsage = 0;
-	let jinaReaderViewportWidth = 1280;
-	let jinaReaderViewportHeight = 12000;
-	let jinaReaderTimeout = 30;
-	let loadedJinaApiKey = '';
-	let loadedJinaReaderTokenUsage = 0;
-	let lastObservedJinaApiKey = '';
-	let jinaConfigLoaded = false;
+	let jinaApiKey = $state('');
+	let jinaReaderApiBaseUrl = $state(DEFAULT_JINA_READER_API_BASE_URL);
+	let jinaReaderTokenUsage = $state(0);
+	let jinaReaderViewportWidth = $state(1280);
+	let jinaReaderViewportHeight = $state(12000);
+	let jinaReaderTimeout = $state(30);
+	let loadedJinaApiKey = $state('');
+	let loadedJinaReaderTokenUsage = $state(0);
+	let lastObservedJinaApiKey = $state('');
+	let jinaConfigLoaded = $state(false);
 
-	let webSearchSystemPrompt = '';
+	let webSearchSystemPrompt = $state('');
 
 	const normalizeApiBaseUrl = (value: string) =>
 		(value || DEFAULT_JINA_READER_API_BASE_URL).trim().replace(/\/+$/, '');
 
-	$: isHostedJinaReader =
+	let isHostedJinaReader = $derived(
 		normalizeApiBaseUrl(jinaReaderApiBaseUrl) ===
-		normalizeApiBaseUrl(DEFAULT_JINA_READER_API_BASE_URL);
+			normalizeApiBaseUrl(DEFAULT_JINA_READER_API_BASE_URL)
+	);
 
 	// YouTube loader settings (kept for compatibility)
-	let youtubeLoaderLanguage = '';
-	let youtubeLoaderProxyUrl = '';
+	let youtubeLoaderLanguage = $state('');
+	let youtubeLoaderProxyUrl = $state('');
 
-	$: if (jinaConfigLoaded && jinaApiKey !== lastObservedJinaApiKey) {
-		// Default to a fresh meter for a new key. Admins can still type an existing
-		// usage value after changing the key if they are migrating an already-used key.
-		jinaReaderTokenUsage = jinaApiKey === loadedJinaApiKey ? loadedJinaReaderTokenUsage : 0;
-		lastObservedJinaApiKey = jinaApiKey;
-	}
+	$effect(() => {
+		if (jinaConfigLoaded && jinaApiKey !== lastObservedJinaApiKey) {
+			// Default to a fresh meter for a new key. Admins can still type an existing
+			// usage value after changing the key if they are migrating an already-used key.
+			jinaReaderTokenUsage = jinaApiKey === loadedJinaApiKey ? loadedJinaReaderTokenUsage : 0;
+			lastObservedJinaApiKey = jinaApiKey;
+		}
+	});
 
 	const toNumber = (value: unknown, fallback: number) => {
 		const parsed = Number(value);
@@ -68,17 +77,21 @@
 
 	// Track the key values as loaded so we can drop a key's error badge the
 	// moment the admin edits that key (a rotated key hasn't failed yet).
-	let loadedExaApiKey = '';
-	let loadedExaApiKey2 = '';
+	let loadedExaApiKey = $state('');
+	let loadedExaApiKey2 = $state('');
 
-	$: if (exaApiKey !== loadedExaApiKey && exaKeyStatus['1']) {
-		const { ['1']: _omit, ...rest } = exaKeyStatus;
-		exaKeyStatus = rest;
-	}
-	$: if (exaApiKey2 !== loadedExaApiKey2 && exaKeyStatus['2']) {
-		const { ['2']: _omit, ...rest } = exaKeyStatus;
-		exaKeyStatus = rest;
-	}
+	$effect(() => {
+		if (exaApiKey !== loadedExaApiKey && exaKeyStatus['1']) {
+			const { ['1']: _omit, ...rest } = exaKeyStatus;
+			exaKeyStatus = rest;
+		}
+	});
+	$effect(() => {
+		if (exaApiKey2 !== loadedExaApiKey2 && exaKeyStatus['2']) {
+			const { ['2']: _omit, ...rest } = exaKeyStatus;
+			exaKeyStatus = rest;
+		}
+	});
 
 	const clearExaKeyStatus = (slot: string) => {
 		const { [slot]: _omit, ...rest } = exaKeyStatus;
@@ -183,10 +196,10 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		await submitHandler();
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		<div class="">
@@ -222,7 +235,7 @@
 
 							{#if exaKeyStatus['1']}
 								<div
-									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
+									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border-hairline border-error-brick/20 bg-error-brick/10 px-2.5 py-1.5 text-xs text-error-brick dark:text-error-brick-dark"
 								>
 									<div class="min-w-0">
 										<span class="font-medium">{$i18n.t('Errors received for this key')}</span>
@@ -236,7 +249,7 @@
 									<button
 										type="button"
 										class="shrink-0 font-medium underline-offset-2 hover:underline"
-										on:click={() => clearExaKeyStatus('1')}
+										onclick={() => clearExaKeyStatus('1')}
 									>
 										{$i18n.t('Clear')}
 									</button>
@@ -262,7 +275,7 @@
 
 							{#if exaKeyStatus['2']}
 								<div
-									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300"
+									class="mt-1.5 flex items-start justify-between gap-2 rounded-lg border-hairline border-error-brick/20 bg-error-brick/10 px-2.5 py-1.5 text-xs text-error-brick dark:text-error-brick-dark"
 								>
 									<div class="min-w-0">
 										<span class="font-medium">{$i18n.t('Errors received for this key')}</span>
@@ -276,7 +289,7 @@
 									<button
 										type="button"
 										class="shrink-0 font-medium underline-offset-2 hover:underline"
-										on:click={() => clearExaKeyStatus('2')}
+										onclick={() => clearExaKeyStatus('2')}
 									>
 										{$i18n.t('Clear')}
 									</button>
@@ -487,8 +500,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Enter system prompt for web search...')}
-								bind:value={webSearchSystemPrompt}
-							></textarea>
+								bind:value={webSearchSystemPrompt}></textarea>
 						</div>
 					</div>
 				{/if}

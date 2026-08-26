@@ -1,40 +1,60 @@
 <script lang="ts">
 	import { getContext, onMount } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
+
 	import {
-		createMCPConnection,
 		deleteMCPConnection,
-		discoverMCP,
 		getMCPConnections,
 		getMCPConnectionTemplates,
 		startMCPConnectionOAuth,
+		restartMCPConnection,
 		verifyMCPConnection
 	} from '$lib/apis/mcp';
-	import { tools } from '$lib/stores';
+	import { tools, user } from '$lib/stores';
 	import { getTools } from '$lib/apis/tools';
+
 	import Spinner from '$lib/components/common/Spinner.svelte';
-	import Switch from '$lib/components/common/Switch.svelte';
+	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
+	import Plus from '$lib/components/icons/Plus.svelte';
+	import Link from '$lib/components/icons/Link.svelte';
+	import ArrowPath from '$lib/components/icons/ArrowPath.svelte';
+	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
+	import WrenchAlt from '$lib/components/icons/WrenchAlt.svelte';
+	import ToolIcon from '$lib/components/common/ToolIcon.svelte';
+	import Cog6 from '$lib/components/icons/Cog6.svelte';
+	import AddMCPConnectionModal from './AddMCPConnectionModal.svelte';
 
 	const i18n = getContext('i18n');
 
-	let loading = true;
-	let saving = false;
-	let connections: any[] = [];
-	let templates: Record<string, any> = {};
+	let loading = $state(true);
+	let connections: any[] = $state([]);
+	let templates: Record<string, any> = $state({});
 
-	let name = '';
-	let transport = 'remote_http';
-	let url = '';
-	let auth_type = 'oauth_2.1';
-	let key = '';
-	let headerText = '';
-	let template = 'outlook-assistant';
-	let enable_write_tools = false;
-	let allow_localhost_oauth = false;
-	let envText = '';
+	let showAddModal = $state(false);
+	let showEditModal = $state(false);
+	let editConnection: any = $state(null);
+	let verifyingId = $state('');
+	let restartingId = $state('');
+
+	let showDeleteConfirm = $state(false);
+	let pendingDelete: any = $state(null);
+
+	let isAdmin = $derived($user?.role === 'admin');
+	let canCustomStdio = $derived(isAdmin || !!$user?.permissions?.features?.mcp_stdio_custom);
 
 	const refreshTools = async () => {
 		tools.set(await getTools(localStorage.token));
+	};
+
+	const onSaved = async () => {
+		await load();
+		await refreshTools();
+	};
+
+	const openEdit = (connection: any) => {
+		editConnection = connection;
+		showEditModal = true;
 	};
 
 	const load = async () => {
@@ -49,185 +69,282 @@
 		}
 	};
 
-	const parseEnv = () => {
-		const env: Record<string, string> = {};
-		for (const line of envText.split('\n')) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith('#')) continue;
-			const idx = trimmed.indexOf('=');
-			if (idx === -1) continue;
-			env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+	const transportLabel = (connection: any) => {
+		if (connection.transport === 'stdio') {
+			return templates[connection?.meta?.template]?.name ?? $i18n.t('Local stdio');
 		}
-		return env;
+		if (connection.transport === 'remote_sse') return $i18n.t('Remote SSE');
+		return $i18n.t('Remote HTTP');
 	};
 
-	const parseHeaders = () => {
-		const headers: { key: string; value: string }[] = [];
-		for (const line of headerText.split('\n')) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith('#')) continue;
-			const idx = trimmed.indexOf(':');
-			if (idx === -1) continue;
-			headers.push({ key: trimmed.slice(0, idx).trim(), value: trimmed.slice(idx + 1).trim() });
-		}
-		return headers;
-	};
-
-	const create = async () => {
-		if (!name.trim()) {
-			toast.error($i18n.t('Please enter a name'));
-			return;
-		}
-		saving = true;
+	const errText = (err: any): string => {
+		const d = err?.detail ?? err;
+		if (typeof d === 'string') return d;
+		if (Array.isArray(d)) return d.map((e) => e?.msg ?? `${e}`).join(', ');
+		// Network-level fetch failures throw an Error whose enumerable props are
+		// empty, so JSON.stringify would render a useless "{}". Show the message.
+		if (d instanceof Error) return d.message;
 		try {
-			const body: any = {
-				name,
-				description: transport === 'stdio' ? templates[template]?.name : url,
-				transport,
-				auth_type: transport === 'stdio' ? 'none' : auth_type,
-				url: transport === 'stdio' ? undefined : url,
-				key: auth_type === 'bearer' ? key : undefined,
-				headers: auth_type === 'headers' ? parseHeaders() : [],
-				policy: { enable_write_tools, allow_localhost_oauth },
-				meta: transport === 'stdio' ? { template } : {},
-				env: parseEnv()
-			};
-			await createMCPConnection(localStorage.token, body);
-			name = '';
-			url = '';
-			key = '';
-			headerText = '';
-			envText = '';
-			await load();
-			await refreshTools();
-			toast.success($i18n.t('MCP connection saved'));
-		} catch (err: any) {
-			toast.error(err?.detail ?? `${err}`);
-		} finally {
-			saving = false;
-		}
-	};
-
-	const discover = async () => {
-		if (!url.trim()) return;
-		try {
-			const res = await discoverMCP(localStorage.token, url);
-			if (res?.endpoint) url = res.endpoint;
-			if (res?.name && !name) name = res.name;
-			toast.success($i18n.t('MCP endpoint discovered'));
-		} catch (err: any) {
-			toast.error(err?.detail ?? `${err}`);
+			return JSON.stringify(d);
+		} catch (e) {
+			return `${d}`;
 		}
 	};
 
 	const verify = async (connection: any) => {
+		verifyingId = connection.id;
 		try {
 			const res = await verifyMCPConnection(localStorage.token, connection.id);
 			if (res?.auth_required && res?.authorization_url) {
+				toast.info(
+					$i18n.t('Sign-in required for {{name}} — opening authorization…', {
+						name: connection.name ?? connection.id
+					})
+				);
 				window.open(res.authorization_url, '_self', 'noopener');
 				return;
 			}
-			toast.success($i18n.t('Connection successful'));
+			const count = res?.specs?.length ?? 0;
+			const hidden = res?.hidden_by_policy ?? 0;
+			if (count === 0 && hidden > 0) {
+				toast.info(
+					$i18n.t(
+						'{{name}} works, but all {{hidden}} of its tools count as write/destructive (no read-only annotations) and are hidden. Turn on "Enable write / destructive tools" in its settings to use them.',
+						{ name: connection.name, hidden }
+					)
+				);
+				return;
+			}
+			if (hidden > 0) {
+				toast.success(
+					$i18n.t(
+						'{{name}} is working — {{count}} tool(s) available, {{hidden}} hidden by the read-only policy.',
+						{ name: connection.name, count, hidden }
+					)
+				);
+				return;
+			}
+			toast.success(
+				$i18n.t('{{name}} is working — {{count}} tool(s) available.', {
+					name: connection.name,
+					count
+				})
+			);
 		} catch (err: any) {
-			toast.error(err?.detail ?? `${err}`);
+			toast.error(errText(err));
+		} finally {
+			verifyingId = '';
+		}
+	};
+
+	const restart = async (connection: any) => {
+		restartingId = connection.id;
+		try {
+			const res = await restartMCPConnection(localStorage.token, connection.id);
+			toast.success(
+				$i18n.t('{{name}} restarted — {{count}} tool(s) available.', {
+					name: connection.name,
+					count: res?.specs?.length ?? 0
+				})
+			);
+		} catch (err: any) {
+			toast.error(errText(err));
+		} finally {
+			restartingId = '';
 		}
 	};
 
 	const connectOAuth = async (connection: any) => {
 		try {
-			const res = await startMCPConnectionOAuth(localStorage.token, connection.id);
-			if (res?.authorization_url) window.open(res.authorization_url, '_self', 'noopener');
+			const returnTo = `${location.pathname}${location.search}`;
+			const res = await startMCPConnectionOAuth(localStorage.token, connection.id, returnTo);
+			if (res?.authorization_url) {
+				window.open(res.authorization_url, '_self', 'noopener');
+			} else {
+				toast.error($i18n.t('Could not start sign-in for {{name}}.', { name: connection.name }));
+			}
 		} catch (err: any) {
-			toast.error(err?.detail ?? `${err}`);
+			toast.error(errText(err));
 		}
 	};
 
-	const remove = async (connection: any) => {
-		await deleteMCPConnection(localStorage.token, connection.id);
-		await load();
-		await refreshTools();
+	const confirmRemove = (connection: any) => {
+		pendingDelete = connection;
+		showDeleteConfirm = true;
+	};
+
+	const remove = async () => {
+		if (!pendingDelete) return;
+		try {
+			await deleteMCPConnection(localStorage.token, pendingDelete.id);
+			await load();
+			await refreshTools();
+		} catch (err: any) {
+			toast.error(errText(err));
+		} finally {
+			pendingDelete = null;
+		}
 	};
 
 	onMount(load);
 </script>
 
+<ConfirmDialog
+	bind:show={showDeleteConfirm}
+	title={$i18n.t('Delete MCP connection')}
+	message={$i18n.t('Delete “{{name}}”? This removes the connection and any saved authorization.', {
+		name: pendingDelete?.name ?? ''
+	})}
+	confirmLabel={$i18n.t('Delete')}
+	onConfirm={remove}
+/>
+
+<AddMCPConnectionModal bind:show={showAddModal} {templates} {isAdmin} {canCustomStdio} {onSaved} />
+<AddMCPConnectionModal
+	bind:show={showEditModal}
+	edit={true}
+	connection={editConnection}
+	{templates}
+	{isAdmin}
+	{canCustomStdio}
+	{onSaved}
+/>
+
 <div class="mt-4 pt-3 border-t border-gray-100 dark:border-gray-850">
-	<div class="font-medium mb-1">{$i18n.t('Personal MCP Connections')}</div>
-	<div class="text-xs text-gray-500 mb-2">
-		{$i18n.t('Connect remote OAuth MCP servers or isolated local stdio MCP templates.')}
+	<div class="flex items-center justify-between gap-2 mb-0.5">
+		<div class="font-medium">{$i18n.t('Personal MCP Connections')}</div>
+		<button
+			type="button"
+			class="flex items-center gap-1 text-xs px-2.5 py-1 rounded-full border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+			onclick={() => (showAddModal = true)}
+		>
+			<Plus className="size-3.5" />
+			{$i18n.t('Add')}
+		</button>
+	</div>
+	<div class="text-xs text-gray-500 mb-2.5">
+		{$i18n.t('Connect remote OAuth MCP servers (Notion, Linear, …) or isolated local stdio tools.')}
 	</div>
 
 	{#if loading}
-		<div class="py-3"><Spinner className="size-5" /></div>
+		<div class="py-4 flex justify-center"><Spinner className="size-5" /></div>
+	{:else if connections.length === 0}
+		<button
+			type="button"
+			class="w-full rounded-xl border border-dashed border-gray-200 dark:border-gray-800 px-3 py-6 text-center text-sm text-gray-500 hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+			onclick={() => (showAddModal = true)}
+		>
+			<div class="flex justify-center mb-1.5 text-gray-400"><WrenchAlt className="size-5" /></div>
+			{$i18n.t('No MCP connections yet — add one to give the model new tools.')}
+		</button>
 	{:else}
-		<div class="flex flex-col gap-1.5 mb-3">
-			{#each connections as connection}
-				<div class="rounded-xl border border-gray-100 dark:border-gray-800 px-3 py-2">
-					<div class="flex justify-between gap-2">
-						<div class="min-w-0">
+		<div class="flex flex-col gap-1.5">
+			{#each connections as connection (connection.id)}
+				<div
+					class="group rounded-xl border border-gray-100 dark:border-gray-800 px-3 py-2.5 flex items-center gap-3"
+				>
+					<div class="shrink-0 text-gray-400">
+						<ToolIcon src={connection?.meta?.icon} alt={connection.name ?? ''} />
+					</div>
+
+					<div class="min-w-0 flex-1">
+						<div class="flex items-center gap-2">
 							<div class="text-sm font-medium truncate">{connection.name}</div>
-							<div class="text-xs text-gray-500 truncate">{connection.transport} · {connection.auth_type}</div>
-						</div>
-						<div class="flex gap-2 text-xs shrink-0">
-							{#if connection.auth_type === 'oauth_2.1' && !connection.authenticated}
-								<button type="button" class="underline" on:click={() => connectOAuth(connection)}>{$i18n.t('Connect')}</button>
+							{#if connection.auth_type === 'oauth_2.1'}
+								{#if connection.authenticated}
+									<span
+										class="shrink-0 inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-success/10 border-hairline border-success/25 text-success dark:text-success-dark"
+									>
+										<span class="size-1.5 rounded-full bg-success dark:bg-success-dark"></span>
+										{$i18n.t('Connected')}
+									</span>
+								{:else}
+									<span
+										class="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-warning/10 border-hairline border-warning/25 text-warning dark:text-warning-dark"
+									>
+										{$i18n.t('Sign in required')}
+									</span>
+								{/if}
 							{/if}
-							<button type="button" class="underline" on:click={() => verify(connection)}>{$i18n.t('Verify')}</button>
-							<button type="button" class="underline" on:click={() => remove(connection)}>{$i18n.t('Delete')}</button>
 						</div>
+						<div class="text-xs text-gray-500 truncate">
+							{transportLabel(connection)}{connection.url
+								? ` · ${connection.url}`
+								: connection.command
+									? ` · ${[connection.command, ...(connection.args ?? [])].join(' ')}`
+									: ''}
+						</div>
+					</div>
+
+					<div class="flex items-center gap-0.5 shrink-0">
+						{#if connection.transport === 'stdio'}
+							<Tooltip content={$i18n.t('Restart server')}>
+								<button
+									type="button"
+									aria-label={$i18n.t('Restart server')}
+									class="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+									disabled={restartingId === connection.id}
+									onclick={() => restart(connection)}
+								>
+									{#if restartingId === connection.id}<Spinner
+											className="size-4"
+										/>{:else}<ArrowPath className="size-4" />{/if}
+								</button>
+							</Tooltip>
+						{/if}
+						{#if connection.auth_type === 'oauth_2.1' && !connection.authenticated}
+							<Tooltip content={$i18n.t('Connect')}>
+								<button
+									type="button"
+									aria-label={$i18n.t('Connect')}
+									class="p-1.5 rounded-lg text-book-cloth dark:text-kraft hover:bg-book-cloth/10 transition"
+									onclick={() => connectOAuth(connection)}
+								>
+									<Link className="size-4" />
+								</button>
+							</Tooltip>
+						{/if}
+						<Tooltip content={$i18n.t('Configure tools & headers')}>
+							<button
+								type="button"
+								aria-label={$i18n.t('Configure tools & headers')}
+								class="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+								onclick={() => openEdit(connection)}
+							>
+								<Cog6 className="size-4" />
+							</button>
+						</Tooltip>
+						<Tooltip content={$i18n.t('Test connection')}>
+							<button
+								type="button"
+								aria-label={$i18n.t('Test connection')}
+								class="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition {verifyingId ===
+								connection.id
+									? 'cursor-wait opacity-60'
+									: ''}"
+								disabled={verifyingId === connection.id}
+								onclick={() => verify(connection)}
+							>
+								{#if verifyingId === connection.id}
+									<Spinner className="size-4" />
+								{:else}
+									<ArrowPath className="size-4" />
+								{/if}
+							</button>
+						</Tooltip>
+						<Tooltip content={$i18n.t('Delete')}>
+							<button
+								type="button"
+								aria-label={$i18n.t('Delete')}
+								class="p-1.5 rounded-lg text-gray-400 hover:text-error-brick dark:hover:text-error-brick-dark hover:bg-error-brick/10 transition"
+								onclick={() => confirmRemove(connection)}
+							>
+								<GarbageBin className="size-4" />
+							</button>
+						</Tooltip>
 					</div>
 				</div>
 			{/each}
 		</div>
 	{/if}
-
-	<div class="rounded-xl bg-gray-50 dark:bg-gray-950 px-3 py-3 flex flex-col gap-2">
-		<input class="text-sm bg-transparent" bind:value={name} placeholder={$i18n.t('Name')} />
-		<select class="text-sm bg-transparent" bind:value={transport}>
-			<option value="remote_http">Remote HTTP</option>
-			<option value="remote_sse">Remote SSE</option>
-			<option value="stdio">Local stdio template</option>
-		</select>
-
-		{#if transport === 'stdio'}
-			<select class="text-sm bg-transparent" bind:value={template}>
-				{#each Object.keys(templates) as templateId}
-					<option value={templateId}>{templates[templateId]?.name ?? templateId}</option>
-				{/each}
-			</select>
-		{:else}
-			<div class="flex gap-2">
-				<input class="text-sm bg-transparent flex-1 min-w-0" bind:value={url} placeholder="https://mcp.notion.com/mcp" />
-				<button class="text-xs underline shrink-0" type="button" on:click={discover}>{$i18n.t('Discover')}</button>
-			</div>
-			<select class="text-sm bg-transparent" bind:value={auth_type}>
-				<option value="oauth_2.1">OAuth 2.1</option>
-				<option value="bearer">Bearer token</option>
-				<option value="headers">Custom headers</option>
-				<option value="none">None</option>
-			</select>
-			{#if auth_type === 'bearer'}
-				<input class="text-sm bg-transparent" bind:value={key} placeholder={$i18n.t('Bearer token')} />
-			{:else if auth_type === 'headers'}
-				<textarea class="text-sm bg-transparent min-h-16" bind:value={headerText} placeholder={'X-API-Key: ...'} />
-			{/if}
-		{/if}
-
-		<textarea class="text-sm bg-transparent min-h-20" bind:value={envText} placeholder={'ENV_KEY=value\nOUTLOOK_CLIENT_ID=...'} />
-
-		<div class="flex justify-between items-center text-xs">
-			<span>{$i18n.t('Enable write/destructive tools')}</span>
-			<Switch bind:state={enable_write_tools} />
-		</div>
-		<div class="flex justify-between items-center text-xs">
-			<span>{$i18n.t('Allow localhost OAuth metadata')}</span>
-			<Switch bind:state={allow_localhost_oauth} />
-		</div>
-
-		<div class="flex justify-end">
-			<button class="px-3 py-1.5 rounded-full bg-black text-white dark:bg-white dark:text-black text-sm" disabled={saving} type="button" on:click={create}>
-				{$i18n.t('Add MCP')}
-			</button>
-		</div>
-	</div>
 </div>

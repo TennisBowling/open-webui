@@ -1,16 +1,19 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher } from 'svelte';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext } from 'svelte';
 
 	import Modal from '../../common/Modal.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	interface Props {
+		show?: boolean;
+		manifest?: any;
+	}
 
-	export let show = false;
-	export let manifest = {};
+	let { show = $bindable(false), manifest = {} }: Props = $props();
 </script>
 
 <Modal size="sm" bind:show>
@@ -18,8 +21,8 @@
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-2">
 			<div class=" text-lg font-medium self-center">{$i18n.t('Show your support!')}</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="self-center p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -31,9 +34,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						show = false;
-					}}
+					})}
 				>
 					<div class="px-1 text-sm">
 						<div class="my-2">
@@ -44,7 +47,7 @@
 
 						<div class="my-2">
 							{$i18n.t(
-								'Your entire contribution will go directly to the plugin developer; Open WebUI does not take any percentage. However, the chosen funding platform might have its own fees.'
+								'Your entire contribution will go directly to the plugin developer; {{WEBUI_NAME}} does not take any percentage. However, the chosen funding platform might have its own fees.'
 							)}
 						</div>
 
@@ -54,7 +57,8 @@
 							<a
 								href={manifest.funding_url}
 								target="_blank"
-								class="underline text-blue-400 hover:text-blue-300">{manifest.funding_url}</a
+								class="underline text-book-cloth dark:text-kraft hover:text-kraft dark:hover:text-book-cloth"
+								>{manifest.funding_url}</a
 							>
 						</div>
 					</div>

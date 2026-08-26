@@ -19,59 +19,65 @@
 
 	const i18n = getContext('i18n');
 
-	export let createHandler: Function;
-	export let importFromLinkHandler: Function;
+	interface Props {
+		createHandler: Function;
+		importFromLinkHandler: Function;
+		onClose?: Function;
+		children?: import('svelte').Snippet;
+	}
 
-	export let onClose: Function = () => {};
+	let { createHandler, importFromLinkHandler, onClose = () => {}, children }: Props = $props();
 
-	let show = false;
+	let show = $state(false);
 </script>
 
 <Dropdown
 	bind:show
-	on:change={(e) => {
+	onchange={(e) => {
 		if (e.detail === false) {
 			onClose();
 		}
 	}}
 >
 	<Tooltip content={$i18n.t('Create')}>
-		<slot />
+		{@render children?.()}
 	</Tooltip>
 
-	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[190px] rounded-2xl px-1 py-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-			sideOffset={6}
-			side="bottom"
-			align="start"
-			transition={flyAndScale}
-		>
-			<button
-				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
-				on:click={async () => {
-					createHandler();
-					show = false;
-				}}
+	{#snippet content()}
+		<div>
+			<DropdownMenu.Content
+				class="w-full max-w-[190px] rounded-2xl px-1 py-1 border-hairline border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+				sideOffset={6}
+				side="bottom"
+				align="start"
+				transition={flyAndScale}
 			>
-				<div class=" self-center mr-2">
-					<Pencil />
-				</div>
-				<div class=" self-center truncate">{$i18n.t('New Tool')}</div>
-			</button>
+				<button
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+					onclick={async () => {
+						createHandler();
+						show = false;
+					}}
+				>
+					<div class=" self-center mr-2">
+						<Pencil />
+					</div>
+					<div class=" self-center truncate">{$i18n.t('New Tool')}</div>
+				</button>
 
-			<button
-				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
-				on:click={async () => {
-					importFromLinkHandler();
-					show = false;
-				}}
-			>
-				<div class=" self-center mr-2">
-					<Link />
-				</div>
-				<div class=" self-center truncate">{$i18n.t('Import From Link')}</div>
-			</button>
-		</DropdownMenu.Content>
-	</div>
+				<button
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+					onclick={async () => {
+						importFromLinkHandler();
+						show = false;
+					}}
+				>
+					<div class=" self-center mr-2">
+						<Link />
+					</div>
+					<div class=" self-center truncate">{$i18n.t('Import From Link')}</div>
+				</button>
+			</DropdownMenu.Content>
+		</div>
+	{/snippet}
 </Dropdown>

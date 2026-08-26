@@ -6,12 +6,17 @@
 	import UserStatus from './UserStatus.svelte';
 	import UserStatusLinkPreview from './UserStatusLinkPreview.svelte';
 
-	export let user = null;
+	interface Props {
+		user?: any;
+		children?: import('svelte').Snippet;
+	}
+
+	let { user = null, children }: Props = $props();
 </script>
 
 <LinkPreview.Root openDelay={0} closeDelay={0}>
 	<LinkPreview.Trigger class=" cursor-pointer no-underline! font-normal! ">
-		<slot />
+		{@render children?.()}
 	</LinkPreview.Trigger>
 
 	<UserStatusLinkPreview id={user?.id} side="right" align="center" sideOffset={8} />

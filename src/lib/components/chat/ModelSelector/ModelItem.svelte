@@ -6,6 +6,7 @@
 
 	import { mobile, settings, user } from '$lib/stores';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { imageFallback } from '$lib/actions/imageFallback';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import { copyToClipboard, sanitizeResponseContent } from '$lib/utils';
@@ -13,21 +14,31 @@
 	import Check from '$lib/components/icons/Check.svelte';
 	import ModelItemMenu from './ModelItemMenu.svelte';
 	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Tag from '$lib/components/icons/Tag.svelte';
 	import Label from '$lib/components/icons/Label.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let selectedModelIdx: number = -1;
-	export let item: any = {};
-	export let index: number = -1;
-	export let value: string = '';
+	interface Props {
+		selectedModelIdx?: number;
+		item?: any;
+		index?: number;
+		value?: string;
+		unloadModelHandler?: (modelValue: string) => void;
+		pinModelHandler?: (modelId: string) => void;
+		onClick?: () => void;
+	}
 
-	export let unloadModelHandler: (modelValue: string) => void = () => {};
-	export let pinModelHandler: (modelId: string) => void = () => {};
-
-	export let onClick: () => void = () => {};
+	let {
+		selectedModelIdx = -1,
+		item = {},
+		index = -1,
+		value = '',
+		unloadModelHandler = () => {},
+		pinModelHandler = () => {},
+		onClick = () => {}
+	}: Props = $props();
 
 	const copyLinkHandler = async (model) => {
 		const baseUrl = window.location.origin;
@@ -40,7 +51,7 @@
 		}
 	};
 
-	let showMenu = false;
+	let showMenu = $state(false);
 </script>
 
 <button
@@ -53,7 +64,7 @@
 	style="-webkit-tap-highlight-color: transparent;"
 	data-arrow-selected={index === selectedModelIdx}
 	data-value={item.value}
-	on:click={() => {
+	onclick={() => {
 		onClick();
 	}}
 >
@@ -82,10 +93,13 @@
 					touch={!$mobile}
 				>
 					<img
+						use:imageFallback
 						src={item.model?.info?.meta?.profile_image_url ??
 							`${WEBUI_BASE_URL}/static/favicon.png`}
 						alt="Model"
 						class="rounded-full size-5 flex items-center"
+						loading="lazy"
+						decoding="async"
 					/>
 				</Tooltip>
 			</div>
@@ -133,9 +147,9 @@
 								<div class=" flex items-center">
 									<span class="relative flex size-2">
 										<span
-											class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"
-										/>
-										<span class="relative inline-flex rounded-full size-2 bg-green-500" />
+											class="animate-ping absolute inline-flex h-full w-full rounded-full bg-kraft opacity-75"
+										></span>
+										<span class="relative inline-flex rounded-full size-2 bg-book-cloth"></span>
 									</span>
 								</div>
 							</Tooltip>
@@ -148,15 +162,17 @@
 				{#if (item?.model?.tags ?? []).length > 0}
 					{#key item.model.id}
 						<Tooltip elementId="tags-{item.model.id}" touch={!$mobile}>
-							<div slot="tooltip" id="tags-{item.model.id}">
-								{#each item.model?.tags.sort((a, b) => a.name.localeCompare(b.name)) as tag}
-									<Tooltip content={tag.name} className="flex-shrink-0" touch={!$mobile}>
-										<div class=" text-xs font-medium rounded-sm uppercase text-white">
-											{tag.name}
-										</div>
-									</Tooltip>
-								{/each}
-							</div>
+							{#snippet tooltip()}
+								<div id="tags-{item.model.id}">
+									{#each item.model?.tags.sort((a, b) => a.name.localeCompare(b.name)) as tag}
+										<Tooltip content={tag.name} className="flex-shrink-0" touch={!$mobile}>
+											<div class=" text-xs font-medium rounded-sm uppercase text-white">
+												{tag.name}
+											</div>
+										</Tooltip>
+									{/each}
+								</div>
+							{/snippet}
 
 							<div class="translate-y-[1px]">
 								<Tag />
@@ -242,8 +258,8 @@
 				className="flex-shrink-0 group-hover/item:opacity-100 opacity-0 "
 			>
 				<button
-					class="flex"
-					on:click={(e) => {
+					class="flex items-center justify-center max-md:p-2.5"
+					onclick={(e) => {
 						e.preventDefault();
 						e.stopPropagation();
 						unloadModelHandler(item.value);
@@ -264,8 +280,8 @@
 		>
 			<button
 				aria-label={`${$i18n.t('More Options')}`}
-				class="flex"
-				on:click={(e) => {
+				class="flex shrink-0 max-md:p-2.5"
+				onclick={(e) => {
 					e.preventDefault();
 					e.stopPropagation();
 					showMenu = !showMenu;

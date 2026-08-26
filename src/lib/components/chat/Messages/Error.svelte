@@ -1,15 +1,21 @@
 <script lang="ts">
 	import Info from '$lib/components/icons/Info.svelte';
 
-	export let content = '';
-	export let onRetryWithoutProvider: (() => void) | null = null;
-	let showRaw = false;
+	interface Props {
+		content?: string;
+		onRetryWithoutProvider?: (() => void) | null;
+	}
+
+	let { content = '', onRetryWithoutProvider = null }: Props = $props();
+	let showRaw = $state(false);
 </script>
 
-<div class="flex flex-col my-2 gap-2.5 border-hairline px-4 py-3 border-error-brick/20 bg-error-brick/10 rounded-lg">
+<div
+	class="flex flex-col my-2 gap-2.5 border-hairline px-4 py-3 border-error-brick/20 bg-error-brick/10 rounded-lg"
+>
 	<div class="flex gap-2.5">
 		<div class=" self-start mt-0.5">
-			<Info className="size-5 text-error-brick dark:text-[#D88577]" />
+			<Info className="size-5 text-error-brick dark:text-error-brick-dark" />
 		</div>
 
 		<div class=" self-center text-sm">
@@ -35,14 +41,15 @@
 		{#if onRetryWithoutProvider}
 			<button
 				class="text-xs px-3 py-1.5 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg transition font-medium text-gray-700 dark:text-gray-300"
-				on:click={onRetryWithoutProvider}
+				onclick={onRetryWithoutProvider}
 			>
 				Retry without provider restrictions
 			</button>
 		{/if}
 		<button
-			class="text-xs text-error-brick dark:text-[#D88577] underline"
-			on:click={() => (showRaw = !showRaw)}
+			class="text-xs text-error-brick dark:text-error-brick-dark underline"
+			data-anchor-on-click
+			onclick={() => (showRaw = !showRaw)}
 		>
 			{showRaw ? 'Hide' : 'Show'} Raw
 		</button>
@@ -50,7 +57,7 @@
 
 	{#if showRaw}
 		<pre
-			class="text-xs text-error-brick dark:text-[#D88577] whitespace-pre-wrap break-words mt-2 p-2 bg-error-brick/5 rounded-sm">
+			class="text-xs text-error-brick dark:text-error-brick-dark whitespace-pre-wrap break-words mt-2 p-2 bg-error-brick/5 rounded-sm">
 			{JSON.stringify(content, null, 2)}
 		</pre>
 	{/if}

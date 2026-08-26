@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext, tick, onDestroy } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -12,14 +12,17 @@
 	import Lock from '$lib/components/icons/Lock.svelte';
 	import Hashtag from '$lib/components/icons/Hashtag.svelte';
 
-	export let onUpdate: Function = () => {};
+	interface Props {
+		onUpdate?: Function;
+		className?: string;
+		channel: any;
+	}
 
-	export let className = '';
-	export let channel;
+	let { onUpdate = () => {}, className = '', channel }: Props = $props();
 
-	let showEditChannelModal = false;
+	let showEditChannelModal = $state(false);
 
-	let itemElement;
+	let itemElement = $state();
 </script>
 
 <ChannelModal
@@ -48,13 +51,13 @@
 	bind:this={itemElement}
 	class=" w-full {className} rounded-xl flex relative group hover:bg-manilla/20 dark:hover:bg-manilla-dark/50 {$page
 		.url.pathname === `/channels/${channel.id}`
-		? 'bg-manilla/40 dark:bg-manilla-dark selected before:content-[\'\'] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r'
+		? "bg-manilla/40 dark:bg-manilla-dark selected before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r"
 		: ''} px-2.5 py-1"
 >
 	<a
 		class=" w-full flex justify-between"
 		href="/channels/{channel.id}"
-		on:click={() => {
+		onclick={() => {
 			console.log(channel);
 			if ($mobile) {
 				showSidebar.set(false);
@@ -79,15 +82,15 @@
 
 	{#if $user?.role === 'admin'}
 		<button
-			class="absolute z-10 right-2 invisible group-hover:visible self-center flex items-center dark:text-gray-300"
-			on:click={(e) => {
+			type="button"
+			aria-label={$i18n.t('Edit Channel')}
+			class="absolute z-10 right-2 invisible group-hover:visible self-center flex items-center p-0.5 max-md:p-2.5 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg touch-auto dark:text-gray-300"
+			onclick={(e) => {
 				e.stopPropagation();
 				showEditChannelModal = true;
 			}}
 		>
-			<button class="p-0.5 dark:hover:bg-gray-850 rounded-lg touch-auto" on:click={(e) => {}}>
-				<Cog6 className="size-3.5" />
-			</button>
+			<Cog6 className="size-3.5" />
 		</button>
 	{/if}
 </div>

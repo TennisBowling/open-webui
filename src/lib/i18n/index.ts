@@ -63,7 +63,8 @@ export const initI18n = (defaultLocale?: string | undefined) => {
 			ns: 'translation',
 			returnEmptyString: false,
 			interpolation: {
-				escapeValue: false // not needed for svelte as it escapes by default
+				escapeValue: false, // not needed for svelte as it escapes by default
+				defaultVariables: { WEBUI_NAME: 'Open WebUI' }
 			}
 		});
 

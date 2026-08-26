@@ -1,7 +1,16 @@
+<script lang="ts" module>
+	// Shared across selector instances/remounts: the model list arrives via the
+	// boot bootstrap and stays fresh over the socket, so opening the picker
+	// shouldn't hit the network every time. Refresh at most once per TTL, in the
+	// background (never blocks the dropdown opening).
+	let lastModelsRefreshAt = 0;
+	const MODELS_REFRESH_TTL_MS = 5 * 60 * 1000;
+</script>
+
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
 	import { marked } from 'marked';
-	import Fuse from 'fuse.js';
+	import type Fuse from 'fuse.js';
 
 	import dayjs from '$lib/dayjs';
 	import relativeTime from 'dayjs/plugin/relativeTime';
@@ -9,7 +18,7 @@
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { flyAndScale } from '$lib/utils/transitions';
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { onMount, getContext, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 
 	import { deleteModel, getOllamaVersion, pullModel, unloadModel } from '$lib/apis/ollama';
@@ -24,8 +33,9 @@
 		config,
 		modelsLoaded
 	} from '$lib/stores';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { capitalizeFirstLetter, sanitizeResponseContent, splitStream } from '$lib/utils';
+	import { noAutoKeyboardFocus } from '$lib/utils/menuFocus';
 	import { getModels } from '$lib/apis';
 
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
@@ -38,58 +48,84 @@
 	import ModelItem from './ModelItem.svelte';
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
+	interface Props {
+		id?: string;
+		value?: string;
+		placeholder?: any;
+		searchEnabled?: boolean;
+		searchPlaceholder?: any;
+		items?: {
+			label: string;
+			value: string;
+			model: Model;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			[key: string]: any;
+		}[];
+		className?: string;
+		triggerClassName?: string;
+		pinModelHandler?: (modelId: string) => void;
+		onSelect?: (modelId: string) => void;
+		children?: import('svelte').Snippet;
+	}
 
-	export let id = '';
-	export let value = '';
-	export let placeholder = $i18n.t('Select a model');
-	export let searchEnabled = true;
-	export let searchPlaceholder = $i18n.t('Search a model');
+	let {
+		id = '',
+		value = '',
+		placeholder = $i18n.t('Select a model'),
+		searchEnabled = true,
+		searchPlaceholder = $i18n.t('Search a model'),
+		items = [],
+		className = 'w-[32rem]',
+		triggerClassName = 'text-lg',
+		pinModelHandler = () => {},
+		onSelect = () => {},
+		children
+	}: Props = $props();
 
-	export let items: {
-		label: string;
-		value: string;
-		model: Model;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		[key: string]: any;
-	}[] = [];
+	let tagsContainerElement = $state();
 
-	export let className = 'w-[32rem]';
-	export let triggerClassName = 'text-lg';
+	let show = $state(false);
+	let tags = $state([]);
 
-	export let pinModelHandler: (modelId: string) => void = () => {};
+	let selectedModel = $state('');
 
-	let tagsContainerElement;
+	let searchValue = $state('');
 
-	let show = false;
-	let tags = [];
+	let selectedTag = $state('');
+	let selectedConnectionType = $state('');
 
-	let selectedModel = '';
-	$: selectedModel = items.find((item) => item.value === value) ?? '';
+	let ollamaVersion = $state(null);
+	let selectedModelIdx = $state(0);
 
-	let searchValue = '';
+	let fuse: Fuse<any> | null = $state(null);
 
-	let selectedTag = '';
-	let selectedConnectionType = '';
+	const selectModel = (modelId: string) => {
+		onSelect(modelId);
+		show = false;
+	};
 
-	let ollamaVersion = null;
-	let selectedModelIdx = 0;
-
-	const fuse = new Fuse(
-		items.map((item) => {
-			const _item = {
-				...item,
-				modelName: item.model?.name,
-				tags: (item.model?.tags ?? []).map((tag) => tag.name).join(' '),
-				desc: item.model?.info?.meta?.description
-			};
-			return _item;
-		}),
-		{
-			keys: ['value', 'tags', 'modelName'],
-			threshold: 0.4
-		}
-	);
+	// fuse.js is lazy-loaded (kept off the cold-load path) when the selector
+	// mounts. updateFuse and the filteredItems search both guard on `fuse`, so the
+	// list is simply unfiltered for the one tick before it loads — which happens
+	// when the dropdown mounts, before the user can type a search.
+	const loadFuse = async () => {
+		const { default: Fuse } = await import('fuse.js');
+		fuse = new Fuse(
+			items.map((item) => {
+				const _item = {
+					...item,
+					modelName: item.model?.name,
+					tags: (item.model?.tags ?? []).map((tag) => tag.name).join(' '),
+					desc: item.model?.info?.meta?.description
+				};
+				return _item;
+			}),
+			{
+				keys: ['value', 'tags', 'modelName'],
+				threshold: 0.4
+			}
+		);
+	};
 
 	const updateFuse = () => {
 		if (fuse) {
@@ -106,60 +142,6 @@
 			);
 		}
 	};
-
-	$: if (items) {
-		updateFuse();
-	}
-
-	$: filteredItems = (
-		searchValue
-			? fuse
-					.search(searchValue)
-					.map((e) => {
-						return e.item;
-					})
-					.filter((item) => {
-						if (selectedTag === '') {
-							return true;
-						}
-						return (item.model?.tags ?? []).map((tag) => tag.name).includes(selectedTag);
-					})
-					.filter((item) => {
-						if (selectedConnectionType === '') {
-							return true;
-						} else if (selectedConnectionType === 'local') {
-							return item.model?.connection_type === 'local';
-						} else if (selectedConnectionType === 'external') {
-							return item.model?.connection_type === 'external';
-						} else if (selectedConnectionType === 'direct') {
-							return item.model?.direct;
-						}
-					})
-			: items
-					.filter((item) => {
-						if (selectedTag === '') {
-							return true;
-						}
-						return (item.model?.tags ?? []).map((tag) => tag.name).includes(selectedTag);
-					})
-					.filter((item) => {
-						if (selectedConnectionType === '') {
-							return true;
-						} else if (selectedConnectionType === 'local') {
-							return item.model?.connection_type === 'local';
-						} else if (selectedConnectionType === 'external') {
-							return item.model?.connection_type === 'external';
-						} else if (selectedConnectionType === 'direct') {
-							return item.model?.direct;
-						}
-					})
-	).filter((item) => !(item.model?.info?.meta?.hidden ?? false));
-
-	$: if (selectedTag || selectedConnectionType) {
-		resetView();
-	} else {
-		resetView();
-	}
 
 	const resetView = async () => {
 		await tick();
@@ -312,6 +294,7 @@
 	};
 
 	onMount(async () => {
+		loadFuse();
 		if (items) {
 			tags = items
 				.filter((item) => !(item.model?.info?.meta?.hidden ?? false))
@@ -322,10 +305,6 @@
 			tags = Array.from(new Set(tags)).sort((a, b) => a.localeCompare(b));
 		}
 	});
-
-	$: if (show) {
-		setOllamaVersion();
-	}
 
 	const cancelModelPullHandler = async (model: string) => {
 		const { reader, abortController } = $MODEL_DOWNLOAD_POOL[model];
@@ -358,21 +337,98 @@
 			);
 		}
 	};
+	$effect(() => {
+		selectedModel = items.find((item) => item.value === value) ?? '';
+	});
+	$effect(() => {
+		if (items) {
+			updateFuse();
+		}
+	});
+	let filteredItems = $derived(
+		(searchValue && fuse
+			? fuse
+					.search(searchValue)
+					.map((e) => {
+						return e.item;
+					})
+					.filter((item) => {
+						if (selectedTag === '') {
+							return true;
+						}
+						return (item.model?.tags ?? []).map((tag) => tag.name).includes(selectedTag);
+					})
+					.filter((item) => {
+						if (selectedConnectionType === '') {
+							return true;
+						} else if (selectedConnectionType === 'local') {
+							return item.model?.connection_type === 'local';
+						} else if (selectedConnectionType === 'external') {
+							return item.model?.connection_type === 'external';
+						} else if (selectedConnectionType === 'direct') {
+							return item.model?.direct;
+						}
+					})
+			: items
+					.filter((item) => {
+						if (selectedTag === '') {
+							return true;
+						}
+						return (item.model?.tags ?? []).map((tag) => tag.name).includes(selectedTag);
+					})
+					.filter((item) => {
+						if (selectedConnectionType === '') {
+							return true;
+						} else if (selectedConnectionType === 'local') {
+							return item.model?.connection_type === 'local';
+						} else if (selectedConnectionType === 'external') {
+							return item.model?.connection_type === 'external';
+						} else if (selectedConnectionType === 'direct') {
+							return item.model?.direct;
+						}
+					})
+		).filter((item) => !(item.model?.info?.meta?.hidden ?? false))
+	);
+	$effect(() => {
+		if (selectedTag || selectedConnectionType) {
+			resetView();
+		} else {
+			resetView();
+		}
+	});
+	// Probe the Ollama version once per mount (gates the admin "pull model" row),
+	// not on every open — it can't change mid-session and the probe 404s
+	// pointlessly when Ollama isn't configured.
+	$effect(() => {
+		if (show && ollamaVersion === null) {
+			ollamaVersion = false;
+			setOllamaVersion();
+		}
+	});
 </script>
 
 <DropdownMenu.Root
 	bind:open={show}
 	onOpenChange={async (open) => {
-		if (open) {
-			models.set(
-				await getModels(
-					localStorage.token,
-					$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
-				)
-			);
+		if (open && Date.now() - lastModelsRefreshAt > MODELS_REFRESH_TTL_MS) {
+			lastModelsRefreshAt = Date.now();
+			// Background refresh — the picker renders instantly from $models
+			// (seeded by bootstrap, kept fresh elsewhere); don't block open on RTT.
+			getModels(
+				localStorage.token,
+				$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
+			)
+				.then((freshModels) => {
+					if (freshModels?.length) {
+						models.set(freshModels);
+					}
+				})
+				.catch(() => {});
 		}
 		searchValue = '';
-		window.setTimeout(() => document.getElementById('model-search-input')?.focus(), 0);
+		if (!$mobile) {
+			window.setTimeout(() => document.getElementById('model-search-input')?.focus(), 0);
+		}
 
 		resetView();
 	}}
@@ -393,10 +449,10 @@
 		>
 			{#if selectedModel}
 				{selectedModel.label}
-			{:else if value}
-				{value}
 			{:else if !$modelsLoaded}
 				{$i18n.t('Loading...')}
+			{:else if value}
+				{value}
 			{:else}
 				{placeholder}
 			{/if}
@@ -413,22 +469,22 @@
 		sideOffset={2}
 		alignOffset={-1}
 	>
-		<slot>
+		{#if children}{@render children()}{:else}
 			{#if searchEnabled}
-				<div class="flex items-center gap-2.5 px-4.5 mt-3.5 mb-1.5">
+				<div class="flex items-center gap-2.5 px-5.5 mt-3.5 mb-1.5">
 					<Search className="size-4" strokeWidth="2.5" />
 
 					<input
 						id="model-search-input"
 						bind:value={searchValue}
+						use:noAutoKeyboardFocus
 						class="w-full text-sm bg-transparent outline-hidden"
 						placeholder={searchPlaceholder}
 						autocomplete="off"
 						aria-label={$i18n.t('Search In Models')}
-						on:keydown={(e) => {
+						onkeydown={(e) => {
 							if (e.code === 'Enter' && filteredItems.length > 0) {
-								value = filteredItems[selectedModelIdx].value;
-								show = false;
+								selectModel(filteredItems[selectedModelIdx].value);
 								return; // dont need to scroll on selection
 							} else if (e.code === 'ArrowDown') {
 								e.stopPropagation();
@@ -448,11 +504,11 @@
 				</div>
 			{/if}
 
-			<div class="px-2">
+			<div class="px-4">
 				{#if tags && items.filter((item) => !(item.model?.info?.meta?.hidden ?? false)).length > 0}
 					<div
-						class=" flex w-full bg-white dark:bg-gray-850 overflow-x-auto scrollbar-none font-[450] mb-0.5"
-						on:wheel={(e) => {
+						class=" flex w-full bg-white dark:bg-gray-850 overflow-x-auto scrollbar-none font-medium mb-0.5"
+						onwheel={(e) => {
 							if (e.deltaY !== 0) {
 								e.preventDefault();
 								e.currentTarget.scrollLeft += e.deltaY;
@@ -465,12 +521,12 @@
 						>
 							{#if items.find((item) => item.model?.connection_type === 'local') || items.find((item) => item.model?.connection_type === 'external') || items.find((item) => item.model?.direct) || tags.length > 0}
 								<button
-									class="min-w-fit outline-none px-1.5 py-0.5 {selectedTag === '' &&
-									selectedConnectionType === ''
+									class="min-w-fit outline-none px-1.5 py-0.5 max-md:py-2 max-md:px-2.5 {selectedTag ===
+										'' && selectedConnectionType === ''
 										? ''
 										: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
 									aria-pressed={selectedTag === '' && selectedConnectionType === ''}
-									on:click={() => {
+									onclick={() => {
 										selectedConnectionType = '';
 										selectedTag = '';
 									}}
@@ -481,11 +537,12 @@
 
 							{#if items.find((item) => item.model?.connection_type === 'local')}
 								<button
-									class="min-w-fit outline-none px-1.5 py-0.5 {selectedConnectionType === 'local'
+									class="min-w-fit outline-none px-1.5 py-0.5 max-md:py-2 max-md:px-2.5 {selectedConnectionType ===
+									'local'
 										? ''
 										: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
 									aria-pressed={selectedConnectionType === 'local'}
-									on:click={() => {
+									onclick={() => {
 										selectedTag = '';
 										selectedConnectionType = 'local';
 									}}
@@ -496,11 +553,12 @@
 
 							{#if items.find((item) => item.model?.connection_type === 'external')}
 								<button
-									class="min-w-fit outline-none px-1.5 py-0.5 {selectedConnectionType === 'external'
+									class="min-w-fit outline-none px-1.5 py-0.5 max-md:py-2 max-md:px-2.5 {selectedConnectionType ===
+									'external'
 										? ''
 										: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
 									aria-pressed={selectedConnectionType === 'external'}
-									on:click={() => {
+									onclick={() => {
 										selectedTag = '';
 										selectedConnectionType = 'external';
 									}}
@@ -511,11 +569,12 @@
 
 							{#if items.find((item) => item.model?.direct)}
 								<button
-									class="min-w-fit outline-none px-1.5 py-0.5 {selectedConnectionType === 'direct'
+									class="min-w-fit outline-none px-1.5 py-0.5 max-md:py-2 max-md:px-2.5 {selectedConnectionType ===
+									'direct'
 										? ''
 										: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
 									aria-pressed={selectedConnectionType === 'direct'}
-									on:click={() => {
+									onclick={() => {
 										selectedTag = '';
 										selectedConnectionType = 'direct';
 									}}
@@ -527,11 +586,12 @@
 							{#each tags as tag}
 								<Tooltip content={tag} touch={!$mobile}>
 									<button
-										class="min-w-fit outline-none px-1.5 py-0.5 {selectedTag === tag
+										class="min-w-fit outline-none px-1.5 py-0.5 max-md:py-2 max-md:px-2.5 {selectedTag ===
+										tag
 											? ''
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
 										aria-pressed={selectedTag === tag}
-										on:click={() => {
+										onclick={() => {
 											selectedConnectionType = '';
 											selectedTag = tag;
 										}}
@@ -545,7 +605,7 @@
 				{/if}
 			</div>
 
-			<div class="px-2.5 max-h-64 overflow-y-auto group relative">
+			<div class="px-2.5 model-picker-list overflow-y-auto group relative">
 				{#each filteredItems as item, index}
 					<ModelItem
 						{selectedModelIdx}
@@ -555,10 +615,8 @@
 						{pinModelHandler}
 						{unloadModelHandler}
 						onClick={() => {
-							value = item.value;
 							selectedModelIdx = index;
-
-							show = false;
+							selectModel(item.value);
 						}}
 					/>
 				{:else}
@@ -579,7 +637,7 @@
 					>
 						<button
 							class="flex w-full font-medium line-clamp-1 select-none items-center rounded-button py-2 pl-3 pr-1.5 text-sm text-gray-700 dark:text-gray-100 outline-hidden transition-all duration-75 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl cursor-pointer data-highlighted:bg-muted"
-							on:click={() => {
+							onclick={() => {
 								pullModelHandler();
 							}}
 						>
@@ -613,7 +671,7 @@
 								</div>
 
 								{#if 'digest' in $MODEL_DOWNLOAD_POOL[model] && $MODEL_DOWNLOAD_POOL[model].digest}
-									<div class="-mt-1 h-fit text-[0.7rem] dark:text-gray-500 line-clamp-1">
+									<div class="-mt-1 h-fit text-xs text-gray-500 dark:text-gray-500 line-clamp-1">
 										{$MODEL_DOWNLOAD_POOL[model].digest}
 									</div>
 								{/if}
@@ -624,7 +682,7 @@
 							<Tooltip content={$i18n.t('Cancel')} touch={!$mobile}>
 								<button
 									class="text-gray-800 dark:text-gray-100"
-									on:click={() => {
+									onclick={() => {
 										cancelModelPullHandler(model);
 									}}
 								>
@@ -654,8 +712,8 @@
 
 			<div class="mb-2.5"></div>
 
-			<div class="hidden w-[42rem]" />
-			<div class="hidden w-[32rem]" />
-		</slot>
+			<div class="hidden w-[42rem]"></div>
+			<div class="hidden w-[32rem]"></div>
+		{/if}
 	</DropdownMenu.Content>
 </DropdownMenu.Root>

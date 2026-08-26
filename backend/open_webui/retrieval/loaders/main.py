@@ -11,7 +11,6 @@ from langchain_community.document_loaders import (
     CSVLoader,
     Docx2txtLoader,
     OutlookMessageLoader,
-    PyPDFLoader,
     TextLoader,
     UnstructuredEPubLoader,
     UnstructuredExcelLoader,
@@ -25,7 +24,6 @@ from langchain_core.documents import Document
 
 from open_webui.retrieval.loaders.external_document import ExternalDocumentLoader
 
-from open_webui.retrieval.loaders.mistral import MistralLoader
 from open_webui.retrieval.loaders.datalab_marker import DatalabMarkerLoader
 from open_webui.retrieval.loaders.mineru import MinerULoader
 
@@ -90,13 +88,24 @@ known_source_ext = [
 ]
 
 
+PDF_RETRIEVAL_REMOVED_MESSAGE = (
+    "PDF retrieval parsing has been removed. Attach the PDF directly to a chat "
+    "so the selected model can read the original document."
+)
+
+
+def is_pdf_file(filename: str, file_content_type: str | None = None) -> bool:
+    content_type = (file_content_type or "").split(";", 1)[0].strip().lower()
+    return content_type == "application/pdf" or (filename or "").lower().endswith(
+        ".pdf"
+    )
+
+
 class TikaLoader:
-    def __init__(self, url, file_path, mime_type=None, extract_images=None):
+    def __init__(self, url, file_path, mime_type=None):
         self.url = url
         self.file_path = file_path
         self.mime_type = mime_type
-
-        self.extract_images = extract_images
 
     def load(self) -> list[Document]:
         with open(self.file_path, "rb") as f:
@@ -106,9 +115,6 @@ class TikaLoader:
             headers = {"Content-Type": self.mime_type}
         else:
             headers = {}
-
-        if self.extract_images == True:
-            headers["X-Tika-PDFextractInlineImages"] = "true"
 
         endpoint = self.url
         if not endpoint.endswith("/"):
@@ -191,9 +197,6 @@ class DoclingLoader:
                         if lang.strip()
                     ]
 
-                if self.params.get("pdf_backend"):
-                    params["pdf_backend"] = self.params.get("pdf_backend")
-
                 if self.params.get("table_mode"):
                     params["table_mode"] = self.params.get("table_mode")
 
@@ -233,6 +236,9 @@ class Loader:
     def load(
         self, filename: str, file_content_type: str, file_path: str
     ) -> list[Document]:
+        if is_pdf_file(filename, file_content_type):
+            raise ValueError(PDF_RETRIEVAL_REMOVED_MESSAGE)
+
         loader = self._get_loader(filename, file_content_type, file_path)
         docs = loader.load()
 
@@ -273,14 +279,12 @@ class Loader:
                     url=self.kwargs.get("TIKA_SERVER_URL"),
                     file_path=file_path,
                     mime_type=file_content_type,
-                    extract_images=self.kwargs.get("PDF_EXTRACT_IMAGES"),
                 )
         elif (
             self.engine == "datalab_marker"
             and self.kwargs.get("DATALAB_MARKER_API_KEY")
             and file_ext
             in [
-                "pdf",
                 "xls",
                 "xlsx",
                 "ods",
@@ -347,7 +351,7 @@ class Loader:
             self.engine == "document_intelligence"
             and self.kwargs.get("DOCUMENT_INTELLIGENCE_ENDPOINT") != ""
             and (
-                file_ext in ["pdf", "docx", "ppt", "pptx"]
+                file_ext in ["docx", "ppt", "pptx"]
                 or file_content_type
                 in [
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -369,7 +373,6 @@ class Loader:
                     azure_credential=DefaultAzureCredential(),
                 )
         elif self.engine == "mineru" and file_ext in [
-            "pdf",
             "doc",
             "docx",
             "ppt",
@@ -384,30 +387,8 @@ class Loader:
                 api_key=self.kwargs.get("MINERU_API_KEY", ""),
                 params=self.kwargs.get("MINERU_PARAMS", {}),
             )
-        elif (
-            self.engine == "mistral_ocr"
-            and self.kwargs.get("MISTRAL_OCR_API_KEY") != ""
-            and file_ext
-            in ["pdf"]  # Mistral OCR currently only supports PDF and images
-        ):
-            loader = MistralLoader(
-                api_key=self.kwargs.get("MISTRAL_OCR_API_KEY"), file_path=file_path
-            )
-        elif (
-            self.engine == "external"
-            and self.kwargs.get("MISTRAL_OCR_API_KEY") != ""
-            and file_ext
-            in ["pdf"]  # Mistral OCR currently only supports PDF and images
-        ):
-            loader = MistralLoader(
-                api_key=self.kwargs.get("MISTRAL_OCR_API_KEY"), file_path=file_path
-            )
         else:
-            if file_ext == "pdf":
-                loader = PyPDFLoader(
-                    file_path, extract_images=self.kwargs.get("PDF_EXTRACT_IMAGES")
-                )
-            elif file_ext == "csv":
+            if file_ext == "csv":
                 loader = CSVLoader(file_path, autodetect_encoding=True)
             elif file_ext == "rst":
                 loader = UnstructuredRSTLoader(file_path, mode="elements")

@@ -1,11 +1,13 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { toast } from '$lib/utils/toast';
 	import { marked } from 'marked';
 
-	import { onMount, getContext, tick, createEventDispatcher } from 'svelte';
+	import { onMount, getContext, tick } from 'svelte';
 	import { blur, fade } from 'svelte/transition';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { updateFolderById } from '$lib/apis/folders';
 
@@ -19,7 +21,14 @@
 		selectedFolder
 	} from '$lib/stores';
 	import { sanitizeResponseContent, extractCurlyBraceWords } from '$lib/utils';
+	import {
+		formatSubscriptionLimitLabel,
+		formatWindowLabel,
+		formatUsedPercent,
+		formatResetsIn
+	} from '$lib/utils/subscriptionUsage';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { imageFallback } from '$lib/actions/imageFallback';
 
 	import Suggestions from './Suggestions.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -30,53 +39,102 @@
 
 	const i18n = getContext('i18n');
 
-	export let createMessagePair: Function;
-	export let stopResponse: Function;
-
-	export let autoScroll = false;
-
-	export let atSelectedModel: Model | undefined;
-	export let selectedModels: [''];
-
-	export let history;
-
-	export let prompt = '';
-	export let files = [];
-	export let messageInput = null;
-
-	export let selectedToolIds = [];
-	export let selectedFilterIds = [];
-	export let onSelectionTouched: () => void = () => {};
-
-	export let showCommands = false;
-
-	export let imageGenerationEnabled = false;
-	export let webSearchEnabled = false;
-	export let studyModeEnabled = false;
-	export let dataVizEnabled = false;
-	export let subagentsEnabled = false;
-	export let subagentReasoningEffort: string = '';
-	export let subagentServiceTier: string = '';
-	export let subagentExternalToolsEnabled = true;
-	export let serviceTier: string = 'default';
-
-	export let onSelect = (e) => {};
-	export let onChange = (e) => {};
-
-	export let toolServers = [];
-	export let relevantGroups = [];
-
-	let models = [];
-	let selectedModelIdx = 0;
-
-	$: if (selectedModels.length > 0) {
-		selectedModelIdx = models.length - 1;
+	interface Props {
+		createMessagePair: Function;
+		stopResponse: Function;
+		autoScroll?: boolean;
+		atSelectedModel: Model | undefined;
+		selectedModels: [''];
+		history: any;
+		prompt?: string;
+		files?: any;
+		messageInput?: any;
+		selectedToolIds?: any;
+		selectedFilterIds?: any;
+		onSelectionTouched?: () => void;
+		onServiceTierTouched?: (tier: string) => void;
+		showCommands?: boolean;
+		imageGenerationEnabled?: boolean;
+		webSearchEnabled?: boolean;
+		studyModeEnabled?: boolean;
+		dataVizEnabled?: boolean;
+		automationsEnabled?: boolean;
+		subagentsEnabled?: boolean;
+		subagentReasoningEffort?: string;
+		subagentServiceTier?: string;
+		subagentModel?: string;
+		subagentExternalToolsEnabled?: boolean;
+		serviceTier?: string;
+		onSelect?: any;
+		onChange?: any;
+		toolServers?: any;
+		relevantGroups?: any;
+		relevantSubscriptions?: any;
 	}
 
-	$: models = selectedModels.map((id) => $_models.find((m) => m.id === id));
+	let {
+		createMessagePair,
+		stopResponse,
+		autoScroll = $bindable(false),
+		atSelectedModel = $bindable(),
+		selectedModels = $bindable(),
+		history,
+		prompt = $bindable(''),
+		files = $bindable([]),
+		messageInput = $bindable(null),
+		selectedToolIds = $bindable([]),
+		selectedFilterIds = $bindable([]),
+		onSelectionTouched = () => {},
+		onServiceTierTouched = () => {},
+		showCommands = $bindable(false),
+		imageGenerationEnabled = $bindable(false),
+		webSearchEnabled = $bindable(false),
+		studyModeEnabled = $bindable(false),
+		dataVizEnabled = $bindable(false),
+		automationsEnabled = $bindable(false),
+		subagentsEnabled = $bindable(false),
+		subagentReasoningEffort = $bindable(''),
+		subagentServiceTier = $bindable(''),
+		subagentModel = $bindable(''),
+		subagentExternalToolsEnabled = $bindable(true),
+		serviceTier = $bindable('default'),
+		onSelect = (e) => {},
+		onChange = (e) => {},
+		toolServers = [],
+		relevantGroups = [],
+		relevantSubscriptions = [],
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+
+	let models = $state([]);
+	let selectedModelIdx = $state(0);
+
+	$effect(() => {
+		models = selectedModels.map((id) => $_models.find((m) => m.id === id));
+	});
+
+	// Clamp only when the current index is out of range (e.g. a model was
+	// removed) — do NOT force-jump to the last model on every array change,
+	// which used to stomp the user's explicit avatar click and disagreed with
+	// the picker (which shows the FIRST selected model).
+	$effect(() => {
+		if (selectedModelIdx > models.length - 1) {
+			selectedModelIdx = Math.max(0, models.length - 1);
+		}
+	});
 </script>
 
-<div class="m-auto w-full max-w-6xl px-2 @2xl:px-20 translate-y-6 py-24 text-center">
+<!-- m-auto centres on the flex cross axis (it beats the parent's items-start, and
+     auto margins collapse to 0 when the block is taller than the viewport, so a
+     small screen scrolls instead of clipping). Mobile used to opt out of the
+     centring with my-0 so that opening the iOS keyboard couldn't pan the model
+     selector off-screen — the --app-offset-top glue in keyboardViewport.ts owns
+     that now, and the opt-out left the landing screen hugging the navbar with
+     two-thirds of a phone blank underneath. Typing mode still pins to the top,
+     via .chat-placeholder in app.css. -->
+<div
+	class="chat-placeholder m-auto w-full max-w-6xl px-2 @2xl:px-20 translate-y-6 max-md:translate-y-0 py-24 max-md:pt-14 max-md:pb-6 text-center"
+>
 	{#if $temporaryChatEnabled}
 		<Tooltip
 			content={$i18n.t("This chat won't appear in history and your messages will not be saved.")}
@@ -120,19 +178,20 @@
 										aria-label={$i18n.t('Get information on {{name}} in the UI', {
 											name: models[modelIdx]?.name
 										})}
-										on:click={() => {
+										onclick={() => {
 											selectedModelIdx = modelIdx;
 										}}
 									>
 										<img
-											crossorigin="anonymous"
+											use:imageFallback
 											src={model?.info?.meta?.profile_image_url ??
 												($i18n.language === 'dg-DG'
 													? `${WEBUI_BASE_URL}/doge.png`
 													: `${WEBUI_BASE_URL}/static/favicon.png`)}
-											class=" size-9 @sm:size-10 rounded-full border-[1px] border-gray-100 dark:border-none"
+											class=" size-9 @sm:size-10 rounded-full border-hairline border-gray-100 dark:border-none"
 											aria-hidden="true"
 											draggable="false"
+											decoding="async"
 										/>
 									</button>
 								</Tooltip>
@@ -206,7 +265,7 @@
 				</div>
 			{/if}
 
-			{#if relevantGroups.length > 0}
+			{#if relevantGroups.length > 0 || relevantSubscriptions.length > 0}
 				<div class="@md:max-w-3xl w-full pb-1">
 					<div class="bg-gray-50 dark:bg-gray-850 rounded-lg p-3 text-xs">
 						{#each relevantGroups as [groupName, groupData]}
@@ -215,12 +274,12 @@
 							<div class="flex items-center justify-between mb-1 last:mb-0">
 								<span
 									class="font-medium {isOverLimit
-										? 'text-error-brick dark:text-[#D88577]'
+										? 'text-error-brick dark:text-error-brick-dark'
 										: 'text-gray-700 dark:text-gray-300'}">{groupName}</span
 								>
 								<div
-									class="flex items-center space-x-2 {isOverLimit
-										? 'text-error-brick dark:text-[#D88577]'
+									class="flex flex-wrap items-center space-x-2 {isOverLimit
+										? 'text-error-brick dark:text-error-brick-dark'
 										: 'text-gray-600 dark:text-gray-400'}"
 								>
 									<span>{effectiveUsage.in.toLocaleString()} IN</span>
@@ -234,6 +293,43 @@
 								</div>
 							</div>
 						{/each}
+						{#each relevantSubscriptions as sub}
+							{#each sub.windows ?? [] as w (w.id)}
+								{@const ratio = (w.used_percent ?? 0) / 100}
+								<div class="flex items-center justify-between gap-3 mb-1 last:mb-0">
+									<span
+										class="font-medium shrink-0 {ratio >= 1
+											? 'text-error-brick dark:text-error-brick-dark'
+											: 'text-gray-700 dark:text-gray-300'}"
+										>{formatSubscriptionLimitLabel(sub.name, w)} · {formatWindowLabel(w)}</span
+									>
+									<div
+										class="flex items-center gap-2 min-w-0 {ratio >= 1
+											? 'text-error-brick dark:text-error-brick-dark'
+											: 'text-gray-600 dark:text-gray-400'}"
+									>
+										{#if w.resets_at}
+											<span class="truncate text-gray-400 dark:text-gray-500"
+												>{formatResetsIn(w.resets_at, Date.now())}</span
+											>
+										{/if}
+										<div
+											class="w-24 sm:w-32 h-[3px] rounded-full bg-gray-200 dark:bg-gray-800 overflow-hidden shrink-0"
+										>
+											<div
+												class="h-full rounded-full {ratio >= 1
+													? 'bg-error-brick dark:bg-error-brick-dark'
+													: ratio >= 0.8
+														? 'bg-warning dark:bg-warning-dark'
+														: 'bg-gray-400 dark:bg-gray-600'}"
+												style="width: {Math.min(100, Math.round(ratio * 100))}%"
+											></div>
+										</div>
+										<span class="tabular-nums shrink-0">{formatUsedPercent(w)}</span>
+									</div>
+								</div>
+							{/each}
+						{/each}
 					</div>
 				</div>
 			{/if}
@@ -242,8 +338,9 @@
 				<MessageInput
 					bind:this={messageInput}
 					{history}
-					{selectedModels}
+					bind:selectedModels
 					{onSelectionTouched}
+					{onServiceTierTouched}
 					bind:files
 					bind:prompt
 					bind:autoScroll
@@ -253,10 +350,12 @@
 					bind:webSearchEnabled
 					bind:studyModeEnabled
 					bind:dataVizEnabled
+					bind:automationsEnabled
 					bind:subagentsEnabled
 					bind:subagentReasoningEffort
 					bind:subagentServiceTier
 					bind:subagentExternalToolsEnabled
+					bind:subagentModel
 					bind:serviceTier
 					bind:atSelectedModel
 					bind:showCommands
@@ -265,10 +364,10 @@
 					{createMessagePair}
 					placeholder={$i18n.t('How can I help you today?')}
 					{onChange}
-					on:upload={(e) => {
+					onupload={(e) => {
 						dispatch('upload', e.detail);
 					}}
-					on:submit={(e) => {
+					onsubmit={(e) => {
 						dispatch('submit', e.detail);
 					}}
 				/>

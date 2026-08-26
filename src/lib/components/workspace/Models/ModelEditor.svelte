@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 
 	import { onMount, getContext, tick } from 'svelte';
 	import { models, tools, functions, user } from '$lib/stores';
@@ -7,7 +9,12 @@
 
 	import { getTools } from '$lib/apis/tools';
 	import { getFunctions } from '$lib/apis/functions';
-	import { EXTRA_REASONING_EFFORTS } from '$lib/constants/reasoning';
+	import {
+		REASONING_EFFORT_ORDER,
+		BASE_REASONING_EFFORTS,
+		orderReasoningEfforts
+	} from '$lib/constants/reasoning';
+	import { getModelReasoning } from '$lib/apis/openai';
 
 	import AdvancedParams from '$lib/components/chat/Settings/Advanced/AdvancedParams.svelte';
 	import Tags from '$lib/components/common/Tags.svelte';
@@ -22,48 +29,49 @@
 	import DefaultFiltersSelector from './DefaultFiltersSelector.svelte';
 	import DefaultToolsAndFeatures from './DefaultToolsAndFeatures.svelte';
 	import OpenRouterProviderSelector from './OpenRouterProviderSelector.svelte';
+	import PeakHours from './PeakHours.svelte';
+	import { DEFAULT_PEAK_NOTE, isValidBlock, type PeakBlock } from '$lib/utils/peakHours';
 
 	const i18n = getContext('i18n');
 
-	export let onSubmit: Function;
-	export let onBack: null | Function = null;
+	interface Props {
+		onSubmit: Function;
+		onBack?: null | Function;
+		model?: any;
+		edit?: boolean;
+		preset?: boolean;
+	}
 
-	export let model = null;
-	export let edit = false;
+	let {
+		onSubmit,
+		onBack = null,
+		model = $bindable(null),
+		edit = false,
+		preset = true
+	}: Props = $props();
 
-	export let preset = true;
-
-	let loading = false;
+	let loading = $state(false);
 	let success = false;
 
-	let filesInputElement;
-	let inputFiles;
+	let filesInputElement = $state();
+	let inputFiles = $state();
 
-	let showAdvanced = false;
-	let showPreview = false;
+	let showAdvanced = $state(false);
+	let showPreview = $state(false);
 
-	let loaded = false;
+	let loaded = $state(false);
 
 	// ///////////
 	// model
 	// ///////////
 
-	let id = '';
-	let name = '';
+	let id = $state('');
+	let name = $state('');
 
-	let enableDescription = true;
+	let enableDescription = $state(true);
 
-	$: if (!edit) {
-		if (name) {
-			id = name
-				.replace(/\s+/g, '-')
-				.replace(/[^a-zA-Z0-9-]/g, '')
-				.toLowerCase();
-		}
-	}
-
-	let system = '';
-	let info = {
+	let system = $state('');
+	let info = $state({
 		id: '',
 		base_model_id: null,
 		name: '',
@@ -76,52 +84,126 @@
 		params: {
 			system: ''
 		}
-	};
+	});
 
-	let params = {
+	let params = $state({
 		system: ''
-	};
+	});
 
-	let toolIds = [];
+	let toolIds = $state([]);
 
-	let filterIds = [];
-	let defaultFilterIds = [];
+	let filterIds = $state([]);
+	let defaultFilterIds = $state([]);
 
-	let capabilities = {
+	let capabilities = $state({
 		vision: true,
+		// Undefined means "auto-detect from the provider's input modalities"
+		// (same tri-state pattern as `usage`). Ticking the box forces video on
+		// for a model the provider hasn't tagged.
+		video: undefined,
 		file_upload: true,
 		web_search: true,
 		image_generation: true,
 		citations: true,
 		status_updates: true,
 		usage: undefined
-	};
-	let visionPreprocessorModels = [];
-	$: visionPreprocessorModels = $models.filter((m) => m.info?.meta?.capabilities?.vision ?? true);
-	let vision_preprocessor_model_id = '';
-	let vision_preprocessor_prompt = '';
+	});
+	let visionPreprocessorModels = $state([]);
+	let vision_preprocessor_model_id = $state('');
+	let vision_preprocessor_prompt = $state('');
 	let visionPlaceholder = `e.g. 'Extract all text via OCR and describe image relevant to user query: {query}'`;
-	let defaultFeatureIds = [];
+	let defaultFeatureIds = $state([]);
 
-	let actionIds = [];
-	let accessControl = {};
+	let actionIds = $state([]);
+	let accessControl = $state({});
 
-	// Reasoning model configuration (per-model)
-	let reasoningModelEnabled = true; // default to enabled
-	let extraReasoningEfforts: string[] = [];
-	let cacheControlEphemeralEnabled = true;
+	// Reasoning model configuration (per-model). `reasoningMode` decides how the
+	// chat effort selector is populated:
+	//   'auto'   → use the efforts discovered from the provider (OpenRouter),
+	//              updating automatically as the provider changes.
+	//   'manual' → use an explicit admin-picked set (`manualReasoningEfforts`).
+	let reasoningModelEnabled = $state(true); // default to enabled
+	let reasoningMode: 'auto' | 'manual' = $state('auto');
+	let manualReasoningEfforts: string[] = $state([]);
+	// Live discovery (fetched from OpenRouter's catalog for this model).
+	let discoveredReasoning: any = $state(null);
+	let discoveringReasoning = $state(false);
+	let reasoningDiscoveryTried = false;
+	let _lastReasoningSlug = '';
+	let _reasoningReqSeq = 0;
+	let cacheControlEphemeralEnabled = $state(true);
+
+	// Full effort vocabulary for the manual-override editor, strongest first.
+	const ALL_REASONING_EFFORTS = [...REASONING_EFFORT_ORDER].reverse();
+
+	const fetchDiscoveredReasoning = async (slug: string, force = false) => {
+		// Monotonic token so an out-of-order/superseded response (admin switched
+		// base model, or cleared it, while a fetch was in flight) can't clobber
+		// the current selection. Bumped for every call, including the early exits.
+		const reqId = ++_reasoningReqSeq;
+		if (!slug) {
+			discoveredReasoning = null;
+			discoveringReasoning = false; // this (latest) request isn't fetching
+			return;
+		}
+		if (!force && slug === _lastReasoningSlug && reasoningDiscoveryTried) {
+			discoveringReasoning = false; // served from prior state, not fetching
+			return;
+		}
+		_lastReasoningSlug = slug;
+		discoveringReasoning = true;
+		try {
+			const res = await getModelReasoning(localStorage.token, slug, force);
+			if (reqId !== _reasoningReqSeq) return;
+			discoveredReasoning = res?.data?.reasoning ?? null;
+		} catch (e) {
+			if (reqId === _reasoningReqSeq) discoveredReasoning = null;
+		} finally {
+			if (reqId === _reasoningReqSeq) {
+				discoveringReasoning = false;
+				reasoningDiscoveryTried = true;
+			}
+		}
+	};
+
+	const toggleManualEffort = (effort: string) => {
+		if (manualReasoningEfforts.includes(effort)) {
+			manualReasoningEfforts = manualReasoningEfforts.filter((e) => e !== effort);
+		} else {
+			manualReasoningEfforts = orderReasoningEfforts([...manualReasoningEfforts, effort]);
+		}
+	};
 
 	// Service tier selector visibility (per-model)
-	let serviceTierEnabled = true; // default to enabled for non-ollama models
+	let serviceTierEnabled = $state(true); // default to enabled for non-ollama models
 	// Comma-separated list of tier names this model accepts. Empty == use the
 	// OpenAI default ['default', 'flex', 'priority']. Gemini wants
 	// ['standard', 'flex', 'priority']; other providers may differ.
-	let serviceTierValues = '';
+	let serviceTierValues = $state('');
+
+	// Peak hours (per-model). Soft, non-blocking heads-up shown to users while the
+	// model is in high-demand UTC windows. Times are "HH:MM" in UTC.
+	let peakHoursEnabled = $state(false);
+	let peakHoursBlocks: PeakBlock[] = $state([]);
+	let peakHoursNote = $state('');
 
 	// OpenRouter provider routing
-	let openrouterProviderOnly: string[] = [];
-	let openrouterProviderOrder: string[] = [];
-	let openrouterBaseModelId: string = '';
+	let openrouterProviderOnly: string[] = $state([]);
+	let openrouterProviderOrder: string[] = $state([]);
+	let openrouterBaseModelId: string = $state('');
+
+	// Capabilities the provider already advertises. Only `video` is discoverable
+	// today (from OpenRouter's input modalities, flattened onto the model by the
+	// backend); the others have no provider-reported equivalent.
+	let autoDetectedCapabilities = $derived.by(() => {
+		const source = $models.find((m) => m.id === (model?.id ?? id)) ?? model;
+		const modalities =
+			source?.input_modalities ??
+			source?.architecture?.input_modalities ??
+			source?.openai?.architecture?.input_modalities ??
+			[];
+		return { video: Array.isArray(modalities) && modalities.includes('video') };
+	});
 
 	const addUsage = (base_model_id) => {
 		const baseModel = $models.find((m) => m.id === base_model_id);
@@ -161,20 +243,25 @@
 		info.access_control = accessControl;
 		info.meta.capabilities = capabilities;
 
-		// Persist reasoning config
-		const normalizedExtraEfforts = Array.from(new Set(extraReasoningEfforts)).filter(Boolean);
+		// Persist reasoning config. A manual override stores an explicit
+		// `supported_efforts` set; Automatic stores nothing and lets live
+		// discovery (or the low/medium/high default) drive the chat selector.
 		if (!reasoningModelEnabled) {
-			info.meta.reasoning = {
-				enabled: false,
-				extra_efforts: normalizedExtraEfforts.length > 0 ? normalizedExtraEfforts : undefined
-			};
-		} else if (normalizedExtraEfforts.length > 0) {
-			info.meta.reasoning = {
-				enabled: true,
-				extra_efforts: normalizedExtraEfforts
-			};
+			info.meta.reasoning = { enabled: false };
+		} else if (reasoningMode === 'manual') {
+			const efforts = orderReasoningEfforts(Array.from(new Set(manualReasoningEfforts)));
+			if (efforts.length > 0) {
+				info.meta.reasoning = {
+					enabled: true,
+					supported_efforts: efforts,
+					source: 'manual'
+				};
+			} else if (info.meta.reasoning) {
+				// Manual but nothing selected → fall back to defaults.
+				delete info.meta.reasoning;
+			}
 		} else {
-			// Default state (enabled + no extras): omit to preserve backward compatible defaults.
+			// Automatic: omit to preserve backward-compatible defaults + live discovery.
 			if (info.meta.reasoning) {
 				delete info.meta.reasoning;
 			}
@@ -200,6 +287,26 @@
 		} else if (_meta.service_tier) {
 			// Default state (enabled + OpenAI tiers): omit to avoid storing unnecessary data
 			delete _meta.service_tier;
+		}
+
+		// Persist peak hours. Keep only valid, distinct windows; omit the whole
+		// block when disabled or empty so default models stay clean.
+		const validPeakBlocks = peakHoursBlocks
+			.map((b) => ({ start: (b.start ?? '').trim(), end: (b.end ?? '').trim() }))
+			.filter((b) => isValidBlock(b));
+		if (peakHoursEnabled && validPeakBlocks.length > 0) {
+			const peakHours: { enabled: boolean; blocks: PeakBlock[]; note?: string } = {
+				enabled: true,
+				blocks: validPeakBlocks
+			};
+			const trimmedNote = (peakHoursNote ?? '').trim();
+			// Store the note only when it's a meaningful override of the default.
+			if (trimmedNote && trimmedNote !== DEFAULT_PEAK_NOTE) {
+				peakHours.note = trimmedNote;
+			}
+			_meta.peak_hours = peakHours;
+		} else if (_meta.peak_hours) {
+			delete _meta.peak_hours;
 		}
 
 		if (vision_preprocessor_model_id) {
@@ -302,8 +409,6 @@
 					.filter((m) => !m?.preset && !(m?.arena ?? false))
 					.find((m) => [model.base_model_id, `${model.base_model_id}:latest`].includes(m.id));
 
-
-
 				if (base_model) {
 					model.base_model_id = base_model.id;
 					openrouterBaseModelId = base_model.id;
@@ -330,12 +435,38 @@
 			defaultFilterIds = model?.meta?.defaultFilterIds ?? [];
 			actionIds = model?.meta?.actionIds ?? [];
 
-			// Load reasoning config (default enabled if omitted)
-			reasoningModelEnabled = model?.meta?.reasoning?.enabled ?? true;
-			extraReasoningEfforts = model?.meta?.reasoning?.extra_efforts ?? [];
+			// Load reasoning config (default enabled if omitted). An explicit
+			// `supported_efforts` (or legacy `extra_efforts`) means the admin
+			// curated a manual set; otherwise the model is in Automatic mode.
+			const _reasoning = model?.meta?.reasoning;
+			reasoningModelEnabled = _reasoning?.enabled ?? true;
+			if (Array.isArray(_reasoning?.supported_efforts) && _reasoning.supported_efforts.length > 0) {
+				reasoningMode = 'manual';
+				manualReasoningEfforts = orderReasoningEfforts(_reasoning.supported_efforts);
+			} else if (Array.isArray(_reasoning?.extra_efforts) && _reasoning.extra_efforts.length > 0) {
+				// Legacy config: represent base ∪ extras as an explicit manual set
+				// so the next save upgrades it to `supported_efforts`.
+				reasoningMode = 'manual';
+				manualReasoningEfforts = orderReasoningEfforts([
+					...BASE_REASONING_EFFORTS,
+					..._reasoning.extra_efforts
+				]);
+			} else {
+				reasoningMode = 'auto';
+				manualReasoningEfforts = [];
+			}
 			cacheControlEphemeralEnabled = model?.meta?.cache_control_ephemeral ?? true;
 			serviceTierEnabled = model?.meta?.service_tier?.enabled ?? true;
 			serviceTierValues = (model?.meta?.service_tier?.values ?? []).join(', ');
+
+			// Load peak hours (default disabled if omitted). Fall back to the default
+			// note so the field is pre-filled when the admin opens an enabled model.
+			peakHoursEnabled = model?.meta?.peak_hours?.enabled ?? false;
+			peakHoursBlocks = (model?.meta?.peak_hours?.blocks ?? []).map((b) => ({
+				start: b?.start ?? '',
+				end: b?.end ?? ''
+			}));
+			peakHoursNote = model?.meta?.peak_hours?.note ?? DEFAULT_PEAK_NOTE;
 
 			// Load OpenRouter provider routing config
 			openrouterProviderOnly = model?.params?.custom_params?.provider?.only ?? [];
@@ -377,13 +508,49 @@
 
 		loaded = true;
 	});
+	$effect(() => {
+		if (!edit) {
+			if (name) {
+				id = name
+					.replace(/\s+/g, '-')
+					.replace(/[^a-zA-Z0-9-]/g, '')
+					.toLowerCase();
+			}
+		}
+	});
+	$effect(() => {
+		visionPreprocessorModels = $models.filter((m) => m.info?.meta?.capabilities?.vision ?? true);
+	});
+	// The efforts the chat will actually offer while in Automatic mode: the
+	// discovered set, or the low/medium/high default when the provider exposes
+	// no effort granularity.
+	let autoEffectiveEfforts = $derived(
+		Array.isArray(discoveredReasoning?.supported_efforts) &&
+			discoveredReasoning.supported_efforts.length > 0
+			? orderReasoningEfforts(discoveredReasoning.supported_efforts)
+			: [...BASE_REASONING_EFFORTS]
+	);
+	// Keep the discovery slug in sync with the selected base model, in BOTH the
+	// create flow and the edit flow (the "Base Model (From)" select binds
+	// info.base_model_id; onMount pre-normalizes it, so this only ever mirrors an
+	// already-resolved id). When the model IS a base (no base_model_id) this
+	// doesn't fire and the onMount-set openrouterBaseModelId (= model.id) stands.
+	$effect(() => {
+		if (info?.base_model_id) {
+			openrouterBaseModelId = info.base_model_id;
+		}
+	});
+	// Fetch discovery whenever the resolved base slug changes.
+	$effect(() => {
+		fetchDiscoveredReasoning(openrouterBaseModelId);
+	});
 </script>
 
 {#if loaded}
 	{#if onBack}
 		<button
 			class="flex space-x-1"
-			on:click={() => {
+			onclick={() => {
 				onBack();
 			}}
 		>
@@ -412,7 +579,7 @@
 			type="file"
 			hidden
 			accept="image/*"
-			on:change={() => {
+			onchange={() => {
 				let reader = new FileReader();
 				reader.onload = (event) => {
 					let originalImageUrl = `${event.target.result}`;
@@ -477,9 +644,9 @@
 		{#if !edit || (edit && model)}
 			<form
 				class="flex flex-col md:flex-row w-full gap-3 md:gap-6"
-				on:submit|preventDefault={() => {
+				onsubmit={preventDefault(() => {
 					submitHandler();
-				}}
+				})}
 			>
 				<div class="self-center md:self-start flex justify-center my-2 shrink-0">
 					<div class="self-center">
@@ -489,7 +656,7 @@
 								? 'bg-transparent'
 								: 'bg-white'} shadow-xl group relative"
 							type="button"
-							on:click={() => {
+							onclick={() => {
 								filesInputElement.click();
 							}}
 						>
@@ -536,7 +703,7 @@
 						<div class="flex w-full mt-1 justify-end">
 							<button
 								class="px-2 py-1 text-gray-500 rounded-lg text-xs"
-								on:click={() => {
+								onclick={() => {
 									info.meta.profile_image_url = `${WEBUI_BASE_URL}/static/favicon.png`;
 								}}
 								type="button"
@@ -552,7 +719,7 @@
 						<div class="flex-1">
 							<div>
 								<input
-									class="text-3xl font-semibold w-full bg-transparent outline-hidden"
+									class="text-3xl font-semibold w-full bg-transparent outline-hidden font-primary"
 									placeholder={$i18n.t('Model Name')}
 									bind:value={name}
 									required
@@ -582,7 +749,7 @@
 									class="text-sm w-full bg-transparent outline-hidden"
 									placeholder={$i18n.t('Select a base model (e.g. llama3, gpt-4o)')}
 									bind:value={info.base_model_id}
-									on:change={(e) => {
+									onchange={(e) => {
 										addUsage(e.target.value);
 									}}
 									required
@@ -609,7 +776,7 @@
 								aria-label={enableDescription
 									? $i18n.t('Custom description enabled')
 									: $i18n.t('Default description enabled')}
-								on:click={() => {
+								onclick={() => {
 									enableDescription = !enableDescription;
 								}}
 							>
@@ -634,11 +801,11 @@
 						<div class="">
 							<Tags
 								tags={info?.meta?.tags ?? []}
-								on:delete={(e) => {
+								ondelete={(e) => {
 									const tagName = e.detail;
 									info.meta.tags = info.meta.tags.filter((tag) => tag.name !== tagName);
 								}}
-								on:add={(e) => {
+								onadd={(e) => {
 									const tagName = e.detail;
 									if (!(info?.meta?.tags ?? null)) {
 										info.meta.tags = [{ name: tagName }];
@@ -651,7 +818,7 @@
 					</div>
 
 					<div class="my-2">
-						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 							<AccessControl
 								bind:accessControl
 								accessRoles={['read', 'write']}
@@ -693,7 +860,7 @@
 								<button
 									class="p-1 px-3 text-xs flex rounded-sm transition"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										showAdvanced = !showAdvanced;
 									}}
 								>
@@ -725,7 +892,7 @@
 								<button
 									class="p-1 text-xs flex rounded-sm transition"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										if ((info?.meta?.suggestion_prompts ?? null) === null) {
 											info.meta.suggestion_prompts = [{ content: '' }];
 										} else {
@@ -745,7 +912,7 @@
 								<button
 									class="p-1 px-2 text-xs flex rounded-sm transition"
 									type="button"
-									on:click={() => {
+									onclick={() => {
 										if (
 											info.meta.suggestion_prompts.length === 0 ||
 											info.meta.suggestion_prompts.at(-1).content !== ''
@@ -785,7 +952,7 @@
 											<button
 												class="px-2"
 												type="button"
-												on:click={() => {
+												onclick={() => {
 													info.meta.suggestion_prompts.splice(promptIdx, 1);
 													info.meta.suggestion_prompts = info.meta.suggestion_prompts;
 												}}
@@ -836,11 +1003,11 @@
 					</div>
 
 					<div class="my-2">
-						<Capabilities bind:capabilities />
+						<Capabilities bind:capabilities autoDetected={autoDetectedCapabilities} />
 					</div>
 
 					<div class="my-2">
-						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 							<div class="flex w-full justify-between items-center">
 								<div class="self-center text-sm font-semibold">{$i18n.t('Reasoning')}</div>
 							</div>
@@ -857,33 +1024,144 @@
 								)}
 							</div>
 
-							<div class="mt-3">
-								<div class="text-xs font-semibold mb-1">{$i18n.t('Extra reasoning efforts')}</div>
-								<div class="text-xs text-gray-500 dark:text-gray-500 mb-2">
-									{$i18n.t(
-										'Enable additional effort values supported by some reasoning models (in addition to low/medium/high).'
-									)}
+							{#if reasoningModelEnabled}
+								<!-- Discovered reasoning efforts (OpenRouter auto-discovery) -->
+								<div
+									class="mt-3 rounded-xl bg-white dark:bg-gray-900 px-3 py-2.5 border-hairline border-gray-100 dark:border-gray-800"
+								>
+									<div class="flex items-center justify-between">
+										<div class="text-xs font-semibold">{$i18n.t('Discovered from provider')}</div>
+										<button
+											type="button"
+											class="text-[11px] text-book-cloth dark:text-kraft hover:underline disabled:opacity-50 disabled:no-underline"
+											disabled={discoveringReasoning || !openrouterBaseModelId}
+											onclick={() => fetchDiscoveredReasoning(openrouterBaseModelId, true)}
+										>
+											{discoveringReasoning ? $i18n.t('Discovering…') : $i18n.t('Re-discover')}
+										</button>
+									</div>
+
+									<div class="mt-1.5">
+										{#if discoveringReasoning}
+											<div class="text-xs text-gray-400 dark:text-gray-500 italic">
+												{$i18n.t('Discovering reasoning support…')}
+											</div>
+										{:else if discoveredReasoning && (discoveredReasoning.supported_efforts?.length ?? 0) > 0}
+											<div class="flex flex-wrap items-center gap-1.5">
+												{#each orderReasoningEfforts(discoveredReasoning.supported_efforts) as effort}
+													<span
+														class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-book-cloth/15 text-book-cloth dark:text-kraft border-hairline border-book-cloth/20"
+													>
+														{effort}
+													</span>
+												{/each}
+												{#if discoveredReasoning.mandatory}
+													<span
+														class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-warning/15 text-warning dark:text-warning-dark"
+													>
+														{$i18n.t('required')}
+													</span>
+												{/if}
+											</div>
+											{#if discoveredReasoning.default_effort}
+												<div class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
+													{$i18n.t('Default')}: {discoveredReasoning.default_effort}
+												</div>
+											{/if}
+										{:else if discoveredReasoning}
+											<div class="text-xs text-gray-500 dark:text-gray-400">
+												{$i18n.t(
+													'This model reasons but the provider exposes no selectable effort levels.'
+												)}
+											</div>
+										{:else}
+											<div class="text-xs text-gray-400 dark:text-gray-500 italic">
+												{$i18n.t(
+													'No provider reasoning data (not an OpenRouter model, or none advertised).'
+												)}
+											</div>
+										{/if}
+									</div>
 								</div>
 
-								<div class="flex flex-wrap gap-3 text-xs">
-									{#each EXTRA_REASONING_EFFORTS as effort}
-										<label class="flex items-center gap-2">
-											<input
-												type="checkbox"
-												value={effort}
-												disabled={!reasoningModelEnabled}
-												bind:group={extraReasoningEfforts}
-											/>
-											<span>{effort}</span>
-										</label>
-									{/each}
+								<!-- Mode: Automatic (discovered) vs Manual override -->
+								<div class="mt-3">
+									<div
+										class="grid grid-cols-2 gap-2 bg-gray-100 dark:bg-gray-800 p-1 rounded-lg text-xs"
+									>
+										<button
+											type="button"
+											class="py-1.5 rounded-md font-medium transition-all {reasoningMode === 'auto'
+												? 'bg-white dark:bg-gray-850 text-book-cloth dark:text-kraft shadow-sm'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											onclick={() => (reasoningMode = 'auto')}
+										>
+											{$i18n.t('Automatic')}
+										</button>
+										<button
+											type="button"
+											class="py-1.5 rounded-md font-medium transition-all {reasoningMode ===
+											'manual'
+												? 'bg-white dark:bg-gray-850 text-book-cloth dark:text-kraft shadow-sm'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											onclick={() => {
+												// Seed the manual set from whatever the model would use now.
+												if (manualReasoningEfforts.length === 0) {
+													manualReasoningEfforts = [...autoEffectiveEfforts];
+												}
+												reasoningMode = 'manual';
+											}}
+										>
+											{$i18n.t('Manual override')}
+										</button>
+									</div>
+
+									{#if reasoningMode === 'auto'}
+										<div class="mt-2 text-xs text-gray-500 dark:text-gray-500">
+											{$i18n.t(
+												'Uses the efforts discovered from the provider and updates automatically. Falls back to low/medium/high when none are advertised.'
+											)}
+										</div>
+										<div class="mt-2 flex flex-wrap gap-1.5">
+											{#each autoEffectiveEfforts as effort}
+												<span
+													class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"
+												>
+													{effort}
+												</span>
+											{/each}
+										</div>
+									{:else}
+										<div class="mt-2 text-xs text-gray-500 dark:text-gray-500 mb-2">
+											{$i18n.t(
+												'Choose exactly which reasoning efforts to offer in chat. Overrides discovery.'
+											)}
+										</div>
+										<div class="flex flex-wrap gap-3 text-xs">
+											{#each ALL_REASONING_EFFORTS as effort}
+												<label class="flex items-center gap-2">
+													<input
+														type="checkbox"
+														checked={manualReasoningEfforts.includes(effort)}
+														onchange={() => toggleManualEffort(effort)}
+													/>
+													<span>{effort}</span>
+												</label>
+											{/each}
+										</div>
+										{#if manualReasoningEfforts.length === 0}
+											<div class="text-[11px] text-warning dark:text-warning-dark mt-1.5">
+												{$i18n.t('Nothing selected — the model will fall back to defaults.')}
+											</div>
+										{/if}
+									{/if}
 								</div>
-							</div>
+							{/if}
 						</div>
 					</div>
 
 					<div class="my-2">
-						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 							<div class="flex w-full justify-between items-center">
 								<div class="self-center text-sm font-semibold">{$i18n.t('Service Tier')}</div>
 								<div class="pr-2">
@@ -908,14 +1186,22 @@
 									disabled={!serviceTierEnabled}
 									bind:value={serviceTierValues}
 									placeholder="default, flex, priority"
-									class="text-sm w-full bg-transparent outline-hidden border rounded px-3 py-2"
+									class="text-sm w-full bg-transparent outline-hidden border-hairline rounded-lg px-3 py-2"
 								/>
 							</div>
 						</div>
 					</div>
 
 					<div class="my-2">
-						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
+						<PeakHours
+							bind:enabled={peakHoursEnabled}
+							bind:blocks={peakHoursBlocks}
+							bind:note={peakHoursNote}
+						/>
+					</div>
+
+					<div class="my-2">
+						<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-2xl">
 							<div class="flex w-full justify-between items-center">
 								<div class="self-center text-sm font-semibold">{$i18n.t('Cache Control')}</div>
 								<div class="pr-2">
@@ -937,13 +1223,13 @@
 					/>
 
 					{#if !capabilities.vision}
-						<div class="my-4 p-4 border rounded-lg bg-gray-50 dark:bg-gray-950">
+						<div class="my-2 p-4 border-hairline rounded-lg bg-gray-50 dark:bg-gray-950">
 							<h3 class="text-sm font-semibold mb-3">Vision Preprocessor (for image inputs)</h3>
 							<div class="mb-3">
 								<label class="block text-xs font-semibold mb-1">Preprocessor Model</label>
 								<select
 									bind:value={vision_preprocessor_model_id}
-									class="text-sm w-full bg-transparent outline-hidden border rounded px-3 py-2"
+									class="text-sm w-full bg-transparent outline-hidden border-hairline rounded-lg px-3 py-2"
 								>
 									<option value="">Select a vision model</option>
 									{#each visionPreprocessorModels as m}
@@ -981,7 +1267,7 @@
 							<button
 								class="p-1 px-3 text-xs flex rounded-sm transition"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									showPreview = !showPreview;
 								}}
 							>
@@ -1000,15 +1286,14 @@
 									rows="10"
 									value={JSON.stringify(info, null, 2)}
 									disabled
-									readonly
-								/>
+									readonly></textarea>
 							</div>
 						{/if}
 					</div>
 
 					<div class="my-2 flex justify-end pb-20">
 						<button
-							class=" text-sm px-3 py-2 transition rounded-lg {loading
+							class=" text-sm px-3 py-2 transition-colors duration-200 ease-paper rounded-full {loading
 								? ' cursor-not-allowed bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:hover:bg-kraft dark:text-white'
 								: 'bg-book-cloth hover:bg-kraft text-white dark:bg-book-cloth dark:hover:bg-kraft dark:text-white'} flex w-full justify-center"
 							type="submit"

@@ -1,6 +1,7 @@
 from typing import Optional
 import io
 import base64
+import hashlib
 import json
 import asyncio
 import logging
@@ -17,16 +18,23 @@ from pydantic import BaseModel
 from open_webui.constants import ERROR_MESSAGES
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     HTTPException,
     Request,
     status,
     Response,
 )
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse
 
 
-from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.auth import (
+    get_admin_user,
+    get_verified_user,
+    get_current_user,
+    bearer_security,
+)
 from open_webui.utils.access_control import has_access_async, has_permission_async
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STATIC_DIR
 
@@ -204,32 +212,93 @@ async def get_model_by_id(id: str, user=Depends(get_verified_user)):
 ###########################
 
 
+async def get_optional_user(
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    auth_token: Optional[HTTPAuthorizationCredentials] = Depends(bearer_security),
+):
+    # Best-effort variant of get_current_user for endpoints that must degrade
+    # gracefully (e.g. <img> tags) instead of surfacing a 401 JSON body, which
+    # the browser renders as a broken-image glyph.
+    try:
+        return await get_current_user(request, response, background_tasks, auth_token)
+    except HTTPException:
+        return None
+
+
 @router.get("/model/profile/image")
-async def get_model_profile_image(id: str, user=Depends(get_verified_user)):
+async def get_model_profile_image(
+    id: str, request: Request, user=Depends(get_optional_user)
+):
+    # Served as an <img src> (cookie-authenticated, no Authorization header) —
+    # get_current_user already falls back to the `token` cookie, so this works.
+    # Unauthenticated requests (e.g. an expired/missing cookie) fall back to
+    # the public favicon instead of a 401, which the browser would otherwise
+    # render as a broken-image glyph. Never serve the real avatar or redirect
+    # to a configured external URL for unauthenticated callers.
+    if user is None:
+        return FileResponse(
+            f"{STATIC_DIR}/favicon.png",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
     model = await Models.get_model_by_id(id)
     if model:
         if model.meta.profile_image_url:
             if model.meta.profile_image_url.startswith("http"):
                 return Response(
                     status_code=status.HTTP_302_FOUND,
-                    headers={"Location": model.meta.profile_image_url},
+                    headers={
+                        "Location": model.meta.profile_image_url,
+                        "Cache-Control": "private, max-age=3600",
+                    },
                 )
             elif model.meta.profile_image_url.startswith("data:image"):
                 try:
-                    header, base64_data = model.meta.profile_image_url.split(",", 1)
+                    data_uri = model.meta.profile_image_url
+                    # ETag == the `v` hash the list URL is versioned by, so an
+                    # unchanged avatar 304s and a changed one busts the cache.
+                    etag = (
+                        '"'
+                        + hashlib.sha256(data_uri.encode("utf-8")).hexdigest()[:16]
+                        + '"'
+                    )
+                    cache_control = "private, max-age=31536000, immutable"
+
+                    inm = request.headers.get("if-none-match")
+                    if inm and etag.strip('"') in {
+                        part.strip().strip('"') for part in inm.split(",")
+                    }:
+                        return Response(
+                            status_code=status.HTTP_304_NOT_MODIFIED,
+                            headers={"ETag": etag, "Cache-Control": cache_control},
+                        )
+
+                    header, base64_data = data_uri.split(",", 1)
                     image_data = base64.b64decode(base64_data)
                     image_buffer = io.BytesIO(image_data)
 
                     return StreamingResponse(
                         image_buffer,
                         media_type="image/png",
-                        headers={"Content-Disposition": "inline; filename=image.png"},
+                        headers={
+                            "Content-Disposition": "inline; filename=image.png",
+                            "ETag": etag,
+                            "Cache-Control": cache_control,
+                        },
                     )
                 except Exception as e:
                     pass
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+        return FileResponse(
+            f"{STATIC_DIR}/favicon.png",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
     else:
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+        return FileResponse(
+            f"{STATIC_DIR}/favicon.png",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
 
 
 ############################

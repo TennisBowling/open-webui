@@ -1,72 +1,120 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { previewFile, showControls, showFilePreview } from '$lib/stores';
+	import {
+		previewFile,
+		previewFileSiblings,
+		showControls,
+		showFilePreview,
+		sharedContext
+	} from '$lib/stores';
 	import { formatFileSize } from '$lib/utils';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
-	import { getFileById } from '$lib/apis/files';
+	import { getFileById, getSharedFileById } from '$lib/apis/files';
+	import { fileContentUrl } from '$lib/utils/sandbox';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Image from '$lib/components/common/Image.svelte';
+	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
-	let loading = false;
-	let loadedId: string | null = null;
-	let item: any = null;
+	let loading = $state(false);
+	let item: any = $state(null);
 
-	$: item = $previewFile;
-	$: file = item?.file ?? null;
-	$: fileId = item?.id ?? file?.id;
-	$: name = item?.name ?? file?.meta?.name ?? file?.filename ?? 'file';
-	$: size = item?.size ?? file?.meta?.size;
-	$: contentType = (file?.meta?.content_type ?? item?.content_type ?? '').toLowerCase();
-	$: workspaceMeta = item?.container_workspace ?? file?.data?.container_workspace ?? {};
-	$: previewFileId =
-		workspaceMeta?.preview_file_id ??
-		file?.data?.preview_file_id ??
-		file?.data?.pdf_file_id ??
-		null;
-	$: previewStatus = workspaceMeta?.preview_status ?? file?.data?.preview_status ?? file?.data?.pdf_status;
-	$: previewError = workspaceMeta?.preview_error ?? file?.data?.preview_error ?? file?.data?.pdf_error;
-	$: textPreview = (file?.data?.content ?? '').trim();
-	$: isPdf = contentType === 'application/pdf' || name.toLowerCase().endsWith('.pdf');
-	$: isImage = contentType.startsWith('image/');
-	$: isAudio = contentType.startsWith('audio/');
-	$: needsDocumentPreview = /\.(docx?|odt|rtf|pptx?|odp|xlsx?|ods)$/i.test(name) || contentType.includes('officedocument') || contentType.includes('msword') || contentType.includes('ms-excel') || contentType.includes('ms-powerpoint') || contentType.includes('opendocument');
-	$: frameFileId = previewFileId || (isPdf ? fileId : null);
-	$: frameUrl = frameFileId ? `${WEBUI_API_BASE_URL}/files/${frameFileId}/content` : '';
-	$: downloadUrl = fileId ? `${WEBUI_API_BASE_URL}/files/${fileId}/content?attachment=true` : '';
+	let shareId = $derived($sharedContext.shareId);
+	$effect(() => {
+		item = $previewFile;
+	});
+	let file = $derived(item?.file ?? null);
+	let fileId = $derived(item?.id ?? file?.id);
+	let name = $derived(item?.name ?? file?.meta?.name ?? file?.filename ?? 'file');
+	let size = $derived(item?.size ?? file?.meta?.size);
+	let contentType = $derived((file?.meta?.content_type ?? item?.content_type ?? '').toLowerCase());
+	let workspaceMeta = $derived(item?.container_workspace ?? file?.data?.container_workspace ?? {});
+	let previewFileId = $derived(
+		workspaceMeta?.preview_file_id ?? file?.data?.preview_file_id ?? file?.data?.pdf_file_id ?? null
+	);
+	let previewStatus = $derived(
+		workspaceMeta?.preview_status ?? file?.data?.preview_status ?? file?.data?.pdf_status
+	);
+	let previewError = $derived(
+		workspaceMeta?.preview_error ?? file?.data?.preview_error ?? file?.data?.pdf_error
+	);
+	let textPreview = $derived((file?.data?.content ?? '').trim());
+	let isPdf = $derived(contentType === 'application/pdf' || name.toLowerCase().endsWith('.pdf'));
+	let isImage = $derived(contentType.startsWith('image/'));
+	let isAudio = $derived(contentType.startsWith('audio/'));
+	let isMarkdown = $derived(
+		/\.(md|markdown|mdown|mkd|mdx)$/i.test(name) ||
+			contentType === 'text/markdown' ||
+			contentType === 'text/x-markdown'
+	);
+	let needsDocumentPreview = $derived(
+		/\.(docx?|odt|rtf|pptx?|odp|xlsx?|ods)$/i.test(name) ||
+			contentType.includes('officedocument') ||
+			contentType.includes('msword') ||
+			contentType.includes('ms-excel') ||
+			contentType.includes('ms-powerpoint') ||
+			contentType.includes('opendocument')
+	);
+	let frameFileId = $derived(previewFileId || (isPdf ? fileId : null));
+	let frameUrl = $derived(
+		frameFileId ? fileContentUrl(frameFileId, WEBUI_API_BASE_URL, { shareId }) : ''
+	);
+	let downloadUrl = $derived(
+		fileId ? fileContentUrl(fileId, WEBUI_API_BASE_URL, { shareId, attachment: true }) : ''
+	);
 
 	const close = () => {
 		showFilePreview.set(false);
 		previewFile.set(null);
+		previewFileSiblings.set([]);
 		showControls.set(false);
 	};
 
 	const loadFile = async () => {
-		if (!fileId || loadedId === fileId) return;
+		// Capture the id we are about to fetch: previewFile can move to another file
+		// while this awaits, and we must not apply a stale result to the new file.
+		const targetId = fileId;
+		if (!targetId) return;
+		// Already hold the hydrated record for THIS id → nothing to do. Re-clicking
+		// the same card re-sets previewFile to a RAW message.files descriptor with no
+		// `.file`, so this is false and we refetch — fixing the "blank on re-open"
+		// stick (the descriptor's id string is unchanged, so a fileId-keyed reactive
+		// block would never re-run; we key on item identity below instead).
+		if (item?.file && item.file.id === targetId) return;
 		loading = true;
-		const res = await getFileById(localStorage.token, fileId).catch((e) => {
+		const res = await (
+			shareId
+				? getSharedFileById(localStorage.token ?? '', shareId, targetId)
+				: getFileById(localStorage.token, targetId)
+		).catch((e) => {
 			console.error('Error fetching preview file:', e);
 			return null;
 		});
-		if (res) {
+		// Apply only if this is the record we asked for AND the panel is still
+		// showing that id (the user may have switched files mid-fetch).
+		if (res && res.id === targetId && (item?.id ?? item?.file?.id) === targetId) {
 			item = { ...item, file: res };
 			previewFile.set(item);
-			loadedId = fileId;
 		}
 		loading = false;
 	};
 
-	$: if (fileId) {
-		loadFile();
-	}
+	// Re-run on every item change (identity), not only when the fileId STRING
+	// changes: re-clicking the same file hands us a fresh un-hydrated descriptor
+	// with the same id, which must still trigger a refetch.
+	$effect(() => {
+		(item, loadFile());
+	});
 </script>
 
 <div class="h-full flex flex-col bg-white dark:bg-gray-850 text-gray-800 dark:text-gray-100">
-	<div class="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-start justify-between gap-3">
+	<div
+		class="px-4 py-3 border-b-hairline border-gray-100 dark:border-gray-800 flex items-start justify-between gap-3"
+	>
 		<div class="min-w-0">
 			<div class="font-medium text-base line-clamp-1">{name}</div>
 			<div class="flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-gray-500 mt-1">
@@ -76,11 +124,20 @@
 		</div>
 		<div class="flex items-center gap-2 shrink-0">
 			{#if downloadUrl}
-				<a class="px-3 py-1.5 rounded-full text-xs bg-gray-900 text-white dark:bg-white dark:text-gray-900" href={downloadUrl} target="_blank" rel="noreferrer">
+				<a
+					class="px-3 py-1.5 rounded-full text-xs bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper"
+					href={downloadUrl}
+					target="_blank"
+					rel="noreferrer"
+				>
 					{$i18n.t('Download')}
 				</a>
 			{/if}
-			<button on:click={close} aria-label={$i18n.t('Close')}>
+			<button
+				onclick={close}
+				aria-label={$i18n.t('Close')}
+				class="self-center p-1 max-md:p-2 rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-800 transition"
+			>
 				<XMark />
 			</button>
 		</div>
@@ -90,26 +147,47 @@
 		{#if loading && !file}
 			<div class="h-full flex items-center justify-center"><Spinner className="size-5" /></div>
 		{:else if frameUrl}
-			<iframe title={name} src={frameUrl} class="w-full h-full min-h-[70vh] border-0 bg-white" />
+			<iframe title={name} src={frameUrl} class="w-full h-full min-h-[70vh] border-0 bg-white"
+			></iframe>
 		{:else if isImage}
 			<div class="p-3 flex justify-center bg-gray-50 dark:bg-gray-900 min-h-full">
-				<Image src={`${WEBUI_API_BASE_URL}/files/${fileId}/content`} alt={name} />
+				<Image src={fileContentUrl(fileId, WEBUI_API_BASE_URL, { shareId })} alt={name} />
 			</div>
 		{:else if isAudio}
 			<div class="p-4">
-				<audio src={`${WEBUI_API_BASE_URL}/files/${fileId}/content`} class="w-full" controls playsinline />
+				<audio
+					src={fileContentUrl(fileId, WEBUI_API_BASE_URL, { shareId })}
+					class="w-full"
+					controls
+					playsinline
+				></audio>
+			</div>
+		{:else if textPreview && isMarkdown}
+			<div class="markdown-prose !w-full !max-w-none p-4 text-sm dark:text-gray-100 min-h-full">
+				<Markdown
+					id={`file-preview-${fileId}`}
+					content={textPreview}
+					done={true}
+					editCodeBlock={false}
+					sandboxFiles={$previewFileSiblings}
+				/>
 			</div>
 		{:else if textPreview && !needsDocumentPreview}
-			<pre class="text-xs whitespace-pre-wrap p-4 bg-gray-50 dark:bg-gray-900 dark:text-gray-100 min-h-full">{textPreview}</pre>
+			<pre
+				class="text-xs whitespace-pre-wrap p-4 bg-gray-50 dark:bg-gray-900 dark:text-gray-100 min-h-full">{textPreview}</pre>
 		{:else}
-			<div class="h-full min-h-80 flex flex-col items-center justify-center gap-2 text-sm text-gray-500 px-6 text-center">
+			<div
+				class="h-full min-h-80 flex flex-col items-center justify-center gap-2 text-sm text-gray-500 px-6 text-center"
+			>
 				<div>
 					{previewError ||
 						(needsDocumentPreview
 							? $i18n.t('Document preview was not generated for this file.')
 							: $i18n.t('No inline preview is available for this file type.'))}
 				</div>
-				{#if downloadUrl}<a class="underline" href={downloadUrl} target="_blank" rel="noreferrer">{$i18n.t('Download the file')}</a>{/if}
+				{#if downloadUrl}<a class="underline" href={downloadUrl} target="_blank" rel="noreferrer"
+						>{$i18n.t('Download the file')}</a
+					>{/if}
 			</div>
 		{/if}
 	</div>

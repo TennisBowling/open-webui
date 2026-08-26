@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { Pane, PaneGroup, PaneResizer } from 'paneforge';
 
-	import { onDestroy, onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	import { chatId, showSidebar, socket, user } from '$lib/stores';
+	import { WEBUI_NAME, chatId, showSidebar, socket, user } from '$lib/stores';
 	import { getChannelById, getChannelMessages, sendMessage } from '$lib/apis/channels';
 
 	import Messages from './Messages.svelte';
@@ -16,26 +16,26 @@
 	import Thread from './Thread.svelte';
 	import i18n from '$lib/i18n';
 
-	export let id = '';
-
-	let scrollEnd = true;
-	let messagesContainerElement = null;
-	let chatInputElement = null;
-
-	let top = false;
-
-	let channel = null;
-	let messages = null;
-
-	let replyToMessage = null;
-	let threadId = null;
-
-	let typingUsers = [];
-	let typingUsersTimeout = {};
-
-	$: if (id) {
-		initHandler();
+	interface Props {
+		id?: string;
 	}
+
+	let { id = '' }: Props = $props();
+
+	let scrollEnd = $state(true);
+	let messagesContainerElement = $state(null);
+	let chatInputElement = $state(null);
+
+	let top = $state(false);
+
+	let channel = $state(null);
+	let messages = $state(null);
+
+	let replyToMessage = $state(null);
+	let threadId = $state(null);
+
+	let typingUsers = $state([]);
+	let typingUsersTimeout = {};
 
 	const scrollToBottom = () => {
 		if (messagesContainerElement) {
@@ -43,7 +43,10 @@
 		}
 	};
 
-	const initHandler = async () => {
+	let initGeneration = 0;
+
+	const initHandler = async (targetId: string) => {
+		const generation = ++initGeneration;
 		top = false;
 		messages = null;
 		channel = null;
@@ -52,12 +55,16 @@
 		typingUsers = [];
 		typingUsersTimeout = {};
 
-		channel = await getChannelById(localStorage.token, id).catch((error) => {
+		const nextChannel = await getChannelById(localStorage.token, targetId).catch((error) => {
 			return null;
 		});
+		if (generation !== initGeneration || id !== targetId) return;
 
-		if (channel) {
-			messages = await getChannelMessages(localStorage.token, id, 0);
+		if (nextChannel) {
+			channel = nextChannel;
+			const nextMessages = await getChannelMessages(localStorage.token, targetId, 0);
+			if (generation !== initGeneration || id !== targetId) return;
+			messages = nextMessages;
 
 			if (messages) {
 				scrollToBottom();
@@ -173,7 +180,7 @@
 	};
 
 	let mediaQuery;
-	let largeScreen = false;
+	let largeScreen = $state(false);
 
 	onMount(() => {
 		if ($chatId) {
@@ -197,12 +204,24 @@
 	});
 
 	onDestroy(() => {
+		initGeneration += 1;
 		$socket?.off('events:channel', channelEventHandler);
+	});
+	$effect(() => {
+		const targetId = id;
+		if (targetId) {
+			// initHandler resets channel-local state before its first await. Keep
+			// those resets out of the effect's dependencies so they cannot
+			// recursively restart a route load or trigger its `/` fallback.
+			untrack(() => {
+				void initHandler(targetId);
+			});
+		}
 	});
 </script>
 
 <svelte:head>
-	<title>#{channel?.name ?? 'Channel'} • Open WebUI</title>
+	<title>#{channel?.name ?? 'Channel'} • {$WEBUI_NAME}</title>
 </svelte:head>
 
 <div
@@ -221,7 +240,7 @@
 						class=" pb-2.5 max-w-full z-10 scrollbar-hidden w-full h-full pt-6 flex-1 flex flex-col-reverse overflow-auto"
 						id="messages-container"
 						bind:this={messagesContainerElement}
-						on:scroll={(e) => {
+						onscroll={(e) => {
 							scrollEnd = Math.abs(messagesContainerElement.scrollTop) <= 50;
 						}}
 					>
@@ -305,7 +324,7 @@
 			>
 				<div
 					class=" absolute -left-1.5 -right-1.5 -top-0 -bottom-0 z-20 cursor-col-resize bg-transparent"
-				/>
+				></div>
 			</PaneResizer>
 
 			<Pane defaultSize={50} minSize={30} class="h-full w-full">

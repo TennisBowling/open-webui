@@ -1,38 +1,72 @@
 <script lang="ts">
 	import { models, showSettings, settings, user, mobile, config } from '$lib/stores';
 	import { onMount, tick, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Selector from './ModelSelector/Selector.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
+	import PeakHoursNotice from './PeakHoursNotice.svelte';
 
 	import { updateUserSettings } from '$lib/apis/users';
 	const i18n = getContext('i18n');
 
-	export let selectedModels = [''];
-	export let disabled = false;
-
-	export let showSetDefault = true;
-
-	// Some routes/users hydrate settings/models asynchronously; keep the selector
-	// on a stable array so Svelte never updates an already-torn-down each block.
-	$: if (!Array.isArray(selectedModels) || selectedModels.length === 0) {
-		selectedModels = [''];
+	interface Props {
+		selectedModels?: string[];
+		disabled?: boolean;
+		showSetDefault?: boolean;
+		onModelsChange?: (modelIds: string[]) => void;
 	}
 
+	let {
+		selectedModels = [''],
+		disabled = false,
+		showSetDefault = true,
+		onModelsChange = () => {}
+	}: Props = $props();
+	let savingDefault = $state(false);
+
+	const updateModels = (modelIds: string[]) => {
+		onModelsChange([...modelIds]);
+	};
+
 	const saveDefaultModel = async () => {
-		const hasEmptyModel = selectedModels.filter((it) => it === '');
-		if (hasEmptyModel.length) {
+		if (selectedModels.some((modelId) => modelId === '')) {
 			toast.error($i18n.t('Choose a model before saving...'));
 			return;
 		}
-		settings.set({ ...$settings, models: selectedModels });
-		await updateUserSettings(localStorage.token, { ui: $settings });
 
-		toast.success($i18n.t('Default model updated'));
+		savingDefault = true;
+		try {
+			const nextUi = { ...$settings, models: [...selectedModels] };
+			const savedSettings = await updateUserSettings(localStorage.token, { ui: nextUi });
+			if (!savedSettings?.ui) {
+				throw new Error($i18n.t('The server did not confirm the settings update.'));
+			}
+
+			settings.set(savedSettings.ui);
+			try {
+				// The settings store is seeded from this cache before the fresh settings
+				// request completes on reload. Keep it in sync so a new chat does not
+				// briefly initialize from (and retain) the previous default model.
+				localStorage.setItem('settings', JSON.stringify(savedSettings));
+			} catch (error) {
+				console.warn('Failed to cache updated user settings', error);
+			}
+
+			toast.success($i18n.t('Default model updated'));
+		} catch (error) {
+			const detail = error?.detail ?? error?.message ?? `${error}`;
+			toast.error(
+				$i18n.t('Failed to save settings: {{error}}', {
+					error: detail
+				})
+			);
+		} finally {
+			savingDefault = false;
+		}
 	};
 
-	const pinModelHandler = async (modelId) => {
-		let pinnedModels = $settings?.pinnedModels ?? [];
+	const pinModelHandler = async (modelId: string) => {
+		let pinnedModels: string[] = $settings?.pinnedModels ?? [];
 
 		if (pinnedModels.includes(modelId)) {
 			pinnedModels = pinnedModels.filter((id) => id !== modelId);
@@ -44,15 +78,13 @@
 		await updateUserSettings(localStorage.token, { ui: $settings });
 	};
 
-	$: if (Array.isArray(selectedModels) && selectedModels.length > 0 && $models.length > 0) {
-		const _selectedModels = selectedModels.map((model) =>
-			$models.map((m) => m.id).includes(model) ? model : ''
-		);
-
-		if (JSON.stringify(_selectedModels) !== JSON.stringify(selectedModels)) {
-			selectedModels = _selectedModels;
-		}
-	}
+	// NOTE: ModelSelector never rewrites `selectedModels` reactively. Chat.svelte
+	// owns the single reconciler that maps selectedModels against $models — a second automatic
+	// writer here previously raced it in the same reactive flush (this block
+	// would wipe an unrecognized/stale id to '' while Chat's reconciler refilled
+	// it), desyncing the two-level bind chain into the Selector so the picker
+	// got stuck showing "Select a model" even though the placeholder above the
+	// composer correctly showed the refilled model.
 </script>
 
 <div class="flex flex-col w-full items-start">
@@ -69,22 +101,25 @@
 							model: model
 						}))}
 						{pinModelHandler}
-						bind:value={selectedModel}
+						value={selectedModel}
+						onSelect={(modelId) => {
+							const next = [...selectedModels];
+							next[selectedModelIdx] = modelId;
+							updateModels(next);
+						}}
 					/>
 				</div>
 			</div>
 
 			{#if $user?.role === 'admin' || ($user?.permissions?.chat?.multiple_models ?? true)}
 				{#if selectedModelIdx === 0}
-					<div
-						class="  self-center mx-1 disabled:text-gray-600 disabled:hover:text-gray-600 -translate-y-[0.5px]"
-					>
+					<div class="self-center mx-1 disabled:text-gray-600 disabled:hover:text-gray-600">
 						<Tooltip content={$i18n.t('Add Model')}>
 							<button
-								class=" "
+								class="inline-flex items-center justify-center max-md:p-2.5 max-md:min-w-10 max-md:min-h-10"
 								{disabled}
-								on:click={() => {
-									selectedModels = [...selectedModels, ''];
+								onclick={() => {
+									updateModels([...selectedModels, '']);
 								}}
 								aria-label="Add Model"
 							>
@@ -102,15 +137,13 @@
 						</Tooltip>
 					</div>
 				{:else}
-					<div
-						class="  self-center mx-1 disabled:text-gray-600 disabled:hover:text-gray-600 -translate-y-[0.5px]"
-					>
+					<div class="self-center mx-1 disabled:text-gray-600 disabled:hover:text-gray-600">
 						<Tooltip content={$i18n.t('Remove Model')}>
 							<button
+								class="inline-flex items-center justify-center max-md:p-2.5 max-md:min-w-10 max-md:min-h-10"
 								{disabled}
-								on:click={() => {
-									selectedModels.splice(selectedModelIdx, 1);
-									selectedModels = selectedModels;
+								onclick={() => {
+									updateModels(selectedModels.filter((_, idx) => idx !== selectedModelIdx));
 								}}
 								aria-label="Remove Model"
 							>
@@ -130,13 +163,25 @@
 				{/if}
 			{/if}
 		</div>
+
+		<PeakHoursNotice
+			model={$models.find((m) => m.id === selectedModel)}
+			className="mt-1 px-0.5 mb-0.5"
+		/>
 	{/each}
 </div>
 
 {#if showSetDefault}
 	<div
-		class="relative text-left mt-[1px] ml-1 text-[0.7rem] text-gray-600 dark:text-gray-400 font-primary"
+		class="relative text-left mt-[1px] px-0.5 text-xs text-gray-600 dark:text-gray-400 font-primary"
 	>
-		<button on:click={saveDefaultModel}> {$i18n.t('Set as default')}</button>
+		<button
+			type="button"
+			class="hover:text-gray-900 dark:hover:text-gray-200 transition disabled:opacity-50"
+			onclick={saveDefaultModel}
+			disabled={savingDefault}
+		>
+			{$i18n.t('Set as default')}</button
+		>
 	</div>
 {/if}

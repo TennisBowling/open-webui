@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
@@ -44,40 +44,31 @@
 
 	const i18n = getContext('i18n');
 
-	let shiftKey = false;
+	let shiftKey = $state(false);
 
-	let functionsImportInputElement: HTMLInputElement;
-	let importFiles;
+	let functionsImportInputElement: HTMLInputElement = $state();
+	let importFiles = $state();
 
-	let tagsContainerElement: HTMLDivElement;
-	let viewOption = '';
+	let tagsContainerElement: HTMLDivElement = $state();
+	let viewOption = $state('');
 
-	let query = '';
+	let query = $state('');
 	let selectedTag = '';
-	let selectedType = '';
+	let selectedType = $state('');
 
-	let showImportModal = false;
+	let showImportModal = $state(false);
 
-	let showConfirm = false;
+	let showConfirm = $state(false);
 
-	let showManifestModal = false;
-	let showValvesModal = false;
-	let selectedFunction = null;
+	let showManifestModal = $state(false);
+	let showValvesModal = $state(false);
+	let selectedFunction = $state(null);
 
-	let showDeleteConfirm = false;
+	let showDeleteConfirm = $state(false);
 
-	let loaded = false;
-	let functions = null;
-	let filteredItems = [];
-
-	$: if (
-		functions &&
-		query !== undefined &&
-		selectedType !== undefined &&
-		viewOption !== undefined
-	) {
-		setFilteredItems();
-	}
+	let loaded = $state(false);
+	let functions = $state(null);
+	let filteredItems = $state([]);
 
 	const setFilteredItems = () => {
 		filteredItems = functions
@@ -235,6 +226,16 @@
 			window.removeEventListener('blur-sm', onBlur);
 		};
 	});
+	$effect(() => {
+		if (
+			functions &&
+			query !== undefined &&
+			selectedType !== undefined &&
+			viewOption !== undefined
+		) {
+			setFilteredItems();
+		}
+	});
 </script>
 
 <svelte:head>
@@ -267,7 +268,7 @@
 					type="file"
 					accept=".json"
 					hidden
-					on:change={() => {
+					onchange={() => {
 						console.log(importFiles);
 						showConfirm = true;
 					}}
@@ -288,7 +289,7 @@
 						{#if $user?.role === 'admin'}
 							<button
 								class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-								on:click={() => {
+								onclick={() => {
 									functionsImportInputElement.click();
 								}}
 							>
@@ -300,7 +301,7 @@
 							{#if functions.length}
 								<button
 									class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-									on:click={async () => {
+									onclick={async () => {
 										const _functions = await exportFunctions(localStorage.token).catch((error) => {
 											toast.error(`${error}`);
 											return null;
@@ -359,7 +360,7 @@
 						<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
 							<button
 								class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
-								on:click={() => {
+								onclick={() => {
 									query = '';
 								}}
 							>
@@ -372,7 +373,7 @@
 
 			<div
 				class="px-3 flex w-full bg-transparent overflow-x-auto scrollbar-none"
-				on:wheel={(e) => {
+				onwheel={(e) => {
 					if (e.deltaY !== 0) {
 						e.preventDefault();
 						e.currentTarget.scrollLeft += e.deltaY;
@@ -407,7 +408,7 @@
 				<div class="px-3 my-2 gap-1 lg:gap-2 grid lg:grid-cols-2">
 					{#each filteredItems as func (func.id)}
 						<div
-							class=" flex space-x-4 cursor-pointer w-full px-2 py-2 dark:hover:bg-white/5 hover:bg-black/5 rounded-xl"
+							class=" flex space-x-4 cursor-pointer w-full px-2 py-2 hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 						>
 							<a
 								class=" flex flex-1 space-x-3.5 cursor-pointer w-full"
@@ -459,9 +460,9 @@
 								{#if shiftKey}
 									<Tooltip content={$i18n.t('Delete')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												deleteHandler(func);
 											}}
 										>
@@ -472,9 +473,9 @@
 									{#if func?.meta?.manifest?.funding_url ?? false}
 										<Tooltip content={$i18n.t('Support')}>
 											<button
-												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 												type="button"
-												on:click={() => {
+												onclick={() => {
 													selectedFunction = func;
 													showManifestModal = true;
 												}}
@@ -486,9 +487,9 @@
 
 									<Tooltip content={$i18n.t('Valves')}>
 										<button
-											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												selectedFunction = func;
 												showValvesModal = true;
 											}}
@@ -541,7 +542,7 @@
 										onClose={() => {}}
 									>
 										<button
-											class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 											type="button"
 										>
 											<EllipsisHorizontal className="size-5" />
@@ -553,7 +554,7 @@
 									<Tooltip content={func.is_active ? $i18n.t('Enabled') : $i18n.t('Disabled')}>
 										<Switch
 											bind:state={func.is_active}
-											on:change={async (e) => {
+											onchange={async (e) => {
 												toggleFunctionById(localStorage.token, func.id);
 												models.set(
 													await getModels(
@@ -622,7 +623,7 @@
 	<DeleteConfirmDialog
 		bind:show={showDeleteConfirm}
 		title={$i18n.t('Delete function?')}
-		on:confirm={() => {
+		onconfirm={() => {
 			deleteHandler(selectedFunction);
 		}}
 	>
@@ -636,7 +637,7 @@
 		bind:show={showValvesModal}
 		type="function"
 		id={selectedFunction?.id ?? null}
-		on:save={async () => {
+		onsave={async () => {
 			await tick();
 			models.set(
 				await getModels(
@@ -651,7 +652,7 @@
 
 	<ConfirmDialog
 		bind:show={showConfirm}
-		on:confirm={() => {
+		onconfirm={() => {
 			const reader = new FileReader();
 			reader.onload = async (event) => {
 				const _functions = JSON.parse(event.target.result);
@@ -685,7 +686,7 @@
 		}}
 	>
 		<div class="text-sm text-gray-500">
-			<div class=" bg-yellow-500/20 text-yellow-700 dark:text-yellow-200 rounded-lg px-4 py-3">
+			<div class=" bg-warning/10 text-warning dark:text-warning-dark rounded-lg px-4 py-3">
 				<div>{$i18n.t('Please carefully review the following warnings:')}</div>
 
 				<ul class=" mt-1 list-disc pl-4 text-xs">

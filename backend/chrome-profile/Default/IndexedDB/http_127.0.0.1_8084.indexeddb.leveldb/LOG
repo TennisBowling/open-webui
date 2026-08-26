@@ -1,0 +1,6 @@
+2026/07/18-02:59:45.860 1f11da Creating DB /home/tennisbowling/open-webui/backend/chrome-profile/Default/IndexedDB/http_127.0.0.1_8084.indexeddb.leveldb since it was missing.
+2026/07/18-02:59:45.866 1f11da Reusing MANIFEST /home/tennisbowling/open-webui/backend/chrome-profile/Default/IndexedDB/http_127.0.0.1_8084.indexeddb.leveldb/MANIFEST-000001
+2026/07/18-03:04:13.540 1f11da Level-0 table #5: started
+2026/07/18-03:04:13.541 1f11da Level-0 table #5: 200219 bytes OK
+2026/07/18-03:04:13.542 1f11da Delete type=0 #3
+2026/07/18-03:04:13.542 1f11da Manual compaction at level-0 from '\x00\x01\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x02\x00\x00\x00' @ 0 : 0; will stop at (end)

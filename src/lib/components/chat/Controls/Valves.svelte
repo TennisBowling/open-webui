@@ -1,8 +1,11 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 
 	import { config, functions, models, settings, tools, user } from '$lib/stores';
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { onMount, getContext, tick } from 'svelte';
 
 	import {
 		getUserValvesSpecById as getToolUserValvesSpecById,
@@ -21,19 +24,24 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Valves from '$lib/components/common/Valves.svelte';
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
+	interface Props {
+		show?: boolean;
+	}
 
-	let tab = 'tools';
-	let selectedId = '';
+	let { show = false, ...eventProps }: Props & Record<string, unknown> = $props();
 
-	let loading = false;
+	let tab = $state('tools');
+	let selectedId = $state('');
 
-	let valvesSpec = null;
-	let valves = {};
+	let loading = $state(false);
+
+	let valvesSpec = $state(null);
+	let valves = $state({});
 
 	let debounceTimer;
 
@@ -109,18 +117,6 @@
 		}
 	};
 
-	$: if (tab) {
-		selectedId = '';
-	}
-
-	$: if (selectedId) {
-		getUserValves();
-	}
-
-	$: if (show) {
-		init();
-	}
-
 	const init = async () => {
 		loading = true;
 
@@ -133,15 +129,30 @@
 
 		loading = false;
 	};
+	$effect(() => {
+		if (tab) {
+			selectedId = '';
+		}
+	});
+	$effect(() => {
+		if (selectedId) {
+			getUserValves();
+		}
+	});
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 </script>
 
 {#if show && !loading}
 	<form
 		class="flex flex-col h-full justify-between space-y-3 text-sm"
-		on:submit|preventDefault={() => {
+		onsubmit={preventDefault(() => {
 			submitHandler();
 			dispatch('save');
-		}}
+		})}
 	>
 		<div class="flex flex-col">
 			<div class="space-y-1">
@@ -163,7 +174,7 @@
 						<select
 							class="w-full rounded-sm py-2 px-1 text-xs bg-transparent outline-hidden"
 							bind:value={selectedId}
-							on:change={async () => {
+							onchange={async () => {
 								await tick();
 							}}
 						>
@@ -197,7 +208,7 @@
 						<Valves
 							{valvesSpec}
 							bind:valves
-							on:change={() => {
+							onchange={() => {
 								debounceSubmitHandler();
 							}}
 						/>

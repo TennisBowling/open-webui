@@ -10,10 +10,15 @@ These are pure-function tests (no DB / no event loop needed). DB env is still
 pointed at a temp copy in case importing the modules touches it.
 """
 
+from unittest.mock import patch
+
+import pytest
+
 from test.util.db import configure_test_database
 
 configure_test_database()
 
+from open_webui.utils import subagent as sub  # noqa: E402
 from open_webui.utils.subagent import reconcile_block_results_from_runs  # noqa: E402
 
 
@@ -136,10 +141,10 @@ def test_total_text_block_len_empty_and_whitespace():
     assert _total_text_block_len([{"type": "reasoning", "content": "x"}]) == 0
 
 
-def test_empty_round_retry_env_default_is_three():
+def test_empty_round_retry_env_default_is_five():
     from open_webui.env import AGENTIC_EMPTY_ROUND_MAX_RETRIES
 
-    assert AGENTIC_EMPTY_ROUND_MAX_RETRIES == 3
+    assert AGENTIC_EMPTY_ROUND_MAX_RETRIES == 5
 
 
 # -- Parallel tool-call cancellation isolation -------------------------------
@@ -178,21 +183,64 @@ def test_failed_call_converts_to_nonempty_error_result_shape():
     def result_for_failed_call(tool_call, exc):
         tcid = tool_call.get("id", "")
         name = tool_call.get("function", {}).get("name", "")
-        msg = (
-            "was cancelled or timed out"
-            if isinstance(exc, asyncio.CancelledError)
-            else f"failed: {exc}"
-        )
+        if isinstance(exc, asyncio.CancelledError):
+            msg = "was interrupted before it returned"
+        elif isinstance(exc, asyncio.TimeoutError):
+            msg = "timed out before it returned"
+        else:
+            msg = f"failed: {exc}"
         return {"tool_call_id": tcid, "content": f"Tool '{name}' {msg}."}
 
     call = {"id": "c1", "function": {"name": "subagent_launch"}}
     r_cancel = result_for_failed_call(call, asyncio.CancelledError())
     assert r_cancel["tool_call_id"] == "c1"
     assert r_cancel["content"].strip()
-    assert "cancelled" in r_cancel["content"]
+    assert "interrupted" in r_cancel["content"]
+
+    r_timeout = result_for_failed_call(call, asyncio.TimeoutError())
+    assert "timed out" in r_timeout["content"]
 
     r_err = result_for_failed_call(call, RuntimeError("boom"))
     assert "boom" in r_err["content"]
+
+
+def test_subagent_cancel_classification_uses_parent_task_context():
+    class FakeTask:
+        def __init__(self, cancelling):
+            self._cancelling = cancelling
+
+        def cancelling(self):
+            return self._cancelling
+
+    token = sub.current_tool_parent_task_var.set(FakeTask(0))
+    try:
+        assert sub._subagent_cancel_is_from_parent_task() is False
+    finally:
+        sub.current_tool_parent_task_var.reset(token)
+
+    token = sub.current_tool_parent_task_var.set(FakeTask(1))
+    try:
+        assert sub._subagent_cancel_is_from_parent_task() is True
+    finally:
+        sub.current_tool_parent_task_var.reset(token)
+
+
+def test_isolated_child_cancellation_is_consumed_for_recovery():
+    async def go():
+        task = asyncio.current_task()
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            cleared = sub._clear_isolated_child_cancellation()
+            assert cleared >= 1
+            assert task.cancelling() == 0
+            # A recovery await should now run normally instead of immediately
+            # receiving the stale cancellation again.
+            await asyncio.sleep(0)
+            return "recovered"
+
+    assert asyncio.run(go()) == "recovered"
 
 
 # -- Genuine vs spurious subagent cancellation -------------------------------
@@ -235,10 +283,9 @@ def test_cancelled_task_reports_cancelling():
     assert results.get("cancelling", 0) > 0
 
 
-# -- Streaming chat-completion timeout (no 5-min total cap) -------------------
+# -- Streaming chat-completion timeout (no hidden wall/gap cap) ---------------
 # The upstream streaming session must NOT inherit aiohttp's 5-minute `total`
-# default, which cancelled long subagents mid-generation. We pin the env shape so
-# a regression that reintroduces a total cap is caught.
+# default, and by default it also must not have a hidden sock_read gap cap.
 
 
 def test_stream_timeout_uses_sock_read_not_total():
@@ -251,15 +298,14 @@ def test_stream_timeout_uses_sock_read_not_total():
     # Overall total is unbounded (None) by default — long generations never get
     # a hard wall-clock cut-off.
     assert AIOHTTP_CLIENT_TIMEOUT is None
-    # The dead-connection guard is a positive integer by default.
-    assert isinstance(AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ, int)
-    assert AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ > 0
+    # The dead-connection guard is opt-in; default is fully unbounded.
+    assert AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ is None
 
     t = aiohttp.ClientTimeout(
         total=None, sock_read=AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ
     )
     assert t.total is None
-    assert t.sock_read == AIOHTTP_CLIENT_TIMEOUT_STREAM_SOCK_READ
+    assert t.sock_read is None
 
 
 # -- Subagent provider non-streaming -----------------------------------------
@@ -428,6 +474,27 @@ import asyncio  # noqa: E402
 import open_webui.utils.subagent as subagent_module  # noqa: E402
 
 
+def test_critical_subagent_write_waits_through_repeated_cancellation():
+    async def scenario():
+        outer = asyncio.current_task()
+
+        async def critical_write():
+            await asyncio.sleep(0)
+            outer.cancel()
+            await asyncio.sleep(0.001)
+            outer.cancel()
+            await asyncio.sleep(0.001)
+            return "committed"
+
+        task = asyncio.create_task(critical_write())
+        cancellation_seen = (
+            await subagent_module._wait_shielded_task_to_completion(task)
+        )
+        return cancellation_seen, task.result()
+
+    assert asyncio.run(scenario()) == (True, "committed")
+
+
 class _FakeAtomicChats:
     """Stand-in for the Chats async proxy that runs the mutator against a single
     shared message dict (read-mutate-write), mirroring update_message_fields_atomic.
@@ -521,6 +588,76 @@ def test_upsert_skips_local_chat(monkeypatch):
     assert "subagent_runs" not in fake.message
 
 
+def test_upsert_never_reports_uncommitted_mutator_state_as_durable(monkeypatch):
+    class FailedWriter:
+        async def update_message_subagent_run_atomic(
+            self, _chat_id, _message_id, _entry_key, mutator
+        ):
+            # The mutator runs and fills its in-memory holder, but the DB layer
+            # reports no committed patch (missing row / failed commit).
+            mutator({})
+            return None
+
+    monkeypatch.setattr(subagent_module, "Chats", FailedWriter())
+    out = asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1",
+            "pm1",
+            "sa1",
+            {"subagent_id": "sa1", "status": "running"},
+            sync_placeholder=False,
+        )
+    )
+    assert out is None
+
+
+def test_rerun_claim_cas_is_idempotent_only_for_its_own_generation(monkeypatch):
+    fake = _FakeAtomicChats(
+        {
+            "subagent_runs": {
+                "sa1": {
+                    "subagent_id": "sa1",
+                    "status": "running",
+                    "rerun_id": "generation-1",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(subagent_module, "Chats", fake)
+
+    same = asyncio.run(
+        subagent_module._upsert_subagent_run(
+            "pc1",
+            "pm1",
+            "sa1",
+            {
+                "status": "running",
+                "rerun": True,
+                "rerun_id": "generation-1",
+            },
+            sync_placeholder=False,
+            cas_block_if_running=True,
+        )
+    )
+    assert same["rerun_id"] == "generation-1"
+
+    with pytest.raises(subagent_module.SubagentRerunBlockedError):
+        asyncio.run(
+            subagent_module._upsert_subagent_run(
+                "pc1",
+                "pm1",
+                "sa1",
+                {
+                    "status": "running",
+                    "rerun": True,
+                    "rerun_id": "generation-2",
+                },
+                sync_placeholder=False,
+                cas_block_if_running=True,
+            )
+        )
+
+
 def test_message_write_lock_serializes_same_key():
     """The per-(chat,message) lock must give mutual exclusion for the same key
     and run different keys concurrently."""
@@ -593,3 +730,44 @@ def test_emit_subagent_terminal_builds_cancel_event():
         )
     )
     assert captured[0]["data"]["inner_event"]["type"] == "chat:tasks:cancel"
+
+
+def test_parent_terminal_sweep_does_not_own_detached_rerun():
+    state = {
+        "subagent_runs": {
+            "inline": {
+                "subagent_id": "inline",
+                "status": "running",
+                "started_at": 10,
+            },
+            "redo": {
+                "subagent_id": "redo",
+                "status": "running",
+                "started_at": 11,
+                "rerun": True,
+                "rerun_id": "redo-generation",
+            },
+        },
+        "content_blocks": [],
+    }
+
+    async def fake_atomic(_chat_id, _message_id, mutator):
+        partial = mutator(dict(state))
+        if partial:
+            state.update(partial)
+        return partial
+
+    async def go():
+        with patch.object(
+            subagent_module.Chats,
+            "update_message_fields_atomic",
+            side_effect=fake_atomic,
+        ):
+            return await subagent_module.sweep_subagent_runs_terminal(
+                "parent-chat", "parent-message", fallback_status="cancelled"
+            )
+
+    assert asyncio.run(go()) is True
+    assert state["subagent_runs"]["inline"]["status"] == "cancelled"
+    assert state["subagent_runs"]["redo"]["status"] == "running"
+    assert state["subagent_runs"]["redo"]["rerun_id"] == "redo-generation"

@@ -1,17 +1,45 @@
+<script lang="ts" module>
+	// Lazy + cached: keeps the DataViz chunk off the first-render path while
+	// handing {#await} a stable promise (a fresh promise per render would
+	// re-enter the pending branch on every streaming re-render).
+	let dataVizModulePromise: Promise<any> | null = null;
+	const loadDataVizWidget = () =>
+		(dataVizModulePromise ??= import('$lib/components/chat/Messages/DataVizWidget.svelte'));
+</script>
+
 <script lang="ts">
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 
-	export let id = '';
-	export let block: any = {};
-	export let blockJson = '';
-	export let blockRev = '';
-	export let chatId = '';
-	export let messageId = '';
+	// Reload-time persisted auto-repair overrides for data-viz widgets, keyed by a
+	// hash of the ORIGINAL widget_code. Threaded down to any show_widget call so a
+
 	// True once the parent assistant message is terminally done / stopped /
 	// errored. The ask_user card uses it to detect an ORPHANED question (the
 	// generation ended — e.g. the user pressed Stop — while the card was still
-	// waiting) so it can disable the form instead of pretending it's live.
-	export let messageTerminated = false;
+
+	interface Props {
+		id?: string;
+		block?: any;
+		blockJson?: string;
+		blockRev?: string;
+		chatId?: string;
+		messageId?: string;
+		// widget that errored and was auto-fixed renders the working version on reload.
+		dataVizOverrides?: Record<string, string>;
+		// waiting) so it can disable the form instead of pretending it's live.
+		messageTerminated?: boolean;
+	}
+
+	let {
+		id = '',
+		block = {},
+		blockJson = '',
+		blockRev = '',
+		chatId = '',
+		messageId = '',
+		dataVizOverrides = {},
+		messageTerminated = false
+	}: Props = $props();
 
 	const subagentToolNames = new Set([
 		'subagent_launch',
@@ -19,39 +47,31 @@
 		'subagent_agent_launch'
 	]);
 
-	// Backend prefixes MCP tool names with `mcp_<8hex>_` to satisfy the
-	// OpenAI/OpenRouter 64-char function-name limit. The model still sees
-	// (and uses) the alias on the wire, but in the UI we'd rather show the
-	// real tool name. Falls through unchanged for non-MCP / non-aliased
-	// names.
-	const MCP_ALIAS_RE = /^mcp_[0-9a-f]{8}_(.+)$/;
-	const friendlyName = (name: string) => {
-		if (!name) return '';
-		const m = name.match(MCP_ALIAS_RE);
-		return m ? m[1] : name;
-	};
+	let parsedBlock: any = $state({});
+	let parsedBlockJson = $state('');
 
-	let parsedBlock: any = {};
-	let parsedBlockJson = '';
-
-	$: if (blockJson !== parsedBlockJson) {
-		parsedBlockJson = blockJson;
-		try {
-			parsedBlock = blockJson ? JSON.parse(blockJson) : {};
-		} catch {
-			parsedBlock = {};
+	$effect(() => {
+		if (blockJson !== parsedBlockJson) {
+			parsedBlockJson = blockJson;
+			try {
+				parsedBlock = blockJson ? JSON.parse(blockJson) : {};
+			} catch {
+				parsedBlock = {};
+			}
 		}
-	}
+	});
 
-	$: renderBlock = blockJson ? parsedBlock : (blockRev, block);
-	$: calls = Array.isArray(renderBlock?.content) ? renderBlock.content : [];
-	$: results = Array.isArray(renderBlock?.results) ? renderBlock.results : [];
-	let resultByCallId: Map<string, any> = new Map();
-	$: resultByCallId = new Map<string, any>(
-		results
-			.filter((result: any) => result?.tool_call_id)
-			.map((result: any) => [result.tool_call_id, result])
-	);
+	let renderBlock = $derived(blockJson ? parsedBlock : (blockRev, block));
+	let calls = $derived(Array.isArray(renderBlock?.content) ? renderBlock.content : []);
+	let results = $derived(Array.isArray(renderBlock?.results) ? renderBlock.results : []);
+	let resultByCallId: Map<string, any> = $state(new Map());
+	$effect(() => {
+		resultByCallId = new Map<string, any>(
+			results
+				.filter((result: any) => result?.tool_call_id)
+				.map((result: any) => [result.tool_call_id, result])
+		);
+	});
 
 	const getResultForCall = (call: any) => {
 		const callId = call?.id ?? call?.tool_call_id ?? '';
@@ -74,6 +94,29 @@
 	const stringifyIfNeeded = (value: any) => {
 		if (value == null) return '';
 		return typeof value === 'string' ? value : JSON.stringify(value);
+	};
+
+	// The built-in show_widget data-viz tool renders an inline sandboxed-iframe
+	// visualization (DataVizWidget) instead of a generic tool-call row. Its
+	// title / widget_code / loading_messages live in the call arguments (a JSON
+	// string per the OpenAI tool-call spec — occasionally double-encoded). These
+	// come straight from content_blocks (NOT an html-escaped attribute), so no
+	// entity-decoding is needed — just parse the JSON, tolerating both shapes and
+	// partial/streaming fragments (returns {} so the widget shows its loading
+	// state until the arguments finish streaming).
+	const isShowWidget = (call: any) => (call?.function?.name ?? '') === 'show_widget';
+
+	const parseCallArguments = (call: any): Record<string, any> => {
+		const raw = call?.function?.arguments;
+		if (raw == null) return {};
+		try {
+			let value: any = raw;
+			if (typeof value === 'string') value = JSON.parse(value);
+			if (typeof value === 'string') value = JSON.parse(value);
+			return value && typeof value === 'object' ? value : {};
+		} catch {
+			return {};
+		}
 	};
 
 	const attributesForCall = (call: any) => {
@@ -100,7 +143,10 @@
 			tool_call_id: call?.id ?? call?.tool_call_id ?? '',
 			chat_id: chatId,
 			message_id: messageId,
-			name: friendlyName(name),
+			// The MCP `mcp_<8hex>_` alias is kept here on purpose: the summary layer
+			// de-aliases it for display AND uses the prefix to tell MCP tools apart
+			// from built-ins when picking a glyph.
+			name,
 			arguments: stringifyIfNeeded(call?.function?.arguments ?? ''),
 			result: result?.content ?? '',
 			result_ref: result?.result_ref ?? '',
@@ -120,10 +166,26 @@
 
 <div class="space-y-1">
 	{#each calls as call, idx (call?.id ?? call?.tool_call_id ?? idx)}
-		<Collapsible
-			id={`${id}-tool-call-${call?.id ?? call?.tool_call_id ?? idx}`}
-			attributes={attributesForCall(call)}
-			className="w-full space-y-1"
-		/>
+		{#if isShowWidget(call)}
+			{@const wargs = parseCallArguments(call)}
+			{#await loadDataVizWidget() then DataVizWidget}
+				<DataVizWidget.default
+					title={wargs.title ?? 'widget'}
+					widgetCode={wargs.widget_code ?? ''}
+					loadingMessages={Array.isArray(wargs.loading_messages) ? wargs.loading_messages : []}
+					streaming={!hasResultPayload(getResultForCall(call)) && !messageTerminated}
+					{chatId}
+					{messageId}
+					{dataVizOverrides}
+				/>
+			{/await}
+		{:else}
+			<Collapsible
+				id={`${id}-tool-call-${call?.id ?? call?.tool_call_id ?? idx}`}
+				attributes={attributesForCall(call)}
+				className="w-full space-y-1"
+				buttonClassName="w-fit max-w-full"
+			/>
+		{/if}
 	{/each}
 </div>

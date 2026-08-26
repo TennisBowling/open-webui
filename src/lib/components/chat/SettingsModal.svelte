@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext, onMount, tick } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { config, models, settings, user } from '$lib/stores';
 	import { updateUserSettings } from '$lib/apis/users';
 	import { getModels as _getModels } from '$lib/apis';
@@ -13,7 +13,6 @@
 	import Interface from './Settings/Interface.svelte';
 	import Audio from './Settings/Audio.svelte';
 	import DataControls from './Settings/DataControls.svelte';
-	import Personalization from './Settings/Personalization.svelte';
 	import Search from '../icons/Search.svelte';
 	import XMark from '../icons/XMark.svelte';
 	import Connections from './Settings/Connections.svelte';
@@ -25,19 +24,16 @@
 	import SoundHigh from '../icons/SoundHigh.svelte';
 	import InfoCircle from '../icons/InfoCircle.svelte';
 	import WrenchAlt from '../icons/WrenchAlt.svelte';
-	import Face from '../icons/Face.svelte';
 	import AppNotification from '../icons/AppNotification.svelte';
 	import UserBadgeCheck from '../icons/UserBadgeCheck.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let show = false;
-
-	$: if (show) {
-		addScrollListener();
-	} else {
-		removeScrollListener();
+	interface Props {
+		show?: boolean;
 	}
+
+	let { show = $bindable(false) }: Props = $props();
 
 	interface SettingsTab {
 		id: string;
@@ -233,28 +229,6 @@
 			]
 		},
 
-		{
-			id: 'personalization',
-			title: 'Personalization',
-			keywords: [
-				'account preferences',
-				'account settings',
-				'accountpreferences',
-				'accountsettings',
-				'custom settings',
-				'customsettings',
-				'experimental',
-				'memories',
-				'memory',
-				'personalization',
-				'personalize',
-				'personal settings',
-				'personalsettings',
-				'profile',
-				'user preferences',
-				'userpreferences'
-			]
-		},
 		{
 			id: 'audio',
 			title: 'Audio',
@@ -469,10 +443,11 @@
 	];
 
 	let availableSettings = [];
-	let filteredSettings = [];
+	let filteredSettings = $state([]);
 
-	let search = '';
+	let search = $state('');
 	let searchDebounceTimeout;
+	let settingsSaveQueue: Promise<void> = Promise.resolve();
 
 	const getAvailableSettings = () => {
 		return allSettings.filter((tab) => {
@@ -518,10 +493,40 @@
 	};
 
 	const saveSettings = async (updated) => {
-		console.log(updated);
-		await settings.set({ ...$settings, ...updated });
-		await models.set(await getModels());
-		await updateUserSettings(localStorage.token, { ui: $settings });
+		const directConnectionsChanged =
+			'directConnections' in updated &&
+			JSON.stringify(updated.directConnections) !== JSON.stringify($settings?.directConnections);
+		settings.set({ ...$settings, ...updated });
+
+		const persist = async () => {
+			try {
+				// Only direct-connection changes can alter the model list — every other
+				// settings toggle was refetching the whole /api/models for nothing.
+				if (directConnectionsChanged) {
+					models.set(await getModels());
+				}
+				const savedSettings = await updateUserSettings(localStorage.token, { ui: $settings });
+				if (!savedSettings) {
+					throw new Error($i18n.t('The server did not confirm the settings update.'));
+				}
+				return true;
+			} catch (error) {
+				const detail = error?.detail ?? error?.message ?? `${error}`;
+				toast.error(
+					$i18n.t('Failed to save settings: {{error}}', {
+						error: detail
+					})
+				);
+				return false;
+			}
+		};
+
+		// Settings switches autosave and can be clicked in quick succession.
+		// Serialize persistence so an older, slower request cannot overwrite a
+		// newer local state on the server.
+		const task = settingsSaveQueue.then(persist, persist);
+		settingsSaveQueue = task.then(() => undefined);
+		return await task;
 	};
 
 	const getModels = async () => {
@@ -531,7 +536,7 @@
 		);
 	};
 
-	let selectedTab = 'general';
+	let selectedTab = $state('general');
 
 	// Function to handle sideways scrolling
 	const scrollHandler = (event) => {
@@ -567,20 +572,27 @@
 			setFilteredSettings();
 		});
 	});
+	$effect(() => {
+		if (show) {
+			addScrollListener();
+		} else {
+			removeScrollListener();
+		}
+	});
 </script>
 
 <Modal size="xl" bind:show>
 	<div class="text-gray-700 dark:text-gray-100 mx-1">
-		<div class=" flex justify-between dark:text-gray-300 px-4 md:px-4.5 pt-4.5 pb-0.5 md:pb-2.5">
+		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-0.5">
 			<div class=" text-lg font-medium self-center">{$i18n.t('Settings')}</div>
 			<button
 				aria-label={$i18n.t('Close settings modal')}
-				class="self-center"
-				on:click={() => {
+				class="tap-target self-center p-1 rounded-full text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+				onclick={() => {
 					show = false;
 				}}
 			>
-				<XMark className="w-5 h-5"></XMark>
+				<XMark className="size-5"></XMark>
 			</button>
 		</div>
 
@@ -606,7 +618,7 @@
 								${($settings?.highContrastMode ?? false) ? 'placeholder-gray-800' : ''}`}
 						bind:value={search}
 						id="search-input-settings-modal"
-						on:input={searchDebounceHandler}
+						oninput={searchDebounceHandler}
 						placeholder={$i18n.t('Search')}
 					/>
 				</div>
@@ -617,7 +629,7 @@
 								role="tab"
 								aria-controls="tab-general"
 								aria-selected={selectedTab === 'general'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'general'
 										? ($settings?.highContrastMode ?? false)
@@ -627,7 +639,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'general';
 								}}
 							>
@@ -641,7 +653,7 @@
 								role="tab"
 								aria-controls="tab-interface"
 								aria-selected={selectedTab === 'interface'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'interface'
 										? ($settings?.highContrastMode ?? false)
@@ -651,7 +663,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'interface';
 								}}
 							>
@@ -666,7 +678,7 @@
 									role="tab"
 									aria-controls="tab-connections"
 									aria-selected={selectedTab === 'connections'}
-									class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+									class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'connections'
 										? ($settings?.highContrastMode ?? false)
@@ -676,7 +688,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-									on:click={() => {
+									onclick={() => {
 										selectedTab = 'connections';
 									}}
 								>
@@ -692,7 +704,7 @@
 									role="tab"
 									aria-controls="tab-tools"
 									aria-selected={selectedTab === 'tools'}
-									class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+									class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'tools'
 										? ($settings?.highContrastMode ?? false)
@@ -702,7 +714,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-									on:click={() => {
+									onclick={() => {
 										selectedTab = 'tools';
 									}}
 								>
@@ -712,36 +724,12 @@
 									<div class=" self-center">{$i18n.t('External Tools')}</div>
 								</button>
 							{/if}
-						{:else if tabId === 'personalization'}
-							<button
-								role="tab"
-								aria-controls="tab-personalization"
-								aria-selected={selectedTab === 'personalization'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
-								${
-									selectedTab === 'personalization'
-										? ($settings?.highContrastMode ?? false)
-											? 'dark:bg-gray-800 bg-gray-200'
-											: ''
-										: ($settings?.highContrastMode ?? false)
-											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
-											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
-								}`}
-								on:click={() => {
-									selectedTab = 'personalization';
-								}}
-							>
-								<div class=" self-center mr-2">
-									<Face strokeWidth="2" />
-								</div>
-								<div class=" self-center">{$i18n.t('Personalization')}</div>
-							</button>
 						{:else if tabId === 'audio'}
 							<button
 								role="tab"
 								aria-controls="tab-audio"
 								aria-selected={selectedTab === 'audio'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'audio'
 										? ($settings?.highContrastMode ?? false)
@@ -751,7 +739,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'audio';
 								}}
 							>
@@ -765,7 +753,7 @@
 								role="tab"
 								aria-controls="tab-data-controls"
 								aria-selected={selectedTab === 'data_controls'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'data_controls'
 										? ($settings?.highContrastMode ?? false)
@@ -775,7 +763,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'data_controls';
 								}}
 							>
@@ -789,7 +777,7 @@
 								role="tab"
 								aria-controls="tab-account"
 								aria-selected={selectedTab === 'account'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'account'
 										? ($settings?.highContrastMode ?? false)
@@ -799,7 +787,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'account';
 								}}
 							>
@@ -813,7 +801,7 @@
 								role="tab"
 								aria-controls="tab-about"
 								aria-selected={selectedTab === 'about'}
-								class={`px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
+								class={`px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none flex text-left transition
 								${
 									selectedTab === 'about'
 										? ($settings?.highContrastMode ?? false)
@@ -823,7 +811,7 @@
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'
 								}`}
-								on:click={() => {
+								onclick={() => {
 									selectedTab = 'about';
 								}}
 							>
@@ -842,10 +830,10 @@
 				{#if $user?.role === 'admin'}
 					<a
 						href="/admin/settings"
-						class="px-0.5 md:px-2.5 py-1 min-w-fit rounded-xl flex-1 md:flex-none md:mt-auto flex text-left transition {$settings?.highContrastMode
+						class="px-0.5 md:px-2.5 py-1 max-md:py-2 min-w-fit rounded-xl flex-1 md:flex-none md:mt-auto flex text-left transition {$settings?.highContrastMode
 							? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 							: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'}"
-						on:click={async (e) => {
+						onclick={async (e) => {
 							e.preventDefault();
 							await goto('/admin/settings');
 							show = false;
@@ -858,47 +846,42 @@
 					</a>
 				{/if}
 			</div>
-			<div class="flex-1 px-3.5 md:pl-0 md:pr-4.5 md:min-h-[36rem] max-h-[36rem]">
+			<div class="flex-1 min-w-0 px-3.5 md:pl-0 md:pr-4.5 md:min-h-[36rem] max-h-[36rem]">
 				{#if selectedTab === 'general'}
 					<General
 						{getModels}
 						{saveSettings}
-						on:save={() => {
+						onsave={() => {
 							toast.success($i18n.t('Settings saved successfully!'));
 						}}
 					/>
 				{:else if selectedTab === 'interface'}
 					<Interface
 						{saveSettings}
-						on:save={() => {
+						onsave={() => {
 							toast.success($i18n.t('Settings saved successfully!'));
 						}}
 					/>
 				{:else if selectedTab === 'connections'}
 					<Connections
 						saveSettings={async (updated) => {
-							await saveSettings(updated);
-							toast.success($i18n.t('Settings saved successfully!'));
+							if (await saveSettings(updated)) {
+								toast.success($i18n.t('Settings saved successfully!'));
+							}
 						}}
 					/>
 				{:else if selectedTab === 'tools'}
 					<Tools
 						saveSettings={async (updated) => {
-							await saveSettings(updated);
-							toast.success($i18n.t('Settings saved successfully!'));
-						}}
-					/>
-				{:else if selectedTab === 'personalization'}
-					<Personalization
-						{saveSettings}
-						on:save={() => {
-							toast.success($i18n.t('Settings saved successfully!'));
+							if (await saveSettings(updated)) {
+								toast.success($i18n.t('Settings saved successfully!'));
+							}
 						}}
 					/>
 				{:else if selectedTab === 'audio'}
 					<Audio
 						{saveSettings}
-						on:save={() => {
+						onsave={() => {
 							toast.success($i18n.t('Settings saved successfully!'));
 						}}
 					/>

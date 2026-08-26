@@ -11,6 +11,12 @@
 			label: $i18n.t('Vision'),
 			description: $i18n.t('Model accepts image inputs')
 		},
+		video: {
+			label: $i18n.t('Video'),
+			description: $i18n.t(
+				'Model accepts video inputs.\nLeave unchecked to auto-detect from the provider’s reported input modalities; check it to force video on for a model the provider has not tagged.'
+			)
+		},
 		file_upload: {
 			label: $i18n.t('File Upload'),
 			description: $i18n.t('Model accepts file inputs')
@@ -39,15 +45,39 @@
 		}
 	};
 
-	export let capabilities: {
-		vision?: boolean;
-		file_upload?: boolean;
-		web_search?: boolean;
-		image_generation?: boolean;
-		usage?: boolean;
-		citations?: boolean;
-		status_updates?: boolean;
-	} = {};
+	interface Props {
+		capabilities?: {
+			vision?: boolean;
+			video?: boolean;
+			file_upload?: boolean;
+			web_search?: boolean;
+			image_generation?: boolean;
+			usage?: boolean;
+			citations?: boolean;
+			status_updates?: boolean;
+		};
+		/**
+		 * Capabilities the provider already reports (e.g. video, from OpenRouter's
+		 * input modalities). Used only for display: a box with no explicit value
+		 * shows the detected state, so the UI never claims a model lacks a
+		 * capability it demonstrably has. Ticking or unticking still writes an
+		 * explicit override, which wins everywhere.
+		 */
+		autoDetected?: Record<string, boolean>;
+	}
+
+	let { capabilities = $bindable({}), autoDetected = {} }: Props = $props();
+
+	const effectiveState = (capability: string) => {
+		const explicit = capabilities[capability];
+		if (explicit !== undefined && explicit !== null) return !!explicit;
+		return !!autoDetected[capability];
+	};
+
+	// True when the box is only ticked because the provider says so.
+	const isInherited = (capability: string) =>
+		(capabilities[capability] === undefined || capabilities[capability] === null) &&
+		!!autoDetected[capability];
 </script>
 
 <div>
@@ -58,14 +88,21 @@
 		{#each Object.keys(capabilityLabels) as capability}
 			<div class=" flex items-center gap-2 mr-3">
 				<Checkbox
-					state={capabilities[capability] ? 'checked' : 'unchecked'}
-					on:change={(e) => {
-						capabilities[capability] = e.detail === 'checked';
+					state={effectiveState(capability) ? 'checked' : 'unchecked'}
+					onchange={(state) => {
+						capabilities[capability] = state === 'checked';
 					}}
 				/>
 
 				<div class=" py-0.5 text-sm capitalize">
-					<Tooltip content={marked.parse(capabilityLabels[capability].description)}>
+					<Tooltip
+						content={marked.parse(
+							capabilityLabels[capability].description +
+								(isInherited(capability)
+									? '\n\n' + $i18n.t('Detected automatically from the provider.')
+									: '')
+						)}
+					>
 						{$i18n.t(capabilityLabels[capability].label)}
 					</Tooltip>
 				</div>

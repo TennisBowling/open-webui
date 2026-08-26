@@ -3,8 +3,7 @@ import { convertOpenApiToToolPayload } from '$lib/utils';
 import { readLocalStorageCache, writeLocalStorageCache } from '$lib/utils/cache';
 import { getOpenAIModelsDirect } from './openai';
 
-import { parse } from 'yaml';
-import { toast } from 'svelte-sonner';
+import { toast } from '$lib/utils/toast';
 
 type DirectConnections = {
 	OPENAI_API_BASE_URLS?: string[];
@@ -238,47 +237,6 @@ export const getModels = async (
 	return request;
 };
 
-type ChatCompletedForm = {
-	model: string;
-	messages: string[];
-	chat_id: string;
-	session_id: string;
-};
-
-/** @deprecated Backend runs outlet filters at the tail of process_chat_response; no client-side completion ping is required. */
-export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
-	let error = null;
-
-	const res = await fetch(`${WEBUI_BASE_URL}/api/chat/completed`, {
-		method: 'POST',
-		headers: {
-			Accept: 'application/json',
-			'Content-Type': 'application/json',
-			...(token && { authorization: `Bearer ${token}` })
-		},
-		body: JSON.stringify(body)
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			console.error(err);
-			if ('detail' in err) {
-				error = err.detail;
-			} else {
-				error = err;
-			}
-			return null;
-		});
-
-	if (error) {
-		throw error;
-	}
-
-	return res;
-};
-
 type ChatActionForm = {
 	model: string;
 	messages: string[];
@@ -318,39 +276,47 @@ export const chatAction = async (token: string, action_id: string, body: ChatAct
 	return res;
 };
 
-export const stopTask = async (token: string, id: string) => {
+export const stopChatGenerations = async (
+	token: string,
+	chatId: string,
+	body: {
+		generations: Array<{
+			generation_id: string;
+			message_id: string;
+			turn_id: string;
+		}>;
+		// Opt-in: also cancel the chat's detached subagent redos, which own task
+		// registry entries outside the generation registry. The composer's Stop
+		// sets this ("halt this chat"); narrowly-scoped callers must not.
+		include_subagent_reruns?: boolean;
+	}
+) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/tasks/stop/${id}`, {
+	const res = await fetch(`${WEBUI_BASE_URL}/api/tasks/stop/chat/${chatId}`, {
 		method: 'POST',
 		headers: {
 			Accept: 'application/json',
 			'Content-Type': 'application/json',
 			...(token && { authorization: `Bearer ${token}` })
-		}
+		},
+		body: JSON.stringify(body)
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
+		.then(async (response) => {
+			if (!response.ok) throw await response.json();
+			return response.json();
 		})
 		.catch((err) => {
 			console.error(err);
-			if ('detail' in err) {
-				error = err.detail;
-			} else {
-				error = err;
-			}
+			error = err && typeof err === 'object' && 'detail' in err ? err.detail : err;
 			return null;
 		});
 
-	if (error) {
-		throw error;
-	}
-
+	if (error) throw error;
 	return res;
 };
 
-export const getTaskIdsByChatId = async (token: string, chat_id: string) => {
+export const getChatWorkState = async (token: string, chat_id: string) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_BASE_URL}/api/tasks/chat/${chat_id}`, {
@@ -460,12 +426,14 @@ export const getStreamDeltas = async (
 	token: string,
 	message_id: string,
 	chat_id?: string | null,
-	after_version: number = 0
+	after_version: number = 0,
+	run?: number | null
 ) => {
 	let error = null;
 	const params = new URLSearchParams();
 	if (chat_id) params.set('chat_id', chat_id);
 	params.set('after_version', `${Math.max(0, after_version || 0)}`);
+	if (typeof run === 'number' && run > 0) params.set('run', `${run}`);
 	const query = params.toString();
 
 	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/streams/${message_id}/deltas?${query}`, {
@@ -544,6 +512,9 @@ export const getToolServerData = async (token: string, url: string) => {
 			if (url.toLowerCase().endsWith('.yaml') || url.toLowerCase().endsWith('.yml')) {
 				if (!res.ok) throw await res.text();
 				const text = await res.text();
+				// Lazy-load the yaml parser — only YAML tool-server specs need it,
+				// so it stays off the cold-load critical path.
+				const { parse } = await import('yaml');
 				return parse(text);
 			} else {
 				if (!res.ok) throw await res.json();
@@ -580,81 +551,95 @@ export const getToolServersData = async (
 	const cacheKey = getToolServerRequestKey(servers, options.cacheUserId ?? null);
 	const useCache = options.useCache ?? true;
 
+	const enabledServers = servers.filter((server) => server?.config?.enable);
+
+	// The icon is presentation-only connection config, so it deliberately stays
+	// OUT of both the cache key and the cached payload — otherwise changing an
+	// icon would re-fetch every OpenAPI spec. It's re-applied on the way out
+	// instead, matched by `idx` (the position in the enabled subset, which the
+	// cache key already pins).
+	const withIcons = (data: any[]) =>
+		data.map((entry) =>
+			entry && typeof entry.idx === 'number'
+				? { ...entry, icon: enabledServers[entry.idx]?.info?.icon ?? null }
+				: entry
+		);
+
 	if (useCache && !options.force) {
 		const cachedToolServers = readLocalStorageCache<any[]>(TOOL_SERVERS_CACHE_KEY, cacheKey);
 		if (Array.isArray(cachedToolServers)) {
-			return cachedToolServers;
+			return withIcons(cachedToolServers);
 		}
 	}
 
 	const pendingRequest = pendingToolServerRequests.get(cacheKey);
 	if (pendingRequest && !options.force) {
-		return pendingRequest;
+		return withIcons(await pendingRequest);
 	}
 
 	const request = (async () => {
 		const toolServersData = (
 			await Promise.all(
-				servers
-					.filter((server) => server?.config?.enable)
-					.map(async (server) => {
-						let error = null;
+				enabledServers.map(async (server, idx) => {
+					let error = null;
 
-						let toolServerToken = null;
+					let toolServerToken = null;
 
-						const auth_type = server?.auth_type ?? 'bearer';
-						if (auth_type === 'bearer') {
-							toolServerToken = server?.key;
-						} else if (auth_type === 'none') {
-							// No authentication
-						} else if (auth_type === 'session') {
-							toolServerToken = localStorage.token;
-						}
+					const auth_type = server?.auth_type ?? 'bearer';
+					if (auth_type === 'bearer') {
+						toolServerToken = server?.key;
+					} else if (auth_type === 'none') {
+						// No authentication
+					} else if (auth_type === 'session') {
+						toolServerToken = localStorage.token;
+					}
 
-						let res = null;
-						const specType = server?.spec_type ?? 'url';
+					let res = null;
+					const specType = server?.spec_type ?? 'url';
 
-						if (specType === 'url') {
-							res = await getToolServerData(
-								toolServerToken,
-								(server?.path ?? '').includes('://')
-									? server?.path
-									: `${server?.url}${(server?.path ?? '').startsWith('/') ? '' : '/'}${server?.path}`
-							).catch((err) => {
-								error = err;
-								return null;
-							});
-						} else if ((specType === 'json' && server?.spec) ?? null) {
-							try {
-								res = JSON.parse(server?.spec);
-							} catch (e) {
-								error = 'Failed to parse JSON spec';
-							}
-						}
-
-						if (res) {
-							const { openapi, info, specs } = {
-								openapi: res,
-								info: res.info,
-								specs: convertOpenApiToToolPayload(res)
-							};
-
-							return {
-								id: server?.id,
-								url: server?.url,
-								openapi: openapi,
-								info: info,
-								specs: specs
-							};
-						} else if (error) {
-							return {
-								error,
-								url: server?.url
-							};
-						} else {
+					if (specType === 'url') {
+						res = await getToolServerData(
+							toolServerToken,
+							(server?.path ?? '').includes('://')
+								? server?.path
+								: `${server?.url}${(server?.path ?? '').startsWith('/') ? '' : '/'}${server?.path}`
+						).catch((err) => {
+							error = err;
 							return null;
+						});
+					} else if ((specType === 'json' && server?.spec) ?? null) {
+						try {
+							res = JSON.parse(server?.spec);
+						} catch (e) {
+							error = 'Failed to parse JSON spec';
 						}
-					})
+					}
+
+					if (res) {
+						const { openapi, info, specs } = {
+							openapi: res,
+							info: res.info,
+							specs: convertOpenApiToToolPayload(res)
+						};
+
+						return {
+							id: server?.id,
+							url: server?.url,
+							idx,
+							openapi: openapi,
+							info: info,
+							specs: specs
+						};
+					} else if (error) {
+						return {
+							error,
+							url: server?.url,
+							idx
+						};
+					} else {
+						return null;
+					}
+				})
 			)
 		).filter((server) => server);
 
@@ -673,7 +658,7 @@ export const getToolServersData = async (
 
 	pendingToolServerRequests.set(cacheKey, request);
 	try {
-		return await request;
+		return withIcons(await request);
 	} finally {
 		if (pendingToolServerRequests.get(cacheKey) === request) {
 			pendingToolServerRequests.delete(cacheKey);
@@ -1272,9 +1257,9 @@ export const generateMoACompletion = async (
 	token: string = '',
 	model: string,
 	prompt: string,
-	responses: string[]
+	responses: string[],
+	controller: AbortController = new AbortController()
 ) => {
-	const controller = new AbortController();
 	let error = null;
 
 	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/moa/completions`, {
@@ -1633,23 +1618,32 @@ export type BootstrapInclude =
 	| 'tags'
 	| 'pinned'
 	| 'chats'
-	| 'channels';
+	| 'channels'
+	| 'subscription_usage';
 
 export type BootstrapResponse = {
 	components: Partial<Record<BootstrapInclude, any>>;
 	components_etags: Partial<Record<BootstrapInclude, string>>;
 	bundle_etag: string;
-	status: 200 | 304;
+	// Contract 1: names the server omitted from `components` because the client's
+	// x-bootstrap-etags map already had a matching etag. Absent on responses from
+	// an older server / when no header was sent (full body, backward-safe).
+	unchanged?: string[];
+	status: 200 | 304 | 401;
 };
 
 export const getBootstrap = async (
 	token: string,
 	{
 		include,
-		ifNoneMatch
+		ifNoneMatch,
+		bootstrapEtags
 	}: {
 		include: BootstrapInclude[];
 		ifNoneMatch?: string | null;
+		// Contract 1: compact JSON object (or pre-serialized string) mapping
+		// component name -> the etag the client already has cached.
+		bootstrapEtags?: Record<string, string> | string | null;
 	}
 ): Promise<BootstrapResponse | null> => {
 	const params = new URLSearchParams({ include: include.join(',') });
@@ -1660,49 +1654,83 @@ export const getBootstrap = async (
 	if (token) headers.authorization = `Bearer ${token}`;
 	if (ifNoneMatch) headers['If-None-Match'] = ifNoneMatch;
 
-	let res: Response;
-	try {
-		res = await fetch(`${WEBUI_BASE_URL}/api/bootstrap?${params.toString()}`, {
-			method: 'GET',
-			credentials: 'include',
-			headers
-		});
-	} catch (err) {
-		console.error('getBootstrap network error', err);
-		return null;
-	}
+	const etagsHeader =
+		typeof bootstrapEtags === 'string'
+			? bootstrapEtags
+			: bootstrapEtags && Object.keys(bootstrapEtags).length > 0
+				? JSON.stringify(bootstrapEtags)
+				: null;
+	if (etagsHeader) headers['x-bootstrap-etags'] = etagsHeader;
 
-	if (res.status === 304) {
-		return {
-			components: {},
-			components_etags: {},
-			bundle_etag: ifNoneMatch ?? '',
-			status: 304
-		};
-	}
-
-	// 404/405: backend bootstrap endpoint not deployed yet — callers fall back to per-component GETs.
-	if (res.status === 404 || res.status === 405) {
-		return null;
-	}
-
-	if (!res.ok) {
+	// One attempt: returns {result, retry}. `retry` is only set for transient
+	// failures (network error / 5xx); 404/405 (endpoint absent) and 401 (auth)
+	// are terminal.
+	const attempt = async (): Promise<{ result: BootstrapResponse | null; retry: boolean }> => {
+		let res: Response;
 		try {
-			const err = await res.json();
-			console.error('getBootstrap error', err);
-		} catch {
-			console.error('getBootstrap http error', res.status);
+			res = await fetch(`${WEBUI_BASE_URL}/api/bootstrap?${params.toString()}`, {
+				method: 'GET',
+				credentials: 'include',
+				headers
+			});
+		} catch (err) {
+			console.error('getBootstrap network error', err);
+			return { result: null, retry: true };
 		}
-		return null;
-	}
 
-	const body = await res.json();
-	return {
-		components: body?.components ?? {},
-		components_etags: body?.components_etags ?? {},
-		bundle_etag: body?.bundle_etag ?? '',
-		status: 200
+		if (res.status === 304) {
+			return {
+				result: {
+					components: {},
+					components_etags: {},
+					bundle_etag: ifNoneMatch ?? '',
+					status: 304
+				},
+				retry: false
+			};
+		}
+
+		if (res.status === 401) {
+			return {
+				result: { components: {}, components_etags: {}, bundle_etag: '', status: 401 },
+				retry: false
+			};
+		}
+
+		// 404/405: backend bootstrap endpoint not deployed yet — callers fall back to per-component GETs.
+		if (res.status === 404 || res.status === 405) {
+			return { result: null, retry: false };
+		}
+
+		if (!res.ok) {
+			try {
+				const err = await res.json();
+				console.error('getBootstrap error', err);
+			} catch {
+				console.error('getBootstrap http error', res.status);
+			}
+			return { result: null, retry: res.status >= 500 };
+		}
+
+		const body = await res.json();
+		return {
+			result: {
+				components: body?.components ?? {},
+				components_etags: body?.components_etags ?? {},
+				bundle_etag: body?.bundle_etag ?? '',
+				unchanged: Array.isArray(body?.unchanged) ? body.unchanged : undefined,
+				status: 200
+			},
+			retry: false
+		};
 	};
+
+	let { result, retry } = await attempt();
+	if (result === null && retry) {
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		({ result } = await attempt());
+	}
+	return result;
 };
 
 export const getBackendConfig = async () => {
@@ -1993,8 +2021,28 @@ export interface ModelConfig {
 	params: ModelParams;
 }
 
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ExtraReasoningEffort = Exclude<ReasoningEffort, 'low' | 'medium' | 'high'>;
+
+/**
+ * A reasoning-effort descriptor discovered from an upstream provider
+ * (OpenRouter). Attached to a resolved model as a top-level `reasoning` field,
+ * and snapshotted into `ModelReasoningConfig.discovery` when an admin saves.
+ */
+export interface DiscoveredReasoning {
+	/** Effort values the model accepts, ascending by strength. */
+	supported_efforts?: ReasoningEffort[];
+	/** Provider-suggested default effort. */
+	default_effort?: ReasoningEffort;
+	/** Whether reasoning is on by default when unset. */
+	default_enabled?: boolean;
+	/** Reasoning cannot be disabled — never offer "none". */
+	mandatory?: boolean;
+	/** Model supports a token-budget control instead of / alongside effort. */
+	supports_max_tokens?: boolean;
+	/** Marker that the model reasons even when no effort granularity is exposed. */
+	is_reasoning?: boolean;
+}
 
 export interface ModelReasoningConfig {
 	/**
@@ -2006,9 +2054,28 @@ export interface ModelReasoningConfig {
 
 	/**
 	 * Extra reasoning effort strings supported by some providers/models.
-	 * Base efforts (low/medium/high) are assumed.
+	 * Base efforts (low/medium/high) are assumed. Legacy — superseded by
+	 * `supported_efforts` on newer saves.
 	 */
 	extra_efforts?: ExtraReasoningEffort[];
+
+	/**
+	 * Authoritative allowed effort set (manual override). When present, this
+	 * exact set is offered in the chat effort selector, ignoring base/extra.
+	 */
+	supported_efforts?: ReasoningEffort[];
+
+	/** Preferred default effort (from discovery or admin). */
+	default_effort?: ReasoningEffort;
+
+	/** Reasoning cannot be disabled for this model. */
+	mandatory?: boolean;
+
+	/** How `supported_efforts` was chosen: automatic (discovery) or manual. */
+	source?: 'auto' | 'manual';
+
+	/** Last discovered snapshot, kept for the admin UI + as a fallback. */
+	discovery?: DiscoveredReasoning;
 }
 
 export interface ModelMeta {
@@ -2150,6 +2217,177 @@ export const updateDataVizConfig = async (token: string, config: object) => {
 			...(token && { authorization: `Bearer ${token}` })
 		},
 		body: JSON.stringify(config)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getChatEmbeddingConfig = async (token: string = '') => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const updateChatEmbeddingConfig = async (token: string, config: object) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify(config)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const verifyChatEmbeddingConnection = async (token: string, config: object) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding/verify`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify(config)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			// Surface the backend's detail string so the caller's toast is meaningful.
+			error = err?.detail ?? err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getChatEmbeddingStats = async (token: string = '') => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding/stats`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const rebuildChatEmbeddings = async (token: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding/rebuild`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const retryFailedChatEmbeddings = async (token: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/configs/chat_embedding/retry_failed`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

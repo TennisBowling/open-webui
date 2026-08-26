@@ -201,6 +201,15 @@ async def get_tools(
                     tools_dict[tool_name] = tool_spec
             continue
 
+        # Handle built-in video viewing tool. Auto-enabled by the chat
+        # middleware only when the selected model accepts video input.
+        if tool_id == "builtin:view_video":
+            view_video_tools = get_view_video_tool_specs(extra_params)
+            if view_video_tools:
+                for tool_name, tool_spec in view_video_tools.items():
+                    tools_dict[tool_name] = tool_spec
+            continue
+
         # Handle built-in data visualization tool
         if tool_id == "builtin:data_viz":
             data_viz_tools = get_data_viz_tool_specs(extra_params)
@@ -209,11 +218,30 @@ async def get_tools(
                     tools_dict[tool_name] = tool_spec
             continue
 
+        # Handle built-in automations tools (schedule work to run later)
+        if tool_id == "builtin:automations":
+            automations_tools = get_automations_tool_specs(extra_params)
+            if automations_tools:
+                for tool_name, tool_spec in automations_tools.items():
+                    tools_dict[tool_name] = tool_spec
+            continue
+
         # Handle built-in subagent tools (subagent_launch, subagent_continue)
         if tool_id == "builtin:subagent":
             subagent_tools = get_subagent_tool_specs(extra_params)
             if subagent_tools:
                 for tool_name, tool_spec in subagent_tools.items():
+                    tools_dict[tool_name] = tool_spec
+            continue
+
+        # Handle the built-in read_tool_result tool (read back a tool output that
+        # conversation compaction summarized away). Auto-enabled by the chat
+        # middleware only when the assembled conversation already carries a
+        # <compacted_context> envelope.
+        if tool_id == "builtin:read_tool_result":
+            read_tool_result_tools = get_read_tool_result_tool_specs(extra_params)
+            if read_tool_result_tools:
+                for tool_name, tool_spec in read_tool_result_tools.items():
                     tools_dict[tool_name] = tool_spec
             continue
 
@@ -544,6 +572,36 @@ def get_functions_from_tool(tool: object) -> list[Callable]:
             getattr(tool, func)
         )  # ensures that the callable is not a class itself, just a method or function.
     ]
+
+
+def _prune_tool_schema(spec_map: dict) -> None:
+    """Shrink builtin tool specs in place before they go into every request's
+    tools array: drop runtime-injected ``__magic__`` params (the parent model
+    never fills these) and strip ``title`` keys (pydantic auto-generates one
+    per field/def from the field name; models use the property name and
+    description, never the title, so it's pure token overhead)."""
+
+    def strip_titles(node):
+        if isinstance(node, dict):
+            node.pop("title", None)
+            for v in node.values():
+                strip_titles(v)
+        elif isinstance(node, list):
+            for v in node:
+                strip_titles(v)
+
+    for spec in spec_map.values():
+        target = spec.get("function", spec)
+        params = target.get("parameters", {})
+        properties = params.get("properties", {}) or {}
+        target["parameters"]["properties"] = {
+            k: v for k, v in properties.items() if not k.startswith("__")
+        }
+        if "required" in params:
+            target["parameters"]["required"] = [
+                r for r in params["required"] if not r.startswith("__")
+            ]
+        strip_titles(target["parameters"])
 
 
 def get_tool_specs(tool_module: object) -> list[dict]:
@@ -1060,17 +1118,7 @@ def get_view_image_tool_specs(extra_params: dict) -> dict:
         if name:
             spec_map[name] = spec
 
-    for spec in spec_map.values():
-        target = spec.get("function", spec)
-        params = target.get("parameters", {})
-        properties = params.get("properties", {}) or {}
-        target["parameters"]["properties"] = {
-            k: v for k, v in properties.items() if not k.startswith("__")
-        }
-        if "required" in params:
-            target["parameters"]["required"] = [
-                r for r in params["required"] if not r.startswith("__")
-            ]
+    _prune_tool_schema(spec_map)
 
     if "view_image" not in spec_map:
         return {}
@@ -1084,6 +1132,102 @@ def get_view_image_tool_specs(extra_params: dict) -> dict:
             "name": "view_image",
             "spec": spec_map["view_image"],
             "callable": callable_view_image,
+            "metadata": {"parallelizable": True},
+        }
+    }
+
+
+def get_view_video_tool_specs(extra_params: dict) -> dict:
+    """
+    Generate the built-in view_video tool spec.
+
+    Args:
+        extra_params: Extra parameters to inject (__request__, __user__, etc.)
+    """
+    from open_webui.utils.view_video_tool import get_view_video_tools_instance
+
+    tool_instance = get_view_video_tools_instance()
+    specs = get_tool_specs(tool_instance)
+
+    if not specs:
+        return {}
+
+    spec_map = {}
+    for spec in specs:
+        if "function" in spec:
+            name = spec["function"].get("name")
+        else:
+            name = spec.get("name")
+        if name:
+            spec_map[name] = spec
+
+    _prune_tool_schema(spec_map)
+
+    if "view_video" not in spec_map:
+        return {}
+
+    callable_view_video = get_async_tool_function_and_apply_extra_params(
+        tool_instance.view_video, extra_params
+    )
+    return {
+        "view_video": {
+            "id": "builtin:view_video",
+            "name": "view_video",
+            "spec": spec_map["view_video"],
+            "callable": callable_view_video,
+            # Downloading + transcoding is long and IO-bound; running several
+            # concurrently is a win, same as view_image.
+            "metadata": {"parallelizable": True},
+        }
+    }
+
+
+def get_read_tool_result_tool_specs(extra_params: dict) -> dict:
+    """
+    Generate the built-in read_tool_result tool spec.
+
+    The escape hatch for conversation compaction (utils/COMPACTION.md §7): the
+    compacted context's <tool_calls> index carries a ref for every tool call that
+    was summarized away, and this tool resolves one back to its full body.
+
+    Args:
+        extra_params: Extra parameters to inject (__request__, __user__, etc.)
+    """
+    from open_webui.utils.read_tool_result_tool import (
+        get_read_tool_result_tools_instance,
+    )
+
+    tool_instance = get_read_tool_result_tools_instance()
+    specs = get_tool_specs(tool_instance)
+
+    if not specs:
+        return {}
+
+    spec_map = {}
+    for spec in specs:
+        if "function" in spec:
+            name = spec["function"].get("name")
+        else:
+            name = spec.get("name")
+        if name:
+            spec_map[name] = spec
+
+    _prune_tool_schema(spec_map)
+
+    if "read_tool_result" not in spec_map:
+        return {}
+
+    callable_read = get_async_tool_function_and_apply_extra_params(
+        tool_instance.read_tool_result, extra_params
+    )
+    return {
+        "read_tool_result": {
+            "id": "builtin:read_tool_result",
+            "name": "read_tool_result",
+            "spec": spec_map["read_tool_result"],
+            "callable": callable_read,
+            # Pure reads against the message store; several refs can resolve
+            # concurrently without touching each other.
             "metadata": {"parallelizable": True},
         }
     }
@@ -1113,19 +1257,7 @@ def get_ask_user_tool_specs(extra_params: dict) -> dict:
         if name:
             spec_map[name] = spec
 
-    # Strip the injected __-prefixed params from the advertised schema so the
-    # model only sees `questions`.
-    for spec in spec_map.values():
-        target = spec.get("function", spec)
-        params = target.get("parameters", {})
-        properties = params.get("properties", {}) or {}
-        target["parameters"]["properties"] = {
-            k: v for k, v in properties.items() if not k.startswith("__")
-        }
-        if "required" in params:
-            target["parameters"]["required"] = [
-                r for r in params["required"] if not r.startswith("__")
-            ]
+    _prune_tool_schema(spec_map)
 
     if "ask_user" not in spec_map:
         return {}
@@ -1174,6 +1306,19 @@ def get_data_viz_tool_specs(extra_params: dict) -> dict:
 
     tools = {}
 
+    if "load_viz_guide" in spec_map:
+        callable_load_guide = get_async_tool_function_and_apply_extra_params(
+            tool_instance.load_viz_guide, extra_params
+        )
+        tools["load_viz_guide"] = {
+            "id": "builtin:data_viz",
+            "name": "load_viz_guide",
+            "spec": spec_map["load_viz_guide"],
+            "callable": callable_load_guide,
+            # Read-only (returns guidance text); safe to run alongside siblings.
+            "metadata": {"parallelizable": True},
+        }
+
     if "show_widget" in spec_map:
         callable_show_widget = get_async_tool_function_and_apply_extra_params(
             tool_instance.show_widget, extra_params
@@ -1184,6 +1329,66 @@ def get_data_viz_tool_specs(extra_params: dict) -> dict:
             "spec": spec_map["show_widget"],
             "callable": callable_show_widget,
             "metadata": {"parallelizable": False},
+        }
+
+    return tools
+
+
+def get_automations_tool_specs(extra_params: dict) -> dict:
+    """
+    Generate tool specs for the built-in automations tools (create/update/
+    list/delete a scheduled task). Returns a dict {tool_name: tool_dict}.
+
+    Args:
+        extra_params: Extra parameters to inject (__request__, __user__,
+            __metadata__).
+    """
+    from open_webui.utils.automations_tool import get_automation_tools_instance
+
+    tool_instance = get_automation_tools_instance()
+    specs = get_tool_specs(tool_instance)
+
+    if not specs:
+        return {}
+
+    spec_map = {}
+    for spec in specs:
+        if "function" in spec:
+            name = spec["function"].get("name")
+        else:
+            name = spec.get("name")
+        if name:
+            spec_map[name] = spec
+
+    _prune_tool_schema(spec_map)
+
+    tools: dict = {}
+
+    for name in ("create_automation", "update_automation", "delete_automation"):
+        if name in spec_map:
+            tools[name] = {
+                "id": "builtin:automations",
+                "name": name,
+                "spec": spec_map[name],
+                "callable": get_async_tool_function_and_apply_extra_params(
+                    getattr(tool_instance, name), extra_params
+                ),
+                # Mutators run serially: two calls in one round can target the
+                # same automation (create-then-update, update-then-delete), and
+                # the model's own ordering is the only thing that disambiguates.
+                "metadata": {"parallelizable": False},
+            }
+
+    if "list_automations" in spec_map:
+        tools["list_automations"] = {
+            "id": "builtin:automations",
+            "name": "list_automations",
+            "spec": spec_map["list_automations"],
+            "callable": get_async_tool_function_and_apply_extra_params(
+                tool_instance.list_automations, extra_params
+            ),
+            # Pure read; safe alongside siblings.
+            "metadata": {"parallelizable": True},
         }
 
     return tools
@@ -1222,17 +1427,7 @@ def get_subagent_tool_specs(extra_params: dict) -> dict:
     # langchain typically drops complex types like Request when emitting the
     # JSON schema, but doing it explicitly here keeps the spec clean and
     # rules out any provider that does accept the leaked field.)
-    for spec in spec_map.values():
-        target = spec.get("function", spec)
-        params = target.get("parameters", {})
-        properties = params.get("properties", {}) or {}
-        target["parameters"]["properties"] = {
-            k: v for k, v in properties.items() if not k.startswith("__")
-        }
-        if "required" in params:
-            target["parameters"]["required"] = [
-                r for r in params["required"] if not r.startswith("__")
-            ]
+    _prune_tool_schema(spec_map)
 
     tools: dict = {}
 
@@ -1259,12 +1454,13 @@ def get_subagent_tool_specs(extra_params: dict) -> dict:
             "name": "subagent_continue",
             "spec": spec_map["subagent_continue"],
             "callable": callable_continue,
-            # Continues mutate the named subagent's chat history — they are
-            # NOT safe to run concurrently against the same subagent. We don't
-            # have per-call dependency analysis, but we mark parallelizable
-            # here because the parent generally continues different subagents
-            # in parallel, rather than the same subagent.
-            "metadata": {"parallelizable": True},
+            # Continues mutate one named subagent's hidden transcript. The DB
+            # transition is guarded/atomic, but preserving model-visible order is
+            # still the right contract when a parent emits consecutive continues:
+            # each follow-up should build on the prior one's completed answer.
+            # Launches remain parallelizable because their hidden chats are
+            # independent.
+            "metadata": {"parallelizable": False},
         }
 
     return tools

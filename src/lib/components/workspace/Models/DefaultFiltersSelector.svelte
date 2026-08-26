@@ -5,10 +5,9 @@
 
 	const i18n = getContext('i18n');
 
-	export let filters = [];
-	export let selectedFilterIds = [];
+	let { filters = [], selectedFilterIds = $bindable([]) } = $props();
 
-	let _filters = {};
+	let _filters = $state({});
 
 	onMount(() => {
 		_filters = filters.reduce((acc, filter) => {
@@ -35,8 +34,8 @@
 						<div class="self-center flex items-center">
 							<Checkbox
 								state={_filters[filter].selected ? 'checked' : 'unchecked'}
-								on:change={(e) => {
-									_filters[filter].selected = e.detail === 'checked';
+								onchange={(state) => {
+									_filters[filter].selected = state === 'checked';
 									selectedFilterIds = Object.keys(_filters).filter((t) => _filters[t].selected);
 								}}
 							/>

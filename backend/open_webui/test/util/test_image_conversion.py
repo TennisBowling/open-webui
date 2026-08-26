@@ -1,4 +1,5 @@
 from open_webui.utils.image_conversion import (
+    convert_heif_to_jpeg,
     is_heif_image,
     normalize_image_mime_type,
     prepare_image_data_for_provider,
@@ -6,6 +7,23 @@ from open_webui.utils.image_conversion import (
     _downscale_image_bytes,
     HEIF_MIME_TYPES,
 )
+
+
+def test_heif_decoder_round_trip():
+    import io
+
+    import pillow_heif
+    from PIL import Image
+
+    source = Image.new("RGB", (8, 5), (12, 34, 56))
+    heif_buffer = io.BytesIO()
+    pillow_heif.from_pillow(source).save(heif_buffer)
+
+    converted = convert_heif_to_jpeg(heif_buffer.getvalue())
+
+    with Image.open(io.BytesIO(converted)) as decoded:
+        assert decoded.format == "JPEG"
+        assert decoded.size == source.size
 
 
 def test_normalizes_browser_image_mime_variants():

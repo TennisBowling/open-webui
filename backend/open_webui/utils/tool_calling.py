@@ -10,14 +10,23 @@ _MCP_TOOL_NAME_MAX = 64
 _MCP_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
 
 
-def merge_streamed_tool_call_field(existing: str | None, chunk: str | None) -> str:
-    """Merge streamed tool-call name/argument fragments without overlap loss.
+def merge_streamed_field(existing: str | None, chunk: str | None) -> str:
+    """Merge a streamed string field fragment without overlap loss.
 
-    ``function.arguments`` is an executable JSON string. OpenAI-compatible
-    streams normally send true deltas, which must append byte-for-byte; generic
-    suffix-overlap dedupe corrupts repeated text like ``https://``, ``rooms``,
-    ``<<``, and long runs. The only compatibility case handled here is a
-    provider resending a cumulative full prefix.
+    THE canonical merge for every streamed string the model produces — tool-call
+    ``function.name``/``function.arguments``, ``reasoning_details``
+    text/data/summary, and reasoning block content. OpenAI-compatible streams
+    normally send true deltas, which must append byte-for-byte; the persisted
+    string is replayed to the provider on later turns, so any deviation from
+    what the model generated silently corrupts content AND breaks prompt-cache
+    reuse for the rest of the conversation.
+
+    The only compatibility case handled is a provider resending a cumulative
+    full prefix (``chunk`` starts with the ENTIRE ``existing`` string). Partial
+    suffix/prefix overlap dedupe is deliberately NOT done: it cannot be
+    distinguished from legitimately repeated text and eats real characters
+    (``bana``+``na``, ``https://``, ``<<``, doubled letters split across
+    tokens, base64 runs). Do not add heuristics here.
     """
     if not chunk:
         return existing or ""
@@ -29,6 +38,22 @@ def merge_streamed_tool_call_field(existing: str | None, chunk: str | None) -> s
     if chunk.startswith(existing):
         return chunk
     return existing + chunk
+
+
+def dedupe_repeated_tool_name(name: str | None) -> str:
+    """Collapse a tool name that is a whole-unit repetition of itself
+    (``web_searchweb_search`` → ``web_search``) — some providers resend the
+    full function name on every stream chunk. Tool names are constrained
+    identifiers, so unit-repetition is a reliable resend signal there; do NOT
+    apply this to free-form text."""
+    if not name:
+        return ""
+    for unit_len in range(1, (len(name) // 2) + 1):
+        if len(name) % unit_len == 0:
+            unit = name[:unit_len]
+            if unit and unit * (len(name) // unit_len) == name:
+                return unit
+    return name
 
 
 def mcp_tool_alias(server_id: str, tool_name: str) -> str:

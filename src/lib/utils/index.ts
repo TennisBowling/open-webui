@@ -15,12 +15,32 @@ dayjs.extend(localizedFormat);
 
 import { TTS_RESPONSE_SPLIT } from '$lib/types';
 
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
-
 import { marked } from 'marked';
 import markedExtension from '$lib/utils/marked/extension';
 import markedKatexExtension from '$lib/utils/marked/katex-extension';
-import hljs from 'highlight.js';
+
+// highlight.js is only needed for the (rare) "copy formatted code" path in
+// copyToClipboard() below, but this file is imported broadly across the app,
+// so a top-level `import hljs from 'highlight.js/lib/common'` used to ship it
+// in the cold-load bundle unconditionally. Warm it up on idle instead of on
+// first paint — this is very likely to have resolved (and be sitting in the
+// module cache) by the time a user actually copies code, so we still get
+// Safari's synchronous clipboard user-gesture window; copyToClipboard() below
+// does its own `await import(...)` which resolves instantly once warmed.
+if (typeof requestIdleCallback !== 'undefined') {
+	requestIdleCallback(() => {
+		import('highlight.js/lib/common');
+	});
+} else if (typeof setTimeout !== 'undefined') {
+	// Safari (macOS + iOS) doesn't implement requestIdleCallback at all, so
+	// without this fallback the warm-up above silently never runs there and
+	// copyToClipboard() always eats a cold import inside the click handler —
+	// defeating the whole point (losing Safari's synchronous clipboard
+	// user-gesture window, which is exactly what the warm-up exists to avoid).
+	setTimeout(() => {
+		import('highlight.js/lib/common');
+	}, 2000);
+}
 
 //////////////////////////
 // Helper functions
@@ -355,6 +375,92 @@ export const compressImage = async (imageUrl, maxWidth, maxHeight) => {
 		img.src = imageUrl;
 	});
 };
+// Downscale a raster image File before UPLOAD to cut upload bytes on very
+// metered / very slow links (camera photos are routinely 3-12MB). Decodes with
+// EXIF-correct orientation, fits the longest edge within `maxDimension`, and
+// re-encodes as WebP — falling back to JPEG when the runtime (some iOS Safari
+// versions) can't produce WebP from a canvas, verified by inspecting the
+// produced blob's type rather than trusting the request.
+//
+// Returns a NEW File, or `null` to signal the caller should upload the ORIGINAL
+// unchanged. `null` is returned for: tiny files (not worth the round-trip),
+// GIF (may be animated) / SVG (vector), decode failures (e.g. HEIC the browser
+// can't decode — the server converts those), or when the re-encode isn't
+// meaningfully smaller than the source.
+export const downscaleImageForUpload = async (
+	file: File,
+	options: { maxDimension?: number; quality?: number; minBytes?: number } = {}
+): Promise<File | null> => {
+	const { maxDimension = 2048, quality = 0.82, minBytes = 300 * 1024 } = options;
+
+	if (typeof createImageBitmap === 'undefined' || typeof document === 'undefined') {
+		return null;
+	}
+
+	const type = (file.type || '').toLowerCase();
+	// GIF may be animated (a canvas re-encode flattens to one frame); SVG is
+	// vector — never rasterize. Both pass through untouched.
+	if (type === 'image/gif' || type === 'image/svg+xml') return null;
+	// Small files aren't worth a decode/re-encode round-trip.
+	if (file.size > 0 && file.size < minBytes) return null;
+
+	let bitmap: ImageBitmap;
+	try {
+		// `imageOrientation: 'from-image'` bakes EXIF rotation into the pixels so
+		// the re-encoded (metadata-stripped) output isn't sideways.
+		bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+	} catch (err) {
+		// Unsupported format (e.g. HEIC on a browser that can't decode it) or a
+		// decode failure — upload the original and let the server handle it.
+		return null;
+	}
+
+	try {
+		const { width, height } = bitmap;
+		if (!width || !height) return null;
+
+		const scale = Math.min(1, maxDimension / Math.max(width, height));
+		const targetW = Math.max(1, Math.round(width * scale));
+		const targetH = Math.max(1, Math.round(height * scale));
+
+		const canvas = document.createElement('canvas');
+		canvas.width = targetW;
+		canvas.height = targetH;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return null;
+		ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+
+		const toBlob = (mime: string): Promise<Blob | null> =>
+			new Promise((resolve) => canvas.toBlob((b) => resolve(b), mime, quality));
+
+		// Prefer WebP; confirm the runtime actually produced WebP (iOS Safari can
+		// silently emit PNG instead), otherwise re-encode as JPEG.
+		let blob = await toBlob('image/webp');
+		let outType = 'image/webp';
+		if (!blob || blob.type !== 'image/webp') {
+			blob = await toBlob('image/jpeg');
+			outType = 'image/jpeg';
+		}
+		if (!blob) return null;
+
+		// Bail when the re-encode isn't meaningfully smaller than the source
+		// (e.g. an already-optimized small-dimension image).
+		if (file.size > 0 && blob.size > file.size * 0.9) return null;
+
+		const ext = outType === 'image/webp' ? 'webp' : 'jpg';
+		// Keep the filename/extension coherent with the re-encoded bytes.
+		const base = (file.name || 'image').replace(/\.[^./\\]+$/, '') || 'image';
+		return new File([blob], `${base}.${ext}`, {
+			type: outType,
+			lastModified: file.lastModified || Date.now()
+		});
+	} catch (err) {
+		return null;
+	} finally {
+		if (typeof bitmap.close === 'function') bitmap.close();
+	}
+};
+
 export const generateInitialsImage = (name) => {
 	const canvas = document.createElement('canvas');
 	const ctx = canvas.getContext('2d');
@@ -406,6 +512,10 @@ export const copyToClipboard = async (text, html = null, formatted = false) => {
 	if (formatted) {
 		let styledHtml = '';
 		if (!html) {
+			// Resolves instantly if the requestIdleCallback warm-up above already
+			// completed (module cache hit); otherwise this is the cold-load path.
+			const { default: hljs } = await import('highlight.js/lib/common');
+
 			const options = {
 				throwOnError: false,
 				highlight: function (code, lang) {
@@ -892,13 +1002,25 @@ const escapeHtmlAttr = (s: unknown): string =>
 		.replace(/</g, '&lt;')
 		.replace(/>/g, '&gt;');
 
-export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
+export const blocksToDisplayMarkdown = (
+	content_blocks: any[] = [],
+	// When the blocks follow the lazy contract (reasoning/tool bodies stripped
+	// to fetch-on-expand stubs), the details tags need the owning chat/message
+	// ids embedded so Collapsible can fetch the body from the lazy endpoint —
+	// including for blocks rendered OUTSIDE the owning message's component tree
+	// (subagent transcripts render another chat's blocks).
+	opts: { chatId?: string; messageId?: string } = {}
+): string => {
 	if (!Array.isArray(content_blocks) || content_blocks.length === 0) return '';
 	let out = '';
 
 	const ensureNewline = () => {
 		if (out && !out.endsWith('\n')) out += '\n';
 	};
+
+	const lazyCtxAttrs = () =>
+		(opts?.chatId ? ` chat_id="${escapeHtmlAttr(opts.chatId)}"` : '') +
+		(opts?.messageId ? ` message_id="${escapeHtmlAttr(opts.messageId)}"` : '');
 
 	for (const block of content_blocks) {
 		const type = block?.type;
@@ -914,10 +1036,17 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 				.map((line) => (line.startsWith('>') ? line : `> ${line}`))
 				.join('\n');
 			const duration = block?.duration;
+			// Lazy stub: the server withheld the reasoning text ("Thought for N
+			// seconds" + content_ref). Emit the ref attrs and an empty body —
+			// Collapsible fetches the text on expand.
+			const lazyAttrs =
+				block?.content_lazy && !reasoning
+					? ` content_lazy="true" content_ref="${escapeHtmlAttr(block?.content_ref ?? '')}"${lazyCtxAttrs()}`
+					: '';
 			if (duration != null) {
-				out += `<details type="reasoning" done="true" duration="${escapeHtmlAttr(duration)}">\n<summary>Thought for ${escapeHtmlAttr(duration)} seconds</summary>\n${quoted}\n</details>\n`;
+				out += `<details type="reasoning" done="true" duration="${escapeHtmlAttr(duration)}"${lazyAttrs}>\n<summary>Thought for ${escapeHtmlAttr(duration)} seconds</summary>\n${quoted}\n</details>\n`;
 			} else {
-				out += `<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n${quoted}\n</details>\n`;
+				out += `<details type="reasoning" done="false"${lazyAttrs}>\n<summary>Thinking…</summary>\n${quoted}\n</details>\n`;
 			}
 		} else if (type === 'tool_calls') {
 			ensureNewline();
@@ -933,7 +1062,11 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 				// tool_calls Collapsible. Must mirror what the backend's
 				// `serialize_content_blocks` does — otherwise this client-side
 				// projection clobbers the backend's HTML on reactive re-render.
-				if (name === 'subagent_launch' || name === 'subagent_continue' || name === 'subagent_agent_launch') {
+				if (
+					name === 'subagent_launch' ||
+					name === 'subagent_continue' ||
+					name === 'subagent_agent_launch'
+				) {
 					const saId = (result as any)?.subagent_id ?? '';
 					const doneFlag = result !== undefined ? 'true' : 'false';
 					out += `<details type="subagent_launch" done="${doneFlag}" tool_call_id="${escapeHtmlAttr(id)}" id="${escapeHtmlAttr(saId)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}">\n<summary>Subagent</summary>\n</details>\n`;
@@ -950,10 +1083,19 @@ export const blocksToDisplayMarkdown = (content_blocks: any[] = []): string => {
 					const errorReasonAttr = result?.error_reason
 						? ` error_reason="${escapeHtmlAttr(result.error_reason)}"`
 						: '';
-					const noticeAttr = result?.notice
-						? ` notice="${escapeHtmlAttr(result.notice)}"`
+					const noticeAttr = result?.notice ? ` notice="${escapeHtmlAttr(result.notice)}"` : '';
+					// Lazy stub result (body withheld server-side): carry the ref +
+					// fetch context so Collapsible's ToolCallResult path can hydrate
+					// on expand even when this projection renders another chat's
+					// blocks (subagent transcripts).
+					const lazyResultAttr = result?.result_lazy
+						? ` result_lazy="true" result_ref="${escapeHtmlAttr(result?.result_ref ?? id)}" tool_call_id="${escapeHtmlAttr(result?.tool_call_id ?? id)}"${lazyCtxAttrs()}` +
+							(result?.summary
+								? ` summary="${escapeHtmlAttr(JSON.stringify(result.summary))}"`
+								: '') +
+							(result?.size != null ? ` size="${escapeHtmlAttr(result.size)}"` : '')
 						: '';
-					out += `<details type="tool_calls" done="true" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}" result="${escapeHtmlAttr(JSON.stringify(resultContent))}" files="${resultFiles ? escapeHtmlAttr(JSON.stringify(resultFiles)) : ''}" embeds="${escapeHtmlAttr(JSON.stringify(resultEmbeds))}"${errorAttr}${errorReasonAttr}${noticeAttr}>\n<summary>Tool Executed</summary>\n</details>\n`;
+					out += `<details type="tool_calls" done="true" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}" result="${escapeHtmlAttr(JSON.stringify(resultContent))}" files="${resultFiles ? escapeHtmlAttr(JSON.stringify(resultFiles)) : ''}" embeds="${escapeHtmlAttr(JSON.stringify(resultEmbeds))}"${errorAttr}${errorReasonAttr}${noticeAttr}${lazyResultAttr}>\n<summary>Tool Executed</summary>\n</details>\n`;
 				} else {
 					out += `<details type="tool_calls" done="false" id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(name)}" arguments="${escapeHtmlAttr(JSON.stringify(args))}">\n<summary>Executing...</summary>\n</details>\n`;
 				}
@@ -1141,6 +1283,35 @@ export const formatDuration = (totalSeconds: number): string => {
 	return `${seconds}s`;
 };
 
+// Spelled-out elapsed time for the agentic-work headers, e.g. 45 -> "45 seconds",
+// 83 -> "1 minute 23 seconds", 3840 -> "1 hour 4 minutes". Same precision as
+// `formatDuration`, but these headers are prose, so they never abbreviate.
+// Singular/plural are separate keys rather than i18next plural suffixes because
+// this project's en-US values are empty strings and fall back to the key itself,
+// which the `_other` form would render as "45 second".
+export const formatDurationLong = (
+	totalSeconds: number,
+	t: (key: string, options?: Record<string, unknown>) => string
+): string => {
+	const s = Math.max(0, Math.floor(totalSeconds || 0));
+	const hours = Math.floor(s / 3600);
+	const minutes = Math.floor((s % 3600) / 60);
+	const seconds = s % 60;
+
+	const unit = (count: number, one: string, many: string) => t(count === 1 ? one : many, { count });
+
+	// Trailing zero segments are dropped ("2 minutes", not "2 minutes 0 seconds").
+	if (hours > 0) {
+		const h = unit(hours, '{{count}} hour', '{{count}} hours');
+		return minutes > 0 ? `${h} ${unit(minutes, '{{count}} minute', '{{count}} minutes')}` : h;
+	}
+	if (minutes > 0) {
+		const m = unit(minutes, '{{count}} minute', '{{count}} minutes');
+		return seconds > 0 ? `${m} ${unit(seconds, '{{count}} second', '{{count}} seconds')}` : m;
+	}
+	return unit(seconds, '{{count}} second', '{{count}} seconds');
+};
+
 export const approximateToHumanReadable = (nanoseconds: number) => {
 	const seconds = Math.floor((nanoseconds / 1e9) % 60);
 	const minutes = Math.floor((nanoseconds / 6e10) % 60);
@@ -1168,11 +1339,7 @@ export const approximateToHumanReadable = (nanoseconds: number) => {
 // suspenders check before {@html} interpolation.
 const _ALLOWED_MARK_RE = /<\/?mark>/g;
 export const escapeHtml = (s: string): string =>
-	s
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;');
+	s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 export const sanitizeMarkSnippet = (raw: string | null | undefined): string => {
 	if (!raw) return '';
@@ -1210,10 +1377,7 @@ export const searchHistoryAdd = (query: string): void => {
 	const current = searchHistoryGet().filter((e) => e.query !== q);
 	current.unshift({ query: q, timestamp: Date.now() });
 	try {
-		localStorage.setItem(
-			SEARCH_HISTORY_KEY,
-			JSON.stringify(current.slice(0, SEARCH_HISTORY_MAX))
-		);
+		localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(current.slice(0, SEARCH_HISTORY_MAX)));
 	} catch {
 		// localStorage full or disabled - silently drop
 	}
@@ -1347,10 +1511,21 @@ export const getWeekday = () => {
 
 export const createMessagesList = (history, messageId) => {
 	const messages = [];
+	// Cycle guard: a corrupted tree (message with parentId === its own id, or
+	// a longer parent cycle) would spin this walk forever and freeze the whole
+	// tab — the client-side twin of the backend's get_message_list wedge.
+	const seen = new Set();
 	let current = messageId ? history.messages[messageId] : undefined;
 	while (current) {
+		if (current.id != null) {
+			if (seen.has(current.id)) break;
+			seen.add(current.id);
+		}
 		messages.unshift(current);
-		current = current.parentId ? history.messages[current.parentId] : undefined;
+		current =
+			current.parentId && current.parentId !== current.id
+				? history.messages[current.parentId]
+				: undefined;
 	}
 	return messages;
 };
@@ -1638,75 +1813,6 @@ export const parseJsonValue = (value: string): any => {
 	return value;
 };
 
-async function ensurePDFjsLoaded() {
-	if (!window.pdfjsLib) {
-		const pdfjs = await import('pdfjs-dist');
-		pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-		window.pdfjsLib = pdfjs;
-	}
-	return window.pdfjsLib;
-}
-
-export type RenderPdfToImageDataUrlsOptions = {
-	maxPages?: number;
-	scale?: number;
-};
-
-export const renderPdfToImageDataUrls = async (
-	pdfData: ArrayBuffer,
-	options: RenderPdfToImageDataUrlsOptions = {}
-) => {
-	const pdfjsLib = await ensurePDFjsLoaded();
-
-	const pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
-	const totalPages: number = pdf.numPages;
-
-	const maxPages = Math.max(1, options.maxPages ?? totalPages);
-	const renderedPages = Math.min(totalPages, maxPages);
-	const scale = options.scale ?? 1.25;
-
-	const images: string[] = [];
-
-	for (let pageNum = 1; pageNum <= renderedPages; pageNum++) {
-		const page = await pdf.getPage(pageNum);
-		const viewport = page.getViewport({ scale });
-
-		const canvas = document.createElement('canvas');
-		const context = canvas.getContext('2d');
-		if (!context) {
-			throw new Error('Failed to render PDF page: canvas context unavailable');
-		}
-
-		canvas.width = Math.ceil(viewport.width);
-		canvas.height = Math.ceil(viewport.height);
-
-		const renderTask = page.render({ canvasContext: context, viewport });
-		await renderTask.promise;
-
-		images.push(canvas.toDataURL('image/png'));
-
-		try {
-			page.cleanup?.();
-		} catch {
-			// ignore
-		}
-	}
-
-	try {
-		pdf.cleanup?.();
-	} catch {
-		// ignore
-	}
-
-	try {
-		await pdf.destroy?.();
-	} catch {
-		// ignore
-	}
-
-	return { totalPages, renderedPages, images };
-};
-
 export const extractContentFromFile = async (file: File) => {
 	// Known text file extensions for extra fallback
 	const textExtensions = [
@@ -1728,31 +1834,49 @@ export const extractContentFromFile = async (file: File) => {
 	// fallback readAsText below would inline e.g. a zipped docx as gibberish
 	// into the user's prompt.
 	const BINARY_EXTENSIONS = new Set([
-		'xlsx', 'xls', 'pptx', 'ppt', 'odt', 'odp', 'ods', 'doc',
-		'epub', 'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz',
-		'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif',
-		'heic', 'heif', 'mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac',
-		'mp4', 'mov', 'avi', 'mkv', 'webm'
+		'pdf',
+		'xlsx',
+		'xls',
+		'pptx',
+		'ppt',
+		'odt',
+		'odp',
+		'ods',
+		'doc',
+		'epub',
+		'zip',
+		'rar',
+		'7z',
+		'tar',
+		'gz',
+		'bz2',
+		'xz',
+		'png',
+		'jpg',
+		'jpeg',
+		'gif',
+		'webp',
+		'bmp',
+		'tiff',
+		'tif',
+		'heic',
+		'heif',
+		'mp3',
+		'wav',
+		'ogg',
+		'm4a',
+		'flac',
+		'aac',
+		'mp4',
+		'mov',
+		'avi',
+		'mkv',
+		'webm'
 	]);
 
 	function getExtension(filename: string) {
 		const dot = filename.lastIndexOf('.');
 		return dot === -1 ? '' : filename.substr(dot).toLowerCase();
-	}
-
-	// Uses pdfjs to extract text from PDF
-	async function extractPdfText(file: File) {
-		const pdfjsLib = await ensurePDFjsLoaded();
-		const arrayBuffer = await file.arrayBuffer();
-		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-		let allText = '';
-		for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-			const page = await pdf.getPage(pageNum);
-			const content = await page.getTextContent();
-			const strings = content.items.map((item: any) => item.str);
-			allText += strings.join(' ') + '\n';
-		}
-		return allText;
 	}
 
 	// Uses mammoth (browser build) to extract raw text from .docx. Mammoth is
@@ -1777,11 +1901,6 @@ export const extractContentFromFile = async (file: File) => {
 
 	const type = file.type || '';
 	const ext = getExtension(file.name);
-
-	// PDF check
-	if (type === 'application/pdf' || ext === '.pdf') {
-		return await extractPdfText(file);
-	}
 
 	// DOCX check — same shape as PDF, mammoth handles the zipped XML.
 	if (

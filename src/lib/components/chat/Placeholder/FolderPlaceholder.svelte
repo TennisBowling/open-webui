@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -8,9 +8,13 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { getChatListByFolderId } from '$lib/apis/chats';
 
-	export let folder = null;
+	interface Props {
+		folder?: any;
+	}
 
-	let chats = null;
+	let { folder = null }: Props = $props();
+
+	let chats = $state(null);
 	let page = 1;
 
 	const setChatList = async () => {
@@ -29,9 +33,11 @@
 		}
 	};
 
-	$: if (folder) {
-		setChatList();
-	}
+	$effect(() => {
+		if (folder) {
+			setChatList();
+		}
+	});
 </script>
 
 <div>
@@ -44,7 +50,7 @@
 					? ''
 					: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 				type="button"
-				on:click={() => {
+				onclick={() => {
 					selectedTab = 'knowledge';
 				}}>{$i18n.t('Knowledge')}</button
 			>
@@ -54,7 +60,7 @@
 					? ''
 					: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 				type="button"
-				on:click={() => {
+				onclick={() => {
 					selectedTab = 'chats';
 				}}
 			>

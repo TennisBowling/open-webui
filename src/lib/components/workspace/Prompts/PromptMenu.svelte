@@ -16,80 +16,88 @@
 
 	const i18n = getContext('i18n');
 
-	export let shareHandler: Function;
-	export let cloneHandler: Function;
-	export let exportHandler: Function;
-	export let deleteHandler: Function;
-	export let onClose: Function;
+	interface Props {
+		shareHandler: Function;
+		cloneHandler: Function;
+		exportHandler: Function;
+		deleteHandler: Function;
+		onClose: Function;
+		children?: import('svelte').Snippet;
+	}
 
-	let show = false;
+	let { shareHandler, cloneHandler, exportHandler, deleteHandler, onClose, children }: Props =
+		$props();
+
+	let show = $state(false);
 </script>
 
 <Dropdown
 	bind:show
-	on:change={(e) => {
+	onchange={(e) => {
 		if (e.detail === false) {
 			onClose();
 		}
 	}}
 >
 	<Tooltip content={$i18n.t('More')}>
-		<slot />
+		{@render children?.()}
 	</Tooltip>
 
-	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[170px] rounded-2xl p-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-			sideOffset={-2}
-			side="bottom"
-			align="start"
-			transition={flyAndScale}
-		>
-			{#if $config.features.enable_community_sharing}
+	{#snippet content()}
+		<div>
+			<DropdownMenu.Content
+				class="w-full max-w-[170px] rounded-2xl p-1 border-hairline border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+				sideOffset={-2}
+				side="bottom"
+				align="start"
+				transition={flyAndScale}
+			>
+				{#if $config.features.enable_community_sharing}
+					<DropdownMenu.Item
+						class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-xl"
+						onclick={() => {
+							shareHandler();
+						}}
+					>
+						<Share />
+						<div class="flex items-center">{$i18n.t('Share')}</div>
+					</DropdownMenu.Item>
+				{/if}
+
 				<DropdownMenu.Item
-					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-xl"
-					on:click={() => {
-						shareHandler();
+					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+					onclick={() => {
+						cloneHandler();
 					}}
 				>
-					<Share />
-					<div class="flex items-center">{$i18n.t('Share')}</div>
+					<DocumentDuplicate />
+
+					<div class="flex items-center">{$i18n.t('Clone')}</div>
 				</DropdownMenu.Item>
-			{/if}
 
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
-				on:click={() => {
-					cloneHandler();
-				}}
-			>
-				<DocumentDuplicate />
+				<DropdownMenu.Item
+					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+					onclick={() => {
+						exportHandler();
+					}}
+				>
+					<Download />
 
-				<div class="flex items-center">{$i18n.t('Clone')}</div>
-			</DropdownMenu.Item>
+					<div class="flex items-center">{$i18n.t('Export')}</div>
+				</DropdownMenu.Item>
 
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
-				on:click={() => {
-					exportHandler();
-				}}
-			>
-				<Download />
+				<hr class="border-gray-50 dark:border-gray-850 my-1" />
 
-				<div class="flex items-center">{$i18n.t('Export')}</div>
-			</DropdownMenu.Item>
-
-			<hr class="border-gray-50 dark:border-gray-850 my-1" />
-
-			<DropdownMenu.Item
-				class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
-				on:click={() => {
-					deleteHandler();
-				}}
-			>
-				<GarbageBin />
-				<div class="flex items-center">{$i18n.t('Delete')}</div>
-			</DropdownMenu.Item>
-		</DropdownMenu.Content>
-	</div>
+				<DropdownMenu.Item
+					class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+					onclick={() => {
+						deleteHandler();
+					}}
+				>
+					<GarbageBin />
+					<div class="flex items-center">{$i18n.t('Delete')}</div>
+				</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</div>
+	{/snippet}
 </Dropdown>

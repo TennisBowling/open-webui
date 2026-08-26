@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -8,16 +10,24 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import { extractFrontmatter } from '$lib/utils';
 
-	export let show = false;
+	interface Props {
+		show?: boolean;
+		onImport?: any;
+		onClose?: any;
+		loadUrlHandler?: Function;
+		successMessage?: string;
+	}
 
-	export let onImport = (e) => {};
-	export let onClose = () => {};
+	let {
+		show = $bindable(false),
+		onImport = (e) => {},
+		onClose = () => {},
+		loadUrlHandler = () => {},
+		successMessage = $bindable('')
+	}: Props = $props();
 
-	export let loadUrlHandler: Function = () => {};
-	export let successMessage: string = '';
-
-	let loading = false;
-	let url = '';
+	let loading = $state(false);
+	let url = $state('');
 
 	const submitHandler = async () => {
 		loading = true;
@@ -66,8 +76,8 @@
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-2">
 			<div class=" text-lg font-medium self-center">{$i18n.t('Import')}</div>
 			<button
-				class="self-center"
-				on:click={() => {
+				class="tap-target self-center"
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -79,9 +89,9 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit|preventDefault={() => {
+					onsubmit={preventDefault(() => {
 						submitHandler();
-					}}
+					})}
 				>
 					<div class="px-1">
 						<div class="flex flex-col w-full">

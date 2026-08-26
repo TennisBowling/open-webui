@@ -12,16 +12,16 @@
 
 	const i18n = getContext('i18n');
 
-	export let onSelect = (e) => {};
+	let { onSelect = (e) => {} } = $props();
 
-	let loaded = false;
+	let loaded = $state(false);
 
-	let items = [];
-	let selectedIdx = 0;
+	let items = $state([]);
+	let selectedIdx = $state(0);
 
 	let page = 1;
-	let itemsLoading = false;
-	let allItemsLoaded = false;
+	let itemsLoading = $state(false);
+	let allItemsLoaded = $state(false);
 
 	const loadMoreItems = async () => {
 		if (allItemsLoaded) return;
@@ -78,20 +78,20 @@
 						? ' bg-gray-50 dark:bg-gray-800 dark:text-gray-100 selected-command-option-button'
 						: ''}"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						onSelect(item);
 					}}
-					on:mousemove={() => {
+					onmousemove={() => {
 						selectedIdx = idx;
 					}}
-					on:mouseleave={() => {
+					onmouseleave={() => {
 						if (idx === 0) {
 							selectedIdx = -1;
 						}
 					}}
 					data-selected={idx === selectedIdx}
 				>
-					<div class="text-black dark:text-gray-100 flex items-center gap-1.5">
+					<div class="text-gray-900 dark:text-gray-100 flex items-center gap-1.5">
 						<Tooltip content={$i18n.t('Note')} placement="top">
 							<PageEdit className="size-4" />
 						</Tooltip>
@@ -107,7 +107,7 @@
 
 			{#if !allItemsLoaded}
 				<Loader
-					on:visible={(e) => {
+					onvisible={(e) => {
 						if (!itemsLoading) {
 							loadMoreItems();
 						}

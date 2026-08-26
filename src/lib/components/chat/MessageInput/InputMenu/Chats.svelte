@@ -18,19 +18,19 @@
 		return match?.[1] ? decodeURIComponent(match[1]) : '';
 	};
 
-	export let onSelect = (e) => {};
+	let { onSelect = (e) => {} } = $props();
 
-	let loaded = false;
+	let loaded = $state(false);
 
-	let items = [];
-	let selectedIdx = 0;
+	let items = $state([]);
+	let selectedIdx = $state(0);
 
 	let page = 1;
-	let itemsLoading = false;
-	let allItemsLoaded = false;
-	let visibleChatId = '';
+	let itemsLoading = $state(false);
+	let allItemsLoaded = $state(false);
+	let visibleChatId = $state('');
 
-	$: {
+	$effect(() => {
 		const browserPathname = typeof window !== 'undefined' ? window.location.pathname : '';
 		const routeChatId =
 			parseChatIdFromPath(browserPathname) || parseChatIdFromPath($routePage.url.pathname);
@@ -39,7 +39,7 @@
 			($temporaryChatEnabled || ($currentChatIdStore ?? '').startsWith('local:')
 				? ($currentChatIdStore ?? '')
 				: '');
-	}
+	});
 
 	const loadMoreItems = async () => {
 		if (allItemsLoaded) return;
@@ -97,20 +97,20 @@
 						? ' bg-gray-50 dark:bg-gray-800 dark:text-gray-100 selected-command-option-button'
 						: ''}"
 					type="button"
-					on:click={() => {
+					onclick={() => {
 						onSelect(item);
 					}}
-					on:mousemove={() => {
+					onmousemove={() => {
 						selectedIdx = idx;
 					}}
-					on:mouseleave={() => {
+					onmouseleave={() => {
 						if (idx === 0) {
 							selectedIdx = -1;
 						}
 					}}
 					data-selected={idx === selectedIdx}
 				>
-					<div class="text-black dark:text-gray-100 flex items-center gap-1.5">
+					<div class="text-gray-900 dark:text-gray-100 flex items-center gap-1.5">
 						<Tooltip content={item.description || decodeString(item?.name)} placement="top-start">
 							<div class="line-clamp-1 flex-1">
 								{decodeString(item?.name)}
@@ -122,7 +122,7 @@
 
 			{#if !allItemsLoaded}
 				<Loader
-					on:visible={(e) => {
+					onvisible={(e) => {
 						if (!itemsLoading) {
 							loadMoreItems();
 						}

@@ -4,7 +4,11 @@
 	const i18n = getContext('i18n');
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
-	export let user = null;
+	interface Props {
+		user?: any;
+	}
+
+	let { user = null }: Props = $props();
 </script>
 
 {#if user}
@@ -28,9 +32,9 @@
 					<div>
 						<span class="relative flex size-2">
 							<span
-								class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"
-							/>
-							<span class="relative inline-flex rounded-full size-2 bg-green-500" />
+								class="animate-ping absolute inline-flex h-full w-full rounded-full bg-success-dark opacity-75"
+							></span>
+							<span class="relative inline-flex rounded-full size-2 bg-success"></span>
 						</span>
 					</div>
 
@@ -38,7 +42,7 @@
 				{:else}
 					<div>
 						<span class="relative flex size-2">
-							<span class="relative inline-flex rounded-full size-2 bg-gray-500" />
+							<span class="relative inline-flex rounded-full size-2 bg-gray-500"></span>
 						</span>
 					</div>
 

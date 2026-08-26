@@ -1,12 +1,17 @@
 <script lang="ts">
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { imageFallback } from '$lib/actions/imageFallback';
 
-	export let className = 'size-8';
-	export let src = `${WEBUI_BASE_URL}/static/favicon.png`;
+	interface Props {
+		className?: string;
+		src?: any;
+	}
+
+	let { className = 'size-8', src = `${WEBUI_BASE_URL}/static/favicon.png` }: Props = $props();
 </script>
 
 <img
-	crossorigin="anonymous"
+	use:imageFallback={`${WEBUI_BASE_URL}/static/favicon.png`}
 	aria-hidden="true"
 	src={src === ''
 		? `${WEBUI_BASE_URL}/static/favicon.png`
@@ -19,4 +24,6 @@
 	class=" {className} object-cover rounded-full"
 	alt="profile"
 	draggable="false"
+	loading="lazy"
+	decoding="async"
 />

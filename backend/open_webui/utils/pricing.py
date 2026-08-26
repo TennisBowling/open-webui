@@ -238,6 +238,17 @@ async def fetch_openrouter_catalog() -> List[dict]:
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         raise RuntimeError("OpenRouter catalog: unexpected payload shape")
+
+    # Warm the reasoning-discovery cache from the same payload — the raw catalog
+    # items carry a per-model ``reasoning`` object we'd otherwise have to fetch
+    # again. Best-effort; never let it break the pricing sync.
+    try:
+        from open_webui.utils import openrouter_reasoning
+
+        openrouter_reasoning.populate_from_catalog_items(data)
+    except Exception as e:
+        log.debug(f"reasoning cache warm from catalog skipped: {e}")
+
     rows = []
     for item in data:
         if not isinstance(item, dict):

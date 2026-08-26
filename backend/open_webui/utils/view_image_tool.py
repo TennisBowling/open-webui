@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from open_webui.env import AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL, SRC_LOG_LEVELS
 from open_webui.models.files import FileForm, Files
 from open_webui.retrieval.web.session import session_for_current_loop
+from open_webui.retrieval.web.utils import validate_url
 from open_webui.storage.provider import Storage
 from open_webui.utils.container_workspace import _reclaim_outputs
 from open_webui.utils.image_conversion import (
@@ -85,18 +86,25 @@ def _workspace_root(data_root: str, chat_id: str) -> Path:
     return (Path(data_root).expanduser().resolve() / chat_id / "workspace").resolve()
 
 
-def _sandbox_rel_path(source: str) -> str:
-    if source.startswith("sandbox://workspace/"):
-        rel = source[len("sandbox://workspace/") :]
-    elif source == "sandbox://workspace":
-        rel = ""
-    elif source.startswith("sandbox:/workspace/"):
-        rel = source[len("sandbox:/workspace/") :]
-    elif source == "sandbox:/workspace":
-        rel = ""
-    else:
-        raise ViewImageError("sandbox URL must start with sandbox:/workspace/")
+# Accept every variant of a workspace file reference a model might emit.
+# `sandbox:` has no registered authority, so the number of slashes after the
+# colon is not semantically meaningful, and models also pass the bare
+# container-absolute path bash uses inside the sandbox — all of these point at
+# the same /workspace root:
+#   sandbox:/workspace/...    sandbox://workspace/...    sandbox:///workspace/...
+#   sandbox:workspace/...     /workspace/...             workspace/...
+# The leading `workspace` is matched only as a whole path segment so a file
+# named e.g. `workspaces.png` is not mistaken for the root. Path confinement
+# (symlink + relative_to-root) happens downstream in _resolve_sandbox_image_path,
+# so broadening this prefix match does not weaken traversal protection.
+_SANDBOX_URI_PREFIX_RE = re.compile(r"^(?:sandbox:)?/*workspace(?:/|$)", re.IGNORECASE)
 
+
+def _sandbox_rel_path(source: str) -> str:
+    source = (source or "").strip()
+    if not _SANDBOX_URI_PREFIX_RE.match(source):
+        raise ViewImageError("sandbox path must start with sandbox:/workspace/ or /workspace/")
+    rel = _SANDBOX_URI_PREFIX_RE.sub("", source, count=1)
     rel = unquote(rel).lstrip("/")
     if not rel:
         raise ViewImageError("sandbox URL must point to an image file")
@@ -144,7 +152,12 @@ def _validate_web_image_url(url: str) -> None:
         raise ViewImageError("image URL is missing a host")
     if parsed.username or parsed.password:
         raise ViewImageError("image URL must not include credentials")
-    validate_url(url)
+    # Blocks private/loopback targets (SSRF). Raises ValueError, which would
+    # otherwise escape as an opaque 500 instead of a model-readable message.
+    try:
+        validate_url(url)
+    except ValueError as e:
+        raise ViewImageError("image URL is not allowed") from e
 
 
 async def _read_response_limited(response: aiohttp.ClientResponse) -> bytes:
@@ -312,10 +325,10 @@ class ViewImageTools:
     ) -> str | dict:
         """Attach an image so you can inspect it visually on the next model call.
 
-        Use for image URLs found by web_search/web_fetch or sandbox:/workspace/...
-        image files created or discovered in the container workspace.
+        Use for image URLs found by web_search/web_fetch or image files created
+        or discovered in the container workspace.
 
-        :param source: Image location. Must be an http(s) URL or sandbox:/workspace/... URL.
+        :param source: Image location. An http(s) URL or a workspace file path (/workspace/... or sandbox:/workspace/...).
         :param detail: Vision detail level: auto, low, or high.
         :return: A short status message. On success the image is attached internally for visual inspection.
         """
@@ -329,7 +342,7 @@ class ViewImageTools:
         try:
             if source.startswith(("http://", "https://")):
                 raw, mime_type, display_name = await _fetch_web_image_bytes(__request__, source)
-            elif source.startswith("sandbox:"):
+            elif _SANDBOX_URI_PREFIX_RE.match(source):
                 target, rel, chat_id = _resolve_sandbox_image_path(source, metadata)
                 workspace = metadata.get("container_workspace") or {}
                 server_id = str(workspace.get("server_id") or "")
@@ -344,7 +357,10 @@ class ViewImageTools:
                 display_name = target.name
                 source = f"sandbox:/workspace/{rel}"
             else:
-                raise ViewImageError("source must be an http(s) URL or sandbox:/workspace/... URL")
+                raise ViewImageError(
+                    "source must be an http(s) URL, a sandbox:/workspace/... URL, "
+                    "or a /workspace/... path"
+                )
 
             image_data, provider_mime = _prepare_image_for_attachment(
                 raw, mime_type, display_name

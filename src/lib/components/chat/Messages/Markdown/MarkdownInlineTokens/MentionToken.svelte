@@ -11,17 +11,17 @@
 
 	const i18n = getContext('i18n');
 
-	export let token: Token;
-
-	let triggerChar = '';
-	let label = '';
-
-	let idType = null;
-	let id = '';
-
-	$: if (token) {
-		init();
+	interface Props {
+		token: Token;
 	}
+
+	let { token }: Props = $props();
+
+	let triggerChar = $state('');
+	let label = $state('');
+
+	let idType = $state(null);
+	let id = $state('');
 
 	const init = () => {
 		const _id = token?.id;
@@ -65,16 +65,21 @@
 			}
 		}
 	};
+	$effect(() => {
+		if (token) {
+			init();
+		}
+	});
 </script>
 
 <LinkPreview.Root openDelay={0} closeDelay={0}>
 	<LinkPreview.Trigger class=" cursor-pointer no-underline! font-normal! ">
-		<!-- svelte-ignore a11y-click-events-have-key-events -->
-		<!-- svelte-ignore a11y-no-static-element-interactions -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
 
 		<span
 			class="mention"
-			on:click={async () => {
+			onclick={async () => {
 				if (triggerChar === '@') {
 					if (idType === 'U') {
 						// Open user profile

@@ -1,38 +1,41 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import { getDataVizConfig, updateDataVizConfig, getModels as _getModels } from '$lib/apis';
 	import { onMount, getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let saveHandler: Function;
+	interface Props {
+		saveHandler: Function;
+	}
 
-	let availableModels: { id: string; name?: string }[] = [];
+	let { saveHandler }: Props = $props();
 
-	let enableDataViz = false;
-	let sharedCorePrompt = '';
+	let availableModels: { id: string; name?: string }[] = $state([]);
 
-	let diagramEnabled = true;
-	let diagramPrompt = '';
+	let enableDataViz = $state(false);
+	let sharedCorePrompt = $state('');
 
-	let mockupInteractiveEnabled = true;
-	let mockupInteractivePrompt = '';
+	let diagramEnabled = $state(true);
+	let diagramPrompt = $state('');
 
-	let chartDataVizEnabled = true;
-	let chartDataVizPrompt = '';
+	let mockupInteractiveEnabled = $state(true);
+	let mockupInteractivePrompt = $state('');
 
-	let artEnabled = true;
-	let artPrompt = '';
+	let chartDataVizEnabled = $state(true);
+	let chartDataVizPrompt = $state('');
 
-	let elicitationEnabled = true;
-	let elicitationPrompt = '';
+	let artEnabled = $state(true);
+	let artPrompt = $state('');
 
-	let autoRepairEnabled = true;
-	let autoRepairMaxAttempts = 3;
-	let autoRepairModel = '';
-	let autoRepairReasoningEffort = ''; // '' | 'low' | 'medium' | 'high'
+	let autoRepairEnabled = $state(true);
+	let autoRepairMaxAttempts = $state(3);
+	let autoRepairModel = $state('');
+	let autoRepairReasoningEffort = $state(''); // '' | 'low' | 'medium' | 'high'
 
 	const submitHandler = async () => {
 		const clampedAttempts = Math.max(1, Math.min(5, Number(autoRepairMaxAttempts) || 1));
@@ -47,8 +50,6 @@
 			DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT: chartDataVizPrompt,
 			DATA_VIZ_MODULE_ART_ENABLED: artEnabled,
 			DATA_VIZ_MODULE_ART_PROMPT: artPrompt,
-			DATA_VIZ_MODULE_ELICITATION_ENABLED: elicitationEnabled,
-			DATA_VIZ_MODULE_ELICITATION_PROMPT: elicitationPrompt,
 			DATA_VIZ_AUTO_REPAIR_ENABLED: autoRepairEnabled,
 			DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS: clampedAttempts,
 			DATA_VIZ_AUTO_REPAIR_MODEL: autoRepairModel,
@@ -90,9 +91,6 @@
 			artEnabled = res.DATA_VIZ_MODULE_ART_ENABLED ?? true;
 			artPrompt = res.DATA_VIZ_MODULE_ART_PROMPT ?? '';
 
-			elicitationEnabled = res.DATA_VIZ_MODULE_ELICITATION_ENABLED ?? true;
-			elicitationPrompt = res.DATA_VIZ_MODULE_ELICITATION_PROMPT ?? '';
-
 			autoRepairEnabled = res.DATA_VIZ_AUTO_REPAIR_ENABLED ?? true;
 			autoRepairMaxAttempts = res.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS ?? 3;
 			autoRepairModel = res.DATA_VIZ_AUTO_REPAIR_MODEL ?? '';
@@ -103,10 +101,10 @@
 
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
-	on:submit|preventDefault={async () => {
+	onsubmit={preventDefault(async () => {
 		await submitHandler();
 		saveHandler();
-	}}
+	})}
 >
 	<div class=" space-y-3 overflow-y-scroll scrollbar-hidden h-full">
 		<div class="">
@@ -141,8 +139,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Paste shared core prompt...')}
-								bind:value={sharedCorePrompt}
-							></textarea>
+								bind:value={sharedCorePrompt}></textarea>
 						</div>
 					</div>
 
@@ -164,8 +161,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Paste diagram module prompt...')}
-								bind:value={diagramPrompt}
-							></textarea>
+								bind:value={diagramPrompt}></textarea>
 						</div>
 					{/if}
 
@@ -184,8 +180,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Paste mockup / interactive module prompt...')}
-								bind:value={mockupInteractivePrompt}
-							></textarea>
+								bind:value={mockupInteractivePrompt}></textarea>
 						</div>
 					{/if}
 
@@ -204,8 +199,7 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Paste chart / data viz module prompt...')}
-								bind:value={chartDataVizPrompt}
-							></textarea>
+								bind:value={chartDataVizPrompt}></textarea>
 						</div>
 					{/if}
 
@@ -224,34 +218,15 @@
 								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
 								rows="6"
 								placeholder={$i18n.t('Paste art module prompt...')}
-								bind:value={artPrompt}
-							></textarea>
-						</div>
-					{/if}
-
-					<!-- Elicitation -->
-					<div class="mb-2.5 flex w-full justify-between">
-						<div class=" self-center text-xs font-medium">
-							{$i18n.t('Elicitation')}
-						</div>
-						<div class="flex items-center relative">
-							<Switch bind:state={elicitationEnabled} />
-						</div>
-					</div>
-					{#if elicitationEnabled}
-						<div class="mb-2.5 flex w-full flex-col">
-							<textarea
-								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden resize-y"
-								rows="6"
-								placeholder={$i18n.t('Paste elicitation module prompt...')}
-								bind:value={elicitationPrompt}
-							></textarea>
+								bind:value={artPrompt}></textarea>
 						</div>
 					{/if}
 
 					<hr class="border-gray-100 dark:border-gray-850 my-3" />
 
-					<div class="mb-1.5 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide">
+					<div
+						class="mb-1.5 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide"
+					>
 						{$i18n.t('Auto-repair')}
 					</div>
 
@@ -320,7 +295,7 @@
 							<div class="self-center text-xs font-medium">
 								<Tooltip
 									content={$i18n.t(
-										'Reasoning effort to apply on repair model calls. Leave on Default for non-reasoning models — sending an effort to a model that doesn\'t support it can error.'
+										"Reasoning effort to apply on repair model calls. Leave on Default for non-reasoning models — sending an effort to a model that doesn't support it can error."
 									)}
 								>
 									{$i18n.t('Reasoning effort')}

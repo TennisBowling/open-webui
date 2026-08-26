@@ -4,8 +4,7 @@
 
 	const i18n = getContext('i18n');
 
-	export let messages = [];
-	export let onInsert = (content: string) => {};
+	let { messages = $bindable([]), onInsert = (content: string) => {} } = $props();
 </script>
 
 <div class="space-y-3 pb-12">

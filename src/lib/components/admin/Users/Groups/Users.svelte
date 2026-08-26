@@ -9,38 +9,38 @@
 	import Badge from '$lib/components/common/Badge.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
 
-	export let users = [];
-	export let userIds = [];
+	let { users = [], userIds = $bindable([]) } = $props();
 
-	let filteredUsers = [];
+	let filteredUsers = $state([]);
 
-	$: filteredUsers = users
-		.filter((user) => {
-			if (query === '') {
-				return true;
-			}
+	let query = $state('');
+	$effect(() => {
+		filteredUsers = users
+			.filter((user) => {
+				if (query === '') {
+					return true;
+				}
 
-			return (
-				user.name.toLowerCase().includes(query.toLowerCase()) ||
-				user.email.toLowerCase().includes(query.toLowerCase())
-			);
-		})
-		.sort((a, b) => {
-			const aUserIndex = userIds.indexOf(a.id);
-			const bUserIndex = userIds.indexOf(b.id);
+				return (
+					user.name.toLowerCase().includes(query.toLowerCase()) ||
+					user.email.toLowerCase().includes(query.toLowerCase())
+				);
+			})
+			.sort((a, b) => {
+				const aUserIndex = userIds.indexOf(a.id);
+				const bUserIndex = userIds.indexOf(b.id);
 
-			// Compare based on userIds or fall back to alphabetical order
-			if (aUserIndex !== -1 && bUserIndex === -1) return -1; // 'a' has valid userId -> prioritize
-			if (bUserIndex !== -1 && aUserIndex === -1) return 1; // 'b' has valid userId -> prioritize
+				// Compare based on userIds or fall back to alphabetical order
+				if (aUserIndex !== -1 && bUserIndex === -1) return -1; // 'a' has valid userId -> prioritize
+				if (bUserIndex !== -1 && aUserIndex === -1) return 1; // 'b' has valid userId -> prioritize
 
-			// Both a and b are either in the userIds array or not, so we'll sort them by their indices
-			if (aUserIndex !== -1 && bUserIndex !== -1) return aUserIndex - bUserIndex;
+				// Both a and b are either in the userIds array or not, so we'll sort them by their indices
+				if (aUserIndex !== -1 && bUserIndex !== -1) return aUserIndex - bUserIndex;
 
-			// If both are not in the userIds, fallback to alphabetical sorting by name
-			return a.name.localeCompare(b.name);
-		});
-
-	let query = '';
+				// If both are not in the userIds, fallback to alphabetical sorting by name
+				return a.name.localeCompare(b.name);
+			});
+	});
 </script>
 
 <div>
@@ -65,8 +65,8 @@
 						<div class="flex items-center">
 							<Checkbox
 								state={userIds.includes(user.id) ? 'checked' : 'unchecked'}
-								on:change={(e) => {
-									if (e.detail === 'checked') {
+								onchange={(state) => {
+									if (state === 'checked') {
 										userIds = [...userIds, user.id];
 									} else {
 										userIds = userIds.filter((id) => id !== user.id);

@@ -1,5 +1,8 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { stopPropagation } from '$lib/utils/eventModifiers';
+
+	import { getContext } from 'svelte';
 	import { formatFileSize } from '$lib/utils';
 
 	import FileItemModal from './FileItemModal.svelte';
@@ -13,10 +16,16 @@
 	// Files that have a meaningful Text/PDF choice (neither plain text, where
 	// PDF mode is pointless, nor PDF/image, where there's no choice at all).
 	const EXTRACTABLE_EXTS = new Set([
-		'docx', 'doc', 'odt', 'rtf',
-		'pptx', 'ppt',
-		'xlsx', 'xls',
-		'html', 'htm',
+		'docx',
+		'doc',
+		'odt',
+		'rtf',
+		'pptx',
+		'ppt',
+		'xlsx',
+		'xls',
+		'html',
+		'htm',
 		'epub'
 	]);
 	const SPREADSHEET_EXTS = new Set(['xlsx', 'xls', 'ods', 'csv', 'tsv']);
@@ -27,48 +36,72 @@
 	};
 
 	const i18n = getContext('i18n');
-	const dispatch = createEventDispatcher();
-
-	export let className = 'w-60';
-	export let colorClassName =
-		'bg-white dark:bg-gray-850 border border-gray-50 dark:border-gray-800';
-	export let url: string | null = null;
-
-	export let dismissible = false;
-	export let modal = false;
-	export let loading = false;
-
-	export let item = null;
-	export let edit = false;
-	export let small = false;
-	export let containerMode = false;
-	export let allowContainer = false;
-
-	export let name: string;
-	export let type: string;
-	export let size: number;
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import DocumentPage from '../icons/DocumentPage.svelte';
 	import Database from '../icons/Database.svelte';
 	import PageEdit from '../icons/PageEdit.svelte';
 	import ChatBubble from '../icons/ChatBubble.svelte';
 	import Folder from '../icons/Folder.svelte';
-	let showModal = false;
-	let showModePopover = false;
-	let pillAnchor: HTMLButtonElement;
+	interface Props {
+		className?: string;
+		colorClassName?: string;
+		url?: string | null;
+		dismissible?: boolean;
+		modal?: boolean;
+		loading?: boolean;
+		item?: any;
+		edit?: boolean;
+		small?: boolean;
+		containerMode?: boolean;
+		allowContainer?: boolean;
+		name: string;
+		type: string;
+		size: number;
+	}
 
-	$: itemExt = getExtension(item?.name || item?.file?.filename || name || '');
-	$: effectiveContainerMode = containerMode || item?.container_mode;
-	$: pillVisible = item && item.type === 'file' && !item.locked && !effectiveContainerMode && EXTRACTABLE_EXTS.has(itemExt);
-	$: pillIsSpreadsheet = SPREADSHEET_EXTS.has(itemExt);
-	$: pillMode = (item?.processing_mode as 'text' | 'pdf') || 'text';
-	$: pillStatus = (() => {
-		// `item.status` is the frontend-facing state set by MessageInput's poll
-		// loop. Treat 'uploading' and 'processing' as the "still cooking" state.
-		if (item?.status === 'uploading' || item?.status === 'processing') return 'processing';
-		if (item?.status === 'failed') return 'failed';
-		return 'ready';
-	})();
+	let {
+		className = 'w-60',
+		colorClassName = 'bg-white dark:bg-gray-850 border-hairline border-gray-50 dark:border-gray-800',
+		url = null,
+		dismissible = false,
+		modal = false,
+		loading = false,
+		item = $bindable(null),
+		edit = false,
+		small = false,
+		containerMode = false,
+		allowContainer = false,
+		name,
+		type,
+		size,
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
+	let showModal = $state(false);
+	let showModePopover = $state(false);
+	let pillAnchor: HTMLButtonElement = $state();
+
+	let itemExt = $derived(getExtension(item?.name || item?.file?.filename || name || ''));
+	let effectiveContainerMode = $derived(containerMode || item?.container_mode);
+	let pillVisible = $derived(
+		item &&
+			item.type === 'file' &&
+			!item.locked &&
+			!effectiveContainerMode &&
+			EXTRACTABLE_EXTS.has(itemExt)
+	);
+	let pillIsSpreadsheet = $derived(SPREADSHEET_EXTS.has(itemExt));
+	let pillMode = $derived((item?.processing_mode as 'text' | 'pdf') || 'text');
+	let pillStatus = $derived(
+		(() => {
+			// `item.status` is the frontend-facing state set by MessageInput's poll
+			// loop. Treat 'uploading' and 'processing' as the "still cooking" state.
+			if (item?.status === 'uploading' || item?.status === 'processing') return 'processing';
+			if (item?.status === 'failed') return 'failed';
+			return 'ready';
+		})()
+	);
 
 	const decodeString = (str: string) => {
 		try {
@@ -86,16 +119,23 @@
 		{edit}
 		containerMode={effectiveContainerMode}
 		{allowContainer}
-		on:modeChange={(e) => dispatch('modeChange', e.detail)}
+		onmodeChange={(e) => dispatch('modeChange', e.detail)}
 	/>
 {/if}
 
-<button
+<div
+	role="button"
+	tabindex="0"
 	class="relative group p-1.5 {className} flex items-center gap-1 {colorClassName} {small
 		? 'rounded-xl p-2'
 		: 'rounded-2xl'} text-left"
-	type="button"
-	on:click={async () => {
+	onkeydown={(event) => {
+		if (event.key === 'Enter' || event.key === ' ') {
+			event.preventDefault();
+			event.currentTarget.click();
+		}
+	}}
+	onclick={async () => {
 		if (item?.file?.data?.content || item?.type === 'file' || modal) {
 			showModal = !showModal;
 		} else {
@@ -203,11 +243,11 @@
 							type="button"
 							class="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium
 								{pillStatus === 'failed'
-									? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-									: 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'}"
-							on:click|stopPropagation={() => {
+								? 'bg-error-brick/10 text-error-brick dark:text-error-brick-dark'
+								: 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'}"
+							onclick={stopPropagation(() => {
 								showModePopover = !showModePopover;
-							}}
+							})}
 							aria-label={$i18n.t('Choose file processing mode')}
 						>
 							<span>{pillMode === 'pdf' ? 'PDF' : $i18n.t('Text')}</span>
@@ -237,11 +277,11 @@
 								fileId={item?.id ?? null}
 								anchorEl={pillAnchor}
 								isSpreadsheet={pillIsSpreadsheet}
-								on:change={(e) => {
+								onchange={(e) => {
 									if (item && e.detail.mode !== 'container') item.processing_mode = e.detail.mode;
 									dispatch('modeChange', e.detail);
 								}}
-								on:close={() => {
+								onclose={() => {
 									showModePopover = false;
 								}}
 							/>
@@ -262,11 +302,11 @@
 								type="button"
 								class="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium
 									{pillStatus === 'failed'
-										? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-										: 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'}"
-								on:click|stopPropagation={() => {
+									? 'bg-error-brick/10 text-error-brick dark:text-error-brick-dark'
+									: 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'}"
+								onclick={stopPropagation(() => {
 									showModePopover = !showModePopover;
-								}}
+								})}
 								aria-label={$i18n.t('Choose file processing mode')}
 							>
 								<span>{pillMode === 'pdf' ? 'PDF' : $i18n.t('Text')}</span>
@@ -296,11 +336,11 @@
 									fileId={item?.id ?? null}
 									anchorEl={pillAnchor}
 									isSpreadsheet={pillIsSpreadsheet}
-									on:change={(e) => {
+									onchange={(e) => {
 										if (item && e.detail.mode !== 'container') item.processing_mode = e.detail.mode;
 										dispatch('modeChange', e.detail);
 									}}
-									on:close={() => {
+									onclose={() => {
 										showModePopover = false;
 									}}
 								/>
@@ -321,14 +361,14 @@
 		<div class=" absolute -top-1 -right-1">
 			<button
 				aria-label={$i18n.t('Remove File')}
-				class=" bg-white text-black border border-gray-50 rounded-full {($settings?.highContrastMode ??
+				class=" bg-white text-black border-hairline border-gray-50 rounded-full max-md:p-2 {($settings?.highContrastMode ??
 				false)
 					? ''
 					: 'outline-hidden focus:outline-hidden group-hover:visible invisible transition'}"
 				type="button"
-				on:click|stopPropagation={() => {
+				onclick={stopPropagation(() => {
 					dispatch('dismiss');
-				}}
+				})}
 			>
 				<XMark className={'size-4'} />
 			</button>
@@ -336,11 +376,11 @@
 			<!-- <button
 				class=" p-1 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-full group-hover:visible invisible transition"
 				type="button"
-				on:click={() => {
+				onclick={() => {
 				}}
 			>
 				<GarbageBin />
 			</button> -->
 		</div>
 	{/if}
-</button>
+</div>

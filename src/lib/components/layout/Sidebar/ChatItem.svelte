@@ -1,10 +1,14 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { goto, invalidate, invalidateAll } from '$app/navigation';
-	import { onMount, getContext, createEventDispatcher, tick, onDestroy } from 'svelte';
+	import { onMount, getContext, tick, onDestroy } from 'svelte';
 	const i18n = getContext('i18n');
 
-	const dispatch = createEventDispatcher();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import {
 		archiveChatById,
@@ -23,12 +27,15 @@
 		chatTitle as _chatTitle,
 		chats,
 		mobile,
+		online,
 		pinnedChats,
 		showSidebar,
 		currentChatPage,
 		tags,
-		selectedFolder
+		selectedFolder,
+		user
 	} from '$lib/stores';
+	import { offlineChatMeta, removeOfflineChat } from '$lib/offline/manager';
 
 	import ChatMenu from './ChatMenu.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -43,26 +50,44 @@
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import { generateTitle } from '$lib/apis';
 
-	export let className = '';
+	interface Props {
+		className?: string;
+		id: any;
+		title: any;
+		active?: boolean;
+		selected?: boolean;
+		shiftKey?: boolean;
+		onDragEnd?: any;
+	}
 
-	export let id;
-	export let title;
-
-	export let active = false;
-	export let selected = false;
-	export let shiftKey = false;
-
-	export let onDragEnd = () => {};
+	let {
+		className = '',
+		id,
+		title,
+		active = false,
+		selected = false,
+		shiftKey = false,
+		onDragEnd = () => {},
+		...eventProps
+	}: Props & Record<string, unknown> = $props();
 
 	let chat = null;
 
-	let mouseOver = false;
+	let mouseOver = $state(false);
 	let draggable = true;
 
-	let showShareChatModal = false;
-	let confirmEdit = false;
+	// While offline (and once the offline meta map has loaded), chats with no
+	// local copy can't open — dim them and intercept the tap with an
+	// explanation instead of letting the open path bounce to the home screen.
+	let unavailableOffline = $derived(
+		!$online && $offlineChatMeta !== null && !$offlineChatMeta.has(id)
+	);
 
-	let chatTitle = title;
+	let showShareChatModal = $state(false);
+	let confirmEdit = $state(false);
+
+	// This is an edit buffer, populated from the latest title by renameHandler.
+	let chatTitle = $state('');
 
 	const editChatTitle = async (id, title) => {
 		if (title === '') {
@@ -112,6 +137,9 @@
 		});
 
 		if (res) {
+			if ($user?.id) {
+				void removeOfflineChat($user.id, id);
+			}
 			tags.set(await getAllTags(localStorage.token));
 			if ($chatId === id) {
 				await goto('/');
@@ -152,16 +180,16 @@
 		}
 	};
 
-	let itemElement;
+	let itemElement = $state();
 
-	let generating = false;
+	let generating = $state(false);
 
-	let ignoreBlur = false;
-	let doubleClicked = false;
+	let ignoreBlur = $state(false);
+	let doubleClicked = $state(false);
 
-	let dragged = false;
-	let x = 0;
-	let y = 0;
+	let dragged = $state(false);
+	let x = $state(0);
+	let y = $state(0);
 
 	const dragImage = new Image();
 	dragImage.src =
@@ -234,7 +262,7 @@
 		}
 	});
 
-	let showDeleteConfirm = false;
+	let showDeleteConfirm = $state(false);
 
 	const chatTitleInputKeydownHandler = (e) => {
 		if (e.key === 'Enter') {
@@ -308,7 +336,7 @@
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
 	title={$i18n.t('Delete chat?')}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteChatHandler(id);
 	}}
 >
@@ -334,6 +362,7 @@
 	id="sidebar-chat-group"
 	bind:this={itemElement}
 	class=" w-full {className} relative group"
+	style="content-visibility: auto; contain-intrinsic-size: auto 36px;"
 	draggable={draggable && !confirmEdit}
 >
 	{#if confirmEdit}
@@ -349,8 +378,8 @@
 				class=" bg-transparent w-full outline-hidden mr-10"
 				placeholder={generating ? $i18n.t('Generating...') : ''}
 				disabled={generating}
-				on:keydown={chatTitleInputKeydownHandler}
-				on:blur={async (e) => {
+				onkeydown={chatTitleInputKeydownHandler}
+				onblur={async (e) => {
 					// check if target is generate button
 					if (ignoreBlur) {
 						ignoreBlur = false;
@@ -392,11 +421,19 @@
 				? "bg-manilla/40 dark:bg-manilla-dark selected before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[3px] before:bg-book-cloth before:rounded-r"
 				: selected
 					? 'bg-manilla/40 dark:bg-manilla-dark selected'
-					: 'hover:bg-manilla/20 dark:hover:bg-manilla-dark/50'}  whitespace-nowrap text-ellipsis"
+					: 'hover:bg-manilla/20 dark:hover:bg-manilla-dark/50'} {unavailableOffline
+				? 'opacity-40'
+				: ''}  whitespace-nowrap text-ellipsis"
 			style="-webkit-tap-highlight-color: transparent;"
 			href="/c/{id}"
-			on:click={(event) => {
+			onclick={(event) => {
 				if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+					return;
+				}
+
+				if (unavailableOffline) {
+					event.preventDefault();
+					toast.error($i18n.t('This chat is not available offline.'));
 					return;
 				}
 
@@ -410,24 +447,24 @@
 					showSidebar.set(false);
 				}
 			}}
-			on:dblclick={async (e) => {
+			ondblclick={async (e) => {
 				e.preventDefault();
 				e.stopPropagation();
 
 				doubleClicked = true;
 				renameHandler();
 			}}
-			on:mouseenter={(e) => {
+			onmouseenter={(e) => {
 				if (!$mobile) {
 					mouseOver = true;
 				}
 			}}
-			on:mouseleave={(e) => {
+			onmouseleave={(e) => {
 				if (!$mobile) {
 					mouseOver = false;
 				}
 			}}
-			on:focus={(e) => {}}
+			onfocus={(e) => {}}
 			draggable="false"
 		>
 			<div class=" flex self-center flex-1 w-full">
@@ -438,7 +475,7 @@
 		</a>
 	{/if}
 
-	<!-- svelte-ignore a11y-no-static-element-interactions -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		id="sidebar-chat-item-menu"
 		class="
@@ -447,27 +484,33 @@
 			: `${$mobile ? '' : 'invisible group-hover:visible'} from-gray-50 dark:from-gray-950`}
 		          absolute {className === 'pr-2'
 			? 'right-[8px]'
-			: 'right-1'} top-[4px] py-1 pr-0.5 mr-1.5 pl-5 bg-linear-to-l from-80%
+			: 'right-1'} inset-y-0 flex items-center py-1 pr-0.5 mr-1.5 pl-5 bg-linear-to-l from-80%
 
-              to-transparent"
-		on:mouseenter={(e) => {
+              to-transparent pointer-events-none"
+		onmouseenter={(e) => {
 			mouseOver = true;
 		}}
-		on:mouseleave={(e) => {
+		onmouseleave={(e) => {
 			mouseOver = false;
 		}}
 	>
 		{#if confirmEdit}
 			<div
-				class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
+				class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px] pointer-events-auto"
 			>
 				<Tooltip content={$i18n.t('Generate')}>
 					<button
-						class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+						class=" self-center text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition disabled:cursor-not-allowed"
 						id="generate-title-button"
 						disabled={generating}
-						on:mouseenter={() => {
+						onmouseenter={() => {
 							ignoreBlur = true;
+						}}
+						onpointerdown={preventDefault(() => {
+							ignoreBlur = true;
+						})}
+						onclick={() => {
+							generateTitleHandler();
 						}}
 					>
 						<Sparkles strokeWidth="2" />
@@ -478,8 +521,8 @@
 			<div class=" flex items-center self-center space-x-1.5">
 				<Tooltip content={$i18n.t('Archive')} className="flex items-center">
 					<button
-						class=" self-center dark:hover:text-white transition"
-						on:click={() => {
+						class=" self-center text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition"
+						onclick={() => {
 							archiveChatHandler(id);
 						}}
 						type="button"
@@ -490,8 +533,8 @@
 
 				<Tooltip content={$i18n.t('Delete')}>
 					<button
-						class=" self-center dark:hover:text-white transition"
-						on:click={() => {
+						class=" self-center text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition"
+						onclick={() => {
 							deleteChatHandler(id);
 						}}
 						type="button"
@@ -521,17 +564,17 @@
 					onClose={() => {
 						dispatch('unselect');
 					}}
-					on:change={async () => {
+					onchange={async () => {
 						dispatch('change');
 					}}
-					on:tag={(e) => {
+					ontag={(e) => {
 						dispatch('tag', e.detail);
 					}}
 				>
 					<button
 						aria-label="Chat Menu"
-						class=" self-center dark:hover:text-white transition m-0"
-						on:click={() => {
+						class=" self-center shrink-0 inline-flex items-center justify-center text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition m-0 max-md:p-2.5 pointer-events-auto"
+						onclick={() => {
 							dispatch('select');
 						}}
 					>
@@ -553,7 +596,7 @@
 					<button
 						id="delete-chat-button"
 						class="hidden"
-						on:click={() => {
+						onclick={() => {
 							showDeleteConfirm = true;
 						}}
 					>

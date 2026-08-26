@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { mobile, showArchivedChats, showSidebar, user } from '$lib/stores';
 
@@ -14,10 +14,10 @@
 
 	const i18n = getContext('i18n');
 
-	export let channel;
+	let { channel } = $props();
 </script>
 
-<nav class="sticky top-0 z-30 w-full px-1.5 py-1.5 -mb-8 flex items-center drag-region">
+<nav class="sticky top-0 z-30 w-full px-1.5 py-1.5 pt-safe -mb-8 flex items-center drag-region">
 	<div
 		class=" bg-linear-to-b via-50% from-white via-white to-transparent dark:from-gray-900 dark:via-gray-900 dark:to-transparent pointer-events-none absolute inset-0 -bottom-7 z-[-1]"
 	></div>
@@ -37,7 +37,7 @@
 						<button
 							id="sidebar-toggle-button"
 							class=" cursor-pointer flex rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition cursor-"
-							on:click={() => {
+							onclick={() => {
 								showSidebar.set(!$showSidebar);
 							}}
 						>
@@ -67,7 +67,7 @@
 						className="max-w-[240px]"
 						role={$user?.role}
 						help={true}
-						on:show={(e) => {
+						onshow={(e) => {
 							if (e.detail === 'archived-chat') {
 								showArchivedChats.set(true);
 							}

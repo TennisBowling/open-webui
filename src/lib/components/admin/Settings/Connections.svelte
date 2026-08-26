@@ -1,8 +1,13 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
 
-	const dispatch = createEventDispatcher();
+	import { toast } from '$lib/utils/toast';
+	import { onMount, getContext, tick } from 'svelte';
+
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	import { getOllamaConfig, updateOllamaConfig } from '$lib/apis/ollama';
 	import { getOpenAIConfig, updateOpenAIConfig, getOpenAIModels } from '$lib/apis/openai';
@@ -33,21 +38,21 @@
 	};
 
 	// External
-	let OLLAMA_BASE_URLS = [''];
-	let OLLAMA_API_CONFIGS = {};
+	let OLLAMA_BASE_URLS = $state(['']);
+	let OLLAMA_API_CONFIGS = $state({});
 
-	let OPENAI_API_KEYS = [''];
-	let OPENAI_API_BASE_URLS = [''];
-	let OPENAI_API_CONFIGS = {};
+	let OPENAI_API_KEYS = $state(['']);
+	let OPENAI_API_BASE_URLS = $state(['']);
+	let OPENAI_API_CONFIGS = $state({});
 
-	let ENABLE_OPENAI_API: null | boolean = null;
-	let ENABLE_OLLAMA_API: null | boolean = null;
+	let ENABLE_OPENAI_API: null | boolean = $state(null);
+	let ENABLE_OLLAMA_API: null | boolean = $state(null);
 
-	let connectionsConfig = null;
+	let connectionsConfig = $state(null);
 
-	let pipelineUrls = {};
-	let showAddOpenAIConnectionModal = false;
-	let showAddOllamaConnectionModal = false;
+	let pipelineUrls = $state({});
+	let showAddOpenAIConnectionModal = $state(false);
+	let showAddOllamaConnectionModal = $state(false);
 
 	const updateOpenAIHandler = async () => {
 		if (ENABLE_OPENAI_API !== null) {
@@ -215,7 +220,7 @@
 	onSubmit={addOllamaConnectionHandler}
 />
 
-<form class="flex flex-col h-full justify-between text-sm" on:submit|preventDefault={submitHandler}>
+<form class="flex flex-col h-full justify-between text-sm" onsubmit={preventDefault(submitHandler)}>
 	<div class=" overflow-y-scroll scrollbar-hidden h-full">
 		{#if ENABLE_OPENAI_API !== null && ENABLE_OLLAMA_API !== null && connectionsConfig !== null}
 			<div class="mb-3.5">
@@ -232,7 +237,7 @@
 								<div class="">
 									<Switch
 										bind:state={ENABLE_OPENAI_API}
-										on:change={async () => {
+										onchange={async () => {
 											updateOpenAIHandler();
 										}}
 									/>
@@ -248,7 +253,7 @@
 									<Tooltip content={$i18n.t(`Add Connection`)}>
 										<button
 											class="px-1"
-											on:click={() => {
+											onclick={() => {
 												showAddOpenAIConnectionModal = true;
 											}}
 											type="button"
@@ -297,7 +302,7 @@
 						<div class="mt-1">
 							<Switch
 								bind:state={ENABLE_OLLAMA_API}
-								on:change={async () => {
+								onchange={async () => {
 									updateOllamaHandler();
 								}}
 							/>
@@ -312,7 +317,7 @@
 								<Tooltip content={$i18n.t(`Add Connection`)}>
 									<button
 										class="px-1"
-										on:click={() => {
+										onclick={() => {
 											showAddOllamaConnectionModal = true;
 										}}
 										type="button"
@@ -369,7 +374,7 @@
 							<div class="">
 								<Switch
 									bind:state={connectionsConfig.ENABLE_DIRECT_CONNECTIONS}
-									on:change={async () => {
+									onchange={async () => {
 										updateConnectionsHandler();
 									}}
 								/>
@@ -394,7 +399,7 @@
 							<div class="">
 								<Switch
 									bind:state={connectionsConfig.ENABLE_BASE_MODELS_CACHE}
-									on:change={async () => {
+									onchange={async () => {
 										updateConnectionsHandler();
 									}}
 								/>

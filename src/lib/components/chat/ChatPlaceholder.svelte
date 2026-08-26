@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { imageFallback } from '$lib/actions/imageFallback';
 	import { marked } from 'marked';
 
 	import { config, user, modelsLoaded, models as _models, temporaryChatEnabled } from '$lib/stores';
@@ -11,23 +12,28 @@
 	import { sanitizeResponseContent } from '$lib/utils';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import EyeSlash from '$lib/components/icons/EyeSlash.svelte';
+	import PeakHoursNotice from './PeakHoursNotice.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let modelIds = [];
-	export let models = [];
-	export let atSelectedModel;
+	let { modelIds = [], models = $bindable([]), atSelectedModel, onSelect = (e) => {} } = $props();
 
-	export let onSelect = (e) => {};
+	let mounted = $state(false);
+	let selectedModelIdx = $state(0);
 
-	let mounted = false;
-	let selectedModelIdx = 0;
+	$effect(() => {
+		models = modelIds.map((id) => $_models.find((m) => m.id === id));
+	});
 
-	$: if (modelIds.length > 0) {
-		selectedModelIdx = models.length - 1;
-	}
-
-	$: models = modelIds.map((id) => $_models.find((m) => m.id === id));
+	// Clamp only when the current index is out of range (e.g. a model was
+	// removed) — do NOT force-jump to the last model on every array change,
+	// which used to stomp the user's explicit avatar click and disagreed with
+	// the picker (which shows the FIRST selected model).
+	$effect(() => {
+		if (selectedModelIdx > models.length - 1) {
+			selectedModelIdx = Math.max(0, models.length - 1);
+		}
+	});
 
 	onMount(() => {
 		mounted = true;
@@ -40,20 +46,21 @@
 			<div class="flex -space-x-4 mb-0.5" in:fade={{ duration: 200 }}>
 				{#each models as model, modelIdx}
 					<button
-						on:click={() => {
+						onclick={() => {
 							selectedModelIdx = modelIdx;
 						}}
 					>
 						<Tooltip
 							content={marked.parse(
-								sanitizeResponseContent(
-									models[selectedModelIdx]?.info?.meta?.description ?? ''
-								).replaceAll('\n', '<br>')
+								sanitizeResponseContent(model?.info?.meta?.description ?? '').replaceAll(
+									'\n',
+									'<br>'
+								)
 							)}
 							placement="right"
 						>
 							<img
-								crossorigin="anonymous"
+								use:imageFallback
 								src={model?.info?.meta?.profile_image_url ??
 									($i18n.language === 'dg-DG'
 										? `${WEBUI_BASE_URL}/doge.png`
@@ -61,6 +68,7 @@
 								class=" size-[2.7rem] rounded-full border-hairline border-gray-300 dark:border-none"
 								alt="logo"
 								draggable="false"
+								decoding="async"
 							/>
 						</Tooltip>
 					</button>
@@ -122,13 +130,15 @@
 							</div>
 						{/if}
 					{:else}
-						<div class=" text-gray-400 dark:text-gray-500 line-clamp-1 font-p">
+						<div class=" text-gray-400 dark:text-gray-500 line-clamp-1 font-primary">
 							{$i18n.t('How can I help you today?')}
 						</div>
 					{/if}
 				</div>
 			</div>
 		</div>
+
+		<PeakHoursNotice model={models[selectedModelIdx]} className="mb-3" />
 
 		<div class=" w-full font-primary" in:fade={{ duration: 200, delay: 300 }}>
 			<Suggestions

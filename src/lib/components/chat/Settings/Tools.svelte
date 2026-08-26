@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
+	import { toast } from '$lib/utils/toast';
 	import { onMount, getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
@@ -17,10 +19,14 @@
 
 	import AddToolServerModal from '$lib/components/AddToolServerModal.svelte';
 
-	export let saveSettings: Function;
+	interface Props {
+		saveSettings: Function;
+	}
 
-	let servers = null;
-	let showConnectionModal = false;
+	let { saveSettings }: Props = $props();
+
+	let servers = $state(null);
+	let showConnectionModal = $state(false);
 
 	const addConnectionHandler = async (server) => {
 		servers = [...servers, server];
@@ -54,11 +60,11 @@
 <form
 	id="tab-tools"
 	class="flex flex-col h-full justify-between text-sm"
-	on:submit|preventDefault={() => {
+	onsubmit={preventDefault(() => {
 		updateHandler();
-	}}
+	})}
 >
-	<div class=" overflow-y-scroll scrollbar-hidden h-full">
+	<div class=" overflow-y-scroll scrollbar-hidden max-h-[28rem] md:max-h-full">
 		{#if servers !== null}
 			<div class="">
 				<div class="pr-1.5">
@@ -73,7 +79,7 @@
 								<button
 									aria-label={$i18n.t(`Add Connection`)}
 									class="px-1"
-									on:click={() => {
+									onclick={() => {
 										showConnectionModal = true;
 									}}
 									type="button"
@@ -86,7 +92,7 @@
 						<div class="flex flex-col gap-1.5">
 							{#each servers as server, idx}
 								<Connection
-									bind:connection={server}
+									bind:connection={servers[idx]}
 									direct
 									onSubmit={() => {
 										updateHandler();
@@ -108,7 +114,7 @@
 							{$i18n.t('Connect to your own OpenAPI compatible external tool servers.')}
 							<br />
 							{$i18n.t(
-								'CORS must be properly configured by the provider to allow requests from Open WebUI.'
+								'CORS must be properly configured by the provider to allow requests from {{WEBUI_NAME}}.'
 							)}
 						</div>
 					</div>

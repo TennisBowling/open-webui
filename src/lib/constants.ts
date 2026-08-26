@@ -1,9 +1,18 @@
 import { browser, dev } from '$app/environment';
 // import { version } from '../../package.json';
 
-export const APP_NAME = 'Open WebUI';
+export const APP_NAME =
+	(browser && document.querySelector('meta[name="application-name"]')?.getAttribute('content')) ||
+	'Open WebUI';
 
-export const WEBUI_HOSTNAME = browser ? (dev ? `${location.hostname}:8080` : ``) : '';
+// Dev only: the backend port `vite dev` talks to. Override with VITE_WEBUI_PORT
+// when the backend is not on the default 8080. Production builds are served by
+// the backend itself and use same-origin relative URLs.
+export const WEBUI_HOSTNAME = browser
+	? dev
+		? `${location.hostname}:${import.meta.env.VITE_WEBUI_PORT ?? '8080'}`
+		: ``
+	: '';
 export const WEBUI_BASE_URL = browser ? (dev ? `http://${WEBUI_HOSTNAME}` : ``) : ``;
 export const WEBUI_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1`;
 

@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -8,8 +8,12 @@
 	import SlideShow from './common/SlideShow.svelte';
 	import ArrowRightCircle from './icons/ArrowRightCircle.svelte';
 
-	export let show = true;
-	export let getStartedHandler = () => {};
+	interface Props {
+		show?: boolean;
+		getStartedHandler?: any;
+	}
+
+	let { show = $bindable(true), getStartedHandler = () => {} }: Props = $props();
 
 	function setLogoImage() {
 		const logo = document.getElementById('logo');
@@ -33,9 +37,11 @@
 		}
 	}
 
-	$: if (show) {
-		setLogoImage();
-	}
+	$effect(() => {
+		if (show) {
+			setLogoImage();
+		}
+	});
 </script>
 
 {#if show}
@@ -89,7 +95,7 @@
 						<button
 							aria-labelledby="get-started"
 							class="relative z-20 flex p-1 rounded-full bg-white/5 hover:bg-white/10 transition font-medium text-sm"
-							on:click={() => {
+							onclick={() => {
 								getStartedHandler();
 							}}
 						>

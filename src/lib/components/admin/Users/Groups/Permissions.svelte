@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext, onMount } from 'svelte';
+	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import Switch from '$lib/components/common/Switch.svelte';
@@ -52,13 +52,7 @@
 		}
 	};
 
-	export let permissions = {};
-	export let defaultPermissions = {};
-
-	// Reactive statement to ensure all fields are present in `permissions`
-	$: {
-		permissions = fillMissingProperties(permissions, DEFAULT_PERMISSIONS);
-	}
+	let { permissions = $bindable({}), defaultPermissions = {} } = $props();
 
 	function fillMissingProperties(obj: any, defaults: any) {
 		return {
@@ -71,7 +65,32 @@
 		};
 	}
 
-	onMount(() => {
+	/** True when `obj` already carries every leaf that `defaults` defines. */
+	function hasMissingProperties(obj: any, defaults: any): boolean {
+		if (!obj || typeof obj !== 'object') return true;
+		return Object.entries(defaults).some(([key, value]) =>
+			value !== null && typeof value === 'object' && !Array.isArray(value)
+				? hasMissingProperties(obj[key], value)
+				: obj[key] === undefined
+		);
+	}
+
+	// Ensure all fields are present in `permissions`.
+	//
+	// This reads `permissions` and writes it back, which Svelte 4's `$:` tolerated
+	// (a reactive block excluded its own assignment targets from its dependency
+	// list) and `$effect` does not: fillMissingProperties returns a fresh object
+	// every call, so the direct port re-triggered itself until Svelte bailed with
+	// effect_update_depth_exceeded, leaving the Edit Default Permissions dialog
+	// rendered but dead.
+	//
+	// Guarding on identity ("did I write this?") does NOT work here: `permissions`
+	// is a $bindable backed by $state, so the object read back is a deep proxy of
+	// the plain object that was written and never === it. Guard on content
+	// instead — once every default leaf exists there is nothing left to fill, so
+	// the effect settles after one write and stays quiet while switches toggle.
+	$effect(() => {
+		if (!hasMissingProperties(permissions, DEFAULT_PERMISSIONS)) return;
 		permissions = fillMissingProperties(permissions, DEFAULT_PERMISSIONS);
 	});
 </script>

@@ -8,11 +8,21 @@
 
 	const i18n = getContext('i18n');
 
-	export let value = '';
-	export let placeholder = $i18n.t('Tag');
-	export let onChange: (value: string) => void = () => {};
+	interface Props {
+		value?: string;
+		placeholder?: any;
+		onChange?: (value: string) => void;
+		items?: any;
+		children?: import('svelte').Snippet;
+	}
 
-	export let items = [];
+	let {
+		value = $bindable(''),
+		placeholder = $i18n.t('Tag'),
+		onChange = () => {},
+		items = [],
+		children
+	}: Props = $props();
 </script>
 
 <Select.Root
@@ -24,7 +34,7 @@
 	}}
 >
 	<Select.Trigger
-		class="relative w-full flex items-center gap-0.5 px-2.5 py-1.5 rounded-xl "
+		class="relative w-full flex items-center gap-0.5 px-2.5 py-1.5 bg-gray-50 dark:bg-gray-850 rounded-xl "
 		aria-label={placeholder}
 	>
 		<Select.Value
@@ -35,7 +45,7 @@
 		{#if value}
 			<button
 				class="outline-none"
-				on:click={() => {
+				onclick={() => {
 					value = '';
 					onChange(value);
 				}}
@@ -48,11 +58,11 @@
 	</Select.Trigger>
 
 	<Select.Content
-		class="rounded-2xl min-w-[170px] p-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+		class="rounded-2xl min-w-[170px] p-1 border-hairline border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
 		sameWidth={false}
 		align="start"
 	>
-		<slot>
+		{#if children}{@render children()}{:else}
 			{#each items as item}
 				<Select.Item
 					class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl capitalize"
@@ -68,7 +78,7 @@
 					{/if}
 				</Select.Item>
 			{/each}
-		</slot>
+		{/if}
 	</Select.Content>
 </Select.Root>
 
@@ -76,7 +86,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >
@@ -87,7 +97,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >
@@ -98,7 +108,7 @@
 	class="min-w-fit outline-none p-1.5 {selectedTag === ''
 		? ''
 		: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition capitalize"
-	on:click={() => {
+	onclick={() => {
 		selectedTag = '';
 	}}
 >

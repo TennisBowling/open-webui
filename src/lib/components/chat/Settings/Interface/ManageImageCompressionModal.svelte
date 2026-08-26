@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -11,9 +11,13 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 
-	export let show = false;
-	export let size = null;
-	export let onSave = () => {};
+	interface Props {
+		show?: boolean;
+		size?: any;
+		onSave?: any;
+	}
+
+	let { show = $bindable(false), size = $bindable(null), onSave = () => {} }: Props = $props();
 
 	const submitHandler = async () => {
 		onSave(size);
@@ -32,7 +36,7 @@
 			<button
 				class="self-center"
 				aria-label={$i18n.t('Close modal')}
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -44,7 +48,7 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full px-1"
-					on:submit={(e) => {
+					onsubmit={(e) => {
 						e.preventDefault();
 						submitHandler();
 					}}

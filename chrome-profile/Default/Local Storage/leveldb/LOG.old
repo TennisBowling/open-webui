@@ -1,0 +1,8 @@
+2026/07/27-00:36:36.234 134e33 Reusing MANIFEST /home/tennisbowling/open-webui/chrome-profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/07/27-00:36:36.237 134e33 Recovering log #509
+2026/07/27-00:36:36.237 134e33 Reusing old log /home/tennisbowling/open-webui/chrome-profile/Default/Local Storage/leveldb/000509.log 
+2026/07/27-00:37:36.239 134e35 Level-0 table #514: started
+2026/07/27-00:37:36.242 134e35 Level-0 table #514: 231924 bytes OK
+2026/07/27-00:37:36.243 134e35 Delete type=0 #509
+2026/07/27-00:41:37.703 134e35 Level-0 table #516: started
+2026/07/27-00:41:37.705 134e35 Level-0 table #516: 211070 bytes OK

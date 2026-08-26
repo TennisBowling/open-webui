@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
-	import { getModels as _getModels } from '$lib/apis';
+	import { preventDefault } from '$lib/utils/eventModifiers';
 
-	const dispatch = createEventDispatcher();
+	import { toast } from '$lib/utils/toast';
+	import { onMount, getContext, tick } from 'svelte';
+	import { getModels as _getModels } from '$lib/apis';
 	const i18n = getContext('i18n');
 
 	import { models, settings, user } from '$lib/stores';
@@ -16,11 +16,15 @@
 
 	import AddConnectionModal from '$lib/components/AddConnectionModal.svelte';
 
-	export let saveSettings: Function;
+	interface Props {
+		saveSettings: Function;
+	}
 
-	let config = null;
+	let { saveSettings }: Props = $props();
 
-	let showConnectionModal = false;
+	let config = $state(null);
+
+	let showConnectionModal = $state(false);
 
 	const addConnectionHandler = async (connection) => {
 		config.OPENAI_API_BASE_URLS.push(connection.url);
@@ -72,11 +76,11 @@
 <form
 	id="tab-connections"
 	class="flex flex-col h-full justify-between text-sm"
-	on:submit|preventDefault={() => {
+	onsubmit={preventDefault(() => {
 		updateHandler();
-	}}
+	})}
 >
-	<div class=" overflow-y-scroll scrollbar-hidden h-full">
+	<div class=" overflow-y-scroll scrollbar-hidden max-h-[28rem] md:max-h-full">
 		{#if config !== null}
 			<div class="">
 				<div class="pr-1.5">
@@ -86,8 +90,9 @@
 
 							<Tooltip content={$i18n.t(`Add Connection`)}>
 								<button
+									aria-label={$i18n.t(`Add Connection`)}
 									class="px-1"
-									on:click={() => {
+									onclick={() => {
 										showConnectionModal = true;
 									}}
 									type="button"
@@ -100,7 +105,7 @@
 						<div class="flex flex-col gap-1.5">
 							{#each config?.OPENAI_API_BASE_URLS ?? [] as url, idx}
 								<Connection
-									bind:url
+									bind:url={config.OPENAI_API_BASE_URLS[idx]}
 									bind:key={config.OPENAI_API_KEYS[idx]}
 									bind:config={config.OPENAI_API_CONFIGS[idx]}
 									onSubmit={() => {
@@ -135,7 +140,7 @@
 							{$i18n.t('Connect to your own OpenAI compatible API endpoints.')}
 							<br />
 							{$i18n.t(
-								'CORS must be properly configured by the provider to allow requests from Open WebUI.'
+								'CORS must be properly configured by the provider to allow requests from {{WEBUI_NAME}}.'
 							)}
 						</div>
 					</div>

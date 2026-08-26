@@ -303,7 +303,7 @@ class WebSearchTools:
             # Get Jina Reader settings from config
             viewport_width = getattr(config, 'JINA_READER_VIEWPORT_WIDTH', 1280)
             viewport_height = getattr(config, 'JINA_READER_VIEWPORT_HEIGHT', 12000)
-            timeout_seconds = getattr(config, 'JINA_READER_TIMEOUT', 30)
+            timeout_seconds = getattr(config, 'JINA_READER_TIMEOUT', 180)
 
             # Fetch content. Reuse the app-level aiohttp session; the per-call
             # semaphore below still limits Jina concurrency for this tool
@@ -337,13 +337,33 @@ class WebSearchTools:
                     }
                 return "Could not fetch content from the provided URLs."
 
+            # A "successful" fetch can still carry zero usable text when the
+            # target served an anti-bot interstitial that the reader scored as
+            # a 200. Report that as the failure it is instead of handing the
+            # model a blank page.
+            non_empty_results = [r for r in results if (r.text or "").strip()]
+            if not non_empty_results:
+                reason = (
+                    _classify_web_error_reason(fetch_errors[0])
+                    if fetch_errors
+                    else "page returned no readable content (possibly bot-blocked)"
+                )
+                log.warning(
+                    "WEB FETCH: all %d result(s) empty for urls='%s'; reason=%s",
+                    len(results), urls, reason,
+                )
+                return {
+                    "content": f"Error fetching content: {reason}",
+                    "_owui_meta": {"error": True, "reason": reason},
+                }
+
             # Format results for the model
             formatted_results = [
                 f"## Fetched Content\n",
-                f"Retrieved content from {len(results)} URL(s).\n\n",
+                f"Retrieved content from {len(non_empty_results)} URL(s).\n\n",
             ]
 
-            for idx, result in enumerate(results, 1):
+            for idx, result in enumerate(non_empty_results, 1):
                 formatted_results.append(f"### Page {idx}: {result.title or 'Untitled'}\n")
                 formatted_results.append(f"**URL:** {result.url}\n")
                 if result.published_date:

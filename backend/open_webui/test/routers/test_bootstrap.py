@@ -1,8 +1,11 @@
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastapi import Response
 
 from open_webui.routers import bootstrap
+from open_webui.utils.auth import create_token
 
 
 @pytest.mark.asyncio
@@ -51,3 +54,56 @@ async def test_resolve_user_includes_effective_permissions(monkeypatch):
         "permissions": effective_permissions,
     }
     assert calls == [("user-1", default_permissions)]
+
+
+class _FakeRequest:
+    """Minimal stand-in exposing the .headers/.cookies surface
+    _renew_token_cookie reads from a real Starlette Request."""
+
+    def __init__(self, headers=None, cookies=None):
+        self.headers = headers or {}
+        self.cookies = cookies or {}
+
+
+def test_renew_token_cookie_sets_cookie_from_bearer_header():
+    # Covers both the 200 and 304 bootstrap response paths, which both call
+    # _renew_token_cookie(request, response) directly before returning —
+    # this is the shared code path, so testing it once here covers both.
+    token = create_token({"id": "user-1"}, expires_delta=timedelta(minutes=30))
+    request = _FakeRequest(headers={"Authorization": f"Bearer {token}"})
+    response = Response()
+
+    bootstrap._renew_token_cookie(request, response)
+
+    set_cookie_headers = response.headers.getlist("set-cookie")
+    assert any(h.startswith("token=") for h in set_cookie_headers)
+
+
+def test_renew_token_cookie_falls_back_to_existing_cookie():
+    token = create_token({"id": "user-1"}, expires_delta=timedelta(minutes=30))
+    request = _FakeRequest(cookies={"token": token})
+    response = Response()
+
+    bootstrap._renew_token_cookie(request, response)
+
+    set_cookie_headers = response.headers.getlist("set-cookie")
+    assert any(h.startswith("token=") for h in set_cookie_headers)
+
+
+def test_renew_token_cookie_skips_when_no_token():
+    request = _FakeRequest()
+    response = Response()
+
+    bootstrap._renew_token_cookie(request, response)
+
+    assert response.headers.getlist("set-cookie") == []
+
+
+def test_renew_token_cookie_skips_when_expired():
+    token = create_token({"id": "user-1"}, expires_delta=timedelta(minutes=-30))
+    request = _FakeRequest(headers={"Authorization": f"Bearer {token}"})
+    response = Response()
+
+    bootstrap._renew_token_cookie(request, response)
+
+    assert response.headers.getlist("set-cookie") == []

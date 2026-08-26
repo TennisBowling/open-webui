@@ -336,14 +336,17 @@ export const getModelEndpoints = async (
 ): Promise<{ data: { endpoints: any[] } }> => {
 	let error = null;
 
-	const res = await fetch(`${OPENAI_API_BASE_URL}/models/${encodeURIComponent(modelId)}/endpoints`, {
-		method: 'GET',
-		headers: {
-			Accept: 'application/json',
-			'Content-Type': 'application/json',
-			...(token && { authorization: `Bearer ${token}` })
+	const res = await fetch(
+		`${OPENAI_API_BASE_URL}/models/${encodeURIComponent(modelId)}/endpoints`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
 		}
-	})
+	)
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
 			return res.json();
@@ -366,12 +369,53 @@ export const getModelEndpoints = async (
 	return res;
 };
 
+export const getModelReasoning = async (
+	token: string,
+	modelId: string,
+	refresh: boolean = false
+): Promise<{ data: { reasoning: any | null; slug: string | null } }> => {
+	let error = null;
+
+	const query = refresh ? '?refresh=true' : '';
+	const res = await fetch(
+		`${OPENAI_API_BASE_URL}/models/${encodeURIComponent(modelId)}/reasoning${query}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			if (err && typeof err === 'object' && 'detail' in err) {
+				error = err.detail;
+			} else {
+				error = 'Server connection failed';
+			}
+			return { data: { reasoning: null, slug: null } };
+		});
+
+	if (error) {
+		console.error('getModelReasoning error:', error);
+		return { data: { reasoning: null, slug: null } };
+	}
+
+	return res;
+};
+
 export const chatCompletion = async (
 	token: string = '',
 	body: object,
-	url: string = `${WEBUI_BASE_URL}/api`
+	url: string = `${WEBUI_BASE_URL}/api`,
+	controller: AbortController = new AbortController()
 ): Promise<[Response | null, AbortController]> => {
-	const controller = new AbortController();
 	let error = null;
 
 	const res = await fetch(`${url}/chat/completions`, {

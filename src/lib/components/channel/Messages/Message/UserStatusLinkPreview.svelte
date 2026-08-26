@@ -7,13 +7,16 @@
 
 	import UserStatus from './UserStatus.svelte';
 
-	export let id = null;
+	interface Props {
+		id?: any;
+		side?: string;
+		align?: string;
+		sideOffset?: number;
+	}
 
-	export let side = 'top';
-	export let align = 'start';
-	export let sideOffset = 6;
+	let { id = null, side = 'top', align = 'start', sideOffset = 6 }: Props = $props();
 
-	let user = null;
+	let user = $state(null);
 
 	onMount(async () => {
 		if (id) {
@@ -27,7 +30,7 @@
 
 {#if user}
 	<LinkPreview.Content
-		class="w-full max-w-[260px] rounded-2xl border border-gray-100  dark:border-gray-800 z-999 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
+		class="w-full max-w-[260px] rounded-2xl border-hairline border-gray-100  dark:border-gray-800 z-999 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
 		{side}
 		{align}
 		{sideOffset}

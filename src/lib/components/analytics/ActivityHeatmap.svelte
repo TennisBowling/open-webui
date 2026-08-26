@@ -5,18 +5,22 @@
 
 	const i18n = getContext('i18n');
 
-	export let year: number | undefined = undefined;
-	export let global: boolean = false;
+	interface Props {
+		year?: number | undefined;
+		global?: boolean;
+	}
 
-	let loading = true;
-	let error: string | null = null;
+	let { year = undefined, global = false }: Props = $props();
+
+	let loading = $state(true);
+	let error: string | null = $state(null);
 	let heatmapData: HeatmapDataPoint[] = [];
 	let maxTokens = 0;
-	let totalDaysActive = 0;
-	let totalTokens = 0;
+	let totalDaysActive = $state(0);
+	let totalTokens = $state(0);
 
 	// Generate weeks structure for display
-	let weeks: { date: string; tokens: number; level: number; dayOfWeek: number }[][] = [];
+	let weeks: { date: string; tokens: number; level: number; dayOfWeek: number }[][] = $state([]);
 
 	const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 	const MONTHS = [
@@ -34,13 +38,13 @@
 		'Dec'
 	];
 
-	// Color levels for heatmap (0-4 scale, from light to dark)
+	// Color levels for heatmap (0-4 scale) - warm manilla->kraft->book-cloth ramp
 	const COLORS = [
-		'bg-gray-100 dark:bg-gray-800', // Level 0 - no activity
-		'bg-emerald-200 dark:bg-emerald-900', // Level 1 - low
-		'bg-emerald-300 dark:bg-emerald-700', // Level 2 - medium-low
-		'bg-emerald-400 dark:bg-emerald-600', // Level 3 - medium-high
-		'bg-emerald-500 dark:bg-emerald-500' // Level 4 - high
+		'bg-gray-200 dark:bg-gray-800', // Level 0 - no activity
+		'bg-manilla dark:bg-book-cloth/30', // Level 1 - low
+		'bg-kraft/60 dark:bg-book-cloth/50', // Level 2 - medium-low
+		'bg-kraft dark:bg-book-cloth/70', // Level 3 - medium-high
+		'bg-book-cloth dark:bg-book-cloth' // Level 4 - high
 	];
 
 	onMount(async () => {
@@ -165,13 +169,13 @@
 		});
 	}
 
-	$: monthLabels = getMonthLabels();
+	let monthLabels = $derived(getMonthLabels());
 </script>
 
 <div class="w-full">
 	{#if loading}
 		<div class="flex items-center justify-center py-12">
-			<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-emerald-500"></div>
+			<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-book-cloth"></div>
 		</div>
 	{:else if error}
 		<div class="text-center py-8 text-gray-500 dark:text-gray-400">

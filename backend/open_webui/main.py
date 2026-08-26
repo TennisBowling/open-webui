@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import html as _stdlib_html
 import inspect
+import io
 import json
 import logging
 import mimetypes
@@ -14,10 +17,10 @@ from uuid import uuid4
 
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode, parse_qs, urlparse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from typing import Optional
+from typing import Dict, Optional
 from aiocache import cached
 import aiohttp
 import anyio.to_thread
@@ -40,8 +43,14 @@ from fastapi import (
 from fastapi.openapi.docs import get_swagger_ui_html
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
+from fastapi.concurrency import run_in_threadpool
 
 from starlette_compress import CompressMiddleware
 
@@ -62,8 +71,8 @@ from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
 from open_webui.utils.logger import start_logger
 from open_webui.socket.main import (
     app as socket_app,
-    periodic_usage_pool_cleanup,
     get_event_emitter,
+    emit_chat_user_message,
     get_models_in_use,
     get_active_user_ids,
     get_token_groups,
@@ -78,6 +87,8 @@ from open_webui.socket.main import (
 from open_webui.routers import (
     analytics,
     audio,
+    automations,
+    push,
     images,
     ollama,
     openai,
@@ -93,7 +104,6 @@ from open_webui.routers import (
     groups,
     files,
     functions,
-    memories,
     models,
     mcp,
     prompts,
@@ -106,6 +116,7 @@ from open_webui.routers import (
     flex_auto_flip,
     streams,
     bootstrap,
+    videos,
 )
 
 from open_webui.routers.retrieval import (
@@ -120,7 +131,8 @@ from open_webui.internal.db import dispose_engine, engine
 from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 from open_webui.models.users import UserModel, Users
-from open_webui.models.chats import Chats
+from open_webui.models.chats import Chats, sanitize_shared_chat_model
+from open_webui.utils.lazy_blocks import text_only_content_from_blocks
 from open_webui.models.token_usage import TokenGroup, TokenUsage
 
 from open_webui.config import (
@@ -140,10 +152,12 @@ from open_webui.config import (
     ENABLE_BASE_MODELS_CACHE,
     ENABLE_PRICING_SYNC,
     PRICING_SYNC_INTERVAL_HOURS,
+    ENABLE_OPENROUTER_REASONING_DISCOVERY,
     # Thread pool size for FastAPI/AnyIO
     THREAD_POOL_SIZE,
     # Tool Server Configs
     TOOL_SERVER_CONNECTIONS,
+    MCP_TOOL_CALL_TIMEOUT,
     # Container Workspace
     ENABLE_CONTAINER_WORKSPACE_SYNC,
     CONTAINER_DATA_ROOT,
@@ -176,6 +190,8 @@ from open_webui.config import (
     AUDIO_STT_SUPPORTED_CONTENT_TYPES,
     AUDIO_STT_OPENAI_API_BASE_URL,
     AUDIO_STT_OPENAI_API_KEY,
+    AUDIO_STT_OPENROUTER_API_KEY,
+    AUDIO_STT_OPENROUTER_TEMPERATURE,
     AUDIO_STT_AZURE_API_KEY,
     AUDIO_STT_AZURE_REGION,
     AUDIO_STT_AZURE_LOCALES,
@@ -187,6 +203,7 @@ from open_webui.config import (
     AUDIO_TTS_OPENAI_API_BASE_URL,
     AUDIO_TTS_OPENAI_API_KEY,
     AUDIO_TTS_OPENAI_PARAMS,
+    AUDIO_TTS_OPENROUTER_API_KEY,
     AUDIO_TTS_API_KEY,
     AUDIO_TTS_SPLIT_ON,
     AUDIO_TTS_AZURE_SPEECH_REGION,
@@ -261,7 +278,6 @@ from open_webui.config import (
     DOCLING_FORCE_OCR,
     DOCLING_OCR_ENGINE,
     DOCLING_OCR_LANG,
-    DOCLING_PDF_BACKEND,
     DOCLING_TABLE_MODE,
     DOCLING_PIPELINE,
     DOCLING_DO_PICTURE_DESCRIPTION,
@@ -270,10 +286,8 @@ from open_webui.config import (
     DOCLING_PICTURE_DESCRIPTION_API,
     DOCUMENT_INTELLIGENCE_ENDPOINT,
     DOCUMENT_INTELLIGENCE_KEY,
-    MISTRAL_OCR_API_KEY,
     RAG_TEXT_SPLITTER,
     TIKTOKEN_ENCODING_NAME,
-    PDF_EXTRACT_IMAGES,
     YOUTUBE_LOADER_LANGUAGE,
     YOUTUBE_LOADER_PROXY_URL,
     # Retrieval (Web Search: Exa search + Jina Reader fetch)
@@ -296,8 +310,26 @@ from open_webui.config import (
     WEB_SEARCH_SYSTEM_PROMPT,
     ENABLE_STUDY_MODE,
     STUDY_MODE_SYSTEM_PROMPT,
+    # Chat semantic search (message embeddings)
+    ENABLE_CHAT_SEMANTIC_SEARCH,
+    CHAT_EMBED_URL,
+    CHAT_EMBED_MODEL,
+    CHAT_EMBED_SWEEP_INTERVAL,
+    CHAT_EMBED_TEXT_BATCH,
     # Data Visualization
     ENABLE_DATA_VIZ,
+    # Automations
+    ENABLE_AUTOMATIONS,
+    AUTOMATIONS_MAX_ACTIVE_PER_USER,
+    WEBPUSH_VAPID_PUBLIC_KEY,
+    WEBPUSH_VAPID_PRIVATE_KEY,
+    ENABLE_VIDEO_INPUT,
+    ENABLE_VIDEO_URL_INGEST,
+    VIDEO_DEFAULT_AUDIO,
+    VIDEO_DEFAULT_FPS,
+    VIDEO_DEFAULT_QUALITY,
+    VIDEO_MAX_SOURCE_SIZE_MB,
+    VIDEO_WARN_DURATION_SECONDS,
     DATA_VIZ_SHARED_CORE_PROMPT,
     DATA_VIZ_MODULE_DIAGRAM_ENABLED,
     DATA_VIZ_MODULE_DIAGRAM_PROMPT,
@@ -307,8 +339,6 @@ from open_webui.config import (
     DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT,
     DATA_VIZ_MODULE_ART_ENABLED,
     DATA_VIZ_MODULE_ART_PROMPT,
-    DATA_VIZ_MODULE_ELICITATION_ENABLED,
-    DATA_VIZ_MODULE_ELICITATION_PROMPT,
     DATA_VIZ_AUTO_REPAIR_ENABLED,
     DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS,
     DATA_VIZ_AUTO_REPAIR_MODEL,
@@ -316,6 +346,7 @@ from open_webui.config import (
     # Subagents
     ENABLE_SUBAGENTS,
     SUBAGENT_DEFAULT_MODEL,
+    SUBAGENT_CONTEXT_FALLBACK_MODEL,
     SUBAGENT_SYSTEM_PROMPT,
     SUBAGENT_SYSTEM_PROMPT_APPEND,
     SUBAGENT_PARENT_PROMPT,
@@ -479,22 +510,27 @@ from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
     ENABLE_STAR_SESSIONS_MIDDLEWARE,
+    AUTOMATION_SWEEP_INTERVAL_SECONDS,
 )
 
 
 from open_webui.utils.models import (
     get_all_models,
-    get_all_base_models,
+    get_all_base_models_deduped,
     check_model_access,
     get_filtered_models,
 )
 from open_webui.utils.chat import (
+    ActiveSubagentRerunError,
+    ChatMessageAncestryError,
+    assemble_conversation_from_leaf,
     generate_chat_completion as chat_completion_handler,
-    chat_completed as chat_completed_handler,
     chat_action as chat_action_handler,
 )
 from open_webui.utils.embeddings import generate_embeddings
 from open_webui.utils.middleware import process_chat_payload, process_chat_response
+from open_webui.utils.live_tool_selection import normalize_live_tool_selection
+from open_webui.utils.chat_transport import is_persisted_chat_generation
 from open_webui.utils.access_control import has_access
 
 from open_webui.utils.auth import (
@@ -502,6 +538,7 @@ from open_webui.utils.auth import (
     get_http_authorization_cred,
     decode_token,
     get_admin_user,
+    get_optional_user,
     get_verified_user,
 )
 from open_webui.utils.plugin import install_tool_and_function_dependencies
@@ -516,11 +553,24 @@ from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.redis import get_redis_connection
 
 from open_webui.tasks import (
+    GenerationCancelledError,
     redis_task_command_listener,
-    list_task_ids_by_item_id,
+    get_generation_operation,
+    is_chat_work_blocked,
+    is_generation_cancelled,
+    is_generation_turn_cancelled,
+    mark_generation_cancelled,
+    heartbeat_generation_operation_until_bound,
+    latch_generation_cancellation,
+    list_generation_operations_by_item,
+    list_item_task_ids_by_prefix,
+    register_generation_operation,
+    supersede_generation_operation,
+    finish_generation_supersede,
+    unregister_generation_operation,
+    collect_chat_work_state,
     create_task,
-    stop_task,
-    list_tasks,
+    stop_tasks_and_wait,
     cancel_all_local_tasks,
 )  # Import from tasks.py
 
@@ -543,6 +593,19 @@ SPA_REVALIDATE_CACHE_CONTROL = "no-cache"
 SPA_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 SPA_LONG_CACHE_CONTROL = "public, max-age=31536000"
 SPA_WASM_CACHE_CONTROL = "public, max-age=86400"
+# Brand/static images + fonts: content-addressed by filename in practice and
+# safe to cache for a week with background revalidation (unlike the html shell,
+# which must stay no-cache so redeploys reach the client immediately).
+SPA_BRAND_ASSET_CACHE_CONTROL = "public, max-age=604800, stale-while-revalidate=86400"
+_CACHEABLE_ASSET_EXTS = (
+    ".png",
+    ".svg",
+    ".ico",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".woff2",
+)
 
 
 class CacheControlStaticFiles(StaticFiles):
@@ -571,16 +634,421 @@ class FrontendStaticFiles(CacheControlStaticFiles):
         if path.startswith("wasm/"):
             return SPA_WASM_CACHE_CONTROL
 
+        # Build-root brand images/fonts (favicon, user, image-placeholder,
+        # marker icons, web-app-manifest pngs, …). html stays no-cache below.
+        if path.lower().endswith(_CACHEABLE_ASSET_EXTS):
+            return SPA_BRAND_ASSET_CACHE_CONTROL
+
         return SPA_REVALIDATE_CACHE_CONTROL
+
+    async def get_response(self, path: str, scope):
+        precompressed = self._precompressed_response(path, scope)
+        if precompressed is not None:
+            return precompressed
+        return await super().get_response(path, scope)
+
+    def _precompressed_response(self, path: str, scope) -> Optional[Response]:
+        """Serve a build-time brotli-11 sibling (``.br``) for immutable JS/CSS.
+
+        Avoids recompressing every cold-load chunk on the fly at brotli q4 (and
+        spending that CPU on the single worker per request); guarantees the smaller
+        q11 payload instead. Produced by ``scripts/precompress.mjs`` (postbuild).
+        Falls back to the normal (live-compressed) path when no ``.br`` exists or
+        the client doesn't accept br. ``Content-Encoding: br`` makes the compress
+        middleware skip the response, so there's no double-encoding.
+        """
+        if scope.get("method", "GET") not in ("GET", "HEAD"):
+            return None
+        if not path.startswith("_app/immutable/"):
+            return None
+        if not (path.endswith(".js") or path.endswith(".css")):
+            return None
+        headers = Headers(scope=scope)
+        accept_encoding = headers.get("accept-encoding", "")
+        if "br" not in {
+            tok.split(";")[0].strip() for tok in accept_encoding.split(",")
+        }:
+            return None
+        if "range" in headers:  # don't range-serve an encoded body
+            return None
+
+        br_full_path = os.path.join(self.directory, path + ".br")
+        try:
+            stat_result = os.stat(br_full_path)
+        except OSError:
+            return None
+
+        media_type = "text/javascript" if path.endswith(".js") else "text/css"
+        response = FileResponse(
+            br_full_path,
+            stat_result=stat_result,
+            media_type=media_type,
+            method=scope.get("method"),
+        )
+        response.headers["Content-Encoding"] = "br"
+        response.headers["Vary"] = "Accept-Encoding"
+        cache_control = self.get_cache_control(path)
+        if cache_control:
+            response.headers["Cache-Control"] = cache_control
+        return response
 
 
 class RevalidatingStaticFiles(CacheControlStaticFiles):
     def get_cache_control(self, path: str) -> Optional[str]:
+        # Images/fonts under /static are effectively immutable brand assets;
+        # cache them for a week. Everything else (html, js, css, json) stays
+        # no-cache so admin edits / redeploys reach clients immediately.
+        if path.lower().endswith(_CACHEABLE_ASSET_EXTS):
+            return SPA_BRAND_ASSET_CACHE_CONTROL
         return SPA_REVALIDATE_CACHE_CONTROL
 
 
+def _render_index_html(
+    raw: str,
+    name: str,
+    base_url: str,
+    strip_loader: bool = False,
+    strip_custom_css: bool = False,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    url: Optional[str] = None,
+) -> str:
+    """Inject the instance name + link-preview meta tags into the built SPA shell.
+
+    Pure string transform (no I/O) so it can be memoized. Rewrites the single
+    ``<title>Open WebUI</title>`` line to the configured name and, unless already
+    present (idempotency guard on ``og:title``), appends description /
+    application-name / Open Graph / Twitter ``<meta>`` tags before ``</head>`` so
+    JS-less link-preview crawlers (Discord/WhatsApp/iMessage) and the first paint
+    both show the real name.
+
+    ``title``/``description``/``url`` override the instance defaults for
+    per-page previews (shared chats): the browser tab becomes
+    ``"{title} • {name}"`` (mirroring the SPA's own title format), the
+    ``og:title``/``twitter:title`` carry the bare page title, and
+    ``og:site_name`` keeps the instance name.
+    """
+    safe_name = _stdlib_html.escape(name, quote=True)
+    if title:
+        safe_title = _stdlib_html.escape(title, quote=True)
+        safe_page_title = _stdlib_html.escape(f"{title} • {name}", quote=True)
+    else:
+        safe_title = safe_name
+        safe_page_title = safe_name
+    if description:
+        # Collapse newlines/runs of whitespace: meta content attributes should
+        # be a single line regardless of what the source message contained.
+        page_description = _stdlib_html.escape(
+            re.sub(r"\s+", " ", description).strip(), quote=True
+        )
+    else:
+        page_description = _stdlib_html.escape(
+            f"{name} is an open, extensible, user-friendly interface for AI that adapts to your workflow.",
+            quote=True,
+        )
+    base = (base_url or "").rstrip("/")
+    image_url = (
+        f"{base}/static/web-app-manifest-512x512.png"
+        if base
+        else "/static/web-app-manifest-512x512.png"
+    )
+    out = raw.replace("<title>Open WebUI</title>", f"<title>{safe_page_title}</title>", 1)
+    # Drop the optional admin-hook tags when their files are empty/absent so the
+    # client doesn't spend a round-trip fetching 0 bytes on every cold load.
+    if strip_loader:
+        out = re.sub(
+            r"<script[^>]*src=\"/static/loader\.js\"[^>]*>\s*</script>",
+            "",
+            out,
+            count=1,
+        )
+    if strip_custom_css:
+        out = re.sub(
+            r"<link[^>]*href=\"/static/custom\.css\"[^>]*/?>",
+            "",
+            out,
+            count=1,
+        )
+    if "og:title" not in out:
+        if url:
+            og_url_tag = f'<meta property="og:url" content="{_stdlib_html.escape(url, quote=True)}" />'
+        elif base:
+            og_url_tag = f'<meta property="og:url" content="{base}/" />'
+        else:
+            og_url_tag = ""
+        tags = (
+            f'<meta name="description" content="{page_description}" />'
+            f'<meta name="application-name" content="{safe_name}" />'
+            f'<meta name="apple-mobile-web-app-title" content="{safe_name}" />'
+            f'<meta property="og:type" content="website" />'
+            f'<meta property="og:site_name" content="{safe_name}" />'
+            f'<meta property="og:title" content="{safe_title}" />'
+            f'<meta property="og:description" content="{page_description}" />'
+            f'<meta property="og:image" content="{image_url}" />'
+            + og_url_tag
+            + f'<meta name="twitter:card" content="summary" />'
+            f'<meta name="twitter:title" content="{safe_title}" />'
+            f'<meta name="twitter:description" content="{page_description}" />'
+            f'<meta name="twitter:image" content="{image_url}" />'
+        )
+        out = out.replace("</head>", tags + "</head>", 1)
+    return out
+
+
+_LINK_PREVIEW_DESCRIPTION_LIMIT = 280
+
+
+def _link_preview_truncate(text: str, limit: int = _LINK_PREVIEW_DESCRIPTION_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # Prefer a word boundary so the snippet doesn't end mid-word.
+    space = cut.rfind(" ")
+    if space > limit * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" \t,;:—-") + "…"
+
+
+def _link_preview_message_text(message: dict) -> str:
+    """Visible text of one message: string content, multimodal text parts, or
+    (lazy-block messages) the canonical text-only projection of content_blocks."""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = " ".join(
+            part.get("text") or ""
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = ""
+    if not text.strip():
+        blocks = message.get("content_blocks")
+        if isinstance(blocks, list) and blocks:
+            try:
+                text = text_only_content_from_blocks(blocks)
+            except Exception:
+                text = ""
+    return text
+
+
+def _shared_chat_link_preview(chat) -> tuple:
+    """(title, description) for a shared chat's link-preview meta tags.
+
+    Title is the chat's own title; the description is the visible text of the
+    first user message (falling back to the first non-empty message) so the
+    embed reflects the actual conversation instead of a static blurb. Messages
+    are ordered leaf→root along the parent chain — the server-side twin of the
+    viewer's ``createMessagesList``. ``chat`` must already be shaped by
+    ``sanitize_shared_chat_model`` so only publicly-shared data is surfaced.
+    """
+    title = (getattr(chat, "title", "") or "").strip()
+    data = getattr(chat, "chat", None)
+    if not title and isinstance(data, dict):
+        title = str(data.get("title") or "").strip()
+
+    description = ""
+    if isinstance(data, dict):
+        history = data.get("history")
+        messages_map = history.get("messages") if isinstance(history, dict) else None
+
+        ordered = []
+        if isinstance(messages_map, dict) and messages_map:
+            # Cycle guard mirrors the frontend walk: a corrupted tree must not
+            # spin the request handler forever.
+            seen = set()
+            current_id = history.get("currentId") if isinstance(history, dict) else None
+            current = messages_map.get(current_id)
+            while isinstance(current, dict):
+                mid = current.get("id")
+                if mid is not None:
+                    if mid in seen:
+                        break
+                    seen.add(mid)
+                ordered.insert(0, current)
+                parent_id = current.get("parentId")
+                current = (
+                    messages_map.get(parent_id)
+                    if parent_id and parent_id != mid
+                    else None
+                )
+        if not ordered and isinstance(data.get("messages"), list):
+            ordered = [m for m in data["messages"] if isinstance(m, dict)]
+
+        def _clean(text: str) -> str:
+            # Message content is markdown/plain text: strip the common markup
+            # so the snippet reads as prose (links → text, headings/emphasis
+            # markers dropped), then drop any residual HTML tags and collapse
+            # whitespace into a single preview line.
+            text = re.sub(r"```[a-zA-Z0-9_-]*", " ", text)
+            text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+            text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+            text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+            text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)
+            text = re.sub(r"`([^`]*)`", r"\1", text)
+            text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+            text = re.sub(r"<[^>]+>", " ", text)
+            return re.sub(r"\s+", " ", text).strip()
+
+        candidate = next(
+            (m for m in ordered if m.get("role") == "user" and _link_preview_message_text(m).strip()),
+            None,
+        )
+        if candidate is None:
+            candidate = next(
+                (m for m in ordered if _link_preview_message_text(m).strip()), None
+            )
+        if candidate is not None:
+            description = _link_preview_truncate(_clean(_link_preview_message_text(candidate)))
+
+    return title or "Shared Chat", description
+
+
+def _build_injected_index_response(
+    scope,
+    directory: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    url: Optional[str] = None,
+) -> Optional[Response]:
+    """Serve the SPA shell with the instance name injected, computed once.
+
+    Zero per-request cost for the generic shell: the transformed HTML is
+    memoized on ``app.state`` keyed by ``(name, base_url)`` and only recomputed
+    when the instance name (which can change at runtime via the license path)
+    or the resolved base URL changes. It's the same single HTML fetch the
+    client already makes — just different bytes. Returns ``None`` on any
+    failure so the caller falls back to the untransformed shell.
+
+    Per-page ``title``/``description``/``url`` overrides (shared-chat link
+    previews) skip the transformed-HTML memo and render per request from a
+    stat-keyed raw-shell cache instead — chat titles/messages change, so only
+    the file read is shared with the generic path.
+    """
+    # Only the document fetch (GET) needs the injected body; leave HEAD and
+    # other methods to the default file handling (correct empty-body HEAD).
+    if scope.get("method", "GET") != "GET":
+        return None
+    try:
+        name = getattr(app.state, "WEBUI_NAME", "Open WebUI")
+
+        base_url = getattr(app.state.config, "WEBUI_URL", "") or ""
+        if not base_url:
+            headers = Headers(scope=scope)
+            proto = (
+                headers.get("x-forwarded-proto") or scope.get("scheme") or "http"
+            )
+            host = headers.get("host")
+            if host:
+                base_url = f"{proto}://{host}"
+
+        # Key the memo on the shell file's identity too: a frontend rebuild
+        # under a running backend replaces the hashed bundles on disk, so a
+        # memo keyed only on (name, base_url) kept serving the OLD html —
+        # whose entry-chunk references 404 (the new build deleted them) and
+        # the app dies with "Failed to fetch dynamically imported module"
+        # until a backend restart. One os.stat per document GET is noise.
+        index_path = os.path.join(directory, "index.html")
+        stat = os.stat(index_path)
+
+        # Stat the optional admin-hook files so (a) an empty one gets its tag
+        # stripped and (b) an admin edit (0 -> non-empty or content change)
+        # busts the memo + ETag and the tag reappears.
+        def _asset_stat(fname):
+            try:
+                st = os.stat(os.path.join(STATIC_DIR, fname))
+                return (st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+        loader_stat = _asset_stat("loader.js")
+        custom_css_stat = _asset_stat("custom.css")
+        strip_loader = loader_stat is None or loader_stat[1] == 0
+        strip_custom_css = custom_css_stat is None or custom_css_stat[1] == 0
+
+        if title is not None or description is not None or url is not None:
+            raw_cache = getattr(app.state, "_spa_raw_index_cache", None)
+            raw_key = (stat.st_mtime_ns, stat.st_size)
+            if raw_cache is None or raw_cache.get("key") != raw_key:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    raw_cache = {"key": raw_key, "raw": f.read()}
+                app.state._spa_raw_index_cache = raw_cache
+            html = _render_index_html(
+                raw_cache["raw"],
+                name,
+                base_url,
+                strip_loader,
+                strip_custom_css,
+                title=title,
+                description=description,
+                url=url,
+            )
+            etag = (
+                '"'
+                + hashlib.sha256(html.encode("utf-8")).hexdigest()[:16]
+                + '"'
+            )
+        else:
+            key = (
+                name,
+                base_url,
+                stat.st_mtime_ns,
+                stat.st_size,
+                loader_stat,
+                custom_css_stat,
+            )
+            cache = getattr(app.state, "_spa_index_cache", None)
+            if cache is None or cache.get("key") != key:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                html = _render_index_html(
+                    raw, name, base_url, strip_loader, strip_custom_css
+                )
+                etag = (
+                    '"'
+                    + hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:16]
+                    + '"'
+                )
+                cache = {"key": key, "html": html, "etag": etag}
+                app.state._spa_index_cache = cache
+
+            html = cache["html"]
+            etag = cache["etag"]
+
+        inm = Headers(scope=scope).get("if-none-match")
+        if inm and etag.strip('"') in {
+            part.strip().strip('"') for part in inm.split(",")
+        }:
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": SPA_REVALIDATE_CACHE_CONTROL,
+                },
+            )
+
+        return HTMLResponse(
+            content=html,
+            headers={
+                "Cache-Control": SPA_REVALIDATE_CACHE_CONTROL,
+                "ETag": etag,
+            },
+        )
+    except Exception as e:
+        log.debug(f"SPA index injection skipped: {e}")
+        return None
+
+
 class SPAStaticFiles(FrontendStaticFiles):
+    def _injected_index_response(self, scope) -> Optional[Response]:
+        return _build_injected_index_response(scope, self.directory)
+
     async def get_response(self, path: str, scope):
+        if path in ("", ".", "index.html"):
+            injected = self._injected_index_response(scope)
+            if injected is not None:
+                return injected
         try:
             return await super().get_response(path, scope)
         except (HTTPException, StarletteHTTPException) as ex:
@@ -589,6 +1057,9 @@ class SPAStaticFiles(FrontendStaticFiles):
                     # Return 404 for javascript files
                     raise ex
                 else:
+                    injected = self._injected_index_response(scope)
+                    if injected is not None:
+                        return injected
                     return await super().get_response("index.html", scope)
             else:
                 raise ex
@@ -640,7 +1111,9 @@ def _install_benign_shutdown_error_filter() -> None:
         exc = context.get("exception")
         blob = f"{context.get('message', '')} {exc!r}"
         if any(marker in blob for marker in benign_markers):
-            log.debug("Suppressed benign async-gen teardown at shutdown: %s", blob.strip())
+            log.debug(
+                "Suppressed benign async-gen teardown at shutdown: %s", blob.strip()
+            )
             return
         if prior_handler is not None:
             prior_handler(loop, context)
@@ -655,11 +1128,67 @@ async def lifespan(app: FastAPI):
     start_logger()
     _install_benign_shutdown_error_filter()
 
+    # Local stdio MCP servers are application services, not chat-turn
+    # subprocesses. Start every enabled saved connection now and retain its
+    # actor-owned session until restart/disable/delete or application shutdown.
+    from open_webui.utils.mcp.persistent import (
+        PersistentMCPManager,
+        personal_mcp_process_key,
+    )
+
+    app.state.persistent_mcp = PersistentMCPManager()
+
     if RESET_CONFIG_ON_START:
         await reset_config_async()
 
     if SAFE_MODE:
         await Functions.deactivate_all_functions()
+
+    try:
+        from open_webui.models.mcp import MCPConnections
+        from open_webui.utils.mcp.connections import build_personal_mcp_connect_kwargs
+
+        for public_connection in await MCPConnections.get_all_connections():
+            if not public_connection.enabled or public_connection.transport != "stdio":
+                continue
+            try:
+                connection = await MCPConnections.get_connection_by_id(
+                    public_connection.id, include_secrets=True
+                )
+                kwargs = await build_personal_mcp_connect_kwargs(connection)
+                await app.state.persistent_mcp.ensure(
+                    personal_mcp_process_key(connection.user_id, connection.id), kwargs
+                )
+            except Exception:
+                log.exception(
+                    "Failed to start persistent MCP connection %s",
+                    public_connection.id,
+                )
+    except Exception:
+        log.exception("Failed to load persistent MCP connections")
+
+    try:
+        from open_webui.utils.mcp.client import build_mcp_connect_kwargs
+        from open_webui.utils.mcp.persistent import admin_mcp_process_key
+
+        for connection in app.state.config.TOOL_SERVER_CONNECTIONS or []:
+            server_id = (connection.get("info") or {}).get("id")
+            if (
+                connection.get("type") == "mcp"
+                and server_id
+                and (connection.get("config") or {}).get("command")
+            ):
+                try:
+                    kwargs = build_mcp_connect_kwargs(
+                        connection, bearer_token=None, metadata=None
+                    )
+                    await app.state.persistent_mcp.ensure(
+                        admin_mcp_process_key(server_id), kwargs
+                    )
+                except Exception:
+                    log.exception("Failed to start persistent admin MCP server %s", server_id)
+    except Exception:
+        log.exception("Failed to load persistent admin MCP servers")
 
     if LICENSE_KEY:
         get_license_data(app, LICENSE_KEY)
@@ -668,6 +1197,18 @@ async def lifespan(app: FastAPI):
     # when the first user lands on the / route.
     log.info("Installing external dependencies of functions and tools...")
     await install_tool_and_function_dependencies()
+
+    # A video job's worker is an in-process task, so a restart orphans anything
+    # mid-flight. Fail those rows now: the UI reads job state from the DB, and a
+    # row left "running" would spin forever with nothing driving it.
+    try:
+        from open_webui.models.videos import VideoJobs
+
+        reclaimed = await VideoJobs.reclaim_stranded_jobs(max_age_seconds=0)
+        if reclaimed:
+            log.info("Reclaimed %s stranded video job(s) after restart", reclaimed)
+    except Exception:
+        log.debug("Video job reclaim failed", exc_info=True)
 
     app.state.redis = get_redis_connection(
         redis_url=REDIS_URL,
@@ -683,23 +1224,73 @@ async def lifespan(app: FastAPI):
             redis_task_command_listener(app)
         )
 
-        # Periodic sweeper: recover chats whose message-queue drain marker was
-        # set but whose generation died before clearing it (worker crash between
-        # marking and spawning). Redis-only — single-worker recovers via
-        # next-completion / tab-load instead. Bounded by the draining_chats set.
-        async def _queue_drain_sweeper():
-            from open_webui.utils.chat_queue import sweep_orphaned_drains
+    # Periodic sweeper: recover chats whose message-queue drain marker was set
+    # but whose generation died before clearing it (worker crash between marking
+    # and the terminal handler). Runs for BOTH multi-worker (enumerates the Redis
+    # draining_chats set) AND single-worker (enumerates draining chats from the
+    # DB) — without it a single-worker crash mid-drain wedged the queue forever
+    # (the stale marker's response id matches no future completion, so every
+    # later drain's ownership guard bails). The per-chat orphan test inside
+    # (started_at grace + no live task + no active stream) prevents reclaiming a
+    # genuinely live drain during normal operation.
+    async def _queue_drain_sweeper():
+        from open_webui.utils.chat_queue import (
+            sweep_orphaned_drains,
+            sweep_pending_queues,
+        )
 
-            while True:
-                try:
-                    await asyncio.sleep(15)
-                    await sweep_orphaned_drains(app)
-                except asyncio.CancelledError:
-                    break
-                except Exception:
-                    log.exception("queue drain sweeper iteration failed")
+        while True:
+            try:
+                await asyncio.sleep(15)
+                # Order matters: unwedge dead drain markers FIRST, so a chat
+                # freed by that is already eligible when the reconciler looks
+                # at it a line later instead of waiting another tick.
+                await sweep_orphaned_drains(app)
+                # The reconciler proper: any chat that still has queued items
+                # with nothing running gets the drain its completion event never
+                # delivered. This is what makes "queue it and close the app"
+                # true — a missed trigger (restart mid-turn, contended lock,
+                # completion down an unexpected path) costs one sweep interval
+                # instead of costing the message.
+                await sweep_pending_queues(app)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("queue drain sweeper iteration failed")
 
-        app.state.queue_drain_sweeper = asyncio.create_task(_queue_drain_sweeper())
+    app.state.queue_drain_sweeper = asyncio.create_task(_queue_drain_sweeper())
+
+    # Automations scheduler: the only thing that ever fires a scheduled task.
+    # Same shape as the queue sweeper (in-process loop, no external scheduler)
+    # and multi-worker safe without one — each due automation is claimed by a
+    # compare-and-set on its own next_run_at, so exactly one worker fires it.
+    # The flag is read live so an admin toggling it takes effect on the next
+    # tick rather than at the next restart.
+    async def _automation_scheduler():
+        from open_webui.utils.automation_runner import sweep_due_automations
+
+        while True:
+            try:
+                await asyncio.sleep(AUTOMATION_SWEEP_INTERVAL_SECONDS)
+                if not app.state.config.ENABLE_AUTOMATIONS:
+                    continue
+                await sweep_due_automations(app)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("automation scheduler iteration failed")
+
+    app.state.automation_scheduler = asyncio.create_task(_automation_scheduler())
+
+    # Web push needs a stable VAPID keypair: rotating it silently invalidates
+    # every existing browser subscription, so mint one ONCE and persist it.
+    if app.state.config.ENABLE_AUTOMATIONS and not app.state.config.WEBPUSH_VAPID_PRIVATE_KEY:
+        from open_webui.utils.webpush import generate_vapid_keys
+
+        public_key, private_key = generate_vapid_keys()
+        await app.state.config.set_async("WEBPUSH_VAPID_PUBLIC_KEY", public_key)
+        await app.state.config.set_async("WEBPUSH_VAPID_PRIVATE_KEY", private_key)
+        log.info("Generated a VAPID keypair for web push notifications")
 
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
         limiter = anyio.to_thread.current_default_thread_limiter()
@@ -712,8 +1303,6 @@ async def lifespan(app: FastAPI):
             interval=PROFILE_LOOP_LAG_INTERVAL,
             window_seconds=PROFILE_LOOP_LAG_WINDOW_SECONDS,
         )
-
-    asyncio.create_task(periodic_usage_pool_cleanup())
 
     # Keep-fresh sweep for chat-search message embeddings (semantic search). Decoupled
     # from the sync write path; embeds new/changed messages on an interval. No-op when
@@ -728,6 +1317,7 @@ async def lifespan(app: FastAPI):
     # asyncio loop (no external scheduler), mirroring the queue-drain sweeper.
     async def _pricing_sync_loop():
         from open_webui.utils.pricing import run_pricing_sync
+        from open_webui.utils import openrouter_reasoning
 
         # small initial delay so boot isn't blocked on an external HTTP call
         first = True
@@ -741,6 +1331,12 @@ async def lifespan(app: FastAPI):
                     first = False
                 if app.state.config.ENABLE_PRICING_SYNC:
                     await run_pricing_sync()
+                # Warm the reasoning-discovery cache on the same cadence. The
+                # pricing sync already fed it from its catalog fetch; this force
+                # refresh is a cheap backstop when pricing sync is disabled.
+                if app.state.config.ENABLE_OPENROUTER_REASONING_DISCOVERY:
+                    if openrouter_reasoning.cache_is_cold():
+                        await openrouter_reasoning.get_reasoning_map(force=True)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -748,6 +1344,16 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(3600)
 
     app.state.pricing_sync_loop = asyncio.create_task(_pricing_sync_loop())
+
+    # Subscription-provider usage poller (percentage windows for connections
+    # flagged `subscription_usage`). Keeps an in-memory snapshot fresh and
+    # pushes `subscription-usage:update` only when the numbers actually move;
+    # skips fetches entirely while no sessions are connected.
+    from open_webui.utils.subscription_usage import subscription_usage_poller
+
+    app.state.subscription_usage_poller = asyncio.create_task(
+        subscription_usage_poller(app)
+    )
 
     # Persistent HTTP session with connection pooling — avoids the cost of
     # creating a new aiohttp.ClientSession (TLS handshake, DNS, connector
@@ -796,6 +1402,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.exception(f"Error cancelling active tasks during shutdown: {e}")
 
+    await app.state.persistent_mcp.close()
+
     if hasattr(app.state, "http_session"):
         await app.state.http_session.close()
 
@@ -804,6 +1412,9 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "queue_drain_sweeper"):
         app.state.queue_drain_sweeper.cancel()
+
+    if hasattr(app.state, "automation_scheduler"):
+        app.state.automation_scheduler.cancel()
 
     if hasattr(app.state, "pricing_sync_loop"):
         app.state.pricing_sync_loop.cancel()
@@ -821,7 +1432,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Open WebUI",
+    title=WEBUI_NAME,
     docs_url="/docs" if ENV == "dev" else None,
     openapi_url="/openapi.json" if ENV == "dev" else None,
     redoc_url=None,
@@ -895,6 +1506,11 @@ app.state.OPENAI_MODELS = {}
 ########################################
 
 app.state.config.TOOL_SERVER_CONNECTIONS = TOOL_SERVER_CONNECTIONS
+# Was defined in config.py but never registered here, so every read of
+# app.state.config.MCP_TOOL_CALL_TIMEOUT raised AttributeError -- which 500'd
+# GET/POST /api/v1/configs/tool_servers and made the whole Admin -> External
+# Tools page unloadable.
+app.state.config.MCP_TOOL_CALL_TIMEOUT = MCP_TOOL_CALL_TIMEOUT
 app.state.TOOL_SERVERS = []
 
 ########################################
@@ -934,7 +1550,11 @@ app.state.SCIM_TOKEN = SCIM_TOKEN
 app.state.config.ENABLE_BASE_MODELS_CACHE = ENABLE_BASE_MODELS_CACHE
 app.state.config.ENABLE_PRICING_SYNC = ENABLE_PRICING_SYNC
 app.state.config.PRICING_SYNC_INTERVAL_HOURS = PRICING_SYNC_INTERVAL_HOURS
+app.state.config.ENABLE_OPENROUTER_REASONING_DISCOVERY = (
+    ENABLE_OPENROUTER_REASONING_DISCOVERY
+)
 app.state.BASE_MODELS = []
+app.state.BASE_MODELS_LOADED = False
 
 ########################################
 #
@@ -1078,7 +1698,6 @@ app.state.config.DOCLING_DO_OCR = DOCLING_DO_OCR
 app.state.config.DOCLING_FORCE_OCR = DOCLING_FORCE_OCR
 app.state.config.DOCLING_OCR_ENGINE = DOCLING_OCR_ENGINE
 app.state.config.DOCLING_OCR_LANG = DOCLING_OCR_LANG
-app.state.config.DOCLING_PDF_BACKEND = DOCLING_PDF_BACKEND
 app.state.config.DOCLING_TABLE_MODE = DOCLING_TABLE_MODE
 app.state.config.DOCLING_PIPELINE = DOCLING_PIPELINE
 app.state.config.DOCLING_DO_PICTURE_DESCRIPTION = DOCLING_DO_PICTURE_DESCRIPTION
@@ -1087,7 +1706,6 @@ app.state.config.DOCLING_PICTURE_DESCRIPTION_LOCAL = DOCLING_PICTURE_DESCRIPTION
 app.state.config.DOCLING_PICTURE_DESCRIPTION_API = DOCLING_PICTURE_DESCRIPTION_API
 app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT = DOCUMENT_INTELLIGENCE_ENDPOINT
 app.state.config.DOCUMENT_INTELLIGENCE_KEY = DOCUMENT_INTELLIGENCE_KEY
-app.state.config.MISTRAL_OCR_API_KEY = MISTRAL_OCR_API_KEY
 app.state.config.MINERU_API_MODE = MINERU_API_MODE
 app.state.config.MINERU_API_URL = MINERU_API_URL
 app.state.config.MINERU_API_KEY = MINERU_API_KEY
@@ -1119,8 +1737,6 @@ app.state.config.RAG_AZURE_OPENAI_API_VERSION = RAG_AZURE_OPENAI_API_VERSION
 
 app.state.config.RAG_OLLAMA_BASE_URL = RAG_OLLAMA_BASE_URL
 app.state.config.RAG_OLLAMA_API_KEY = RAG_OLLAMA_API_KEY
-
-app.state.config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
 
 # LibreOffice availability for the "Convert to PDF" attachment mode. Probed once
 # at startup; the frontend hides the PDF mode option when this is False so users
@@ -1167,6 +1783,21 @@ app.state.config.WEB_SEARCH_SYSTEM_PROMPT = WEB_SEARCH_SYSTEM_PROMPT
 app.state.config.ENABLE_STUDY_MODE = ENABLE_STUDY_MODE
 app.state.config.STUDY_MODE_SYSTEM_PROMPT = STUDY_MODE_SYSTEM_PROMPT
 
+# Video inputs
+app.state.config.ENABLE_VIDEO_INPUT = ENABLE_VIDEO_INPUT
+app.state.config.ENABLE_VIDEO_URL_INGEST = ENABLE_VIDEO_URL_INGEST
+app.state.config.VIDEO_DEFAULT_FPS = VIDEO_DEFAULT_FPS
+app.state.config.VIDEO_DEFAULT_QUALITY = VIDEO_DEFAULT_QUALITY
+app.state.config.VIDEO_DEFAULT_AUDIO = VIDEO_DEFAULT_AUDIO
+app.state.config.VIDEO_MAX_SOURCE_SIZE_MB = VIDEO_MAX_SOURCE_SIZE_MB
+app.state.config.VIDEO_WARN_DURATION_SECONDS = VIDEO_WARN_DURATION_SECONDS
+
+# Automations
+app.state.config.ENABLE_AUTOMATIONS = ENABLE_AUTOMATIONS
+app.state.config.AUTOMATIONS_MAX_ACTIVE_PER_USER = AUTOMATIONS_MAX_ACTIVE_PER_USER
+app.state.config.WEBPUSH_VAPID_PUBLIC_KEY = WEBPUSH_VAPID_PUBLIC_KEY
+app.state.config.WEBPUSH_VAPID_PRIVATE_KEY = WEBPUSH_VAPID_PRIVATE_KEY
+
 # Data Visualization
 app.state.config.ENABLE_DATA_VIZ = ENABLE_DATA_VIZ
 app.state.config.DATA_VIZ_SHARED_CORE_PROMPT = DATA_VIZ_SHARED_CORE_PROMPT
@@ -1181,11 +1812,11 @@ app.state.config.DATA_VIZ_MODULE_MOCKUP_INTERACTIVE_PROMPT = (
 app.state.config.DATA_VIZ_MODULE_CHART_DATAVIZ_ENABLED = (
     DATA_VIZ_MODULE_CHART_DATAVIZ_ENABLED
 )
-app.state.config.DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT = DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT
+app.state.config.DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT = (
+    DATA_VIZ_MODULE_CHART_DATAVIZ_PROMPT
+)
 app.state.config.DATA_VIZ_MODULE_ART_ENABLED = DATA_VIZ_MODULE_ART_ENABLED
 app.state.config.DATA_VIZ_MODULE_ART_PROMPT = DATA_VIZ_MODULE_ART_PROMPT
-app.state.config.DATA_VIZ_MODULE_ELICITATION_ENABLED = DATA_VIZ_MODULE_ELICITATION_ENABLED
-app.state.config.DATA_VIZ_MODULE_ELICITATION_PROMPT = DATA_VIZ_MODULE_ELICITATION_PROMPT
 app.state.config.DATA_VIZ_AUTO_REPAIR_ENABLED = DATA_VIZ_AUTO_REPAIR_ENABLED
 app.state.config.DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS = DATA_VIZ_AUTO_REPAIR_MAX_ATTEMPTS
 app.state.config.DATA_VIZ_AUTO_REPAIR_MODEL = DATA_VIZ_AUTO_REPAIR_MODEL
@@ -1193,9 +1824,31 @@ app.state.config.DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT = (
     DATA_VIZ_AUTO_REPAIR_REASONING_EFFORT
 )
 
+# Chat semantic search (message embeddings). Bridge the persisted values into the
+# chat_embedder module's live globals so the background sweep + query path use the
+# admin-configured URL/model/enable flag (POST /configs/chat_embedding re-applies).
+app.state.config.ENABLE_CHAT_SEMANTIC_SEARCH = ENABLE_CHAT_SEMANTIC_SEARCH
+app.state.config.CHAT_EMBED_URL = CHAT_EMBED_URL
+app.state.config.CHAT_EMBED_MODEL = CHAT_EMBED_MODEL
+app.state.config.CHAT_EMBED_SWEEP_INTERVAL = CHAT_EMBED_SWEEP_INTERVAL
+app.state.config.CHAT_EMBED_TEXT_BATCH = CHAT_EMBED_TEXT_BATCH
+
+from open_webui.utils.chat_embedder import (
+    apply_runtime_config as _apply_chat_embed_config,
+)
+
+_apply_chat_embed_config(
+    url=app.state.config.CHAT_EMBED_URL,
+    model=app.state.config.CHAT_EMBED_MODEL,
+    enabled=app.state.config.ENABLE_CHAT_SEMANTIC_SEARCH,
+    sweep_interval=app.state.config.CHAT_EMBED_SWEEP_INTERVAL,
+    text_batch=app.state.config.CHAT_EMBED_TEXT_BATCH,
+)
+
 # Subagents
 app.state.config.ENABLE_SUBAGENTS = ENABLE_SUBAGENTS
 app.state.config.SUBAGENT_DEFAULT_MODEL = SUBAGENT_DEFAULT_MODEL
+app.state.config.SUBAGENT_CONTEXT_FALLBACK_MODEL = SUBAGENT_CONTEXT_FALLBACK_MODEL
 app.state.config.SUBAGENT_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT
 app.state.config.SUBAGENT_SYSTEM_PROMPT_APPEND = SUBAGENT_SYSTEM_PROMPT_APPEND
 app.state.config.SUBAGENT_PARENT_PROMPT = SUBAGENT_PARENT_PROMPT
@@ -1330,6 +1983,8 @@ app.state.config.STT_SUPPORTED_CONTENT_TYPES = AUDIO_STT_SUPPORTED_CONTENT_TYPES
 
 app.state.config.STT_OPENAI_API_BASE_URL = AUDIO_STT_OPENAI_API_BASE_URL
 app.state.config.STT_OPENAI_API_KEY = AUDIO_STT_OPENAI_API_KEY
+app.state.config.STT_OPENROUTER_API_KEY = AUDIO_STT_OPENROUTER_API_KEY
+app.state.config.STT_OPENROUTER_TEMPERATURE = AUDIO_STT_OPENROUTER_TEMPERATURE
 
 app.state.config.WHISPER_MODEL = WHISPER_MODEL
 app.state.config.WHISPER_VAD_FILTER = WHISPER_VAD_FILTER
@@ -1349,6 +2004,7 @@ app.state.config.TTS_VOICE = AUDIO_TTS_VOICE
 app.state.config.TTS_OPENAI_API_BASE_URL = AUDIO_TTS_OPENAI_API_BASE_URL
 app.state.config.TTS_OPENAI_API_KEY = AUDIO_TTS_OPENAI_API_KEY
 app.state.config.TTS_OPENAI_PARAMS = AUDIO_TTS_OPENAI_PARAMS
+app.state.config.TTS_OPENROUTER_API_KEY = AUDIO_TTS_OPENROUTER_API_KEY
 
 app.state.config.TTS_API_KEY = AUDIO_TTS_API_KEY
 app.state.config.TTS_SPLIT_ON = AUDIO_TTS_SPLIT_ON
@@ -1458,7 +2114,18 @@ class RedirectMiddleware(BaseHTTPMiddleware):
 
 # Add the middleware to the app
 if ENABLE_COMPRESSION_MIDDLEWARE:
-    app.add_middleware(CompressMiddleware)
+    # Tuned for metered/slow clients: brotli q9 (much smaller than the q4 default
+    # for the sizable JSON/HTML responses here) with a matching zstd level, gzip 6
+    # as the fallback. text/event-stream is excluded by the library's streaming
+    # content-type set, so SSE stays unbuffered. minimum_size stays at the 500B
+    # default (tiny bodies don't benefit).
+    app.add_middleware(
+        CompressMiddleware,
+        minimum_size=500,
+        brotli_quality=9,
+        zstd_level=9,
+        gzip_level=6,
+    )
 
 app.add_middleware(RedirectMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -1508,6 +2175,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Without this, cross-origin JS (dev: vite on :5173 against :8080) can't
+    # read the ETag response header and the conditional chat-open silently
+    # never engages. Same-origin prod is unaffected either way.
+    expose_headers=["ETag"],
 )
 
 
@@ -1521,10 +2192,15 @@ app.include_router(openai.router, prefix="/openai", tags=["openai"])
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
 app.include_router(images.router, prefix="/api/v1/images", tags=["images"])
+app.include_router(videos.router, prefix="/api/v1/videos", tags=["videos"])
 
 app.include_router(audio.router, prefix="/api/v1/audio", tags=["audio"])
 app.include_router(retrieval.router, prefix="/api/v1/retrieval", tags=["retrieval"])
 app.include_router(subagents.router, prefix="/api/v1/subagents", tags=["subagents"])
+app.include_router(
+    automations.router, prefix="/api/v1/automations", tags=["automations"]
+)
+app.include_router(push.router, prefix="/api/v1/push", tags=["push"])
 app.include_router(
     flex_auto_flip.router,
     prefix="/api/v1/flex-auto-flip",
@@ -1550,7 +2226,6 @@ app.include_router(mcp.oauth_router, prefix="/oauth/mcp", tags=["mcp-oauth"])
 app.include_router(prompts.router, prefix="/api/v1/prompts", tags=["prompts"])
 app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
 
-app.include_router(memories.router, prefix="/api/v1/memories", tags=["memories"])
 app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
@@ -1586,6 +2261,82 @@ if audit_level != AuditLevel.NONE:
 # Chat Endpoints
 #
 ##################################
+
+
+def _model_avatar_url(model_id, data_uri: str) -> str:
+    """Client-facing URL for a data: model avatar, versioned by content hash.
+
+    The base64 bytes live server-side; the list ships a tiny cacheable URL
+    instead (see get_model_profile_image, which serves them with an ETag +
+    immutable Cache-Control). ``v`` = sha256(data_uri)[:16] so a changed avatar
+    busts the cache without a query on every list render.
+    """
+    v = hashlib.sha256(data_uri.encode("utf-8")).hexdigest()[:16]
+    return "/api/v1/models/model/profile/image?" + urlencode(
+        {"id": str(model_id), "v": v}
+    )
+
+
+def _project_model_for_client(model: dict) -> dict:
+    """Trim a single model dict for the client-facing /api/models list.
+
+    Behavior-safe payload reduction only: strips the raw upstream echo
+    (``openai``), prunes the ``ollama`` echo to the few fields the client reads,
+    drops server-enforced ``info.access_control``, and replaces inline base64
+    ``profile_image_url`` data URIs with a cacheable endpoint URL. Never mutates
+    the shared app.state objects — every nested dict it changes is copied first.
+    ``info.params`` is intentionally kept (Chat.svelte reads custom_params /
+    stream_response from it).
+    """
+    m = dict(model)
+
+    # Raw upstream provider echo — never read by any client surface.
+    m.pop("openai", None)
+
+    # Prune the ollama echo to only the fields the client actually reads.
+    ollama = m.get("ollama")
+    if isinstance(ollama, dict):
+        pruned: dict = {}
+        details = ollama.get("details")
+        if isinstance(details, dict):
+            pruned_details = {
+                k: details[k]
+                for k in ("parameter_size", "quantization_level")
+                if k in details
+            }
+            if pruned_details:
+                pruned["details"] = pruned_details
+        for k in ("size", "expires_at"):
+            if k in ollama:
+                pruned[k] = ollama[k]
+        m["ollama"] = pruned
+
+    model_id = m.get("id")
+
+    info = m.get("info")
+    if isinstance(info, dict):
+        new_info = dict(info)
+        # Access control is enforced server-side (get_filtered_models); the
+        # workspace/admin editors read it from /api/v1/models/ instead.
+        new_info.pop("access_control", None)
+        meta = new_info.get("meta")
+        if isinstance(meta, dict):
+            img = meta.get("profile_image_url")
+            if isinstance(img, str) and img.startswith("data:"):
+                new_meta = dict(meta)
+                new_meta["profile_image_url"] = _model_avatar_url(model_id, img)
+                new_info["meta"] = new_meta
+        m["info"] = new_info
+
+    top_meta = m.get("meta")
+    if isinstance(top_meta, dict):
+        img = top_meta.get("profile_image_url")
+        if isinstance(img, str) and img.startswith("data:"):
+            new_meta = dict(top_meta)
+            new_meta["profile_image_url"] = _model_avatar_url(model_id, img)
+            m["meta"] = new_meta
+
+    return m
 
 
 @app.get("/api/models")
@@ -1633,12 +2384,33 @@ async def get_models(
     log.debug(
         f"/api/models returned filtered models accessible to the user: {json.dumps([model.get('id') for model in models])}"
     )
+
+    # Trim the client-facing payload (base64 avatars, raw upstream echoes,
+    # server-only fields) without touching app.state.MODELS / the full objects
+    # server paths depend on.
+    models = [_project_model_for_client(model) for model in models]
+
     return etag_response({"data": models}, request)
 
 
 @app.get("/api/models/base")
-async def get_base_models(request: Request, user=Depends(get_admin_user)):
-    models = await get_all_base_models(request, user=user)
+async def get_base_models(
+    request: Request, refresh: bool = False, user=Depends(get_admin_user)
+):
+    # The Admin Models page should display the same provider catalog the model
+    # registry is already using. Re-querying every provider here made merely
+    # opening the page block on the slowest/down connection. Only an explicit
+    # refresh performs discovery; normal loads reuse the populated registry.
+    catalog_loaded = getattr(
+        request.app.state,
+        "BASE_MODELS_LOADED",
+        bool(request.app.state.BASE_MODELS),
+    )
+    models = request.app.state.BASE_MODELS if not refresh and catalog_loaded else None
+    if models is None:
+        models = await get_all_base_models_deduped(request, refresh=refresh, user=user)
+        request.app.state.BASE_MODELS = models
+        request.app.state.BASE_MODELS_LOADED = True
     return {"data": models}
 
 
@@ -1674,12 +2446,12 @@ async def embeddings(
     return await generate_embeddings(request, form_data, user)
 
 
-@app.post("/api/chat/completions")
-@app.post("/api/v1/chat/completions")  # Experimental: Compatibility with OpenAI API
-async def chat_completion(
+async def _chat_completion_impl(
     request: Request,
     form_data: dict,
     user=Depends(get_verified_user),
+    *,
+    generation_operation: Optional[dict] = None,
 ):
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
@@ -1687,6 +2459,11 @@ async def chat_completion(
     # B10: detect v2.1 body shape (carries `leaf_message_id`, no `messages`).
     # Server walks the chat tree to assemble the canonical conversation. v1 body
     # (with `messages`) falls through to the existing pipeline unchanged.
+    #
+    # Cross-device prompt sync: assemble fills this with the freshly-persisted
+    # user-message row (only on a genuinely new turn) so we can broadcast it to
+    # other devices viewing this chat once `metadata` is known.
+    persisted_user_out: dict = {}
     if (
         "leaf_message_id" in form_data
         and "messages" not in form_data
@@ -1694,15 +2471,68 @@ async def chat_completion(
         and not str(form_data.get("chat_id", "")).startswith("local:")
     ):
         try:
-            from open_webui.utils.chat import assemble_conversation_from_leaf
-
             # Auth: caller must own the chat we're about to walk.
             if user and user.role != "admin":
-                owned = await Chats.get_chat_by_id_and_user_id(form_data["chat_id"], user.id)
+                owned = await Chats.get_chat_by_id_and_user_id(
+                    form_data["chat_id"], user.id
+                )
                 if owned is None:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail=ERROR_MESSAGES.DEFAULT(),
+                    )
+
+            try:
+                _subagent_work_state = await collect_chat_work_state(
+                    request.app.state.redis, form_data["chat_id"]
+                )
+            except Exception:
+                log.exception(
+                    "subagent rerun task preflight failed for chat %s",
+                    form_data["chat_id"],
+                )
+                _subagent_work_state = None
+            _active_rerun_keys = (
+                _subagent_work_state.get("subagent_rerun_entry_keys") or []
+                if isinstance(_subagent_work_state, dict)
+                else []
+            )
+            if _active_rerun_keys:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": (
+                            "Wait for the active subagent redo to finish before "
+                            "continuing the main chat."
+                        ),
+                        "code": "subagent_rerun_in_progress",
+                        "entry_keys": list(dict.fromkeys(_active_rerun_keys)),
+                    },
+                )
+            if isinstance(_subagent_work_state, dict):
+                # Concurrent-turn ownership is enforced atomically by the
+                # generation-operation registry before assembly. Unlike this
+                # old task-list snapshot, that lease distinguishes a legitimate
+                # multi-model sibling (same turn_id) from a second user turn and
+                # also covers the pre-task registration window.
+                try:
+                    from open_webui.utils.subagent import (
+                        reconcile_stranded_subagent_runs_by_chat_id,
+                    )
+
+                    await reconcile_stranded_subagent_runs_by_chat_id(
+                        form_data["chat_id"],
+                        parent_live=bool(_subagent_work_state.get("generations")),
+                        live_rerun_entry_keys=[],
+                        user_id=user.id,
+                    )
+                except Exception:
+                    # The persisted-chain guard below remains fail-closed. This
+                    # repair merely lets a direct API send recover a rerun whose
+                    # worker died before any chat-open/task-poll could heal it.
+                    log.exception(
+                        "pre-send stranded subagent reconcile failed for chat %s",
+                        form_data["chat_id"],
                     )
 
             leaf_id = form_data.pop("leaf_message_id", None)
@@ -1711,7 +2541,10 @@ async def chat_completion(
             assemble_model_id = form_data.get("model")
             if assemble_model_id and assemble_model_id in request.app.state.MODELS:
                 assemble_model = request.app.state.MODELS[assemble_model_id]
-            elif isinstance(form_data.get("model_item"), dict) and form_data["model_item"]:
+            elif (
+                isinstance(form_data.get("model_item"), dict)
+                and form_data["model_item"]
+            ):
                 assemble_model = form_data["model_item"]
 
             container_server_id = str(
@@ -1735,8 +2568,76 @@ async def chat_completion(
                 container_workspace_active=container_workspace_active,
                 request=request,
                 user=user,
+                persisted_out=persisted_user_out,
+                # The assistant row this turn writes into. On a retry it is also
+                # the pinned leaf, so it is in the walked chain carrying the
+                # previous attempt's half-written answer.
+                resume_message_id=form_data.get("id"),
             )
             form_data["messages"] = assembled
+
+            # Conversation compaction, inter-turn half of the gate (see
+            # utils/COMPACTION.md §5 — the check runs before EVERY model request,
+            # and this is the one that fires between turns). It reads the previous
+            # assistant message's last-round usage, and on a hit summarizes and
+            # writes a `compaction` anchor into that message. The conversation is
+            # then re-assembled so `blocks_to_api_messages` can apply the cut.
+            #
+            # Best-effort by design: a summarizer failure must never block a send.
+            # The turn proceeds uncompacted and the provider's own context-length
+            # error is what surfaces — visible, not silent.
+            try:
+                from open_webui.utils.compaction import maybe_compact_at_turn_start
+
+                if await maybe_compact_at_turn_start(
+                    request,
+                    user,
+                    chat_id=form_data["chat_id"],
+                    model=assemble_model,
+                    api_messages=assembled,
+                    chain=persisted_user_out.get("chain") or [],
+                    # The in-flight assistant, so the "Compacting…" status lands
+                    # on the message the user is watching. Turn-start compaction
+                    # runs before the first upstream call and can take ~90s on a
+                    # 350k-token conversation; unannounced, that reads as a hang.
+                    response_message_id=form_data.get("id"),
+                ):
+                    form_data["messages"] = await assemble_conversation_from_leaf(
+                        form_data["chat_id"],
+                        leaf_id,
+                        new_user_message=None,
+                        model=assemble_model,
+                        system_prompt=(form_data.get("params") or {}).get("system"),
+                        container_workspace_active=container_workspace_active,
+                        request=request,
+                        user=user,
+                    )
+            except ChatMessageAncestryError:
+                raise
+            except Exception:
+                log.exception(
+                    "turn-start compaction failed for chat %s",
+                    form_data.get("chat_id"),
+                )
+        except ActiveSubagentRerunError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": str(e),
+                    "code": "subagent_rerun_in_progress",
+                    "entry_keys": e.entry_keys,
+                },
+            )
+        except ChatMessageAncestryError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": str(e),
+                    "code": e.code,
+                    "leaf_id": e.leaf_id,
+                    "message_id": e.message_id,
+                },
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -1795,14 +2696,27 @@ async def chat_completion(
             "user_id": user.id,
             "chat_id": form_data.pop("chat_id", None),
             "message_id": form_data.pop("id", None),
+            "generation_id": form_data.pop("generation_id", None),
+            "turn_id": form_data.pop("turn_id", None),
+            # Internal ownership object. It is passed explicitly through the
+            # generation pipeline so terminal queue handoff never depends on a
+            # hidden request.state side channel.
+            "generation_operation": generation_operation,
             "session_id": form_data.pop("session_id", None),
             "headless": form_data.pop("headless", False),
-            "queue_drained_broadcast": form_data.pop(
-                "queue_drained_broadcast", None
-            ),
+            # Set (to the automation's id) when this turn is a scheduled run.
+            # Headless already says "no originating socket"; this says "no human
+            # at all", which is what gates the interactive built-ins.
+            "automation_run": form_data.pop("automation_run", None),
+            "queue_drained_broadcast": form_data.pop("queue_drained_broadcast", None),
             "filter_ids": form_data.pop("filter_ids", []),
             "tool_ids": form_data.get("tool_ids", None),
             "tool_servers": form_data.pop("tool_servers", None),
+            "live_tool_selection": (
+                normalize_live_tool_selection(form_data.pop("tool_selection"))
+                if isinstance(form_data.get("tool_selection"), dict)
+                else None
+            ),
             "files": form_data.get("files", None),
             "features": form_data.get("features", {}),
             "variables": form_data.get("variables", {}),
@@ -1824,7 +2738,9 @@ async def chat_completion(
 
         if metadata.get("chat_id") and (user and user.role != "admin"):
             if not metadata["chat_id"].startswith("local:"):
-                chat = await Chats.get_chat_by_id_and_user_id(metadata["chat_id"], user.id)
+                chat = await Chats.get_chat_by_id_and_user_id(
+                    metadata["chat_id"], user.id
+                )
                 if chat is None:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -1841,6 +2757,62 @@ async def chat_completion(
             detail=str(e),
         )
 
+    # Cross-device prompt sync: co-deliver the just-persisted user message to
+    # other devices viewing this chat so the prompt bubble appears alongside the
+    # assistant stream (which already reaches them via the chat's stream room).
+    #
+    # This now ALSO covers queue-drained turns. The drained user message is
+    # persisted by assembly above, so emitting it here makes the bubble appear the
+    # instant the queue chip is cleared (see the paired chip-clear broadcast
+    # below) instead of only when the much-later `chat:queue:drained` ->
+    # loadChat() lands — which, for a non-streaming upstream, is withheld until
+    # the whole response is ready, so the queued message used to disappear for the
+    # entire turn. The emit is idempotent on the client (keyed by user_message.id)
+    # and the drained turn carries no session_id, so every viewing tab (no
+    # origin-skip) surgically inserts the bubble; the subsequent loadChat()
+    # reconciles to that same row rather than duplicating it.
+    _persisted_user_message = persisted_user_out.get("user_message")
+    if (
+        _persisted_user_message
+        and metadata.get("chat_id")
+        and not str(metadata.get("chat_id", "")).startswith("local:")
+    ):
+        bubble_delivered = False
+        try:
+            bubble_delivered = await emit_chat_user_message(
+                metadata.get("user_id"),
+                metadata.get("chat_id"),
+                metadata.get("session_id"),
+                metadata.get("message_id"),
+                _persisted_user_message,
+                persisted_user_out.get("leaf_message_id"),
+            )
+        except Exception:
+            log.exception("cross-device chat:user-message emit failed")
+        # Queue-drained turn: the chip strip is still showing this item (the early
+        # chip-shrink broadcast was removed from maybe_drain_queue so the message
+        # never disappears into a gap). Clear it NOW, atomically with the bubble
+        # appearing above, so the queued chip visibly becomes the chat bubble with
+        # no flicker / no empty window.
+        #
+        # ONLY clear the chip when the bubble was actually delivered. If the
+        # user-message emit was skipped (e.g. an oversized data: image trips the
+        # payload-size guard), keep the chip so the message stays visible until the
+        # later chat:queue:drained -> loadChat backstop renders the bubble AND
+        # clears the chip together — otherwise the oversized case would reintroduce
+        # the very "chip gone, bubble missing" gap this fix removes.
+        if metadata.get("queue_drained_broadcast") and bubble_delivered:
+            try:
+                from open_webui.utils.chat_queue import broadcast_queue_state
+
+                await broadcast_queue_state(
+                    metadata.get("user_id"),
+                    metadata.get("chat_id"),
+                    event_type="chat:queue:updated",
+                )
+            except Exception:
+                log.exception("queue-drained chip-clear broadcast failed")
+
     async def register_stream_start_if_needed():
         if STREAM_PROTOCOL_VERSION != "v2.1":
             return
@@ -1851,13 +2823,36 @@ async def chat_completion(
         ):
             return
         try:
+            # Parent linkage hint: when the frontend's pre-send append PATCH never
+            # landed (offline send retried after a blip), this upsert CREATES the
+            # assistant row — without a parent it would be an orphan the tree walk
+            # can't reach (reload shows the prompt with no response). The freshly-
+            # persisted user message from assembly is the authoritative parent in
+            # exactly that case; when the row already exists this merge is a no-op
+            # on identical values.
+            _parent_hint = (persisted_user_out.get("user_message") or {}).get("id")
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 metadata["chat_id"],
                 metadata["message_id"],
                 {
                     "role": "assistant",
                     "model": model_id,
+                    "generation_id": metadata.get("generation_id"),
+                    "turn_id": metadata.get("turn_id"),
                     "done": False,
+                    **({"parentId": _parent_hint} if _parent_hint else {}),
+                    # Clear any stale Stop flag from a PRIOR run of this message id
+                    # (continue/retry reuses the same id). Otherwise the queue
+                    # drain's stop-intent check (_was_user_stopped) could read the
+                    # old userStopped:true after this fresh run finishes cleanly and
+                    # wrongly pause the queue. Merge-upsert, so this only clears it.
+                    "userStopped": False,
+                    # Likewise clear a stale error from a PRIOR run: a retryable
+                    # error persists error onto the row AND emits chat:message:error
+                    # to every tab. This fresh run (the retry) must clear it so the
+                    # completed answer doesn't reload with a stale red error banner on
+                    # any client. Merge-upsert, so this only clears it.
+                    "error": None,
                 },
                 return_model=False,
             )
@@ -1897,32 +2892,32 @@ async def chat_completion(
                 request, form_data, user, metadata, model
             )
 
-            stage = "completion"
-            response = await chat_completion_handler(request, form_data, user)
-            if metadata.get("chat_id") and metadata.get("message_id"):
-                try:
-                    if not metadata["chat_id"].startswith("local:"):
-                        await Chats.upsert_message_to_chat_by_id_and_message_id(
-                            metadata["chat_id"],
-                            metadata["message_id"],
-                            {
-                                "model": model_id,
-                            },
-                        )
-                except:
-                    pass
-
-            # Headless queue drain: at this point the new user message is
-            # persisted (assemble_conversation_from_leaf stamped history.currentId)
-            # and the assistant row has its model. Materialize a minimal assistant
-            # placeholder + register stream state, THEN tell every tab to attach —
-            # so a tab's loadChat() finds the user message, the assistant row
-            # (model + generating), and an active stream to subscribe/snapshot.
-            # Broadcasting earlier (at drain time) raced ahead of this persistence
-            # and left tabs showing only an empty date divider.
-            if metadata.get("headless") and metadata.get("chat_id") and metadata.get(
-                "message_id"
-            ) and not str(metadata["chat_id"]).startswith("local:"):
+            # Headless queue drain: register the assistant placeholder + in-progress
+            # stream state and broadcast chat:queue:drained BEFORE the (possibly
+            # blocking) upstream call below — NOT after it.
+            #
+            # A headless drain carries session_id=None, so chat_completion's
+            # register_stream_start_if_needed (the normal-send path that stamps the
+            # done:false placeholder + registers the active stream early) was SKIPPED.
+            # If we deferred this until after chat_completion_handler returned, then
+            # for a NON-STREAMING upstream (which blocks until the entire body is
+            # ready) — and during the time-to-first-token of a streaming one — every
+            # viewing / origin / reopened tab would render the drained user bubble with
+            # NO assistant container and NO live cursor (history.currentId stuck on the
+            # user message; get_active_streams_for_chat empty so loadChat can't
+            # materialize it). That is the "I just see my message" symptom. Doing it
+            # up front makes the assistant row + active stream exist immediately, so
+            # loadChat / requestStreamSnapshot attach and the canonical
+            # "user bubble + assistant + live cursor" renders right away, exactly like
+            # a normal send. The assembly above already persisted the user message;
+            # the error/cancel handlers below tear this stream state down if the
+            # upstream call then fails (symmetric with the normal-send placeholder).
+            if (
+                metadata.get("headless")
+                and metadata.get("chat_id")
+                and metadata.get("message_id")
+                and not str(metadata["chat_id"]).startswith("local:")
+            ):
                 broadcast_spec = metadata.get("queue_drained_broadcast") or {}
                 try:
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -1932,6 +2927,8 @@ async def chat_completion(
                             "role": "assistant",
                             "model": model_id,
                             "parentId": broadcast_spec.get("user_message_id"),
+                            "generation_id": metadata.get("generation_id"),
+                            "turn_id": metadata.get("turn_id"),
                             "done": False,
                         },
                         return_model=False,
@@ -1962,12 +2959,45 @@ async def chat_completion(
                                 "item_id",
                                 "user_message_id",
                                 "response_message_id",
+                                "generation_id",
+                                "turn_id",
                             )
                             if broadcast_spec.get(k) is not None
                         },
                     )
                 except Exception:
                     log.exception("headless chat:queue:drained broadcast failed")
+
+            stage = "completion"
+            response = await chat_completion_handler(request, form_data, user)
+            if metadata.get("chat_id") and metadata.get("message_id"):
+                try:
+                    if not metadata["chat_id"].startswith("local:"):
+                        # Same shape-safety as the stream-start placeholder: on the
+                        # session-less (synchronous) path this stamp can be the row's
+                        # CREATION — a bare {model} used to leave a role-less,
+                        # parent-less skeleton the tree walk can't reach.
+                        _sync_parent_hint = (
+                            persisted_user_out.get("user_message") or {}
+                        ).get("id")
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
+                            metadata["chat_id"],
+                            metadata["message_id"],
+                            {
+                                "role": "assistant",
+                                "model": model_id,
+                                "generation_id": metadata.get("generation_id"),
+                                "turn_id": metadata.get("turn_id"),
+                                **(
+                                    {"parentId": _sync_parent_hint}
+                                    if _sync_parent_hint
+                                    else {}
+                                ),
+                            },
+                            return_model=False,
+                        )
+                except:
+                    pass
 
             stage = "response"
             return await process_chat_response(
@@ -1980,22 +3010,38 @@ async def chat_completion(
                 stage,
                 mcp_server_ids,
             )
+            user_stopped = False
+            if metadata.get("chat_id"):
+                try:
+                    user_stopped = bool(
+                        await is_generation_cancelled(
+                            getattr(request.app.state, "redis", None),
+                            metadata["chat_id"],
+                            metadata.get("generation_id"),
+                        )
+                        or await is_generation_turn_cancelled(
+                            getattr(request.app.state, "redis", None),
+                            metadata["chat_id"],
+                            metadata.get("turn_id"),
+                        )
+                    )
+                except Exception:
+                    log.exception("generation cancellation classification failed")
+            interruption_error = {
+                "content": (
+                    "The model request was interrupted before a response could be completed."
+                )
+            }
             if metadata.get("message_id"):
                 set_stream_state(
                     metadata["message_id"],
                     {
                         "chat_id": metadata.get("chat_id"),
-                        "status": "cancelled",
+                        "status": "cancelled" if user_stopped else "error",
+                        **({} if user_stopped else {"error": interruption_error}),
                     },
                 )
                 clear_stream_state(metadata["message_id"])
-            try:
-                event_emitter = get_event_emitter(metadata)
-                await event_emitter(
-                    {"type": "chat:tasks:cancel"},
-                )
-            except Exception as e:
-                pass
             # Cancelled before/around streaming: PAUSE the queue (clear this
             # generation's marker, best-effort).
             if metadata.get("chat_id") and metadata.get("message_id"):
@@ -2010,6 +3056,76 @@ async def chat_completion(
                     )
                 except Exception:
                     pass
+            # Any saved-chat cancellation must leave an explicit durable terminal
+            # row, not just a socket event. This covers setup/TTFT cancellations
+            # before process_chat_response installs its richer teardown. A mobile
+            # tab may be gone when the event fires; on return it reconstructs the
+            # exact outcome from this row. User Stop remains a clean stopped turn;
+            # infrastructure/shutdown cancellation is a visible retryable error.
+            if is_persisted_chat_generation(metadata):
+                broadcast_spec = metadata.get("queue_drained_broadcast") or {}
+                parent_hint = broadcast_spec.get("user_message_id") or (
+                    (persisted_user_out.get("user_message") or {}).get("id")
+                )
+                terminal_update = {
+                    "role": "assistant",
+                    "model": model_id,
+                    "parentId": parent_hint,
+                    "done": True,
+                    **(
+                        {"userStopped": True}
+                        if user_stopped
+                        else {"error": interruption_error}
+                    ),
+                }
+                try:
+                    await Chats.update_generation_message_if_current(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        metadata.get("generation_id"),
+                        metadata.get("turn_id"),
+                        terminal_update,
+                        create_if_missing=True,
+                    )
+                except Exception:
+                    log.exception("cancel terminal assistant upsert failed")
+
+                if metadata.get("headless"):
+                    try:
+                        from open_webui.utils.chat_queue import broadcast_queue_state
+
+                        await broadcast_queue_state(
+                            metadata.get("user_id"),
+                            metadata["chat_id"],
+                            event_type="chat:queue:drained",
+                            **{
+                                k: broadcast_spec[k]
+                                for k in (
+                                    "item_id",
+                                    "user_message_id",
+                                    "response_message_id",
+                                    "generation_id",
+                                    "turn_id",
+                                )
+                                if broadcast_spec.get(k) is not None
+                            },
+                        )
+                    except Exception:
+                        log.exception(
+                            "headless cancel chat:queue:drained broadcast failed"
+                        )
+            try:
+                event_emitter = get_event_emitter(metadata)
+                if not user_stopped:
+                    await event_emitter(
+                        {
+                            "type": "chat:message:error",
+                            "data": {"error": interruption_error},
+                        }
+                    )
+                await event_emitter({"type": "chat:tasks:cancel"})
+            except Exception:
+                pass
             # Re-raise after cleanup so the cancellation propagates and the task
             # actually unwinds/exits. Swallowing it leaves the task alive inside
             # anyio's cancel scope, which then reschedules _deliver_cancellation
@@ -2017,7 +3133,24 @@ async def chat_completion(
             # the matching fix + py-spy evidence in process_chat_response).
             raise
         except Exception as e:
-            log.debug(f"Error processing chat payload: {e}")
+            # `log.exception`, not `log.debug`: this is the LAST handler for an
+            # unhandled server-side fault in a generation. Under the old debug-level
+            # log an internal crash left no traceback anywhere — the only trace of a
+            # `KeyError('content')` in the terminal projection was the reader-facing
+            # string "'content'" on the message row, which is not a diagnosis.
+            log.exception(f"Error processing chat payload: {e}")
+            # A bare `str(e)` is the exception's *repr payload*, which for the common
+            # KeyError/AttributeError/IndexError family is just the missing key —
+            # unreadable to a user and unsearchable in a log. Name the fault instead
+            # and keep the cause attached.
+            _err_detail = f"{type(e).__name__}: {e}".strip().rstrip(":").strip()
+            _error_payload = {
+                "content": (
+                    "The server hit an internal error while completing this "
+                    f"response ({_err_detail})."
+                ),
+                "code": "internal_error",
+            }
             if metadata.get("chat_id") and metadata.get("message_id"):
                 # Update the chat message with the error
                 set_stream_state(
@@ -2025,7 +3158,7 @@ async def chat_completion(
                     {
                         "chat_id": metadata.get("chat_id"),
                         "status": "error",
-                        "error": {"content": str(e)},
+                        "error": _error_payload,
                     },
                 )
                 clear_stream_state(metadata["message_id"])
@@ -2035,7 +3168,17 @@ async def chat_completion(
                             metadata["chat_id"],
                             metadata["message_id"],
                             {
-                                "error": {"content": str(e)},
+                                "generation_id": metadata.get("generation_id"),
+                                "turn_id": metadata.get("turn_id"),
+                                "error": _error_payload,
+                                # Terminal means terminal: never persist an error
+                                # alongside `done: false`. See the matching write in
+                                # the middleware's terminal-error path — a row that
+                                # is both errored and unfinished reads as "still
+                                # generating" to every reconcile path, which is what
+                                # made a crashed turn look like it resumed streaming
+                                # after a reload.
+                                "done": True,
                             },
                         )
 
@@ -2043,7 +3186,7 @@ async def chat_completion(
                     await event_emitter(
                         {
                             "type": "chat:message:error",
-                            "data": {"error": {"content": str(e)}},
+                            "data": {"error": _error_payload},
                         }
                     )
                     await event_emitter(
@@ -2070,38 +3213,330 @@ async def chat_completion(
                 except Exception:
                     pass
         finally:
-            mcp_clients = metadata.get("mcp_clients") or {}
-            for server_id, client in mcp_clients.items():
-                try:
-                    # MCP transports create AnyIO cancel scopes that must be
-                    # closed by the same asyncio task that opened them.
-                    await client.disconnect()
-                except Exception:
-                    log.exception(
-                        "Error disconnecting MCP client %r during cleanup",
-                        server_id,
-                    )
+            # MCP transports create AnyIO cancel scopes that must be closed by
+            # the same asyncio task that opened them, and in REVERSE connection
+            # order — see disconnect_mcp_clients for why the order is a hard
+            # requirement rather than a preference.
+            from open_webui.utils.mcp.client import disconnect_mcp_clients
 
-    if (
-        metadata.get("session_id")
-        and metadata.get("chat_id")
-        and metadata.get("message_id")
-    ):
-        await register_stream_start_if_needed()
-        # Asynchronous Chat Processing
-        task_id, _ = await create_task(
-            request.app.state.redis,
-            process_chat(request, form_data, user, metadata, model),
-            id=metadata["chat_id"],
-        )
+            await disconnect_mcp_clients(
+                metadata.get("mcp_clients"), context="chat cleanup"
+            )
+
+    # A saved chat is durable work whether or not its originating browser socket
+    # happens to be connected. Socket presence controls event delivery only; it
+    # must never select the synchronous path, whose response exists only in the
+    # requesting tab and leaves an empty assistant placeholder after reload.
+    if is_persisted_chat_generation(metadata):
+        try:
+            await register_stream_start_if_needed()
+            task_id, _ = await create_task(
+                request.app.state.redis,
+                process_chat(request, form_data, user, metadata, model),
+                id=metadata["chat_id"],
+                generation_operation=generation_operation,
+            )
+        except GenerationCancelledError:
+            if (
+                metadata.get("chat_id")
+                and metadata.get("message_id")
+                and metadata.get("generation_id")
+                and metadata.get("turn_id")
+                and not str(metadata["chat_id"]).startswith("local:")
+            ):
+                await Chats.mark_generation_stopped_if_current(
+                    metadata["chat_id"],
+                    metadata["message_id"],
+                    metadata["generation_id"],
+                    metadata["turn_id"],
+                )
+            return {
+                "status": True,
+                "cancelled": True,
+                "generation_id": metadata.get("generation_id"),
+            }
         return {"status": True, "task_id": task_id}
     else:
         return await process_chat(request, form_data, user, metadata, model)
 
 
-# Alias for chat_completion (Legacy)
-generate_chat_completions = chat_completion
-generate_chat_completion = chat_completion
+async def _persist_stopped_generation_operations(
+    chat_id: str,
+    operations: list[dict],
+) -> None:
+    """Persist cancellation only while each displaced identity still owns its row."""
+    for operation in operations:
+        message_id = str(operation.get("message_id") or "")
+        generation_id = str(operation.get("generation_id") or "")
+        turn_id = str(operation.get("turn_id") or "")
+        if not message_id or not generation_id or not turn_id:
+            continue
+        try:
+            await Chats.mark_generation_stopped_if_current(
+                chat_id,
+                message_id,
+                generation_id,
+                turn_id,
+                require_unfinished=True,
+            )
+        except Exception:
+            log.exception(
+                "persisting stopped generation marker failed for %s/%s",
+                chat_id,
+                message_id,
+            )
+
+
+async def _chat_completion_with_operation(
+    request: Request,
+    form_data: dict,
+    user,
+    *,
+    pre_registered_operation: Optional[dict] = None,
+):
+    """Own one generation operation from request arrival through task teardown.
+
+    Registering here, before conversation assembly, makes pending work visible
+    to Stop and queue-drain guards. ``turn_id`` permits parallel sibling model
+    responses while atomically rejecting a different concurrent user turn.
+    """
+    # This is a lifecycle command for our registry, never an upstream model
+    # parameter. Remove it before payload processing can forward unknown fields.
+    supersede_active_turn = form_data.pop("supersede_active_turn", False) is True
+    chat_id = str(form_data.get("chat_id") or "")
+    message_id = str(form_data.get("id") or "")
+    saved_chat = bool(chat_id and not chat_id.startswith("local:"))
+    operation = None
+    displaced_operations: list[dict] = []
+    if saved_chat and message_id:
+        if user and user.role != "admin":
+            owned = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+            if owned is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=ERROR_MESSAGES.DEFAULT(),
+                )
+
+        turn_id = str(form_data.get("turn_id") or "")
+        generation_id = str(form_data.get("generation_id") or "")
+        if not generation_id or not turn_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": (
+                        "Saved-chat completions require generation_id and turn_id."
+                    ),
+                    "code": "generation_identity_required",
+                },
+            )
+        form_data["generation_id"] = generation_id
+        form_data["turn_id"] = turn_id
+        operation = {
+            "generation_id": generation_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "task_id": "",
+        }
+
+        if pre_registered_operation is not None:
+            pre_registered_identity = {
+                key: str(pre_registered_operation.get(key) or "")
+                for key in ("generation_id", "chat_id", "message_id", "turn_id")
+            }
+            operation_identity = {
+                key: operation[key]
+                for key in ("generation_id", "chat_id", "message_id", "turn_id")
+            }
+            existing = await get_generation_operation(
+                request.app.state.redis, generation_id
+            )
+            existing_identity = (
+                {
+                    key: str(existing.get(key) or "")
+                    for key in (
+                        "generation_id",
+                        "chat_id",
+                        "message_id",
+                        "turn_id",
+                    )
+                }
+                if existing is not None
+                else None
+            )
+            if (
+                pre_registered_identity != operation_identity
+                or existing_identity != operation_identity
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": "The reserved queue generation is no longer owned by this task.",
+                        "code": "generation_reservation_lost",
+                    },
+                )
+            operation["task_id"] = str(existing.get("task_id") or "")
+            registration = (
+                "cancelled"
+                if (
+                    await is_generation_cancelled(
+                        request.app.state.redis, chat_id, generation_id
+                    )
+                    or await is_generation_turn_cancelled(
+                        request.app.state.redis, chat_id, turn_id
+                    )
+                    or await is_chat_work_blocked(request.app.state.redis, chat_id)
+                )
+                else "acquired"
+            )
+        elif supersede_active_turn:
+            supersede_result = await supersede_generation_operation(
+                request.app.state.redis, operation
+            )
+            registration = supersede_result["registration"]
+            displaced_operations = supersede_result["displaced"]
+        else:
+            registration = await register_generation_operation(
+                request.app.state.redis, operation
+            )
+        if registration == "cancelled":
+            return {
+                "status": True,
+                "cancelled": True,
+                "generation_id": generation_id,
+            }
+        if registration == "turn_conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "The chat is already processing a different turn.",
+                    "code": "chat_generation_in_progress",
+                },
+            )
+        if registration == "id_conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "The generation id is already owned by another request.",
+                    "code": "generation_id_conflict",
+                },
+            )
+        if registration == "duplicate":
+            # A lost POST response may retry while the original is still in
+            # assembly. Return its task once bound; otherwise explicitly report
+            # pending instead of manufacturing a second generation.
+            existing = await get_generation_operation(
+                request.app.state.redis, generation_id
+            )
+            for _ in range(20):
+                if existing and existing.get("task_id"):
+                    return {
+                        "status": True,
+                        "task_id": existing["task_id"],
+                        "generation_id": generation_id,
+                        "deduped": True,
+                    }
+                if await is_generation_cancelled(
+                    request.app.state.redis, chat_id, generation_id
+                ):
+                    return {
+                        "status": True,
+                        "cancelled": True,
+                        "generation_id": generation_id,
+                    }
+                await asyncio.sleep(0.1)
+                existing = await get_generation_operation(
+                    request.app.state.redis, generation_id
+                )
+            return {
+                "status": True,
+                "pending": True,
+                "generation_id": generation_id,
+                "deduped": True,
+            }
+
+        if supersede_active_turn and displaced_operations:
+            # The registry transaction above already transferred admission to
+            # this replacement and latched the displaced turn. Provider work for
+            # the replacement waits here until every concrete old task has
+            # unwound, preserving the intuitive redo contract: one click means
+            # stop the old run, then start this one.
+            await _persist_stopped_generation_operations(chat_id, displaced_operations)
+            displaced_task_ids = list(
+                dict.fromkeys(
+                    str(displaced.get("task_id") or "")
+                    for displaced in displaced_operations
+                    if str(displaced.get("task_id") or "")
+                )
+            )
+            pending_task_ids = await stop_tasks_and_wait(
+                request.app.state.redis,
+                displaced_task_ids,
+                timeout=10.0,
+            )
+            # A cancellation can race the last provider token. Repeat the
+            # identity-guarded terminal marker after teardown so a genuinely
+            # cancelled row is durable without relabelling a clean completion.
+            await _persist_stopped_generation_operations(chat_id, displaced_operations)
+            if pending_task_ids:
+                await mark_generation_cancelled(
+                    request.app.state.redis, chat_id, generation_id
+                )
+                await unregister_generation_operation(
+                    request.app.state.redis, operation
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "message": (
+                            "The previous turn did not stop in time; the replacement "
+                            "was not started."
+                        ),
+                        "code": "turn_supersede_timeout",
+                    },
+                )
+            await finish_generation_supersede(
+                request.app.state.redis, chat_id, turn_id
+            )
+
+    preflight_heartbeat = None
+    if (
+        operation
+        and request.app.state.redis
+        and not str(operation.get("task_id") or "")
+    ):
+        preflight_heartbeat = asyncio.create_task(
+            heartbeat_generation_operation_until_bound(
+                request.app.state.redis, operation
+            )
+        )
+
+    try:
+        return await _chat_completion_impl(
+            request,
+            form_data,
+            user,
+            generation_operation=operation,
+        )
+    finally:
+        if preflight_heartbeat is not None:
+            preflight_heartbeat.cancel()
+            try:
+                await preflight_heartbeat
+            except asyncio.CancelledError:
+                pass
+        if operation and not operation.get("task_id"):
+            await unregister_generation_operation(request.app.state.redis, operation)
+
+
+@app.post("/api/chat/completions")
+@app.post("/api/v1/chat/completions")  # Experimental: Compatibility with OpenAI API
+async def chat_completion(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    return await _chat_completion_with_operation(request, form_data, user)
 
 
 async def start_generation(
@@ -2110,6 +3545,7 @@ async def start_generation(
     user,
     *,
     oauth_session_id: Optional[str] = None,
+    generation_operation: Optional[dict] = None,
 ):
     """Request-free entrypoint to start a chat generation.
 
@@ -2123,7 +3559,8 @@ async def start_generation(
 
     ``send_spec`` keys (all optional except ``model`` + ``leaf_message_id`` +
     ``new_user_message``): ``model``, ``leaf_message_id``, ``new_user_message``,
-    ``params``, ``tool_ids``, ``tool_servers``, ``filter_ids``, ``features``,
+    ``params``, ``tool_ids``, ``tool_servers``, ``tool_selection``,
+    ``filter_ids``, ``features``,
     ``variables``, ``files``, ``reasoning``, ``service_tier``, ``timezone``,
     ``background_tasks``, ``stream`` (defaults True), ``model_item``.
 
@@ -2133,8 +3570,10 @@ async def start_generation(
     recoverable via the snapshot/active-stream machinery. Returns whatever
     ``chat_completion`` returns (the generation runs inline within this call).
     """
-    request = HeadlessRequest(app, cookies={"oauth_session_id": oauth_session_id} if oauth_session_id else None)
-
+    request = HeadlessRequest(
+        app,
+        cookies={"oauth_session_id": oauth_session_id} if oauth_session_id else None,
+    )
     form_data = {
         "stream": send_spec.get("stream", True),
         "model": send_spec.get("model"),
@@ -2152,6 +3591,7 @@ async def start_generation(
         "params",
         "tool_ids",
         "tool_servers",
+        "tool_selection",
         "filter_ids",
         "features",
         "variables",
@@ -2163,22 +3603,19 @@ async def start_generation(
         "stream_options",
         "timezone",
         "queue_drained_broadcast",
+        "generation_id",
+        "turn_id",
+        "automation_run",
     ):
         if send_spec.get(key) is not None:
             form_data[key] = send_spec[key]
 
-    return await chat_completion(request, form_data, user)
-
-
-@app.post("/api/chat/completed")
-async def chat_completed(
-    request: Request, form_data: dict, user=Depends(get_verified_user)
-):
-    # B12: outlet filters now run server-side at the tail of
-    # process_chat_response. This route is kept as a no-op shim so v1
-    # frontends that still POST here don't 404; they receive their messages
-    # back unchanged.
-    return {"messages": form_data.get("messages", [])}
+    return await _chat_completion_with_operation(
+        request,
+        form_data,
+        user,
+        pre_registered_operation=generation_operation,
+    )
 
 
 @app.post("/api/chat/actions/{action_id}")
@@ -2200,34 +3637,322 @@ async def chat_action(
         )
 
 
-@app.post("/api/tasks/stop/{task_id}")
-async def stop_task_endpoint(
-    request: Request, task_id: str, user=Depends(get_verified_user)
+class StopGenerationTarget(BaseModel):
+    generation_id: str
+    message_id: str
+    turn_id: str
+
+
+class StopChatGenerationsForm(BaseModel):
+    generations: list[StopGenerationTarget] = Field(default_factory=list)
+    # Detached subagent reruns are registered outside the generation registry so
+    # a parent-generation cancel cannot tear them down. The composer's Stop means
+    # "halt this chat", so it opts in; narrowly-scoped callers (the drain-raced-a-
+    # Stop guard) leave this off and only cancel the generation they named.
+    include_subagent_reruns: bool = False
+
+
+@app.post("/api/tasks/stop/chat/{chat_id}")
+async def stop_chat_generations_endpoint(
+    request: Request,
+    chat_id: str,
+    form_data: StopChatGenerationsForm,
+    user=Depends(get_verified_user),
 ):
+    """Latch exact generation intent, then cancel that complete user turn.
+
+    Intent is written first. A task that registers after our registry snapshot
+    observes it before opening its start gate; a task that registered first is
+    already discoverable below. Message ids are deliberately insufficient:
+    continue/retry may reuse an assistant row, so every Stop carries the
+    generation and turn identities that owned it.
+
+    ``include_subagent_reruns`` additionally cancels the chat's detached subagent
+    redos, which own their own task registry entries and their own shielded
+    terminal writes.
+    """
+    chat = await Chats.get_chat_by_id(chat_id)
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found",
+        )
+    if chat.user_id != user.id and user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to stop this chat",
+        )
+
+    redis = request.app.state.redis
+
+    # Detached subagent redos live in the task registry under their own item key,
+    # not as generation operations, so they must be collected separately. Failing
+    # to find them must not block cancelling the generations themselves.
+    subagent_rerun_task_ids: list[str] = []
+    if form_data.include_subagent_reruns:
+        try:
+            subagent_rerun_task_ids = list(
+                dict.fromkeys(
+                    await list_item_task_ids_by_prefix(
+                        redis, f"subagent-rerun:{chat_id}:"
+                    )
+                )
+            )
+        except Exception:
+            log.exception(
+                "collecting subagent rerun tasks while stopping chat %s failed",
+                chat_id,
+            )
+
+    active_operations = await list_generation_operations_by_item(redis, chat_id)
+    operations_by_id = {
+        str(operation.get("generation_id") or ""): operation
+        for operation in active_operations
+        if operation.get("generation_id")
+    }
+    target_operations: dict[str, dict[str, str]] = {}
+    generation_ids_to_cancel: set[str] = set()
+    turn_ids_to_cancel: set[str] = set()
+
+    for target in form_data.generations:
+        generation_id = str(target.generation_id or "")
+        message_id = str(target.message_id or "")
+        turn_id = str(target.turn_id or "")
+        if not generation_id or not message_id or not turn_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": (
+                        "generation_id, message_id, and turn_id are required "
+                        "for every Stop target."
+                    ),
+                    "code": "generation_identity_required",
+                },
+            )
+
+        active_operation = operations_by_id.get(generation_id)
+        if active_operation is None:
+            # Generation ids are globally unique. Resolve a same-id operation
+            # outside this chat so the request cannot turn a foreign live id
+            # into an unrelated local cancellation latch.
+            active_operation = await get_generation_operation(redis, generation_id)
+        if active_operation is not None:
+            if str(active_operation.get("chat_id") or "") != chat_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Generation belongs to another chat",
+                )
+            active_message_id = str(active_operation.get("message_id") or "")
+            if active_message_id != message_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Generation belongs to another message",
+                )
+            active_turn_id = str(active_operation.get("turn_id") or "")
+            if active_turn_id != turn_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Generation belongs to another turn",
+                )
+
+        identity = {
+            "generation_id": generation_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "task_id": str((active_operation or {}).get("task_id") or ""),
+        }
+        previous = target_operations.get(generation_id)
+        if previous is not None and previous != identity:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflicting identities were supplied for one generation",
+            )
+        target_operations[generation_id] = identity
+        generation_ids_to_cancel.add(generation_id)
+        turn_ids_to_cancel.add(turn_id)
+
+    if not target_operations:
+        # No generation to latch, but a Stop with reruns in flight still has work
+        # to do — the user asked for the whole chat to halt.
+        remaining_rerun_task_ids = (
+            await stop_tasks_and_wait(redis, subagent_rerun_task_ids, timeout=10.0)
+            if subagent_rerun_task_ids
+            else []
+        )
+        return {
+            "status": True,
+            "generation_ids": [],
+            "turn_ids": [],
+            "task_ids": list(subagent_rerun_task_ids),
+            "pending_task_ids": remaining_rerun_task_ids,
+            "subagent_rerun_task_ids": list(subagent_rerun_task_ids),
+        }
+
     try:
-        result = await stop_task(request.app.state.redis, task_id)
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        cancelled_operations = await latch_generation_cancellation(
+            redis,
+            chat_id,
+            generation_ids=generation_ids_to_cancel,
+            turn_ids=turn_ids_to_cancel,
+        )
+    except Exception as e:
+        log.exception("collecting tasks while stopping chat %s failed", chat_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": "Cancellation was recorded, but live task state is unavailable.",
+                "code": "task_state_unavailable",
+            },
+        ) from e
 
+    cancelled_operation_task_ids: set[str] = set()
+    for operation in cancelled_operations:
+        operation_generation_id = str(operation.get("generation_id") or "")
+        operation_turn_id = str(operation.get("turn_id") or "")
+        operation_task_id = str(operation.get("task_id") or "")
+        if operation_generation_id:
+            generation_ids_to_cancel.add(operation_generation_id)
+            target_operations[operation_generation_id] = {
+                "generation_id": operation_generation_id,
+                "chat_id": chat_id,
+                "message_id": str(operation.get("message_id") or ""),
+                "turn_id": operation_turn_id,
+                "task_id": operation_task_id,
+            }
+        if operation_turn_id:
+            turn_ids_to_cancel.add(operation_turn_id)
+        if operation_task_id:
+            cancelled_operation_task_ids.add(operation_task_id)
 
-@app.get("/api/tasks")
-async def list_tasks_endpoint(request: Request, user=Depends(get_verified_user)):
-    return {"tasks": await list_tasks(request.app.state.redis)}
+    task_ids_to_stop = sorted(cancelled_operation_task_ids)
+    # Reruns are stopped in the SAME wait as the generations: a detached redo that
+    # outlived the Stop it was cancelled by would keep writing into the chat the
+    # user just halted.
+    task_ids_to_stop.extend(
+        task_id
+        for task_id in subagent_rerun_task_ids
+        if task_id not in cancelled_operation_task_ids
+    )
+
+    async def _persist_stopped_identities() -> None:
+        for operation in target_operations.values():
+            message_id = operation["message_id"]
+            if not message_id:
+                continue
+            try:
+                await Chats.mark_generation_stopped_if_current(
+                    chat_id,
+                    message_id,
+                    operation["generation_id"],
+                    operation["turn_id"],
+                    # Never relabel a turn that already reached `done`. Stop
+                    # races completion constantly (the button is live until the
+                    # last token), and stamping userStopped on a finished answer
+                    # both mislabels it in the UI and pauses the message queue.
+                    # A genuinely cancelled run records its own intent in the
+                    # task's cancel teardown.
+                    require_unfinished=True,
+                )
+            except Exception:
+                log.exception(
+                    "persisting stopped generation marker failed for %s/%s",
+                    chat_id,
+                    message_id,
+                )
+
+    # Mark before cancellation so queue ownership observes Stop. The compare and
+    # update are one DB transaction, so an old request cannot mutate a row that a
+    # newer generation has already claimed.
+    await _persist_stopped_identities()
+
+    remaining_task_ids = await stop_tasks_and_wait(
+        redis,
+        task_ids_to_stop,
+        timeout=10.0,
+    )
+    # A very fast Stop can precede placeholder persistence. Task teardown writes
+    # the exact generation identity as part of its terminal checkpoint; retry
+    # the conditional marker after waiting so that case also records user intent.
+    await _persist_stopped_identities()
+
+    return {
+        "status": True,
+        "generation_ids": sorted(generation_ids_to_cancel),
+        "turn_ids": sorted(turn_ids_to_cancel),
+        "task_ids": task_ids_to_stop,
+        "pending_task_ids": remaining_task_ids,
+        "subagent_rerun_task_ids": list(subagent_rerun_task_ids),
+    }
 
 
 @app.get("/api/tasks/chat/{chat_id}")
-async def list_tasks_by_chat_id_endpoint(
+async def get_chat_work_state_endpoint(
     request: Request, chat_id: str, user=Depends(get_verified_user)
 ):
-    chat = await Chats.get_chat_by_id(chat_id)
-    if chat is None or chat.user_id != user.id:
-        return {"task_ids": []}
+    # Ownership check without hydrating the complete conversation blob.
+    if await Chats.get_chat_open_validator(chat_id, user.id) is None:
+        return {
+            "generations": [],
+            "rerun_task_ids": [],
+            "subagent_rerun_entry_keys": [],
+            "draining": None,
+        }
 
-    task_ids = await list_task_ids_by_item_id(request.app.state.redis, chat_id)
+    try:
+        work_state = await collect_chat_work_state(request.app.state.redis, chat_id)
+    except Exception as e:
+        log.exception("collecting work state failed for chat %s", chat_id)
+        # Unknown is not empty. Returning an empty registry here caused the
+        # caller and the stranded-run reconciler below to declare genuinely
+        # live work dead during a Redis outage. A 503 makes clients preserve
+        # their current state and retry.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": "Task state is temporarily unavailable.",
+                "code": "task_state_unavailable",
+            },
+        ) from e
 
-    log.debug(f"Task IDs for chat {chat_id}: {task_ids}")
-    return {"task_ids": task_ids}
+    generations = work_state["generations"]
+    generation_task_ids = [
+        operation["task_id"] for operation in generations if operation.get("task_id")
+    ]
+    rerun_task_ids = work_state["rerun_task_ids"]
+    subagent_rerun_entry_keys = work_state["subagent_rerun_entry_keys"]
+    log.debug(
+        "Generation/rerun task IDs for chat %s: %s / %s",
+        chat_id,
+        generation_task_ids,
+        rerun_task_ids,
+    )
+
+    # Self-heal stranded subagent runs: an entry stuck at status='running' whose
+    # owning task DIED (server restart/crash, or — pre-shield — a cancel that
+    # truncated the terminal write) never resolves on the backend, because a
+    # detached rerun has no parent finalizer sweep. The frontend only DISPLAYS it
+    # as a permanent "Stopped" without recovering the real answer. The poller is the
+    # natural server-side liveness hook (the client calls it on chat load), and it
+    # already knows which tasks/reruns are live — so terminalize any genuinely-idle
+    # stranded entry durably here (recovering final_text when its hidden chat
+    # produced one). Gated so a live run is never stomped.
+    try:
+        from open_webui.utils.subagent import (
+            reconcile_stranded_subagent_runs_by_chat_id,
+        )
+
+        parent_live = bool(generations)
+        await reconcile_stranded_subagent_runs_by_chat_id(
+            chat_id,
+            parent_live=parent_live,
+            live_rerun_entry_keys=subagent_rerun_entry_keys,
+            user_id=user.id,
+        )
+    except Exception:
+        log.exception("stranded subagent reconcile failed for chat %s", chat_id)
+
+    return work_state
 
 
 ##################################
@@ -2300,6 +4025,12 @@ async def get_app_config(request: Request):
                     "enable_web_search": app.state.config.ENABLE_WEB_SEARCH,
                     "enable_study_mode": app.state.config.ENABLE_STUDY_MODE,
                     "enable_data_viz": app.state.config.ENABLE_DATA_VIZ,
+                    "enable_automations": app.state.config.ENABLE_AUTOMATIONS,
+                    # The VAPID public key is public by definition — the browser
+                    # needs it as `applicationServerKey` to subscribe at all.
+                    "webpush_public_key": app.state.config.WEBPUSH_VAPID_PUBLIC_KEY,
+                    "enable_video_input": app.state.config.ENABLE_VIDEO_INPUT,
+                    "enable_video_url_ingest": app.state.config.ENABLE_VIDEO_URL_INGEST,
                     "enable_subagents": app.state.config.ENABLE_SUBAGENTS,
                     "enable_ask_user": app.state.config.ENABLE_ASK_USER,
                     "enable_container_workspace_sync": app.state.config.ENABLE_CONTAINER_WORKSPACE_SYNC,
@@ -2322,6 +4053,19 @@ async def get_app_config(request: Request):
                     "flex_auto_flip_threshold_ratio": app.state.config.FLEX_AUTO_FLIP_THRESHOLD_RATIO,
                     "enable_image_generation": app.state.config.ENABLE_IMAGE_GENERATION,
                     "enable_autocomplete_generation": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
+                    # Effective follow-up enablement (override beats the base flag),
+                    # mirroring generate_follow_ups() in routers/tasks.py. Surfaced so
+                    # the chat UI can reserve the follow-up row's space during streaming
+                    # ONLY when a row will actually arrive — otherwise the reserve would
+                    # be held open and never filled (empty trailing gap).
+                    "enable_follow_up_generation": (
+                        app.state.config.FOLLOW_UP_GENERATION_OVERRIDE == "force_enable"
+                        or (
+                            app.state.config.FOLLOW_UP_GENERATION_OVERRIDE
+                            != "force_disable"
+                            and app.state.config.ENABLE_FOLLOW_UP_GENERATION
+                        )
+                    ),
                     "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,
                     "enable_message_rating": app.state.config.ENABLE_MESSAGE_RATING,
                     "enable_user_webhooks": app.state.config.ENABLE_USER_WEBHOOKS,
@@ -2370,7 +4114,15 @@ async def get_app_config(request: Request):
                         "max_dimension": app.state.config.IMAGE_PROVIDER_MAX_DIMENSION,
                     },
                 },
-                "permissions": {**app.state.config.USER_PERMISSIONS},
+                # Global permission DEFAULTS are admin-config data; every client
+                # surface reads the per-user resolved `user.permissions` instead
+                # (grep confirms zero `config.permissions` reads), so only ship
+                # the global defaults to admins.
+                **(
+                    {"permissions": {**app.state.config.USER_PERMISSIONS}}
+                    if user is not None and user.role == "admin"
+                    else {}
+                ),
                 "google_drive": {
                     "client_id": GOOGLE_DRIVE_CLIENT_ID.value,
                     "api_key": GOOGLE_DRIVE_API_KEY.value,
@@ -2599,26 +4351,39 @@ async def get_manifest_json(response: Response):
     response.headers["Cache-Control"] = SPA_REVALIDATE_CACHE_CONTROL
 
     if app.state.EXTERNAL_PWA_MANIFEST_URL:
-        return requests.get(app.state.EXTERNAL_PWA_MANIFEST_URL).json()
+        # Async fetch — a blocking requests.get() here would stall the whole event
+        # loop for every concurrent request while the external manifest loads.
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.get(app.state.EXTERNAL_PWA_MANIFEST_URL) as resp:
+                return await resp.json()
     else:
         return {
+            "id": "/",
             "name": app.state.WEBUI_NAME,
             "short_name": app.state.WEBUI_NAME,
             "description": f"{app.state.WEBUI_NAME} is an open, extensible, user-friendly interface for AI that adapts to your workflow.",
             "start_url": "/",
+            "scope": "/",
             "display": "standalone",
-            "background_color": "#343541",
+            "background_color": "#FAFAF7",
+            "theme_color": "#FAFAF7",
             "icons": [
                 {
-                    "src": "/static/logo.png",
+                    "src": "/static/web-app-manifest-192x192.png",
                     "type": "image/png",
-                    "sizes": "500x500",
+                    "sizes": "192x192",
                     "purpose": "any",
                 },
                 {
-                    "src": "/static/logo.png",
+                    "src": "/static/web-app-manifest-512x512.png",
                     "type": "image/png",
-                    "sizes": "500x500",
+                    "sizes": "512x512",
+                    "purpose": "any",
+                },
+                {
+                    "src": "/static/web-app-manifest-512x512.png",
+                    "type": "image/png",
+                    "sizes": "512x512",
                     "purpose": "maskable",
                 },
             ],
@@ -2627,7 +4392,117 @@ async def get_manifest_json(response: Response):
                 "method": "GET",
                 "params": {"text": "shared"},
             },
+            "shortcuts": [
+                {
+                    "name": "New Chat",
+                    "short_name": "New",
+                    "url": "/",
+                    "description": "Start a new chat",
+                }
+            ],
+            "categories": ["productivity", "utilities"],
+            "display_override": ["standalone"],
         }
+
+
+# In-process cache for generated iOS launch-screen PNGs. Keyed by the raw
+# `spec` string (e.g. "1170x2532" or "1170x2532-dark"). The endpoint only
+# accepts specs whose (width, height) pair is in `_SPLASH_ALLOWED_SIZES`
+# below (the exact sizes referenced by the apple-touch-startup-image <link>
+# tags in src/app.html), so the reachable key space is small and fixed —
+# a plain dict (no LRU eviction) is safe.
+_splash_cache: dict[str, bytes] = {}
+_SPLASH_SPEC_RE = re.compile(r"^(\d+)x(\d+)(-dark)?$")
+
+# Exact (width, height) pairs referenced by apple-touch-startup-image <link>
+# tags in src/app.html. Keep in sync with that file.
+_SPLASH_ALLOWED_SIZES = frozenset(
+    {
+        (750, 1334),
+        (1125, 2436),
+        (828, 1792),
+        (1242, 2688),
+        (1080, 2340),
+        (1170, 2532),
+        (1284, 2778),
+        (1179, 2556),
+        (1290, 2796),
+        (1206, 2622),
+        (1320, 2868),
+        (1620, 2160),
+        (1640, 2360),
+        (1668, 2388),
+        (2048, 2732),
+    }
+)
+
+
+def _render_splash_image(width: int, height: int, is_dark: bool) -> bytes:
+    """Blocking PIL work — must be run off the event loop (threadpool)."""
+    from PIL import Image
+
+    bg_color = "#262625" if is_dark else "#FAFAF7"
+    logo_path = os.path.join(STATIC_DIR, "splash-dark.png" if is_dark else "splash.png")
+
+    canvas = Image.new("RGBA", (width, height), bg_color)
+
+    try:
+        with Image.open(logo_path) as logo:
+            logo = logo.convert("RGBA")
+            # Scale the logo so it roughly fills 20% of the shorter side,
+            # preserving aspect ratio.
+            target = int(min(width, height) * 0.2)
+            logo_w, logo_h = logo.size
+            if logo_w and logo_h and target > 0:
+                scale = target / min(logo_w, logo_h)
+                new_size = (max(1, int(logo_w * scale)), max(1, int(logo_h * scale)))
+                resample = getattr(Image, "Resampling", Image).LANCZOS
+                logo = logo.resize(new_size, resample)
+
+            paste_x = (width - logo.size[0]) // 2
+            paste_y = (height - logo.size[1]) // 2
+            canvas.paste(logo, (paste_x, paste_y), logo)
+    except Exception as e:
+        log.debug("splash logo composite skipped for %sx%s: %s", width, height, e)
+
+    buffer = io.BytesIO()
+    canvas.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@app.get("/api/splash/{spec}.png")
+async def get_splash_image(spec: str):
+    """Generate an iOS `apple-touch-startup-image` launch screen on the fly.
+
+    Public/unauthenticated — iOS fetches launch screens without app auth
+    headers — so only the exact (width, height) pairs actually referenced
+    by src/app.html are accepted (see `_SPLASH_ALLOWED_SIZES`); anything
+    else 404s rather than hinting that other sizes might be valid. This
+    keeps the cacheable key space small and fixed regardless of who calls
+    it. Rendering itself runs in a threadpool so it never blocks the event
+    loop.
+    """
+    match = _SPLASH_SPEC_RE.match(spec)
+    if not match:
+        raise HTTPException(status_code=404)
+
+    width, height = int(match.group(1)), int(match.group(2))
+    is_dark = bool(match.group(3))
+
+    if (width, height) not in _SPLASH_ALLOWED_SIZES:
+        raise HTTPException(status_code=404)
+
+    cache_key = spec
+    cached = _splash_cache.get(cache_key)
+    if cached is None:
+        cached = await run_in_threadpool(_render_splash_image, width, height, is_dark)
+        _splash_cache[cache_key] = cached
+
+    return Response(
+        content=cached,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
 
 
 @app.get("/opensearch.xml")
@@ -2650,8 +4525,8 @@ class TokenGroupCreate(BaseModel):
     name: str
     models: list[str]
     limit: Optional[int] = None
-    resetTime: Optional[str] = '00:00'
-    resetTimezone: Optional[str] = 'UTC'
+    resetTime: Optional[str] = "00:00"
+    resetTimezone: Optional[str] = "UTC"
 
 
 class TokenGroupUpdate(BaseModel):
@@ -2681,38 +4556,45 @@ async def get_usage_groups(user=Depends(get_verified_user)):
     # get_token_groups now handles reset checks and returns full data
     groups = await get_token_groups()
 
-    return {"groups": groups}
+    # Subscription-provider usage rides along so the mount-time fetch seeds
+    # both bars in one request. Kick a background refresh when the snapshot is
+    # stale (poller idles while no sessions are connected); any change lands
+    # via the subscription-usage:update push moments later.
+    from open_webui.utils.subscription_usage import (
+        get_subscription_usage_state,
+        kick_refresh_if_stale,
+    )
+
+    kick_refresh_if_stale()
+    return {"groups": groups, "subscriptions": get_subscription_usage_state()}
 
 
 @app.post("/api/usage/groups")
 async def create_usage_group(
-    form_data: TokenGroupCreate,
-    user=Depends(get_verified_user)
+    form_data: TokenGroupCreate, user=Depends(get_verified_user)
 ):
     """Create a new token group"""
     try:
-        await set_token_group(form_data.name, form_data.models, form_data.limit, form_data.resetTime, form_data.resetTimezone)
+        await set_token_group(
+            form_data.name,
+            form_data.models,
+            form_data.limit,
+            form_data.resetTime,
+            form_data.resetTimezone,
+        )
 
         # Get the created group data (includes usage and reset info)
         groups = await get_token_groups()
         group_data = groups.get(form_data.name, {})
 
-        return {
-            "status": True,
-            "group": {
-                "name": form_data.name,
-                **group_data
-            }
-        }
+        return {"status": True, "group": {"name": form_data.name, **group_data}}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.put("/api/usage/groups/{name}")
 async def update_usage_group(
-    name: str,
-    form_data: TokenGroupUpdate,
-    user=Depends(get_verified_user)
+    name: str, form_data: TokenGroupUpdate, user=Depends(get_verified_user)
 ):
     """Update an existing token group"""
     try:
@@ -2724,13 +4606,7 @@ async def update_usage_group(
         groups = await get_token_groups()
         group_data = groups.get(name, {})
 
-        return {
-            "status": True,
-            "group": {
-                "name": name,
-                **group_data
-            }
-        }
+        return {"status": True, "group": {"name": name, **group_data}}
     except HTTPException:
         raise
     except Exception as e:
@@ -2738,16 +4614,13 @@ async def update_usage_group(
 
 
 @app.delete("/api/usage/groups/{name}")
-async def delete_usage_group(
-    name: str,
-    user=Depends(get_verified_user)
-):
+async def delete_usage_group(name: str, user=Depends(get_verified_user)):
     """Delete a token group"""
     try:
         success = await delete_token_group(name)
         if not success:
             raise HTTPException(status_code=404, detail="Group not found")
-        
+
         return {"status": True}
     except HTTPException:
         raise
@@ -2760,16 +4633,17 @@ async def manual_reset_usage(user=Depends(get_verified_user)):
     """Manually reset all token usage (for testing daily reset functionality)"""
     try:
         from open_webui.models.token_usage import token_groups
+
         success = await token_groups.force_reset_all_usage()
-        
+
         if success:
             return {
-                "status": True, 
-                "message": "All token usage counters have been reset to 0"
+                "status": True,
+                "message": "All token usage counters have been reset to 0",
             }
         else:
             raise HTTPException(status_code=500, detail="Failed to reset token usage")
-            
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2784,6 +4658,48 @@ async def healthcheck_with_db():
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     return {"status": True}
+
+
+############################
+# SharedChatPage
+#
+# Serves the SPA shell for /s/{share_id} with per-chat link-preview meta tags
+# (og:title = chat title, og:description = first-message snippet) so JS-less
+# crawlers (Discord/WhatsApp/iMessage) unfurl the actual conversation instead
+# of the generic instance blurb. Registered before the catch-all SPA mount,
+# which would otherwise serve the unmodified shell for this path.
+############################
+
+
+@app.get("/s/{share_id}")
+async def get_shared_chat_page(
+    share_id: str, request: Request, user=Depends(get_optional_user)
+):
+    try:
+        chat = await Chats.resolve_shared_chat(share_id)
+    except Exception:
+        chat = None
+
+    # Not found / not previewable keeps title/description None, which serves
+    # the plain injected shell so the SPA loads and applies its own not-found
+    # redirect behavior.
+    title = description = None
+    if chat and not (user and user.role == "pending"):
+        # Same public shaping as GET /api/v1/chats/share/{share_id}: only data
+        # an anonymous viewer could already fetch is embedded in the HTML.
+        sanitized = sanitize_shared_chat_model(chat, share_id=share_id)
+        title, description = _shared_chat_link_preview(sanitized)
+
+    response = _build_injected_index_response(
+        request.scope,
+        FRONTEND_BUILD_DIR,
+        title=title,
+        description=description,
+        url=str(request.url),
+    )
+    if response is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return response
 
 
 app.mount("/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static")

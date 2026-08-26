@@ -1,6 +1,6 @@
 <script>
 	import { v4 as uuidv4 } from 'uuid';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { goto } from '$app/navigation';
 	import { config, models, settings } from '$lib/stores';
 	import { WEBUI_BASE_URL } from '$lib/constants';
@@ -59,7 +59,7 @@
 		}
 	};
 
-	let model = null;
+	let model = $state(null);
 
 	onMount(async () => {
 		window.addEventListener('message', async (event) => {

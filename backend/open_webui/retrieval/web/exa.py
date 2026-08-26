@@ -5,9 +5,14 @@ Search remains Exa-backed, but all HTTP I/O in this module is async via
 aiohttp so tool calls and subagent runs never block the event loop.
 """
 
+import asyncio
 import logging
+import random
+import time
 from dataclasses import dataclass
-from typing import Optional, List
+from datetime import UTC
+from email.utils import parsedate_to_datetime
+from typing import List, Optional
 
 import aiohttp
 from open_webui.env import SRC_LOG_LEVELS
@@ -18,6 +23,46 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
 
 EXA_API_BASE = "https://api.exa.ai"
+EXA_HTTP_MAX_ATTEMPTS = 5
+EXA_HTTP_BACKOFF_BASE_SECONDS = 0.5
+EXA_HTTP_BACKOFF_MAX_SECONDS = 8.0
+
+
+def _parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
+    """Parse an HTTP Retry-After value as seconds from now."""
+    if not value:
+        return None
+
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        current_time = time.time() if now is None else now
+        return max(0.0, retry_at.timestamp() - current_time)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _exa_retry_delay(retry_after: str | None, retry_number: int) -> float:
+    """Return a capped provider-aware backoff with jitter for a 429 retry."""
+    provider_delay = _parse_retry_after(retry_after)
+    base_delay = (
+        provider_delay
+        if provider_delay is not None
+        else EXA_HTTP_BACKOFF_BASE_SECONDS * (2**retry_number)
+    )
+    base_delay = min(EXA_HTTP_BACKOFF_MAX_SECONDS, max(0.0, base_delay))
+
+    # Parallel tool calls tend to receive 429s together. A little jitter keeps
+    # every retry from landing on the same rate-limit boundary again.
+    jitter = random.uniform(0.0, min(0.5, max(0.05, base_delay * 0.25)))
+    return min(EXA_HTTP_BACKOFF_MAX_SECONDS, base_delay + jitter)
 
 
 @dataclass
@@ -57,23 +102,40 @@ async def _post_exa_json(
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
     async def run_with_session(active_session: aiohttp.ClientSession):
-        async with active_session.post(
-            f"{EXA_API_BASE}{path}",
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-        ) as response:
-            response_text = await response.text()
+        for attempt in range(EXA_HTTP_MAX_ATTEMPTS):
+            async with active_session.post(
+                f"{EXA_API_BASE}{path}",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                response_text = await response.text()
 
-            if response.status >= 400:
-                raise Exception(
-                    f"Exa API {path} failed: HTTP {response.status} {response_text[:500]}"
-                )
+                if response.status == 429 and attempt + 1 < EXA_HTTP_MAX_ATTEMPTS:
+                    delay = _exa_retry_delay(
+                        response.headers.get("Retry-After"), attempt
+                    )
+                    log.warning(
+                        "Exa API %s rate limited (attempt %s/%s); retrying in %.2fs",
+                        path,
+                        attempt + 1,
+                        EXA_HTTP_MAX_ATTEMPTS,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-            try:
-                return await response.json(content_type=None)
-            except Exception as e:
-                raise Exception(f"Exa API {path} returned invalid JSON: {e}")
+                if response.status >= 400:
+                    raise Exception(
+                        f"Exa API {path} failed: HTTP {response.status} {response_text[:500]}"
+                    )
+
+                try:
+                    return await response.json(content_type=None)
+                except Exception as e:
+                    raise Exception(f"Exa API {path} returned invalid JSON: {e}")
+
+        raise RuntimeError("Exa request retry loop exited unexpectedly")
 
     active_session = session_for_current_loop(session)
     if active_session is not None:

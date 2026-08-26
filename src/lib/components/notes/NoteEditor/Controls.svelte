@@ -8,20 +8,28 @@
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import Image from '$lib/components/common/Image.svelte';
 
-	export let show = false;
-	export let selectedModelId = '';
-	export let files = [];
+	interface Props {
+		show?: boolean;
+		selectedModelId?: string;
+		files?: any;
+		onUpdate?: any; // Default no-op function
+	}
 
-	export let onUpdate = (files: any[]) => {
-		// Default no-op function
-	};
+	let {
+		show = $bindable(false),
+		selectedModelId = $bindable(''),
+		files = $bindable([]),
+		onUpdate = (files: any[]) => {
+			// Default no-op function
+		}
+	}: Props = $props();
 </script>
 
 <div class="flex items-center mb-1.5 pt-1.5 px-2.5">
 	<div class=" mr-1 flex items-center">
 		<button
-			class="p-0.5 bg-transparent transition rounded-lg"
-			on:click={() => {
+			class="p-0.5 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+			onclick={() => {
 				show = !show;
 			}}
 		>
@@ -54,14 +62,14 @@
 						type={file.type}
 						size={file?.size}
 						loading={file.status === 'uploading'}
-						on:dismiss={() => {
+						ondismiss={() => {
 							// Remove the file from the files array
 							files = files.filter((item) => item.id !== file.id);
 							files = files;
 
 							onUpdate(files);
 						}}
-						on:click={() => {
+						onclick={() => {
 							console.log(file);
 						}}
 					/>

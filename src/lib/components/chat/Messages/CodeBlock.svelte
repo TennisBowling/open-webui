@@ -1,6 +1,6 @@
 <script lang="ts">
-	import hljs from 'highlight.js';
-	import { toast } from 'svelte-sonner';
+	import hljs from 'highlight.js/lib/common';
+	import { toast } from '$lib/utils/toast';
 	import { getContext, onMount, onDestroy } from 'svelte';
 
 	import { copyToClipboard, renderMermaidDiagram, renderVegaVisualization } from '$lib/utils';
@@ -24,46 +24,58 @@
 
 	const i18n = getContext('i18n');
 
-	export let id = '';
-	export let edit = true;
-
-	export let onSave = (e) => {};
-	export let onUpdate = (e) => {};
-	export let onPreview = (e) => {};
-
-	export let save = false;
-	export let preview = false;
-	export let collapsed = false;
-
-	export let token;
-	export let lang = '';
-	export let code = '';
-
-	export let className = 'mb-2';
-	export let editorClassName = '';
-	export let stickyButtonsClassName = 'top-0';
-
-	let codeBlockElement = null;
-	let visible = false;
-	let observer = null;
-	let editing = false;
-
-	let _code = '';
-	$: if (code) {
-		updateCode();
+	interface Props {
+		id?: string;
+		edit?: boolean;
+		onSave?: any;
+		onUpdate?: any;
+		onPreview?: any;
+		save?: boolean;
+		preview?: boolean;
+		collapsed?: boolean;
+		token: any;
+		lang?: string;
+		code?: string;
+		className?: string;
+		editorClassName?: string;
+		stickyButtonsClassName?: string;
 	}
+
+	let {
+		id = '',
+		edit = true,
+		onSave = (e) => {},
+		onUpdate = (e) => {},
+		onPreview = (e) => {},
+		save = false,
+		preview = false,
+		collapsed = $bindable(false),
+		token,
+		lang = '',
+		code = $bindable(''),
+		className = 'mb-2',
+		editorClassName = '',
+		stickyButtonsClassName = 'top-0'
+	}: Props = $props();
+
+	let codeBlockElement = $state(null);
+	let visible = $state(false);
+	let observer = null;
+	let editing = $state(false);
+
+	let _code = $state('');
 
 	const updateCode = () => {
 		_code = code;
 	};
 
-	let _token = null;
+	let _token = $state(null);
 
-	let mermaidHtml = null;
-	let vegaHtml = null;
+	let mermaidHtml = $state(null);
+	let vegaHtml = $state(null);
 
-	let copied = false;
-	let saved = false;
+	let copied = $state(false);
+	let saved = $state(false);
 
 	const collapseCodeBlock = () => {
 		collapsed = !collapsed;
@@ -124,18 +136,7 @@
 	// trailing-fence changes) avoids the previous double `JSON.stringify(token)`
 	// of a growing token on every reactive pass -- O(token) per pass during
 	// streaming -> O(token^2) over the block's life.
-	let _tokenSig = '';
-	$: if (token) {
-		const sig = `${lang} ${(code ?? '').length} ${(token?.raw ?? '').length}`;
-		if (sig !== _tokenSig) {
-			_tokenSig = sig;
-			_token = token;
-		}
-	}
-
-	$: if (_token) {
-		render();
-	}
+	let _tokenSig = $state('');
 
 	// Memoized syntax highlighting. Recomputes ONLY when the visible code or its
 	// language changes -- not on every reactive pass. Prefer `hljs.highlight` with
@@ -143,24 +144,8 @@
 	// which previously ran in the template on every re-render of a growing code
 	// block -> O(code^2) over the stream). Falls back to auto-detect only when the
 	// language is unknown.
-	let highlightedHtml = '';
-	let _lastHighlightKey = '';
-	$: {
-		if (visible && code) {
-			const key = `${lang} ${code}`;
-			if (key !== _lastHighlightKey) {
-				_lastHighlightKey = key;
-				try {
-					const known = lang && hljs.getLanguage(lang);
-					highlightedHtml = known
-						? hljs.highlight(code, { language: lang, ignoreIllegal: true }).value
-						: hljs.highlightAuto(code).value || code;
-				} catch {
-					highlightedHtml = code;
-				}
-			}
-		}
-	}
+	let highlightedHtml = $state('');
+	let _lastHighlightKey = $state('');
 
 	onMount(async () => {
 		observer = new IntersectionObserver((entries) => {
@@ -182,6 +167,41 @@
 	onDestroy(() => {
 		if (observer) {
 			observer.disconnect();
+		}
+	});
+	$effect(() => {
+		if (code) {
+			updateCode();
+		}
+	});
+	$effect(() => {
+		if (token) {
+			const sig = `${lang} ${(code ?? '').length} ${(token?.raw ?? '').length}`;
+			if (sig !== _tokenSig) {
+				_tokenSig = sig;
+				_token = token;
+			}
+		}
+	});
+	$effect(() => {
+		if (_token) {
+			render();
+		}
+	});
+	$effect(() => {
+		if (visible && code) {
+			const key = `${lang} ${code}`;
+			if (key !== _lastHighlightKey) {
+				_lastHighlightKey = key;
+				try {
+					const known = lang && hljs.getLanguage(lang);
+					highlightedHtml = known
+						? hljs.highlight(code, { language: lang, ignoreIllegal: true }).value
+						: hljs.highlightAuto(code).value || code;
+				} catch {
+					highlightedHtml = code;
+				}
+			}
 		}
 	});
 </script>
@@ -214,7 +234,7 @@
 			{/if}
 		{:else}
 			<div
-				class="absolute left-0 right-0 py-2.5 pr-3 text-text-300 pl-4.5 text-xs font-medium dark:text-white"
+				class="absolute left-0 right-0 py-2.5 pr-3 text-gray-500 pl-4.5 text-xs font-medium dark:text-gray-400"
 			>
 				{lang}
 			</div>
@@ -224,8 +244,9 @@
 			>
 				<div class="flex items-center gap-0.5">
 					<button
-						class="flex gap-1 items-center bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-						on:click={collapseCodeBlock}
+						class="flex gap-1 items-center bg-none border-none transition rounded-md px-1.5 py-0.5 max-md:py-1.5 bg-white/70 dark:bg-gray-800 hover:bg-white dark:hover:bg-gray-700"
+						data-anchor-on-click
+						onclick={collapseCodeBlock}
 					>
 						<div class=" -translate-y-[0.5px]">
 							<ChevronUpDown className="size-3" />
@@ -238,8 +259,9 @@
 
 					{#if save && !edit && !editing}
 						<button
-							class="edit-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-							on:click={() => (editing = true)}
+							class="edit-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 max-md:py-1.5 bg-white/70 dark:bg-gray-800 hover:bg-white dark:hover:bg-gray-700"
+							data-anchor-on-click
+							onclick={() => (editing = true)}
 						>
 							{$i18n.t('Edit')}
 						</button>
@@ -247,22 +269,22 @@
 
 					{#if save && (edit || editing)}
 						<button
-							class="save-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-							on:click={saveCode}
+							class="save-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 max-md:py-1.5 bg-white/70 dark:bg-gray-800 hover:bg-white dark:hover:bg-gray-700"
+							onclick={saveCode}
 						>
 							{saved ? $i18n.t('Saved') : $i18n.t('Save')}
 						</button>
 					{/if}
 
 					<button
-						class="copy-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-						on:click={copyCode}>{copied ? $i18n.t('Copied') : $i18n.t('Copy')}</button
+						class="copy-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 max-md:py-1.5 bg-white/70 dark:bg-gray-800 hover:bg-white dark:hover:bg-gray-700"
+						onclick={copyCode}>{copied ? $i18n.t('Copied') : $i18n.t('Copy')}</button
 					>
 
 					{#if preview && ['html', 'svg'].includes(lang)}
 						<button
-							class="flex gap-1 items-center preview-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white/70 dark:bg-gray-800"
-							on:click={previewCode}
+							class="flex gap-1 items-center preview-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 max-md:py-1.5 bg-white/70 dark:bg-gray-800 hover:bg-white dark:hover:bg-gray-700"
+							onclick={previewCode}
 						>
 							<div>
 								{$i18n.t('Preview')}
@@ -282,8 +304,7 @@
 				{#if !collapsed}
 					{#if edit || editing}
 						{#await loadCodeEditor() then m}
-							<svelte:component
-								this={m.default}
+							<m.default
 								value={code}
 								{id}
 								{lang}

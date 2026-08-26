@@ -1,12 +1,10 @@
 <script lang="ts">
 	import dayjs from 'dayjs';
 	import { onMount, tick, getContext } from 'svelte';
-	import { createEventDispatcher } from 'svelte';
 
 	import { mobile, models, settings } from '$lib/stores';
 
 	import { generateMoACompletion } from '$lib/apis';
-	import { updateChatById } from '$lib/apis/chats';
 	import { createOpenAITextStream } from '$lib/apis/streaming';
 
 	import ResponseMessage from './ResponseMessage.svelte';
@@ -19,54 +17,87 @@
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 	import ProfileImage from './ProfileImage.svelte';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { shouldScrollIntoViewOnRender } from '$lib/utils/editScroll';
+	import { getOrderedChildIds } from '$lib/utils/chatHistoryGraph';
 	const i18n = getContext('i18n');
 	dayjs.extend(localizedFormat);
 
-	export let chatId;
-	export let history;
-	export let messageId;
-	export let selectedModels = [];
-
-	export let isLastMessage;
-	export let readOnly = false;
-	export let editCodeBlock = true;
-
-	export let setInputText: Function = () => {};
-	export let updateChat: Function;
-	export let editMessage: Function;
-	export let saveMessage: Function;
-	export let rateMessage: Function;
-	export let actionMessage: Function;
-
-	export let submitMessage: Function;
-	export let deleteMessage: Function;
-
-	export let continueResponse: Function;
-	export let regenerateResponse: Function;
-	export let retryWithoutProviderRestrictions: Function = () => {};
-	export let markSkipRemainingRetries: Function = () => {};
-	export let regenerateWithModel: Function = () => {};
-	export let mergeResponses: Function;
-
-	export let addMessages: Function;
-
-	export let triggerScroll: Function;
-
-	export let topPadding = false;
-
-	const dispatch = createEventDispatcher();
-
-	let currentMessageId;
-	let parentMessage;
-	let groupedMessageIds = {};
-	let groupedMessageIdsIdx = {};
-
-	let selectedModelIdx = null;
-
-	let message = history.messages[messageId];
-	$: if (history.messages?.[messageId] && message !== history.messages[messageId]) {
-		message = history.messages[messageId];
+	interface Props {
+		chatId: any;
+		history: any;
+		messageId: any;
+		activateMessageBranch: Function;
+		selectedModels?: any;
+		isLastMessage: any;
+		readOnly?: boolean;
+		editCodeBlock?: boolean;
+		setInputText?: Function;
+		updateChat: Function;
+		editMessage: Function;
+		saveMessage: Function;
+		rateMessage: Function;
+		actionMessage: Function;
+		submitMessage: Function;
+		deleteMessage: Function;
+		continueResponse: Function;
+		regenerateResponse: Function;
+		rewindAndInsert?: Function;
+		retryWithoutProviderRestrictions?: Function;
+		markSkipRemainingRetries?: Function;
+		regenerateWithModel?: Function;
+		mergeResponses: Function;
+		triggerScroll: Function;
+		topPadding?: boolean;
 	}
+
+	let {
+		chatId,
+		history = $bindable(),
+		messageId,
+		activateMessageBranch,
+		selectedModels = [],
+		isLastMessage,
+		readOnly = false,
+		editCodeBlock = true,
+		setInputText = () => {},
+		updateChat,
+		editMessage,
+		saveMessage,
+		rateMessage,
+		actionMessage,
+		submitMessage,
+		deleteMessage,
+		continueResponse,
+		regenerateResponse,
+		rewindAndInsert = () => {},
+		retryWithoutProviderRestrictions = () => {},
+		markSkipRemainingRetries = () => {},
+		regenerateWithModel = () => {},
+		mergeResponses,
+		triggerScroll,
+		topPadding = false
+	}: Props = $props();
+	let currentMessageId;
+	let parentMessage = $state();
+	let groupedMessageIds = $state({});
+	let groupedMessageIdsIdx = $state({});
+
+	// The merged response synthesises the per-model answers and has no .files of
+	// its own, so sandbox: links in it must resolve against the union of the
+	// currently-displayed contributing responses' generated files.
+	let mergedSandboxFiles = $derived(
+		Object.keys(groupedMessageIds ?? {})
+			.flatMap((modelIdx) => {
+				const ids = groupedMessageIds[modelIdx]?.messageIds ?? [];
+				const mid = ids[groupedMessageIdsIdx[modelIdx] ?? ids.length - 1];
+				return history?.messages?.[mid]?.files ?? [];
+			})
+			.filter((file) => file?.container_workspace)
+	);
+
+	let selectedModelIdx = $state(null);
+
+	let message = $derived(history.messages[messageId]);
 
 	const gotoMessage = async (modelIdx, messageIdx) => {
 		// Clamp messageIdx to ensure it's within valid range
@@ -75,46 +106,15 @@
 			Math.min(messageIdx, groupedMessageIds[modelIdx].messageIds.length - 1)
 		);
 
-		// Get the messageId at the specified index
-		let messageId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
-		console.log(messageId);
-
-		// Traverse the branch to find the deepest child message
-		let messageChildrenIds = history.messages[messageId].childrenIds;
-		while (messageChildrenIds.length !== 0) {
-			messageId = messageChildrenIds.at(-1);
-			messageChildrenIds = history.messages[messageId].childrenIds;
-		}
-
-		// Update the current message ID in history
-		history.currentId = messageId;
-
-		// Await UI updates
-		await tick();
-		await updateChat();
-
-		// Trigger scrolling after navigation
-		triggerScroll();
+		const targetId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
+		await activateMessageBranch(targetId);
 	};
 
 	const showPreviousMessage = async (modelIdx) => {
 		groupedMessageIdsIdx[modelIdx] = Math.max(0, groupedMessageIdsIdx[modelIdx] - 1);
 
-		let messageId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
-		console.log(messageId);
-
-		let messageChildrenIds = history.messages[messageId].childrenIds;
-
-		while (messageChildrenIds.length !== 0) {
-			messageId = messageChildrenIds.at(-1);
-			messageChildrenIds = history.messages[messageId].childrenIds;
-		}
-
-		history.currentId = messageId;
-
-		await tick();
-		await updateChat();
-		triggerScroll();
+		const targetId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
+		await activateMessageBranch(targetId);
 	};
 
 	const showNextMessage = async (modelIdx) => {
@@ -123,21 +123,8 @@
 			groupedMessageIdsIdx[modelIdx] + 1
 		);
 
-		let messageId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
-		console.log(messageId);
-
-		let messageChildrenIds = history.messages[messageId].childrenIds;
-
-		while (messageChildrenIds.length !== 0) {
-			messageId = messageChildrenIds.at(-1);
-			messageChildrenIds = history.messages[messageId].childrenIds;
-		}
-
-		history.currentId = messageId;
-
-		await tick();
-		await updateChat();
-		triggerScroll();
+		const targetId = groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]];
+		await activateMessageBranch(targetId);
 	};
 
 	const initHandler = async () => {
@@ -148,10 +135,13 @@
 		parentMessage = history.messages[messageId].parentId
 			? history.messages[history.messages[messageId].parentId]
 			: null;
+		const parentChildIds = parentMessage?.id
+			? getOrderedChildIds(history.messages ?? {}, parentMessage.id)
+			: [];
 
 		groupedMessageIds = parentMessage?.models.reduce((a, model, modelIdx) => {
 			// Find all messages that are children of the parent message and have the same model
-			let modelMessageIds = parentMessage?.childrenIds
+			let modelMessageIds = parentChildIds
 				.map((id) => history.messages[id])
 				.filter((m) => m?.modelIdx === modelIdx)
 				.map((m) => m.id);
@@ -159,7 +149,7 @@
 			// Legacy support for messages that don't have a modelIdx
 			// Find all messages that are children of the parent message and have the same model
 			if (modelMessageIds.length === 0) {
-				let modelMessages = parentMessage?.childrenIds
+				let modelMessages = parentChildIds
 					.map((id) => history.messages[id])
 					.filter((m) => m?.model === model);
 
@@ -200,18 +190,8 @@
 
 	const onGroupClick = async (_messageId, modelIdx) => {
 		if (messageId != _messageId) {
-			let currentMessageId = _messageId;
-			let messageChildrenIds = history.messages[currentMessageId].childrenIds;
-			while (messageChildrenIds.length !== 0) {
-				currentMessageId = messageChildrenIds.at(-1);
-				messageChildrenIds = history.messages[currentMessageId].childrenIds;
-			}
-			history.currentId = currentMessageId;
 			selectedModelIdx = modelIdx;
-
-			// await tick();
-			// await updateChat();
-			// triggerScroll();
+			await activateMessageBranch(_messageId);
 		}
 	};
 
@@ -229,7 +209,11 @@
 		await initHandler();
 		await tick();
 
-		if ($settings?.scrollOnBranchChange ?? true) {
+		// Only pull the new/selected turn into view when the reader is already at
+		// the bottom (a fresh submit, or branch-switching while tailing). If they
+		// scrolled up to read/edit, this mount-time scroll would yank them away —
+		// honor the 'preserve' intent the edit/branch paths already compute.
+		if (($settings?.scrollOnBranchChange ?? true) && shouldScrollIntoViewOnRender()) {
 			const messageElement = document.getElementById(`message-${messageId}`);
 			if (messageElement) {
 				messageElement.scrollIntoView({ block: 'start' });
@@ -246,14 +230,14 @@
 		>
 			{#if $settings?.displayMultiModelResponsesInTabs ?? false}
 				<div class="w-full">
-					<div class=" flex w-full mb-4.5 border-b border-gray-200 dark:border-gray-850">
+					<div class=" flex w-full mb-4.5 border-b-hairline border-gray-200 dark:border-gray-850">
 						<div
 							class="flex gap-2 scrollbar-none overflow-x-auto w-fit text-center font-medium bg-transparent pt-1 text-sm"
 						>
 							{#each Object.keys(groupedMessageIds) as modelIdx}
 								{#if groupedMessageIdsIdx[modelIdx] !== undefined && groupedMessageIds[modelIdx].messageIds.length > 0}
-									<!-- svelte-ignore a11y-no-static-element-interactions -->
-									<!-- svelte-ignore a11y-click-events-have-key-events -->
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<!-- svelte-ignore a11y_click_events_have_key_events -->
 
 									{@const _messageId =
 										groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]]}
@@ -264,7 +248,7 @@
 										class="min-w-fit {selectedModelIdx == modelIdx
 											? ' dark:border-gray-300 '
 											: ' opacity-35 border-transparent'} pb-1.5 px-2.5 transition border-b-2"
-										on:click={async () => {
+										onclick={async () => {
 											if (selectedModelIdx != modelIdx) {
 												selectedModelIdx = modelIdx;
 											}
@@ -317,6 +301,7 @@
 									{actionMessage}
 									{submitMessage}
 									{continueResponse}
+									{rewindAndInsert}
 									regenerateResponse={async (message, prompt = null) => {
 										regenerateResponse(message, prompt);
 										await tick();
@@ -331,7 +316,6 @@
 										groupedMessageIdsIdx[selectedModelIdx] =
 											groupedMessageIds[selectedModelIdx].messageIds.length - 1;
 									}}
-									{addMessages}
 									{readOnly}
 									{topPadding}
 								/>
@@ -342,21 +326,21 @@
 			{:else}
 				{#each Object.keys(groupedMessageIds) as modelIdx}
 					{#if groupedMessageIdsIdx[modelIdx] !== undefined && groupedMessageIds[modelIdx].messageIds.length > 0}
-						<!-- svelte-ignore a11y-no-static-element-interactions -->
-						<!-- svelte-ignore a11y-click-events-have-key-events -->
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<!-- svelte-ignore a11y_click_events_have_key_events -->
 						{@const _messageId =
 							groupedMessageIds[modelIdx].messageIds[groupedMessageIdsIdx[modelIdx]]}
 
 						<div
-							class=" snap-center w-full max-w-full m-1 border {history.messages[messageId]
+							class=" snap-center w-full max-w-full m-1 border-hairline {history.messages[messageId]
 								?.modelIdx == modelIdx
-								? `bg-gray-50 dark:bg-gray-850 border-gray-100 dark:border-gray-800 border-2 ${
+								? `bg-gray-50 dark:bg-gray-850 border-book-cloth/40 ${
 										$mobile ? 'min-w-full' : 'min-w-80'
 									}`
 								: `border-gray-100 dark:border-gray-850 border-dashed ${
 										$mobile ? 'min-w-full' : 'min-w-80'
 									}`} transition-all p-5 rounded-2xl"
-							on:click={async () => {
+							onclick={async () => {
 								onGroupClick(_messageId, modelIdx);
 							}}
 						>
@@ -381,6 +365,7 @@
 										{actionMessage}
 										{submitMessage}
 										{continueResponse}
+										{rewindAndInsert}
 										regenerateResponse={async (message, prompt = null) => {
 											regenerateResponse(message, prompt);
 											await tick();
@@ -395,7 +380,6 @@
 											groupedMessageIdsIdx[modelIdx] =
 												groupedMessageIds[modelIdx].messageIds.length - 1;
 										}}
-										{addMessages}
 										{readOnly}
 										{editCodeBlock}
 										{topPadding}
@@ -436,7 +420,11 @@
 									{#if (message?.content ?? '') === ''}
 										<Skeleton />
 									{:else}
-										<Markdown id={`merged`} content={message.content ?? ''} />
+										<Markdown
+											id={`merged`}
+											content={message.content ?? ''}
+											sandboxFiles={mergedSandboxFiles}
+										/>
 									{/if}
 								</div>
 							</div>
@@ -451,8 +439,8 @@
 									id="merge-response-button"
 									class="{true
 										? 'visible'
-										: 'invisible group-hover:visible'} p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-									on:click={() => {
+										: 'invisible group-hover:visible'} p-1 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+									onclick={() => {
 										mergeResponsesHandler();
 									}}
 								>

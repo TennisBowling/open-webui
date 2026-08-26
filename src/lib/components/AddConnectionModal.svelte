@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import { getContext, onMount } from 'svelte';
 	const i18n = getContext('i18n');
 
@@ -19,38 +19,65 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Textarea from './common/Textarea.svelte';
 
-	export let onSubmit: Function = () => {};
-	export let onDelete: Function = () => {};
+	interface Props {
+		onSubmit?: Function;
+		onDelete?: Function;
+		show?: boolean;
+		edit?: boolean;
+		ollama?: boolean;
+		direct?: boolean;
+		connection?: any;
+	}
 
-	export let show = false;
-	export let edit = false;
+	let {
+		onSubmit = () => {},
+		onDelete = () => {},
+		show = $bindable(false),
+		edit = false,
+		ollama = false,
+		direct = false,
+		connection = null
+	}: Props = $props();
 
-	export let ollama = false;
-	export let direct = false;
+	let url = $state('');
+	let key = $state('');
+	let auth_type = $state('bearer');
 
-	export let connection = null;
+	let connectionType = $state('external');
+	let azure = $state(false);
+	$effect(() => {
+		azure =
+			(url.includes('azure.') || url.includes('cognitive.microsoft.com')) && !direct ? true : false;
+	});
 
-	let url = '';
-	let key = '';
-	let auth_type = 'bearer';
+	let prefixId = $state('');
+	let enable = $state(true);
+	let apiVersion = $state('');
 
-	let connectionType = 'external';
-	let azure = false;
-	$: azure =
-		(url.includes('azure.') || url.includes('cognitive.microsoft.com')) && !direct ? true : false;
+	// Subscription-based provider (e.g. a ChatGPT plan behind a Codex-style
+	// proxy): usage is percentage windows from a usage endpoint, not counted
+	// tokens. The backend polls the endpoint and drives the composer usage bar.
+	let subscriptionUsage = $state(false);
+	let usageUrl = $state('');
+	let derivedUsageUrl = $derived(
+		(() => {
+			try {
+				const parsed = new URL(url);
+				return `${parsed.protocol}//${parsed.host}/usage`;
+			} catch {
+				return '';
+			}
+		})()
+	);
 
-	let prefixId = '';
-	let enable = true;
-	let apiVersion = '';
+	let headers = $state('');
 
-	let headers = '';
+	let tags = $state([]);
 
-	let tags = [];
+	let modelId = $state('');
+	let modelIds = $state([]);
 
-	let modelId = '';
-	let modelIds = [];
-
-	let loading = false;
+	let loading = $state(false);
 
 	const verifyOllamaHandler = async () => {
 		// remove trailing slash from url
@@ -183,7 +210,13 @@
 				connection_type: connectionType,
 				auth_type,
 				headers: headers ? JSON.parse(headers) : undefined,
-				...(!ollama && azure ? { azure: true, api_version: apiVersion } : {})
+				...(!ollama && azure ? { azure: true, api_version: apiVersion } : {}),
+				...(!ollama && !direct
+					? {
+							subscription_usage: subscriptionUsage,
+							...(subscriptionUsage && usageUrl.trim() ? { usage_url: usageUrl.trim() } : {})
+						}
+					: {})
 			}
 		};
 
@@ -198,6 +231,8 @@
 		prefixId = '';
 		tags = [];
 		modelIds = [];
+		subscriptionUsage = false;
+		usageUrl = '';
 	};
 
 	const init = () => {
@@ -221,13 +256,17 @@
 				connectionType = connection.config?.connection_type ?? 'external';
 				azure = connection.config?.azure ?? false;
 				apiVersion = connection.config?.api_version ?? '';
+				subscriptionUsage = connection.config?.subscription_usage ?? false;
+				usageUrl = connection.config?.usage_url ?? '';
 			}
 		}
 	};
 
-	$: if (show) {
-		init();
-	}
+	$effect(() => {
+		if (show) {
+			init();
+		}
+	});
 
 	onMount(() => {
 		init();
@@ -245,9 +284,9 @@
 				{/if}
 			</h1>
 			<button
-				class="self-center"
+				class="tap-target self-center"
 				aria-label={$i18n.t('Close modal')}
-				on:click={() => {
+				onclick={() => {
 					show = false;
 				}}
 			>
@@ -259,7 +298,7 @@
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
-					on:submit={(e) => {
+					onsubmit={(e) => {
 						e.preventDefault();
 						submitHandler();
 					}}
@@ -272,7 +311,7 @@
 
 									<div class="">
 										<button
-											on:click={() => {
+											onclick={() => {
 												connectionType = connectionType === 'local' ? 'external' : 'local';
 											}}
 											type="button"
@@ -314,7 +353,7 @@
 							<Tooltip content={$i18n.t('Verify Connection')} className="self-end -mb-1">
 								<button
 									class="self-center p-1 bg-transparent hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 rounded-lg transition"
-									on:click={() => {
+									onclick={() => {
 										verifyHandler();
 									}}
 									type="button"
@@ -481,7 +520,7 @@
 
 								<div>
 									<button
-										on:click={() => {
+										onclick={() => {
 											azure = !azure;
 										}}
 										type="button"
@@ -518,6 +557,56 @@
 							</div>
 						{/if}
 
+						{#if !ollama && !direct}
+							<div class="flex flex-row justify-between items-center w-full mt-2">
+								<label
+									for="toggle-subscription-usage"
+									class={`mb-0.5 text-xs text-gray-500
+								${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : ''}`}
+									>{$i18n.t('Subscription Usage')}</label
+								>
+
+								<Tooltip
+									content={$i18n.t(
+										'Track this provider as a subscription: usage is polled from its usage endpoint as percentage limit windows instead of counted tokens'
+									)}
+								>
+									<Switch id="toggle-subscription-usage" bind:state={subscriptionUsage} />
+								</Tooltip>
+							</div>
+
+							{#if subscriptionUsage}
+								<div class="flex gap-2 mt-2">
+									<div class="flex flex-col w-full">
+										<label
+											for="usage-url-input"
+											class={`mb-0.5 text-xs text-gray-500
+									${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : ''}`}
+											>{$i18n.t('Usage API URL')}</label
+										>
+
+										<div class="flex-1">
+											<Tooltip
+												content={$i18n.t(
+													'Endpoint reporting subscription usage - leave empty to use {{url}}',
+													{ url: derivedUsageUrl || '<base host>/usage' }
+												)}
+											>
+												<input
+													id="usage-url-input"
+													class={`w-full text-sm bg-transparent ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+													type="text"
+													bind:value={usageUrl}
+													placeholder={derivedUsageUrl || $i18n.t('Usage API URL')}
+													autocomplete="off"
+												/>
+											</Tooltip>
+										</div>
+									</div>
+								</div>
+							{/if}
+						{/if}
+
 						<div class="flex flex-col w-full mt-2">
 							<div class="mb-1 flex justify-between">
 								<div
@@ -541,7 +630,7 @@
 														MODELID: modelId
 													})}
 													type="button"
-													on:click={() => {
+													onclick={() => {
 														modelIds = modelIds.filter((_, idx) => idx !== modelIdx);
 													}}
 												>
@@ -591,7 +680,7 @@
 								<button
 									type="button"
 									aria-label={$i18n.t('Add')}
-									on:click={() => {
+									onclick={() => {
 										addModelHandler();
 									}}
 								>
@@ -613,7 +702,7 @@
 							<div class="flex-1 mt-0.5">
 								<Tags
 									bind:tags
-									on:add={(e) => {
+									onadd={(e) => {
 										tags = [
 											...tags,
 											{
@@ -621,7 +710,7 @@
 											}
 										];
 									}}
-									on:delete={(e) => {
+									ondelete={(e) => {
 										tags = tags.filter((tag) => tag.name !== e.detail);
 									}}
 								/>
@@ -634,7 +723,7 @@
 							<button
 								class="px-3.5 py-1.5 text-sm font-medium dark:bg-black dark:hover:bg-gray-900 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									onDelete();
 									show = false;
 								}}

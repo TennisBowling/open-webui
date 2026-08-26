@@ -1,11 +1,17 @@
 <script lang="ts">
+	import { preventDefault } from '$lib/utils/eventModifiers';
 	import dayjs from 'dayjs';
-	import { toast } from 'svelte-sonner';
-	import { tick, getContext, onMount } from 'svelte';
+	import { toast } from '$lib/utils/toast';
+	import { tick, getContext, onMount, onDestroy } from 'svelte';
 
-	import { models, settings, config } from '$lib/stores';
+	import { models, settings, config, messageEditingIds } from '$lib/stores';
 	import { user as _user } from '$lib/stores';
 	import { copyToClipboard as _copyToClipboard, formatDate } from '$lib/utils';
+	import {
+		autoGrowEditTextarea,
+		captureEditEntryAnchor,
+		placeEditBoxForKeyboard
+	} from '$lib/utils/editScroll';
 	import { WEBUI_BASE_URL, WEBUI_API_BASE_URL } from '$lib/constants';
 	import { uploadFile } from '$lib/apis/files';
 
@@ -24,36 +30,73 @@
 	const i18n = getContext('i18n');
 	dayjs.extend(localizedFormat);
 
-	export let user;
+	interface Props {
+		user: any;
+		chatId: any;
+		history: any;
+		messageId: any;
+		siblings: any;
+		gotoMessage: Function;
+		showPreviousMessage: Function;
+		showNextMessage: Function;
+		editMessage: Function;
+		deleteMessage: Function;
+		isFirstMessage: boolean;
+		readOnly: boolean;
+		editCodeBlock?: boolean;
+		topPadding?: boolean;
+	}
 
-	export let chatId;
-	export let history;
-	export let messageId;
+	let {
+		user,
+		chatId,
+		history,
+		messageId,
+		siblings,
+		gotoMessage,
+		showPreviousMessage,
+		showNextMessage,
+		editMessage,
+		deleteMessage,
+		isFirstMessage,
+		readOnly,
+		editCodeBlock = true,
+		topPadding = false
+	}: Props = $props();
 
-	export let siblings;
+	let showDeleteConfirm = $state(false);
 
-	export let gotoMessage: Function;
-	export let showPreviousMessage: Function;
-	export let showNextMessage: Function;
+	let messageIndexEdit = $state(false);
 
-	export let editMessage: Function;
-	export let deleteMessage: Function;
+	let edit = $state(false);
+	let editSubmitting = $state(false);
+	let editedContent = $state('');
+	let editedFiles = $state([]);
 
-	export let isFirstMessage: boolean;
-	export let readOnly: boolean;
-	export let editCodeBlock = true;
-	export let topPadding = false;
+	// Mirror the local edit flag into the shared store so chat-level chrome
+	// (mobile composer/token panels, sidebar edge strip) can stand down while
+	// this message is being edited. Tracks the exact id it registered so a
+	// messageId prop swap mid-edit can't strand a stale entry (which would
+	// keep the composer hidden); onDestroy covers branch/chat teardown.
+	let registeredEditId: string | null = null;
+	const syncEditRegistration = (editing: boolean, id: string) => {
+		const target = editing ? id : null;
+		if (target === registeredEditId) return;
+		messageEditingIds.update((ids) => {
+			const next = new Set(ids);
+			if (registeredEditId !== null) next.delete(registeredEditId);
+			if (target !== null) next.add(target);
+			return next;
+		});
+		registeredEditId = target;
+	};
+	$effect(() => {
+		syncEditRegistration(edit, messageId);
+	});
+	onDestroy(() => syncEditRegistration(false, messageId));
 
-	let showDeleteConfirm = false;
-
-	let messageIndexEdit = false;
-
-	let edit = false;
-	let editedContent = '';
-	let editedFiles = [];
-
-	let messageEditTextAreaElement: HTMLTextAreaElement;
-	let editFileInputElement: HTMLInputElement;
+	let messageEditTextAreaElement: HTMLTextAreaElement = $state();
+	let editFileInputElement: HTMLInputElement = $state();
 
 	const addFilesToEdit = async (inputFiles: FileList) => {
 		for (const file of Array.from(inputFiles)) {
@@ -80,10 +123,7 @@
 		}
 	};
 
-	let message = history.messages[messageId];
-	$: if (history.messages?.[messageId] && message !== history.messages[messageId]) {
-		message = history.messages[messageId];
-	}
+	let message = $derived(history.messages[messageId]);
 
 	const getMessageTextContent = (content) => {
 		if (typeof content === 'string') {
@@ -109,7 +149,7 @@
 		return '';
 	};
 
-	$: messageTextContent = getMessageTextContent(message?.content);
+	let messageTextContent = $derived(getMessageTextContent(message?.content));
 
 	const copyToClipboard = async (text) => {
 		const res = await _copyToClipboard(text);
@@ -123,27 +163,57 @@
 		editedContent = messageTextContent;
 		editedFiles = message.files ?? [];
 
+		// Anchor the edited message at its current on-screen position so swapping
+		// rendered markdown for the (tall) edit textarea + focusing doesn't shove
+		// the viewport. Captured BEFORE the await so it reflects the pre-edit DOM.
+		const restoreAnchor = captureEditEntryAnchor(message.id);
+
 		await tick();
 
 		if (messageEditTextAreaElement) {
 			messageEditTextAreaElement.style.height = '';
 			messageEditTextAreaElement.style.height = `${messageEditTextAreaElement.scrollHeight}px`;
 
-			messageEditTextAreaElement?.focus();
+			// preventScroll: do NOT let the browser scroll-into-view the freshly
+			// focused (often tall) textarea — that is what threw the edit box to the
+			// top of the screen, and it is the worst offender on iOS Safari.
+			messageEditTextAreaElement?.focus({ preventScroll: true });
 		}
+
+		await tick();
+		restoreAnchor();
+
+		// The focus above summons the iOS keyboard AFTER this handler returns.
+		// When it arrives (or if it is already up from the composer), the edit
+		// box gets top-aligned in the keyboard-shrunk viewport for maximum
+		// editing room; on desktop this expires and the anchor result stands.
+		placeEditBoxForKeyboard(message.id);
 	};
 
 	const editMessageConfirmHandler = async (submit = true) => {
+		if (editSubmitting) return;
 		if (!editedContent && (editedFiles ?? []).length === 0) {
 			toast.error($i18n.t('Please enter a message or attach a file.'));
 			return;
 		}
 
-		editMessage(message.id, { content: editedContent, files: editedFiles }, submit);
+		editSubmitting = true;
+		try {
+			const accepted = await editMessage(
+				message.id,
+				{ content: editedContent, files: editedFiles },
+				submit
+			);
+			// Keep the editor and its text intact if the active turn could not be
+			// safely released. No replacement branch has been created in that case.
+			if (accepted === false) return;
 
-		edit = false;
-		editedContent = '';
-		editedFiles = [];
+			edit = false;
+			editedContent = '';
+			editedFiles = [];
+		} finally {
+			editSubmitting = false;
+		}
 	};
 
 	const cancelEditMessage = () => {
@@ -164,7 +234,7 @@
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
 	title={$i18n.t('Delete message?')}
-	on:confirm={() => {
+	onconfirm={() => {
 		deleteMessageHandler();
 	}}
 />
@@ -175,7 +245,7 @@
 	id="message-{message.id}"
 >
 	{#if !($settings?.chatBubble ?? true)}
-		<div class={`shrink-0 ltr:mr-3 rtl:ml-3 mt-1`}>
+		<div class={`shrink-0 ltr:mr-3 rtl:ml-3 hidden @lg:flex mt-1`}>
 			<ProfileImage
 				src={message.user
 					? ($models.find((m) => m.id === message.user)?.info?.meta?.profile_image_url ??
@@ -202,7 +272,7 @@
 						<div
 							class="self-center text-xs font-medium first-letter:capitalize ml-0.5 translate-y-[1px] {($settings?.highContrastMode ??
 							false)
-								? 'dark:text-gray-900 text-gray-100'
+								? 'dark:text-gray-100 text-gray-900'
 								: 'invisible group-hover:visible transition'}"
 						>
 							<Tooltip content={dayjs(message.timestamp * 1000).format('LLLL')}>
@@ -224,7 +294,7 @@
 		{:else if message.timestamp}
 			<div class="flex justify-end pr-2 text-xs">
 				<div
-					class="text-[0.65rem] font-medium first-letter:capitalize mb-0.5 {($settings?.highContrastMode ??
+					class="text-xs font-medium first-letter:capitalize mb-0.5 {($settings?.highContrastMode ??
 					false)
 						? 'dark:text-gray-100 text-gray-900'
 						: 'invisible group-hover:visible transition text-gray-400'}"
@@ -243,7 +313,7 @@
 
 		<div class="chat-{message.role} w-full min-w-full markdown-prose">
 			{#if edit !== true}
-				{#if message.files}
+				{#if (message.files ?? []).length > 0}
 					<div class="mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap">
 						{#each message.files as file}
 							<div class={($settings?.chatBubble ?? true) ? 'self-end' : ''}>
@@ -270,14 +340,17 @@
 			{/if}
 
 			{#if edit === true}
-				<div class=" w-full bg-gray-50 dark:bg-gray-800 rounded-3xl px-5 py-3 mb-2">
+				<div
+					class="message-edit-box w-full bg-gray-50 dark:bg-gray-800 rounded-2xl px-5 py-3 mb-2"
+					data-kb-keep
+				>
 					<input
 						bind:this={editFileInputElement}
 						type="file"
 						hidden
 						accept="image/*"
 						multiple
-						on:change={async () => {
+						onchange={async () => {
 							if (editFileInputElement?.files) {
 								await addFilesToEdit(editFileInputElement.files);
 								editFileInputElement.value = '';
@@ -298,12 +371,12 @@
 									</div>
 									<div class=" absolute -top-1 -right-1">
 										<button
-											class=" bg-white text-black border border-white rounded-full {($settings?.highContrastMode ??
+											class=" bg-white text-black border-hairline border-white rounded-full max-md:p-1 {($settings?.highContrastMode ??
 											false)
 												? ''
 												: 'group-hover:visible invisible transition'}"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												editedFiles.splice(fileIdx, 1);
 
 												editedFiles = editedFiles;
@@ -326,7 +399,7 @@
 											compact={true}
 											fullQuality={file.fullQuality === true}
 											size={file?.file?.meta?.size ?? null}
-											on:toggle={(e) => {
+											ontoggle={(e) => {
 												const target = editedFiles[fileIdx];
 												if (target) {
 													target.fullQuality = e.detail.fullQuality;
@@ -345,12 +418,12 @@
 									loading={file.status === 'uploading'}
 									dismissible={true}
 									edit={true}
-									on:dismiss={async () => {
+									ondismiss={async () => {
 										editedFiles.splice(fileIdx, 1);
 
 										editedFiles = editedFiles;
 									}}
-									on:click={() => {
+									onclick={() => {
 										console.log(file);
 									}}
 								/>
@@ -360,7 +433,7 @@
 						<button
 							type="button"
 							class="flex items-center justify-center size-14 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-gray-400 dark:hover:border-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition text-gray-400 dark:text-gray-500"
-							on:click={() => {
+							onclick={() => {
 								editFileInputElement?.click();
 							}}
 						>
@@ -377,22 +450,22 @@
 						</button>
 					</div>
 
-					<!-- svelte-ignore a11y-no-static-element-interactions -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
-						class="max-h-96 overflow-auto"
-						on:dragover|preventDefault
-						on:drop|preventDefault={async (e) => {
+						class="message-edit-scroller max-h-96 overflow-auto"
+						ondragover={preventDefault()}
+						ondrop={preventDefault(async (e) => {
 							if (e.dataTransfer?.files?.length) {
 								await addFilesToEdit(e.dataTransfer.files);
 							}
-						}}
+						})}
 					>
 						<textarea
 							id="message-edit-{message.id}"
 							bind:this={messageEditTextAreaElement}
-							class=" bg-transparent outline-hidden w-full resize-none"
+							class="block bg-transparent outline-hidden w-full resize-none"
 							bind:value={editedContent}
-							on:paste={async (e) => {
+							onpaste={async (e) => {
 								const items = e.clipboardData?.items;
 								if (!items) return;
 								const imageFiles = [];
@@ -409,11 +482,10 @@
 									await addFilesToEdit(dt.files);
 								}
 							}}
-							on:input={(e) => {
-								e.target.style.height = '';
-								e.target.style.height = `${e.target.scrollHeight}px`;
+							oninput={(e) => {
+								autoGrowEditTextarea(e.currentTarget);
 							}}
-							on:keydown={(e) => {
+							onkeydown={(e) => {
 								if (e.key === 'Escape') {
 									document.getElementById('close-edit-message-button')?.click();
 								}
@@ -424,28 +496,29 @@
 								if (isCmdOrCtrlPressed && isEnterPressed) {
 									document.getElementById('confirm-edit-message-button')?.click();
 								}
-							}}
-						/>
+							}}></textarea>
 					</div>
 
-					<div class=" mt-2 mb-1 flex justify-between text-sm font-medium">
+					<div class="mt-2 flex justify-between text-sm font-medium">
 						<div>
 							<button
 								id="save-edit-message-button"
-								class="px-3.5 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 border border-gray-100 dark:border-gray-700 text-gray-700 dark:text-gray-200 transition rounded-3xl"
-								on:click={() => {
+								disabled={editSubmitting}
+								class="px-3.5 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 border-hairline border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 transition rounded-lg"
+								onclick={() => {
 									editMessageConfirmHandler(false);
 								}}
 							>
-								{$i18n.t('Save')}
+								{$i18n.t('Save version')}
 							</button>
 						</div>
 
 						<div class="flex space-x-1.5">
 							<button
 								id="close-edit-message-button"
-								class="px-3.5 py-1.5 bg-white dark:bg-gray-900 hover:bg-gray-100 text-gray-800 dark:text-gray-100 transition rounded-3xl"
-								on:click={() => {
+								disabled={editSubmitting}
+								class="px-3.5 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-white transition rounded-lg"
+								onclick={() => {
 									cancelEditMessage();
 								}}
 							>
@@ -454,8 +527,9 @@
 
 							<button
 								id="confirm-edit-message-button"
-								class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-2xl"
-								on:click={() => {
+								disabled={editSubmitting}
+								class="px-3.5 py-1.5 bg-book-cloth hover:bg-kraft text-white transition-colors duration-200 ease-paper rounded-lg"
+								onclick={() => {
 									editMessageConfirmHandler();
 								}}
 							>
@@ -490,8 +564,11 @@
 			{/if}
 
 			{#if edit !== true}
+				<!-- max-md:-mx-2.5: same touch-padding cancellation as the response
+				     action row — the edge icon lines up with the bubble edge instead of
+				     sitting 10px inside it, and the row gets the full message width. -->
 				<div
-					class=" flex {($settings?.chatBubble ?? true)
+					class=" flex max-md:-mx-2.5 {($settings?.chatBubble ?? true)
 						? 'justify-end'
 						: ''}  text-gray-600 dark:text-gray-500"
 				>
@@ -499,8 +576,8 @@
 						{#if siblings.length > 1}
 							<div class="flex self-center" dir="ltr">
 								<button
-									class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-									on:click={() => {
+									class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+									onclick={() => {
 										showPreviousMessage(message);
 									}}
 								>
@@ -510,7 +587,7 @@
 										viewBox="0 0 24 24"
 										stroke="currentColor"
 										stroke-width="2.5"
-										class="size-3.5"
+										class="size-4"
 									>
 										<path
 											stroke-linecap="round"
@@ -530,14 +607,14 @@
 											value={siblings.indexOf(message.id) + 1}
 											min="1"
 											max={siblings.length}
-											on:focus={(e) => {
+											onfocus={(e) => {
 												e.target.select();
 											}}
-											on:blur={(e) => {
+											onblur={(e) => {
 												gotoMessage(message, e.target.value - 1);
 												messageIndexEdit = false;
 											}}
-											on:keydown={(e) => {
+											onkeydown={(e) => {
 												if (e.key === 'Enter') {
 													gotoMessage(message, e.target.value - 1);
 													messageIndexEdit = false;
@@ -547,16 +624,16 @@
 										/>/{siblings.length}
 									</div>
 								{:else}
-									<!-- svelte-ignore a11y-no-static-element-interactions -->
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
 									<div
-										class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit"
-										on:dblclick={async () => {
+										class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit max-md:px-1"
+										ondblclick={async () => {
 											messageIndexEdit = true;
 
 											await tick();
 											const input = document.getElementById(`message-index-input-${message.id}`);
 											if (input) {
-												input.focus();
+												input.focus({ preventScroll: true });
 												input.select();
 											}
 										}}
@@ -566,8 +643,8 @@
 								{/if}
 
 								<button
-									class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-									on:click={() => {
+									class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+									onclick={() => {
 										showNextMessage(message);
 									}}
 								>
@@ -577,7 +654,7 @@
 										viewBox="0 0 24 24"
 										stroke="currentColor"
 										stroke-width="2.5"
-										class="size-3.5"
+										class="size-4"
 									>
 										<path
 											stroke-linecap="round"
@@ -594,8 +671,8 @@
 							<button
 								class="{($settings?.highContrastMode ?? false)
 									? ''
-									: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition edit-user-message-button"
-								on:click={() => {
+									: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition edit-user-message-button"
+								onclick={() => {
 									editMessageHandler();
 								}}
 							>
@@ -622,8 +699,8 @@
 							<button
 								class="{($settings?.highContrastMode ?? false)
 									? ''
-									: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
-								on:click={() => {
+									: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+								onclick={() => {
 									copyToClipboard(messageTextContent);
 								}}
 							>
@@ -651,8 +728,8 @@
 								<button
 									class="{($settings?.highContrastMode ?? false)
 										? ''
-										: 'invisible group-hover:visible'} p-1 rounded-sm dark:hover:text-white hover:text-black transition"
-									on:click={() => {
+										: 'invisible group-hover:visible'} p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+									onclick={() => {
 										showDeleteConfirm = true;
 									}}
 								>
@@ -679,8 +756,8 @@
 						{#if siblings.length > 1}
 							<div class="flex self-center" dir="ltr">
 								<button
-									class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-									on:click={() => {
+									class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+									onclick={() => {
 										showPreviousMessage(message);
 									}}
 								>
@@ -690,7 +767,7 @@
 										viewBox="0 0 24 24"
 										stroke="currentColor"
 										stroke-width="2.5"
-										class="size-3.5"
+										class="size-4"
 									>
 										<path
 											stroke-linecap="round"
@@ -710,14 +787,14 @@
 											value={siblings.indexOf(message.id) + 1}
 											min="1"
 											max={siblings.length}
-											on:focus={(e) => {
+											onfocus={(e) => {
 												e.target.select();
 											}}
-											on:blur={(e) => {
+											onblur={(e) => {
 												gotoMessage(message, e.target.value - 1);
 												messageIndexEdit = false;
 											}}
-											on:keydown={(e) => {
+											onkeydown={(e) => {
 												if (e.key === 'Enter') {
 													gotoMessage(message, e.target.value - 1);
 													messageIndexEdit = false;
@@ -727,16 +804,16 @@
 										/>/{siblings.length}
 									</div>
 								{:else}
-									<!-- svelte-ignore a11y-no-static-element-interactions -->
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
 									<div
-										class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit"
-										on:dblclick={async () => {
+										class="text-sm tracking-widest font-semibold self-center dark:text-gray-100 min-w-fit max-md:px-1"
+										ondblclick={async () => {
 											messageIndexEdit = true;
 
 											await tick();
 											const input = document.getElementById(`message-index-input-${message.id}`);
 											if (input) {
-												input.focus();
+												input.focus({ preventScroll: true });
 												input.select();
 											}
 										}}
@@ -746,8 +823,8 @@
 								{/if}
 
 								<button
-									class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition"
-									on:click={() => {
+									class="self-center p-1.5 max-md:p-2.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-lg transition"
+									onclick={() => {
 										showNextMessage(message);
 									}}
 								>
@@ -757,7 +834,7 @@
 										viewBox="0 0 24 24"
 										stroke="currentColor"
 										stroke-width="2.5"
-										class="size-3.5"
+										class="size-4"
 									>
 										<path
 											stroke-linecap="round"

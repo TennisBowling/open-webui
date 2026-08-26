@@ -1,14 +1,17 @@
 <script lang="ts">
+	import { dispatchComponentEvent } from '$lib/utils/componentEvents';
+	import { preventDefault } from '$lib/utils/eventModifiers';
+
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
 	import { v4 as uuidv4 } from 'uuid';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 
 	import { getBackendConfig, getModels, getTaskConfig, updateTaskConfig } from '$lib/apis';
 	import { setDefaultPromptSuggestions } from '$lib/apis/configs';
 	import { config, settings, user } from '$lib/stores';
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { onMount, getContext } from 'svelte';
 
 	import { banners as _banners } from '$lib/stores';
 	import type { Banner } from '$lib/types';
@@ -22,11 +25,13 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Banners from './Interface/Banners.svelte';
 
-	const dispatch = createEventDispatcher();
+	const eventProps: Record<string, unknown> = $props();
+	const dispatch = (type: string, detail?: unknown) =>
+		dispatchComponentEvent(eventProps, type, detail);
 
 	const i18n = getContext('i18n');
 
-	let taskConfig = {
+	let taskConfig = $state({
 		TASK_MODEL: '',
 		TASK_MODEL_EXTERNAL: '',
 		ENABLE_TITLE_GENERATION: true,
@@ -45,10 +50,10 @@
 		ENABLE_RETRIEVAL_QUERY_GENERATION: true,
 		QUERY_GENERATION_PROMPT_TEMPLATE: '',
 		TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE: ''
-	};
+	});
 
-	let promptSuggestions = [];
-	let banners: Banner[] = [];
+	let promptSuggestions = $state([]);
+	let banners: Banner[] = $state([]);
 
 	const updateInterfaceHandler = async () => {
 		taskConfig = await updateTaskConfig(localStorage.token, taskConfig);
@@ -67,7 +72,7 @@
 	let workspaceModels = null;
 	let baseModels = null;
 
-	let models = null;
+	let models = $state(null);
 
 	const init = async () => {
 		taskConfig = await getTaskConfig(localStorage.token);
@@ -107,10 +112,10 @@
 {#if models !== null && taskConfig}
 	<form
 		class="flex flex-col h-full justify-between space-y-3 text-sm"
-		on:submit|preventDefault={() => {
+		onsubmit={preventDefault(() => {
 			updateInterfaceHandler();
 			dispatch('save');
-		}}
+		})}
 	>
 		<div class="  overflow-y-scroll scrollbar-hidden h-full pr-1.5">
 			<div class="mb-3.5">
@@ -149,7 +154,7 @@
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
 							bind:value={taskConfig.TASK_MODEL}
 							placeholder={$i18n.t('Select a model')}
-							on:change={() => {
+							onchange={() => {
 								if (taskConfig.TASK_MODEL) {
 									const model = models.find((m) => m.id === taskConfig.TASK_MODEL);
 									if (model) {
@@ -184,7 +189,7 @@
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
 							bind:value={taskConfig.TASK_MODEL_EXTERNAL}
 							placeholder={$i18n.t('Select a model')}
-							on:change={() => {
+							onchange={() => {
 								if (taskConfig.TASK_MODEL_EXTERNAL) {
 									const model = models.find((m) => m.id === taskConfig.TASK_MODEL_EXTERNAL);
 									if (model) {
@@ -257,7 +262,7 @@
 							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
 							bind:value={taskConfig.TITLE_GENERATION_MODEL}
 							placeholder={$i18n.t('Select a model')}
-							on:change={() => {
+							onchange={() => {
 								if (taskConfig.TITLE_GENERATION_MODEL) {
 									const model = models.find((m) => m.id === taskConfig.TITLE_GENERATION_MODEL);
 									if (model) {
@@ -459,7 +464,7 @@
 						<button
 							class="p-1 px-3 text-xs flex rounded-sm transition"
 							type="button"
-							on:click={() => {
+							onclick={() => {
 								if (banners.length === 0 || banners.at(-1).content !== '') {
 									banners = [
 										...banners,
@@ -501,7 +506,7 @@
 							<button
 								class="p-1 px-3 text-xs flex rounded-sm transition"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									if (promptSuggestions.length === 0 || promptSuggestions.at(-1).content !== '') {
 										promptSuggestions = [...promptSuggestions, { content: '', title: ['', ''] }];
 									}
@@ -547,15 +552,14 @@
 												'Prompt (e.g. Tell me a fun fact about the Roman Empire)'
 											)}
 											rows="3"
-											bind:value={prompt.content}
-										/>
+											bind:value={prompt.content}></textarea>
 									</div>
 
 									<div class="">
 										<button
 											class="p-3"
 											type="button"
-											on:click={() => {
+											onclick={() => {
 												promptSuggestions.splice(promptIdx, 1);
 												promptSuggestions = promptSuggestions;
 											}}
@@ -588,7 +592,7 @@
 								type="file"
 								accept=".json"
 								hidden
-								on:change={(e) => {
+								onchange={(e) => {
 									const files = e.target.files;
 									if (!files || files.length === 0) {
 										return;
@@ -627,7 +631,7 @@
 							<button
 								class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-200 transition"
 								type="button"
-								on:click={() => {
+								onclick={() => {
 									const input = document.getElementById('prompt-suggestions-import-input');
 									if (input) {
 										input.click();
@@ -658,7 +662,7 @@
 								<button
 									class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-200 transition"
 									type="button"
-									on:click={async () => {
+									onclick={async () => {
 										let blob = new Blob([JSON.stringify(promptSuggestions)], {
 											type: 'application/json'
 										});

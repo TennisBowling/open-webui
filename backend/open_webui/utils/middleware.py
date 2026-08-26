@@ -6,6 +6,7 @@ import base64
 import copy
 
 import asyncio
+from functools import partial
 import hashlib
 from aiocache import cached
 from contextvars import ContextVar
@@ -17,6 +18,12 @@ import inspect
 import re
 
 from uuid import uuid4
+
+from open_webui.utils.chat_transport import should_attach_chat_event_transport
+from open_webui.utils.response_durability import (
+    is_selection_metadata_only_completion,
+    text_content_blocks,
+)
 
 
 # Set inside `_execute_tool_call` so a tool callable can find out which
@@ -34,150 +41,14 @@ current_tool_call_id_var: ContextVar[Optional[str]] = ContextVar(
     "current_tool_call_id", default=None
 )
 
-
-def _merge_streamed_string(existing: str | None, chunk: str | None) -> str:
-    """Merge streamed reasoning metadata that may resend cumulative text."""
-    if not chunk:
-        return existing or ""
-    existing = existing or ""
-    if not existing:
-        return chunk
-    if chunk == existing:
-        return existing
-    if chunk.startswith(existing):
-        return chunk
-    if existing.endswith(chunk):
-        return existing
-
-    max_overlap = min(len(existing), len(chunk))
-    for overlap in range(max_overlap, 0, -1):
-        if existing.endswith(chunk[:overlap]):
-            return existing + chunk[overlap:]
-    return existing + chunk
-
-
-class _StreamTextAccumulator:
-    """O(1)-amortized accumulator for a streaming text/reasoning block's growing
-    `content` string.
-
-    The streaming hot path used to grow the tail block with
-    ``block["content"] = block["content"] + value`` every token. That is a
-    dict-subscript concatenation: CPython's in-place ``+=`` optimization never
-    applies (it is limited to local-variable targets, and per-token snapshot
-    sharing held extra references anyway), so it reallocated a length-N string
-    every token — O(N^2) per stream, multiple seconds of pure event-loop block
-    on long responses, which starved the socket delta flush and produced the
-    "trickle, long stall, burst at completion" symptom.
-
-    This accumulator keeps appended chunks in a list and joins lazily:
-      * ``append(value)``     — O(len(value)); never touches the joined string.
-      * ``take_appended()``   — O(new chars); returns text appended since the
-                                last call, for emitting one ``text_append`` delta.
-      * ``materialize()``     — O(current length); folds the list into one string
-                                and returns it. Call this only when a reader
-                                actually needs the whole string (snapshot,
-                                checkpoint, block boundary, finalize), NOT per
-                                token — the cadence keeps it K-bounded.
-
-    Invariants (verified in tests):
-      materialize()                         == every value append()ed, in order.
-      concat of all take_appended() results == materialize()  (no loss / dup).
-    """
-
-    __slots__ = ("_parts", "_emit_idx", "_len")
-
-    def __init__(self, initial: str = ""):
-        self._parts: list[str] = [initial] if initial else []
-        # Index into _parts of the first chunk NOT yet returned by take_appended.
-        # `initial` represents content already present on the block at stream
-        # start (already known to the client mirror / snapshot), so it begins
-        # life as already-emitted: the cursor starts PAST it. Contract:
-        #   initial + concat(take_appended() calls) == materialize()
-        self._emit_idx: int = len(self._parts)
-        self._len: int = len(initial)
-
-    def append(self, value: str) -> None:
-        if not value:
-            return
-        self._parts.append(value)
-        self._len += len(value)
-
-    def take_appended(self) -> str:
-        """Return text appended since the last take_appended(), advancing the
-        emit cursor. Used to ship exactly one delta's worth of new text."""
-        if self._emit_idx >= len(self._parts):
-            return ""
-        appended = "".join(self._parts[self._emit_idx :])
-        self._emit_idx = len(self._parts)
-        return appended
-
-    @property
-    def has_unemitted(self) -> bool:
-        return self._emit_idx < len(self._parts)
-
-    def suffix(self, n: int) -> str:
-        """Return the last `n` characters of the accumulated content without
-        mutating state (does NOT collapse the parts list or move the cursor).
-        Used for bounded-suffix overlap detection on reasoning deltas."""
-        if n <= 0:
-            return ""
-        out: list[str] = []
-        need = n
-        for part in reversed(self._parts):
-            if need <= 0:
-                break
-            if len(part) <= need:
-                out.append(part)
-                need -= len(part)
-            else:
-                out.append(part[-need:])
-                need = 0
-        return "".join(reversed(out))
-
-    def materialize(self) -> str:
-        """Fold to a single string and return it. Collapses the parts list so
-        future appends stay cheap, while PRESERVING the emit cursor's logical
-        position — critical because a reader (e.g. a checkpoint) can materialize
-        AFTER a token was appended but BEFORE the flush emitted it as a delta.
-        Collapsing that un-emitted tail to 'emitted' would drop it from the wire
-        (live text loss); collapsing to 'un-emitted' would re-ship already-sent
-        text (duplication). So we split at the cursor into [emitted, unemitted]."""
-        if not self._parts:
-            return ""
-        if self._emit_idx <= 0:
-            joined = "".join(self._parts)
-            self._parts = [joined] if joined else []
-            self._emit_idx = 0
-            return joined
-        if self._emit_idx >= len(self._parts):
-            joined = "".join(self._parts)
-            self._parts = [joined] if joined else []
-            self._emit_idx = len(self._parts)
-            return joined
-        emitted = "".join(self._parts[: self._emit_idx])
-        unemitted = "".join(self._parts[self._emit_idx :])
-        self._parts = []
-        if emitted:
-            self._parts.append(emitted)
-        self._emit_idx = len(self._parts)
-        if unemitted:
-            self._parts.append(unemitted)
-        return emitted + unemitted
-
-    def __len__(self) -> int:
-        return self._len
-
-
-def _dedupe_repeated_tool_name(name: str | None) -> str:
-    if not name:
-        return ""
-    # Covers web_searchweb_search, subagent_launchsubagent_launch, etc.
-    for unit_len in range(1, (len(name) // 2) + 1):
-        if len(name) % unit_len == 0:
-            unit = name[:unit_len]
-            if unit and unit * (len(name) // unit_len) == name:
-                return unit
-    return name
+# Set alongside ``current_tool_call_id_var`` for each gathered tool branch. A
+# parallel tool/subagent runs in its own child task, so inside the tool
+# ``asyncio.current_task().cancelling()`` describes the child, not the parent chat
+# generation. Subagent cancellation handling uses this to distinguish a genuine
+# user-stop of the parent response task from an isolated child cancellation.
+current_tool_parent_task_var: ContextVar[Optional[asyncio.Task]] = ContextVar(
+    "current_tool_parent_task", default=None
+)
 
 
 from fastapi import Request, HTTPException
@@ -195,6 +66,8 @@ from open_webui.socket.main import (
     get_headless_event_call,
     get_active_status_by_user_id,
     process_token_usage,
+    usage_has_data,
+    normalize_provider_usage,
     is_primary_session,
     stream_version_init,
     stream_version_incr,
@@ -214,6 +87,13 @@ from open_webui.tasks import (
     clear_pending_model_switch,
     get_pending_service_tier,
     clear_pending_service_tier,
+    pop_pending_tool_selection,
+    is_generation_cancelled,
+    is_generation_turn_cancelled,
+)
+from open_webui.utils.live_tool_selection import (
+    build_tool_selection_change_block,
+    normalize_live_tool_selection,
 )
 from open_webui.routers.tasks import (
     generate_queries,
@@ -236,7 +116,6 @@ from open_webui.routers.pipelines import (
     process_pipeline_inlet_filter,
     process_pipeline_outlet_filter,
 )
-from open_webui.routers.memories import query_memory, QueryMemoryForm
 
 from open_webui.utils.webhook import post_webhook
 from open_webui.utils.files import (
@@ -284,28 +163,57 @@ from open_webui.utils.filter import (
     process_filter_functions,
 )
 from open_webui.utils.payload import apply_system_prompt_to_body
-from open_webui.utils.messages import blocks_to_api_messages, blocks_to_plain_text
+from open_webui.utils.messages import (
+    align_reasoning_rounds_to_blocks,
+    blocks_to_api_messages,
+    blocks_to_plain_text,
+    is_aborted_attempt,
+    resume_boundary_blocks,
+    round_base_messages,
+)
+from open_webui.utils.lazy_blocks import (
+    GENERIC_TOOL_INLINE_RESULT_MAX,
+    LAZY_RESULT_EXEMPT_TOOL_NAMES,
+    SUBAGENT_INLINE_RESULT_MAX,
+    SUBAGENT_TOOL_NAMES,
+    TOOL_INLINE_RESULT_MAX,
+    WEB_TOOL_INLINE_RESULT_MAX,
+    _merge_tool_result_body_maps,
+    _slim_tool_result,
+    _strip_tool_results,
+    _summarize_tool_result,
+    _tool_call_name_by_id,
+    split_reasoning_bodies,
+    split_tool_result_bodies,
+    text_only_content_from_blocks,
+)
 from open_webui.models.mcp import MCPConnections
 from open_webui.utils.mcp.client import (
     MCPClient,
     mcp_tool_alias,
     build_mcp_connect_kwargs,
+    BearerRefreshAuth,
 )
 from open_webui.utils.tool_calling import (
-    merge_streamed_tool_call_field,
+    dedupe_repeated_tool_name,
+    merge_streamed_field,
     mcp_model_facing_tool_name,
     parse_tool_call_arguments,
 )
 from open_webui.utils.mcp.connections import (
     build_personal_mcp_connect_kwargs,
     parse_personal_mcp_tool_id,
+    resolve_personal_mcp_call_meta,
     tool_allowed_by_policy,
+    tool_filter_allows,
 )
+from open_webui.utils.mcp.oauth import MCPOAuthReauthRequired
 from open_webui.utils.container_workspace import (
     is_container_workspace_active,
     import_changed_container_outputs,
     prepare_container_workspace_for_turn,
     browser_progress_poller,
+    build_bash_result_suffix,
     _normalize_container_server_id,
 )
 
@@ -327,8 +235,22 @@ from open_webui.env import (
     STREAM_DB_CHECKPOINT_CHAR_DELTA,
     AGENTIC_MAX_TOOL_ROUNDS,
     AGENTIC_EMPTY_ROUND_MAX_RETRIES,
+    ENABLE_CONVERSATION_COMPACTION,
+    COMPACTION_THRESHOLD,
     PROFILE_CHAT,
     PROFILE_CHAT_DIR,
+)
+from open_webui.utils.context_window import resolve_context_length
+from open_webui.utils.compaction import (
+    COMPACTION_BLOCK_TYPE,
+    capture_compaction_envelope,
+    compact_content_blocks,
+    conversation_has_compacted_context,
+    has_uncompacted_span,
+    is_compact_command,
+    is_compaction_block,
+    should_compact,
+    usage_total_tokens,
 )
 from open_webui.constants import TASKS
 
@@ -337,84 +259,59 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
+# ---------------------------------------------------------------------------
+# Extracted streaming subsystems (2026-08-02 de-spaghettification). These
+# names are re-exported here so every existing importer of
+# `open_webui.utils.middleware` keeps working; new code should import from the
+# dedicated modules directly.
+# ---------------------------------------------------------------------------
+from open_webui.utils.provider_errors import (
+    _is_context_fallback_provider_error,
+    _is_context_limit_provider_error,
+    _is_nonretryable_provider_error,
+    _nonstreaming_round_length_error,
+    _provider_error_code,
+    _provider_error_payload,
+    _provider_error_text,
+    _safe_error_response_text,
+)
+from open_webui.utils.streaming.accumulate import (
+    TailAccumulator,
+    _StreamTextAccumulator,
+    _append_reasoning_delta,
+    _apply_reasoning_detail_delta,
+)
+from open_webui.utils.streaming.serialize import (
+    serialize_content_blocks as _serialize_content_blocks,
+)
+from open_webui.utils.streaming.blocks import (
+    _finalize_open_agentic_blocks,
+    _total_text_block_len,
+    _visible_nonstreaming_reasoning,
+    _visible_reasoning_from_details,
+)
+from open_webui.utils.streaming.wire import (
+    STREAM_DELTA_MAX_BYTES,
+    STREAM_TEXT_COALESCE_MIN_CHARS,
+    STREAM_TEXT_COALESCE_WINDOW_S,
+    STREAM_TEXT_DELTA_MAX_BYTES,
+    _emit_delta_for_blocks,
+    _json_size_bytes,
+    _split_stream_delta_op,
+    _split_text_by_utf8_bytes,
+    _utf8_len,
+    _wrap_event_emitter_v21,
+)
 
-# ---------------------------------------------------------------------------
-# Stream v2.1 delta translator
-# ---------------------------------------------------------------------------
-#
-# The v1 emitter ships the entire `content_blocks` array on every flush (O(N²)
-# bytes per turn). v2.1 ships only what changed since the last emit. To avoid
-# rewriting the 1300-line stream loop, we install a translator that diffs the
-# incoming content_blocks against a per-message mirror and emits the matching
-# `chat:delta` ops. Anything not a content_blocks-bearing `chat:completion`
-# event passes through unchanged (status, sources, citations, errors, ...).
-#
-# Wire Contract #1 (see plan Phase 0) — ops emitted:
-#   text_append, block_open, block_close, tool_call_add, replace, sources,
-#   selected_model_id. tool_call:result is emitted separately at exec time.
 
 WEB_TOOL_NAMES = {"web_search", "web_fetch"}
-WEB_TOOL_INLINE_RESULT_MAX = 2048
-GENERIC_TOOL_INLINE_RESULT_MAX = max(
-    4096, int(os.environ.get("GENERIC_TOOL_INLINE_RESULT_MAX", "65536") or "65536")
-)
-STREAM_TEXT_DELTA_MAX_BYTES = max(
-    4096, int(os.environ.get("STREAM_TEXT_DELTA_MAX_BYTES", "262144") or "262144")
-)
-STREAM_DELTA_MAX_BYTES = max(
-    STREAM_TEXT_DELTA_MAX_BYTES,
-    int(os.environ.get("STREAM_DELTA_MAX_BYTES", "524288") or "524288"),
-)
-
-
-def _utf8_len(value: str) -> int:
-    return len((value or "").encode("utf-8", "replace"))
-
-
-def _split_text_by_utf8_bytes(text: str, max_bytes: int = STREAM_TEXT_DELTA_MAX_BYTES):
-    text = text or ""
-    if not text:
-        return []
-    if _utf8_len(text) <= max_bytes:
-        return [text]
-
-    chunks = []
-    current = []
-    current_bytes = 0
-    for char in text:
-        char_bytes = _utf8_len(char)
-        if current and current_bytes + char_bytes > max_bytes:
-            chunks.append("".join(current))
-            current = [char]
-            current_bytes = char_bytes
-        else:
-            current.append(char)
-            current_bytes += char_bytes
-    if current:
-        chunks.append("".join(current))
-    return chunks
-
-
-def _json_size_bytes(value) -> int:
-    try:
-        return _utf8_len(json.dumps(value, ensure_ascii=False, default=str))
-    except Exception:
-        return STREAM_DELTA_MAX_BYTES + 1
-
-
-def _split_stream_delta_op(op: dict) -> list[dict]:
-    if op.get("op") == "text_append" and isinstance(op.get("text"), str):
-        return [
-            {**op, "text": text_chunk}
-            for text_chunk in _split_text_by_utf8_bytes(op.get("text") or "")
-        ]
-
-    if _json_size_bytes(op) > STREAM_DELTA_MAX_BYTES:
-        return [{"op": "snapshot", "reason": "delta_too_large"}]
-
-    return [op]
-
-
+# Tool result bodies are LAZY by default for ALL tools: the collapsed card
+# renders entirely from the call arguments + the slim stub (summary / size /
+# status), and the full body crosses the network only when the card is
+# expanded (the tool-result-body endpoint). Inlining only pays below the
+# stub's own overhead: see utils/lazy_blocks.py, the single owner of the lazy
+# message-body contract (thresholds, exemptions, splitters). Imported above so
+# existing references keep working.
 def _as_tool_id_list(tool_ids) -> list[str]:
     if isinstance(tool_ids, str):
         return [tool_ids]
@@ -442,14 +339,32 @@ def _should_enable_view_image_tool(request, model, metadata: dict, tool_ids) -> 
     return is_container_workspace_active(request, metadata, selected)
 
 
+def _should_enable_view_video_tool(request, model) -> bool:
+    """Return true when view_video should be present in the model tool list.
+
+    Gated purely on the model actually accepting video — unlike view_image there
+    is no web-search/container precondition, because a video is something the
+    model can usefully go and fetch on its own from any link in the conversation.
+    """
+    cfg = getattr(request.app.state, "config", None)
+    if cfg is not None and not getattr(cfg, "ENABLE_VIDEO_INPUT", True):
+        return False
+
+    from open_webui.utils.models import model_supports_video_input
+
+    return model_supports_video_input(model)
+
+
 def _should_enable_ask_user_tool(request, metadata: dict) -> bool:
     """Return true when the built-in ask_user tool should be exposed to the
-    model. Gated on the admin config flag and explicitly OFF for subagent inner
-    runs — a subagent has no user to interrogate (it must not block waiting on a
-    human answer that will never arrive), and persisting question state on the
-    parent chat from inside a subagent would be wrong. Temp/local chats are
-    allowed: the tool degrades to a socket-ack prompt there (no durable blob)."""
-    if metadata.get("subagent_inner"):
+    model. Gated on the admin config flag and explicitly OFF for runs with no
+    human on the other end — a subagent has no user to interrogate and an
+    automation fires on a schedule with nobody watching, so either would block
+    waiting on an answer that never arrives (and persisting question state on
+    the parent chat from inside a subagent would be wrong besides). Temp/local
+    chats are allowed: the tool degrades to a socket-ack prompt there (no
+    durable blob)."""
+    if metadata.get("subagent_inner") or metadata.get("automation_run"):
         return False
     try:
         return bool(getattr(request.app.state.config, "ENABLE_ASK_USER", False))
@@ -457,565 +372,11 @@ def _should_enable_ask_user_tool(request, metadata: dict) -> bool:
         return False
 
 
-def _tool_call_name_by_id(block):
-    out = {}
-    for call in block.get("content") or []:
-        if not isinstance(call, dict):
-            continue
-        call_id = call.get("id") or call.get("tool_call_id")
-        if call_id:
-            out[call_id] = call.get("function", {}).get("name", "")
-    return out
-
-
-def _summarize_tool_result(tool_name: str, content: str) -> dict:
-    summary = {
-        "kind": tool_name or "tool",
-        "size": len((content or "").encode("utf-8")),
-    }
-    if tool_name == "web_search":
-        match = re.search(r"^Found\s+(\d+)\s+results", content or "", flags=re.I | re.M)
-        if match:
-            summary["result_count"] = int(match.group(1))
-    elif tool_name == "web_fetch":
-        match = re.search(
-            r"^Retrieved content from\s+(\d+)\s+URL", content or "", flags=re.I | re.M
-        )
-        if match:
-            summary["page_count"] = int(match.group(1))
-    return summary
-
-
-def _slim_tool_result(result, tool_name: str = "", *, store_body: bool = False):
-    if not isinstance(result, dict):
-        return result, None
-    content = result.get("content")
-    if not isinstance(content, str):
-        return result, None
-
-    inline_limit = (
-        WEB_TOOL_INLINE_RESULT_MAX
-        if tool_name in WEB_TOOL_NAMES
-        else GENERIC_TOOL_INLINE_RESULT_MAX
-    )
-    content_size = len(content.encode("utf-8", "replace"))
-    if content_size <= inline_limit:
-        return result, None
-
-    tool_call_id = result.get("tool_call_id") or ""
-    body = dict(result)
-    slim = {k: v for k, v in result.items() if k != "content"}
-    slim.update(
-        {
-            "tool_call_id": tool_call_id,
-            "content": "",
-            "result_ref": tool_call_id,
-            "result_lazy": True,
-            "size": content_size,
-            "sha256": hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
-            "summary": _summarize_tool_result(tool_name, content),
-        }
-    )
-    return slim, body if store_body else None
-
-
-def split_tool_result_bodies(content_blocks):
-    """Return (slim_blocks, bodies_by_tool_call_id). Large web tool bodies are
-    replaced with refs in the message hot path and persisted separately on the
-    assistant message as `tool_result_bodies`."""
-    bodies = {}
-    out = []
-    for block in content_blocks or []:
-        if block.get("type") == "tool_calls" and "results" in block:
-            name_by_id = _tool_call_name_by_id(block)
-            slim = {k: v for k, v in block.items() if k != "results"}
-            slim_results = []
-            for r in block.get("results") or []:
-                tc_id = r.get("tool_call_id") if isinstance(r, dict) else ""
-                slim_r, body = _slim_tool_result(
-                    r, name_by_id.get(tc_id, ""), store_body=True
-                )
-                if body is not None and tc_id:
-                    bodies[tc_id] = body
-                slim_results.append(slim_r)
-            slim["results"] = slim_results
-            out.append(slim)
-        else:
-            out.append(block)
-    return out, bodies
-
-
-def _merge_tool_result_body_maps(*body_maps):
-    merged = {}
-    for body_map in body_maps:
-        if not isinstance(body_map, dict):
-            continue
-        for tool_call_id, body in body_map.items():
-            if tool_call_id and isinstance(body, dict):
-                merged[str(tool_call_id)] = body
-    return merged
-
-
-def _strip_tool_results(content_blocks):
-    """Mirror state stores block shapes but never heavy web tool result bodies.
-    Non-web/small results remain inline for compatibility; large web results
-    retain refs/metadata so collapsed cards can render cheaply."""
-    return split_tool_result_bodies(content_blocks)[0]
-
-
-def _total_text_block_len(content_blocks) -> int:
-    """Sum the length of every ``text`` block's content. Used to detect whether a
-    model round produced any visible assistant text (an order-independent signal
-    that survives the trailing-empty-text-block cleanup stream_body_handler does).
-    """
-    total = 0
-    for block in content_blocks or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            c = block.get("content")
-            if isinstance(c, str):
-                total += len(c.strip())
-    return total
-
-
-def _finalize_open_agentic_block(content_blocks):
-    """Stamp ended_at/duration on a trailing reasoning/tool_calls block that was
-    still open when the stream was interrupted (user cancel or terminal error).
-
-    Normal completion already finalizes reasoning (first text token / end of
-    stream) and tool_calls (when results attach), so this only matters for the
-    cancel/error paths. Without it, the UI's "Working for X" timer would have a
-    start but no end on a frozen, persisted message — a dangling clock. Idempotent
-    and safe to call on any content_blocks list.
-    """
-    if not content_blocks:
-        return
-    block = content_blocks[-1]
-    if (
-        block.get("type") in ("reasoning", "tool_calls")
-        and block.get("started_at") is not None
-        and block.get("ended_at") is None
-    ):
-        block["ended_at"] = time.time()
-        block["duration"] = int(block["ended_at"] - block["started_at"])
-
-
-def _emit_delta_for_blocks(
-    raw_emit, message_id, mirror, new_blocks, extra_payload=None
-):
-    """Compute & emit the deltas needed to move the client mirror from
-    `mirror['blocks']` to `new_blocks`. Returns a list of awaitables."""
-    new_blocks = _strip_tool_results(new_blocks)
-    # Bind old_blocks to the LIVE mirror list (not a throwaway via `or []`) so
-    # newly-opened blocks appended below actually persist in the mirror. With the
-    # previous `mirror.get("blocks") or []`, an empty mirror yielded a fresh list,
-    # so block_open appends never reached `mirror["blocks"]`; the mirror stayed
-    # empty and every subsequent flush re-ran a full diff from scratch (and the
-    # native fast-path, gated on a populated mirror, could never engage). Seed the
-    # mirror in place when missing/empty.
-    if not isinstance(mirror.get("blocks"), list):
-        mirror["blocks"] = []
-    old_blocks = mirror["blocks"]
-    ops = []
-
-    common = min(len(old_blocks), len(new_blocks))
-    structural_rewrite = False
-    for i in range(common):
-        if old_blocks[i].get("type") != new_blocks[i].get("type"):
-            structural_rewrite = True
-            break
-
-    if structural_rewrite:
-        ops.append(
-            {
-                "op": "replace",
-                "block_idx": 0,
-                "content_blocks": new_blocks,
-            }
-        )
-        mirror["blocks"] = [dict(b) for b in new_blocks]
-    else:
-        # Per-block diff for the prefix; new blocks beyond `common` are opened.
-        for i in range(common):
-            old_b = old_blocks[i]
-            new_b = new_blocks[i]
-            btype = new_b.get("type")
-            # Native fast-path coordination: when the streaming loop emitted text
-            # for this block directly (bypassing this translator), it advanced an
-            # `_emitted_len` cursor on the mirror block WITHOUT refreshing the
-            # mirror's `content` string (refreshing it per token would reintroduce
-            # the O(N^2) concat). The client has therefore received exactly
-            # `_emitted_len` chars of this block. Trust that cursor over the stale
-            # `content` string so we diff against what the client actually has —
-            # otherwise we'd re-emit the gap as a duplicate text_append. This makes
-            # the native/translator handoff correct at EVERY translator entry point
-            # (round-boundary emits, usage/error flushes, etc.), not just the ones
-            # that pre-reconcile.
-            if btype in ("text", "reasoning"):
-                emitted_len = old_b.get("_emitted_len")
-                if emitted_len is not None:
-                    new_full = new_b.get("content", "") or ""
-                    old_b["content"] = (
-                        new_full[:emitted_len]
-                        if len(new_full) >= emitted_len
-                        else new_full
-                    )
-                    old_b.pop("_emitted_len", None)
-            if btype == "text":
-                old_text = old_b.get("content", "") or ""
-                new_text = new_b.get("content", "") or ""
-                if new_text == old_text:
-                    continue
-                if new_text.startswith(old_text):
-                    appended = new_text[len(old_text) :]
-                    if appended:
-                        ops.append(
-                            {
-                                "op": "text_append",
-                                "block_idx": i,
-                                "text": appended,
-                            }
-                        )
-                else:
-                    ops.append(
-                        {
-                            "op": "replace",
-                            "block_idx": i,
-                            "content_blocks": [new_b],
-                        }
-                    )
-                old_b["content"] = new_text
-            elif btype == "reasoning":
-                old_text = old_b.get("content", "") or ""
-                new_text = new_b.get("content", "") or ""
-                if new_text != old_text and new_text.startswith(old_text):
-                    appended = new_text[len(old_text) :]
-                    if appended:
-                        ops.append(
-                            {
-                                "op": "text_append",
-                                "block_idx": i,
-                                "text": appended,
-                            }
-                        )
-                elif new_text != old_text:
-                    ops.append(
-                        {
-                            "op": "replace",
-                            "block_idx": i,
-                            "content_blocks": [new_b],
-                        }
-                    )
-                old_b["content"] = new_text
-                # close detection: ended_at gained
-                if new_b.get("ended_at") and not old_b.get("ended_at"):
-                    ops.append(
-                        {
-                            "op": "block_close",
-                            "block_idx": i,
-                            "duration": new_b.get("duration"),
-                        }
-                    )
-                    old_b["ended_at"] = new_b["ended_at"]
-                    old_b["duration"] = new_b.get("duration")
-            elif btype == "tool_calls":
-                # tool_calls block: if the underlying tool_call list grew or
-                # results landed, send a replace for the whole slim block.
-                if old_b != new_b:
-                    ops.append(
-                        {
-                            "op": "replace",
-                            "block_idx": i,
-                            "content_blocks": [new_b],
-                        }
-                    )
-                    old_blocks[i] = dict(new_b)
-            else:
-                if old_b != new_b:
-                    ops.append(
-                        {
-                            "op": "replace",
-                            "block_idx": i,
-                            "content_blocks": [new_b],
-                        }
-                    )
-                    old_blocks[i] = dict(new_b)
-
-        if len(new_blocks) > common:
-            for i in range(common, len(new_blocks)):
-                new_b = new_blocks[i]
-                # For text/reasoning the content streams via a following
-                # text_append; for tool_calls it rides tool_call_add. Any OTHER
-                # block type (e.g. `user_steer`, a mid-task user interjection)
-                # carries its content as a static attr so the client mirror gets
-                # it from the single block_open — there is no follow-up op for it.
-                static_attrs = {
-                    k: v
-                    for k, v in new_b.items()
-                    if k not in ("type", "content", "results")
-                }
-                if new_b.get("type") not in ("text", "reasoning", "tool_calls"):
-                    static_attrs["content"] = new_b.get("content", "")
-                ops.append(
-                    {
-                        "op": "block_open",
-                        "block_idx": i,
-                        "type": new_b.get("type"),
-                        "attrs": static_attrs,
-                    }
-                )
-                if new_b.get("type") in ("text", "reasoning"):
-                    text = new_b.get("content", "") or ""
-                    if text:
-                        ops.append(
-                            {
-                                "op": "text_append",
-                                "block_idx": i,
-                                "text": text,
-                            }
-                        )
-                elif new_b.get("type") == "tool_calls":
-                    for tool_call in new_b.get("content") or []:
-                        ops.append(
-                            {
-                                "op": "tool_call_add",
-                                "block_idx": i,
-                                "tool_call": tool_call,
-                            }
-                        )
-                    if new_b.get("results"):
-                        ops.append(
-                            {
-                                "op": "block_close",
-                                "block_idx": i,
-                                "results": new_b.get("results") or [],
-                            }
-                        )
-                old_blocks.append(dict(new_b))
-        elif len(new_blocks) < len(old_blocks):
-            # truncation — fall back to replace
-            ops.append(
-                {
-                    "op": "replace",
-                    "block_idx": 0,
-                    "content_blocks": new_blocks,
-                }
-            )
-            mirror["blocks"] = [dict(b) for b in new_blocks]
-
-    awaitables = []
-    for op in ops:
-        for split_op in _split_stream_delta_op(op):
-            version = stream_version_incr(message_id)
-            payload = {
-                "type": "chat:delta",
-                "data": {
-                    "message_id": message_id,
-                    "version": version,
-                    "op": split_op["op"],
-                    "payload": {k: v for k, v in split_op.items() if k != "op"},
-                },
-            }
-            awaitables.append(raw_emit(payload))
-
-    if extra_payload:
-        version = stream_version_incr(message_id)
-        payload = {
-            "type": "chat:delta",
-            "data": {
-                "message_id": message_id,
-                "version": version,
-                "op": extra_payload["op"],
-                "payload": extra_payload.get("payload", {}),
-            },
-        }
-        awaitables.append(raw_emit(payload))
-
-    return awaitables
-
-
-def _wrap_event_emitter_v21(inner_emitter, metadata):
-    """Returns an async event_emitter that translates `chat:completion` flushes
-    into compact `chat:delta` ops, leaves non-streaming events untouched, and
-    funnels stream events to the user's primary session only (B8 election)."""
-    message_id = metadata.get("message_id")
-    user_id = metadata.get("user_id")
-    chat_id = metadata.get("chat_id")
-    session_id = metadata.get("session_id")
-    mirror = {"blocks": [], "tool_results_sent": set()}
-
-    if message_id:
-        stream_version_init(
-            message_id,
-            chat_id=chat_id,
-            user_id=user_id,
-            session_id=session_id,
-            content_blocks=[],
-        )
-
-    async def _emit_raw_primary(payload):
-        # Send a fully-formed `events` envelope to the primary session only.
-        # Fallback: if no primary registered, fan to all (handled inside
-        # emit_to_primary). DB persistence is already handled by the inner
-        # emitter for v1-shaped payloads; v2.1 deltas are not persisted on a
-        # per-emit basis (the per-chunk upsert at the call site covers the
-        # canonical content).
-        if not user_id:
-            await inner_emitter(payload["data"] if "data" in payload else payload)
-            return
-        envelope = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "session_id": session_id,
-            "data": payload,
-        }
-        await emit_to_primary(user_id, envelope)
-
-    async def __v21_emitter__(event_data):
-        etype = (event_data or {}).get("type")
-
-        # Pass-through events: anything not `chat:completion` flows through
-        # the inner emitter unchanged (status, source, citation, message,
-        # replace, embeds, files, data_viz, model-switch:applied, errors,
-        # chat:tasks:cancel, chat:subagent:*, chat:message:error, ...).
-        # Inner emitter also handles its DB side-effects.
-        if etype != "chat:completion":
-            await inner_emitter(event_data)
-            return
-
-        data = event_data.get("data") or {}
-        # selected_model_id flush: emit as chat:delta selected_model_id.
-        # Some end-of-stream payloads carry both selected_model_id AND
-        # content_blocks (see process_chat_response final `data` dict). Only
-        # short-circuit when content_blocks is absent — otherwise fall through
-        # so the content diff still ships.
-        if "selected_model_id" in data and "content_blocks" not in data and message_id:
-            set_stream_state(
-                message_id, {"selected_model_id": data["selected_model_id"]}
-            )
-            version = stream_version_incr(message_id)
-            await _emit_raw_primary(
-                {
-                    "type": "chat:delta",
-                    "data": {
-                        "message_id": message_id,
-                        "version": version,
-                        "op": "selected_model_id",
-                        "payload": {"model_id": data["selected_model_id"]},
-                    },
-                }
-            )
-            return
-
-        # Usage-only flush
-        if set(data.keys()) <= {"usage"} and "usage" in data and message_id:
-            set_stream_state(message_id, {"usage": data["usage"]})
-            version = stream_version_incr(message_id)
-            await _emit_raw_primary(
-                {
-                    "type": "chat:delta",
-                    "data": {
-                        "message_id": message_id,
-                        "version": version,
-                        "op": "usage",
-                        "payload": {"usage": data["usage"]},
-                    },
-                }
-            )
-            return
-
-        # Error mid-stream
-        if "error" in data and message_id:
-            set_stream_state(message_id, {"status": "error", "error": data["error"]})
-            version = stream_version_incr(message_id)
-            await _emit_raw_primary(
-                {
-                    "type": "chat:message:error",
-                    "data": {
-                        "message_id": message_id,
-                        "version": version,
-                        "error": data["error"],
-                    },
-                }
-            )
-            return
-
-        # Content-bearing flush
-        if "content_blocks" in data and message_id:
-            state_patch = {
-                "content_blocks": _strip_tool_results(data["content_blocks"]),
-                "status": "done" if data.get("done") else "in_progress",
-            }
-            if data.get("usage") is not None:
-                state_patch["usage"] = data["usage"]
-            if data.get("error") is not None:
-                state_patch["error"] = data["error"]
-                state_patch["status"] = "error"
-            set_stream_state(message_id, state_patch)
-            awaitables = _emit_delta_for_blocks(
-                _emit_raw_primary, message_id, mirror, data["content_blocks"]
-            )
-            # These ops are versioned and order-dependent. Emitting them via
-            # gather lets block_open/text_append races clobber text on the
-            # client (text_append creates the block, late block_open resets it).
-            # Keep wire order deterministic.
-            for awaitable in awaitables:
-                await awaitable
-            if "selected_model_id" in data:
-                set_stream_state(
-                    message_id, {"selected_model_id": data["selected_model_id"]}
-                )
-                version = stream_version_incr(message_id)
-                await _emit_raw_primary(
-                    {
-                        "type": "chat:delta",
-                        "data": {
-                            "message_id": message_id,
-                            "version": version,
-                            "op": "selected_model_id",
-                            "payload": {"model_id": data["selected_model_id"]},
-                        },
-                    }
-                )
-            # Sources arrive in the same payload occasionally
-            if data.get("sources"):
-                set_stream_state(message_id, {"sources": data["sources"]})
-                version = stream_version_incr(message_id)
-                await _emit_raw_primary(
-                    {
-                        "type": "chat:delta",
-                        "data": {
-                            "message_id": message_id,
-                            "version": version,
-                            "op": "sources",
-                            "payload": {"sources": data["sources"]},
-                        },
-                    }
-                )
-            # Snapshot-version decoupling invariant (Part C): the content snapshot
-            # was written above (before the version bumps), so it already contains
-            # everything through the current live version. Stamp snapshot_version
-            # to the live version (after ALL bumps in this flush) so the /snapshot
-            # endpoint advertises a version consistent with this content —
-            # otherwise a stale lower snapshot_version left by a prior native flush
-            # would make a reattach replay deltas already folded into the snapshot.
-            # selected_model_id/sources ops are idempotent field-sets (not text
-            # appends), so even being inside the advertised range is harmless.
-            if message_id:
-                set_stream_state(
-                    message_id, {"snapshot_version": stream_version_get(message_id)}
-                )
-                stream_version_flush(message_id)
-            return
-
-        # Anything else with content_blocks absent — pass through.
-        await inner_emitter(event_data)
-
-    # Expose the mirror so the outer pipeline can emit tool_call:result events
-    # and the final chat:done envelope coherently.
-    __v21_emitter__._v21_mirror = mirror  # type: ignore[attr-defined]
-    __v21_emitter__._inner = inner_emitter  # type: ignore[attr-defined]
-    __v21_emitter__._emit_raw_primary = _emit_raw_primary  # type: ignore[attr-defined]
-    return __v21_emitter__
+# _tool_call_name_by_id / _summarize_tool_result / _slim_tool_result /
+# split_tool_result_bodies / _merge_tool_result_body_maps / _strip_tool_results
+# moved to utils/lazy_blocks.py (imported above): the read-path projection in
+# models/chats.py needs the same slimming rules, and importing middleware from
+# there would be circular.
 
 
 async def process_tool_result(
@@ -1041,9 +402,8 @@ async def process_tool_result(
     #   {"content": <string the model sees>, "_owui_meta": {error?, reason?, notice?}}.
     # Unwrap it up front: the model only ever sees `content`; the metadata travels
     # separately on the result entry.
-    if (
-        isinstance(tool_result, dict)
-        and isinstance(tool_result.get("_owui_meta"), dict)
+    if isinstance(tool_result, dict) and isinstance(
+        tool_result.get("_owui_meta"), dict
     ):
         _owui_meta = tool_result.get("_owui_meta") or {}
         if _owui_meta.get("error"):
@@ -1232,9 +592,8 @@ async def process_tool_result(
                         # (-> _image_observation_message synthetic user image).
                         # Bridge it here, gated on vision support so non-vision
                         # models aren't sent image_url content they can't accept.
-                        if (
-                            item.get("type") == "image"
-                            and _model_supports_vision(model)
+                        if item.get("type") == "image" and _model_supports_vision(
+                            model
                         ):
                             tool_result_vision_attachments.append(
                                 {"url": file_url, "detail": "auto"}
@@ -1256,6 +615,15 @@ async def process_tool_result(
 
     if isinstance(tool_result, dict) or isinstance(tool_result, list):
         tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+
+    # Strip raw NUL (0x00) at the ingestion boundary. Tool results (web_fetch /
+    # web_search scrapes, MCP, OpenAPI) can carry a 0x00 from binary/garbage page
+    # content, and ``ensure_ascii=False`` above preserves it. Removing it here
+    # keeps the byte out of content_blocks, the RAM stream snapshot, and any error
+    # string built from this content — Postgres text/jsonb cannot store a NUL, so a
+    # single stray byte would otherwise abort the assistant-message write.
+    if isinstance(tool_result, str) and "\x00" in tool_result:
+        tool_result = tool_result.replace("\x00", "")
 
     return (
         tool_result,
@@ -1586,45 +954,6 @@ async def chat_completion_tools_handler(
     return body, {"sources": sources}
 
 
-async def chat_memory_handler(
-    request: Request, form_data: dict, extra_params: dict, user
-):
-    try:
-        results = await query_memory(
-            request,
-            QueryMemoryForm(
-                **{
-                    "content": get_last_user_message(form_data["messages"]) or "",
-                    "k": 3,
-                }
-            ),
-            user,
-        )
-    except Exception as e:
-        log.debug(e)
-        results = None
-
-    user_context = ""
-    if results and hasattr(results, "documents"):
-        if results.documents and len(results.documents) > 0:
-            for doc_idx, doc in enumerate(results.documents[0]):
-                created_at_date = "Unknown Date"
-
-                if results.metadatas[0][doc_idx].get("created_at"):
-                    created_at_timestamp = results.metadatas[0][doc_idx]["created_at"]
-                    created_at_date = time.strftime(
-                        "%Y-%m-%d", time.localtime(created_at_timestamp)
-                    )
-
-                user_context += f"{doc_idx + 1}. [{created_at_date}] {doc}\n"
-
-    form_data["messages"] = add_or_update_system_message(
-        f"User Context:\n{user_context}\n", form_data["messages"], append=True
-    )
-
-    return form_data
-
-
 async def chat_web_search_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
@@ -1881,12 +1210,10 @@ async def chat_image_generation_handler(
 
         system_message_content = "<context>Unable to generate an image, tell the user that an error occurred</context>"
 
-    if system_message_content:
-        form_data["messages"] = add_or_update_system_message(
-            system_message_content, form_data["messages"]
-        )
-
-    return form_data
+    # The caller owns system-prompt composition. Returning the generated
+    # turn-level context separately lets live tool refreshes rebuild selectable
+    # feature prompts without rerunning image generation or losing this context.
+    return form_data, system_message_content
 
 
 async def apply_params_to_form_data(form_data, model):
@@ -1956,9 +1283,13 @@ async def apply_params_to_form_data(form_data, model):
 
 
 async def process_chat_payload(request, form_data, user, metadata, model):
-    # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
+    # Pipeline Inlet -> Filter Inlet -> Chat Web Search -> Chat Image Generation
     # -> (Default) Chat Tools Function Calling -> Chat Files
 
+    # A live tool refresh deliberately re-enters only the canonical feature/tool
+    # resolution portion of this function. Pipeline/filter/image handlers
+    # are turn-level work and must not run again between agentic rounds.
+    tool_selection_refresh = bool(metadata.pop("_tool_selection_refresh", False))
     incoming_params = form_data.get("params") if isinstance(form_data, dict) else None
     incoming_subagent_external_tools_enabled = None
     if (
@@ -1969,7 +1300,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             incoming_params.get("subagentExternalToolsEnabled")
         )
 
-    form_data = await apply_params_to_form_data(form_data, model)
+    if not tool_selection_refresh:
+        form_data = await apply_params_to_form_data(form_data, model)
 
     if "subagentExternalToolsEnabled" in form_data:
         metadata.setdefault("params", {})["subagentExternalToolsEnabled"] = bool(
@@ -1989,7 +1321,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     log.debug(f"form_data: {form_data}")
 
     system_message = get_system_message(form_data.get("messages", []))
-    if system_message:  # Chat Controls/User Settings
+    if system_message and not tool_selection_refresh:  # Chat Controls/User Settings
         try:
             form_data = apply_system_prompt_to_body(
                 system_message.get("content"), form_data, metadata, user, replace=True
@@ -2042,7 +1374,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Folder "Project" handling
     # Check if the request has chat_id and is inside of a folder
     chat_id = metadata.get("chat_id", None)
-    if chat_id and user:
+    if chat_id and user and not tool_selection_refresh:
         chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
         if chat and chat.folder_id:
             folder = await Folders.get_folder_by_id_and_user_id(chat.folder_id, user.id)
@@ -2057,49 +1389,152 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     variables = form_data.pop("variables", None)
 
-    # Process the form_data through the pipeline
-    try:
-        form_data = await process_pipeline_inlet_filter(
-            request, form_data, user, models
-        )
-    except Exception as e:
-        raise e
-
-    try:
-        filter_functions = [
-            await Functions.get_function_by_id(filter_id)
-            for filter_id in await get_sorted_filter_ids(
-                request, model, metadata.get("filter_ids", [])
+    if not tool_selection_refresh:
+        # Process the form_data through the pipeline
+        try:
+            form_data = await process_pipeline_inlet_filter(
+                request, form_data, user, models
             )
-        ]
+        except Exception as e:
+            raise e
 
-        form_data, flags = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=extra_params,
-        )
-    except Exception as e:
-        raise Exception(f"{e}")
+        try:
+            filter_functions = [
+                await Functions.get_function_by_id(filter_id)
+                for filter_id in await get_sorted_filter_ids(
+                    request, model, metadata.get("filter_ids", [])
+                )
+            ]
+
+            form_data, flags = await process_filter_functions(
+                request=request,
+                filter_functions=filter_functions,
+                filter_type="inlet",
+                form_data=form_data,
+                extra_params=extra_params,
+            )
+        except Exception as e:
+            raise Exception(f"{e}")
 
     # Pop tool_ids early so we can modify it in feature handlers
     tool_ids = form_data.pop("tool_ids", None)
 
     features = form_data.pop("features", None)
-    if features:
-        # Memory ships its own user-context retrieval; it has to run inline
-        # because it touches the vector store. Everything else is just a
-        # config-driven prompt fragment, gathered below and applied once at
-        # the end as a single deterministic compose step (keeps the prompt
-        # cache stable across turns when feature flags don't change).
-        if "memory" in features and features["memory"]:
-            form_data = await chat_memory_handler(
-                request, form_data, extra_params, user
+
+    if not tool_selection_refresh:
+        if not isinstance(metadata.get("live_tool_selection"), dict):
+            requested_ids = _as_tool_id_list(tool_ids)
+            requested_features = features if isinstance(features, dict) else {}
+            feature_selection_ids = [
+                f"feature:{feature}"
+                for feature in (
+                    "web_search",
+                    "study_mode",
+                    "data_viz",
+                    "subagents",
+                    "automations",
+                )
+                if requested_features.get(feature)
+            ]
+            metadata["live_tool_selection"] = normalize_live_tool_selection(
+                {
+                    "selection_ids": [*requested_ids, *feature_selection_ids],
+                    "tool_ids": requested_ids,
+                    "tool_servers": metadata.get("tool_servers") or [],
+                    "features": requested_features,
+                    "params": incoming_params or {},
+                }
             )
 
-        feature_prompt_parts: list[str] = []
+    # C2: enforce the subagent feature gate SERVER-SIDE — the browser gate is only
+    # advisory. Honor features.subagents (and a builtin:subagent tool a client may
+    # smuggle straight into tool_ids) ONLY when the feature is globally enabled AND
+    # this user is permitted. Otherwise an admin's global ENABLE_SUBAGENTS=off and a
+    # per-user permission revocation are both cosmetic: any verified user (incl. an
+    # API key) could still spawn subagents — hidden chats, inherited tools, token/USD
+    # cost. Strip the flag + the tool when not allowed.
+    _subagents_allowed = bool(
+        getattr(request.app.state.config, "ENABLE_SUBAGENTS", False)
+    )
+    if _subagents_allowed and getattr(user, "role", None) != "admin":
+        try:
+            from open_webui.utils.access_control import has_permission_async
 
+            _subagents_allowed = await has_permission_async(
+                user.id,
+                "features.subagents",
+                request.app.state.config.USER_PERMISSIONS,
+            )
+        except Exception:
+            log.exception("subagent permission check failed; denying")
+            _subagents_allowed = False
+    if not _subagents_allowed:
+        if isinstance(features, dict):
+            features.pop("subagents", None)
+        if isinstance(tool_ids, list):
+            tool_ids = [t for t in tool_ids if t != "builtin:subagent"]
+
+    # Same server-side enforcement for data_viz: the browser feature flag is only
+    # advisory, so honor features.data_viz (and a builtin:data_viz tool a client
+    # may smuggle straight into tool_ids) ONLY when ENABLE_DATA_VIZ is globally
+    # on. Otherwise an admin's global disable is cosmetic — any verified user
+    # (incl. an API key) could still inject the show_widget tool.
+    if not bool(getattr(request.app.state.config, "ENABLE_DATA_VIZ", False)):
+        if isinstance(features, dict):
+            features.pop("data_viz", None)
+        if isinstance(tool_ids, list):
+            tool_ids = [t for t in tool_ids if t != "builtin:data_viz"]
+
+    # And for automations: a smuggled builtin:automations would let any verified
+    # user schedule unattended, recurring, billable generations on an instance
+    # whose admin has the feature off.
+    if not bool(getattr(request.app.state.config, "ENABLE_AUTOMATIONS", False)):
+        if isinstance(features, dict):
+            features.pop("automations", None)
+        if isinstance(tool_ids, list):
+            tool_ids = [t for t in tool_ids if t != "builtin:automations"]
+
+    if isinstance(metadata.get("live_tool_selection"), dict):
+        effective_features = {
+            feature: bool(features.get(feature))
+            for feature in (
+                "web_search",
+                "study_mode",
+                "data_viz",
+                "subagents",
+                "automations",
+            )
+            if isinstance(features, dict)
+        }
+        allowed_feature_ids = {
+            f"feature:{feature}"
+            for feature, enabled in effective_features.items()
+            if enabled
+        }
+        current_live_selection = metadata["live_tool_selection"]
+        metadata["live_tool_selection"] = normalize_live_tool_selection(
+            {
+                **current_live_selection,
+                "features": effective_features,
+                "selection_ids": [
+                    selection_id
+                    for selection_id in current_live_selection.get(
+                        "selection_ids", []
+                    )
+                    if not str(selection_id).startswith("feature:")
+                    or selection_id in allowed_feature_ids
+                ],
+            }
+        )
+
+    # One-time handlers such as image generation may enrich the conversation,
+    # while selectable feature prompts below must be rebuilt on every live
+    # change. Capture the seam between those two classes of work.
+    tool_selection_base_messages = None
+    post_feature_system_messages: list[str] = []
+    feature_prompt_parts: list[str] = []
+
+    if features:
         if features.get("web_search"):
             if tool_ids is None:
                 tool_ids = []
@@ -2125,6 +1560,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if features.get("data_viz"):
             from open_webui.utils.data_viz_prompts import (
                 assemble_data_viz_system_prompt,
+                MINIMAL_FALLBACK_PROMPT,
             )
 
             if tool_ids is None:
@@ -2134,11 +1570,34 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             metadata.setdefault("params", {})["function_calling"] = "native"
 
             data_viz_prompt = assemble_data_viz_system_prompt(request.app.state.config)
+            if not data_viz_prompt:
+                # The default prompt modules ship empty (admin pastes real text).
+                # We still inject the show_widget tool above, so without ANY
+                # guidance the model would be flying blind. Fall back to a minimal
+                # built-in description of the tool's contract.
+                data_viz_prompt = MINIMAL_FALLBACK_PROMPT
             if data_viz_prompt:
                 feature_prompt_parts.append(data_viz_prompt)
             log.info(
                 "Auto-enabled data visualization tool with native function calling"
             )
+
+        if features.get("automations"):
+            # Automations let the model schedule a prompt to run later in a
+            # fresh chat (see utils/automations_tool.py). The system prompt is a
+            # constant rather than admin-editable config: it encodes the
+            # title/prompt contract the runner actually enforces, so drifting it
+            # would produce automations that read as nonsense when they fire.
+            from open_webui.utils.automations_tool import AUTOMATIONS_SYSTEM_PROMPT
+
+            if tool_ids is None:
+                tool_ids = []
+            if "builtin:automations" not in tool_ids:
+                tool_ids.append("builtin:automations")
+            metadata.setdefault("params", {})["function_calling"] = "native"
+
+            feature_prompt_parts.append(AUTOMATIONS_SYSTEM_PROMPT)
+            log.info("Auto-enabled automations tools with native function calling")
 
         if features.get("subagents"):
             # Subagents are isolated research workers the parent can spawn via
@@ -2161,6 +1620,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 feature_prompt_parts.append(subagent_parent_prompt)
             log.info("Auto-enabled subagent tools with native function calling")
 
+        if not tool_selection_refresh:
+            tool_selection_base_messages = copy.deepcopy(
+                form_data.get("messages", [])
+            )
+
         if feature_prompt_parts:
             form_data["messages"] = add_or_update_system_message(
                 "\n\n".join(feature_prompt_parts),
@@ -2173,10 +1637,40 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         #         request, form_data, extra_params, user
         #     )
 
-        if "image_generation" in features and features["image_generation"]:
-            form_data = await chat_image_generation_handler(
+        if (
+            not tool_selection_refresh
+            and "image_generation" in features
+            and features["image_generation"]
+        ):
+            form_data, image_system_message = await chat_image_generation_handler(
                 request, form_data, extra_params, user
             )
+            if image_system_message:
+                form_data["messages"] = add_or_update_system_message(
+                    image_system_message, form_data["messages"]
+                )
+                post_feature_system_messages.append(image_system_message)
+
+    if tool_selection_refresh:
+        # These are one-time turn contexts that were originally composed after
+        # selectable feature prompts. Reapply the stored values in the same
+        # order without rerunning their side effects.
+        for system_context in metadata.get(
+            "_tool_selection_post_feature_system_messages", []
+        ):
+            if isinstance(system_context, str) and system_context:
+                form_data["messages"] = add_or_update_system_message(
+                    system_context, form_data["messages"]
+                )
+    else:
+        metadata["_tool_selection_base_messages"] = (
+            tool_selection_base_messages
+            if tool_selection_base_messages is not None
+            else copy.deepcopy(form_data.get("messages", []))
+        )
+        metadata["_tool_selection_post_feature_system_messages"] = (
+            post_feature_system_messages
+        )
 
     container_prompt = await prepare_container_workspace_for_turn(
         request, metadata, form_data, user, tool_ids
@@ -2194,6 +1688,33 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         metadata.setdefault("params", {})["function_calling"] = "native"
         log.info("Auto-enabled view_image tool with native function calling")
 
+    if _should_enable_view_video_tool(request, model):
+        if tool_ids is None:
+            tool_ids = []
+        if "builtin:view_video" not in tool_ids:
+            tool_ids.append("builtin:view_video")
+        metadata.setdefault("params", {})["function_calling"] = "native"
+        log.info("Auto-enabled view_video tool with native function calling")
+
+    # The compaction read-back escape hatch. Bound only when this conversation
+    # actually carries a <compacted_context> envelope, so it never pollutes the
+    # tool list (or the cached tools prefix) of a chat that has never compacted.
+    #
+    # Known gap: tools are resolved once, here, per turn. A conversation whose
+    # FIRST compaction happens mid-turn therefore doesn't get the tool until the
+    # next turn — the model's only recourse for that one turn is to re-run the
+    # tool. The mechanical index is the load-bearing part (COMPACTION.md §7);
+    # this is the escape hatch, so the gap is a degradation, not a break.
+    if ENABLE_CONVERSATION_COMPACTION and conversation_has_compacted_context(
+        form_data.get("messages")
+    ):
+        if tool_ids is None:
+            tool_ids = []
+        if "builtin:read_tool_result" not in tool_ids:
+            tool_ids.append("builtin:read_tool_result")
+        metadata.setdefault("params", {})["function_calling"] = "native"
+        log.info("Auto-enabled read_tool_result tool (conversation is compacted)")
+
     if _should_enable_ask_user_tool(request, metadata):
         if tool_ids is None:
             tool_ids = []
@@ -2210,6 +1731,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         log.info("Auto-enabled ask_user tool with native function calling")
 
     prompt = get_last_user_message(form_data["messages"])
+
+    # Keep a handle to the CALLER's metadata object before we rebind `metadata` to
+    # a fresh dict below. The connected MCP clients are only attached to that fresh
+    # dict at the very end of this function — so if we raise/cancel mid-connect (a
+    # CancelledError during a later connect / list_tool_specs / get_tools, or a
+    # transient tool-load error), the caller, which holds the INPUT object and
+    # reads it in its `finally` on error, could never reach the already-connected
+    # clients and would leak a stdio subprocess / HTTP stream per launch. Attaching
+    # the SAME mcp_clients dict to the caller's object up front (below) guarantees
+    # cleanup always has a live target. (See main.process_chat and
+    # subagent._run_inner_chat finally blocks, which both read the input metadata
+    # on an early raise.)
+    _caller_metadata = metadata
 
     metadata = {
         **metadata,
@@ -2229,6 +1763,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     tools_dict = {}
 
     mcp_clients = {}
+    # Expose the (initially empty) clients dict on the caller's metadata object
+    # immediately, so a raise/cancel anywhere below still leaves every connected
+    # client reachable for the caller's finally to disconnect (see _caller_metadata
+    # rationale above). Same dict object that gets attached to the returned metadata
+    # at the end, so there is exactly one set of clients and one disconnect.
+    if isinstance(_caller_metadata, dict):
+        _caller_metadata["mcp_clients"] = mcp_clients
     mcp_tools_dict = {}
     mcp_failures: list[dict] = []
 
@@ -2237,6 +1778,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             personal_connection_id = parse_personal_mcp_tool_id(tool_id)
             if personal_connection_id:
                 original_server_id = f"user:{personal_connection_id}"
+                # Dedupe: a duplicate tool_id in the request would overwrite (and
+                # leak) the already-connected client for this connection.
+                if original_server_id in mcp_clients:
+                    continue
                 personal_connection = None
                 try:
                     personal_connection = (
@@ -2254,30 +1799,51 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         )
                         continue
 
-                    mcp_clients[original_server_id] = MCPClient()
                     connect_kwargs = await build_personal_mcp_connect_kwargs(
                         personal_connection,
                         user=user,
                         metadata=metadata,
                     )
-                    await mcp_clients[original_server_id].connect(**connect_kwargs)
+                    if personal_connection.transport == "stdio":
+                        from open_webui.utils.mcp.persistent import personal_mcp_process_key
+
+                        mcp_clients[original_server_id] = await request.app.state.persistent_mcp.ensure(
+                            personal_mcp_process_key(user.id, personal_connection_id),
+                            connect_kwargs,
+                        )
+                    else:
+                        mcp_clients[original_server_id] = MCPClient()
+                        await mcp_clients[original_server_id].connect(**connect_kwargs)
 
                     tool_specs = await mcp_clients[original_server_id].list_tool_specs()
+                    call_meta = resolve_personal_mcp_call_meta(
+                        personal_connection,
+                        user=user,
+                        metadata=metadata,
+                    )
                     for tool_spec in tool_specs or []:
                         if not tool_allowed_by_policy(tool_spec, personal_connection):
                             continue
 
-                        def make_tool_function(client, function_name):
+                        def make_tool_function(client, function_name, call_meta):
                             async def tool_function(**kwargs):
                                 return await client.call_tool(
                                     function_name,
                                     function_args=kwargs,
+                                    meta=call_meta,
+                                    timeout_seconds=getattr(
+                                        request.app.state.config,
+                                        "MCP_TOOL_CALL_TIMEOUT",
+                                        None,
+                                    ),
                                 )
 
                             return tool_function
 
                         tool_function = make_tool_function(
-                            mcp_clients[original_server_id], tool_spec["name"]
+                            mcp_clients[original_server_id],
+                            tool_spec["name"],
+                            call_meta,
                         )
                         alias = mcp_tool_alias(original_server_id, tool_spec["name"])
                         if alias in mcp_tools_dict:
@@ -2311,7 +1877,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         "Personal MCP connection %r failed during connect/list_tool_specs",
                         original_server_id,
                     )
-                    mcp_clients.pop(original_server_id, None)
+                    _leaked = mcp_clients.pop(original_server_id, None)
+                    if _leaked is not None:
+                        # C8: connect() may have SUCCEEDED and the failure came from
+                        # list_tool_specs / spec iteration — popping alone leaks a live
+                        # stdio subprocess / HTTP stream (amplified per parallel
+                        # subagent). Disconnect best-effort before dropping it.
+                        try:
+                            await _leaked.disconnect()
+                        except Exception:
+                            log.exception(
+                                "MCP client disconnect on setup-failure failed (%r)",
+                                original_server_id,
+                            )
                     mcp_failures.append(
                         {
                             "server_id": original_server_id,
@@ -2319,6 +1897,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                 personal_connection, "name", personal_connection_id
                             ),
                             "reason": f"{type(e).__name__}: {e}",
+                            "needs_reauth": isinstance(e, MCPOAuthReauthRequired),
                         }
                     )
                     continue
@@ -2331,8 +1910,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 # trailing segment can't silently overwrite each other.
                 original_server_id = tool_id[len("server:mcp:") :]
                 server_id = original_server_id
+                # Dedupe: a duplicate tool_id would overwrite (and leak) the
+                # already-connected client for this server.
+                if original_server_id in mcp_clients:
+                    continue
                 try:
                     mcp_server_connection = None
+                    # Bound before the connection-scan loop so the except handler
+                    # (which reads them for needs_reauth) never hits an unbound or
+                    # stale value if a malformed config entry throws in the scan.
+                    auth_type = ""
+                    bearer_token: Optional[str] = None
                     for (
                         server_connection
                     ) in request.app.state.config.TOOL_SERVER_CONNECTIONS:
@@ -2369,18 +1957,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             bearer_token = oauth_token.get("access_token", "") or None
                     elif auth_type == "oauth_2.1":
                         try:
-                            splits = server_id.split(":")
-                            # Keep `oauth_lookup_id` distinct from
-                            # `original_server_id`; the OAuth client manager
-                            # is keyed on the trailing segment per existing
-                            # convention, but our dicts stay keyed by the
-                            # full id to avoid collisions.
-                            oauth_lookup_id = (
-                                splits[-1] if len(splits) > 1 else server_id
-                            )
-
+                            # Look up the session by the FULL server id — the same
+                            # key the client/session were registered under
+                            # (`mcp:{server_id}`). Truncating to a trailing colon
+                            # segment here missed the session for any colon-bearing
+                            # id, so the server connected unauthenticated.
                             oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                                user.id, f"mcp:{oauth_lookup_id}"
+                                user.id, f"mcp:{server_id}"
                             )
 
                             if oauth_token:
@@ -2391,31 +1974,91 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             log.error(f"Error getting OAuth token: {e}")
                             oauth_token = None
 
-                    mcp_clients[original_server_id] = MCPClient()
+                    # For an admin oauth_2.1 remote_http server, ship a refreshing
+                    # auth flow (mirroring the personal path) so a mid-session 401
+                    # — the access token expiring during a long agentic turn —
+                    # triggers a serialized refresh + retry instead of failing
+                    # every remaining tool call (audit A6).
+                    refresh_auth = None
+                    server_transport = (
+                        mcp_server_connection.get("transport") or "remote_http"
+                    )
+                    if auth_type == "oauth_2.1" and server_transport == "remote_http":
+                        _ocm = request.app.state.oauth_client_manager
+                        _sid = server_id
+                        _uid = user.id
+
+                        async def _admin_oauth_refresh_cb(
+                            _stale, _ocm=_ocm, _sid=_sid, _uid=_uid
+                        ):
+                            tok = await _ocm.get_oauth_token(
+                                _uid, f"mcp:{_sid}", force_refresh=True
+                            )
+                            return (tok or {}).get("access_token") or None
+
+                        refresh_auth = BearerRefreshAuth(
+                            bearer_token, _admin_oauth_refresh_cb
+                        )
 
                     connect_kwargs = build_mcp_connect_kwargs(
                         mcp_server_connection,
-                        bearer_token=bearer_token,
+                        bearer_token=None if refresh_auth is not None else bearer_token,
                         user=user,
                         metadata=metadata,
                     )
+                    if refresh_auth is not None:
+                        connect_kwargs["auth"] = refresh_auth
 
-                    await mcp_clients[original_server_id].connect(**connect_kwargs)
+                    if connect_kwargs.get("transport") == "stdio":
+                        from open_webui.utils.mcp.persistent import admin_mcp_process_key
+
+                        mcp_clients[original_server_id] = await request.app.state.persistent_mcp.ensure(
+                            admin_mcp_process_key(server_id), connect_kwargs
+                        )
+                    else:
+                        mcp_clients[original_server_id] = MCPClient()
+                        await mcp_clients[original_server_id].connect(**connect_kwargs)
 
                     tool_specs = await mcp_clients[original_server_id].list_tool_specs()
+                    # A persistent stdio process has no per-request HTTP headers.
+                    # Resolve configured context templates for this chat now and
+                    # carry them in the protocol-native tools/call `_meta` field.
+                    # Keep this value in the callable closure so concurrent chats
+                    # never share mutable "current chat" process state.
+                    call_meta = None
+                    if connect_kwargs.get("transport") == "stdio":
+                        call_meta = resolve_tool_server_headers(
+                            mcp_server_connection,
+                            user=user,
+                            metadata=metadata,
+                        ) or None
                     for tool_spec in tool_specs:
+                        # Admin per-tool enable/disable: skip any tool the admin
+                        # disabled for this server so the model never sees it.
+                        if not tool_filter_allows(
+                            tool_spec, mcp_server_connection.get("tool_filters")
+                        ):
+                            continue
 
-                        def make_tool_function(client, function_name):
+                        def make_tool_function(client, function_name, call_meta):
                             async def tool_function(**kwargs):
                                 return await client.call_tool(
                                     function_name,
                                     function_args=kwargs,
+                                    meta=call_meta,
+                                    timeout_seconds=getattr(
+                                        request.app.state.config,
+                                        "MCP_TOOL_CALL_TIMEOUT",
+                                        None,
+                                    ),
                                 )
 
                             return tool_function
 
                         tool_function = make_tool_function(
-                            mcp_clients[original_server_id], tool_spec["name"]
+                            mcp_clients[original_server_id],
+                            tool_spec["name"],
+                            call_meta,
                         )
 
                         # Model-facing names must satisfy provider constraints.
@@ -2472,7 +2115,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         "MCP server %r failed during connect/list_tool_specs",
                         original_server_id,
                     )
-                    mcp_clients.pop(original_server_id, None)
+                    _leaked = mcp_clients.pop(original_server_id, None)
+                    if _leaked is not None:
+                        # C8: if connect() succeeded but list_tool_specs / spec
+                        # iteration raised, popping alone leaks a live connection.
+                        try:
+                            await _leaked.disconnect()
+                        except Exception:
+                            log.exception(
+                                "MCP client disconnect on setup-failure failed (%r)",
+                                original_server_id,
+                            )
                     server_name = (mcp_server_connection or {}).get("info", {}).get(
                         "name"
                     ) or original_server_id
@@ -2481,6 +2134,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             "server_id": original_server_id,
                             "name": server_name,
                             "reason": f"{type(e).__name__}: {e}",
+                            # An oauth_2.1 server whose grant is dead resolves to no
+                            # bearer token and then 401s; surface the same reconnect
+                            # prompt the personal path shows instead of a generic
+                            # "failed to load" (the admin OAuth path returns None
+                            # rather than raising MCPOAuthReauthRequired).
+                            "needs_reauth": auth_type == "oauth_2.1"
+                            and not bearer_token,
                         }
                     )
                     continue
@@ -2495,16 +2155,22 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             )
             if event_emitter:
                 for fail in mcp_failures:
+                    needs_reauth = bool(fail.get("needs_reauth"))
+                    description = (
+                        f"MCP server '{fail['name']}' needs to be reconnected — "
+                        f"its authorization expired. Reconnect it in Settings → Tools."
+                        if needs_reauth
+                        else f"MCP server '{fail['name']}' failed to load: {fail['reason']}"
+                    )
                     try:
                         await event_emitter(
                             {
                                 "type": "status",
                                 "data": {
                                     "action": "mcp_server",
-                                    "description": (
-                                        f"MCP server '{fail['name']}' failed to load: "
-                                        f"{fail['reason']}"
-                                    ),
+                                    "description": description,
+                                    "server_id": fail.get("server_id"),
+                                    "needs_reauth": needs_reauth,
                                     "done": True,
                                     "error": True,
                                 },
@@ -2512,6 +2178,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         )
                     except Exception:
                         log.exception("Failed to emit MCP failure status")
+            if tool_selection_refresh:
+                failed_names = ", ".join(
+                    str(fail.get("name") or fail.get("server_id") or "tool server")
+                    for fail in mcp_failures
+                )
+                raise RuntimeError(
+                    f"Could not apply tool selection because {failed_names} failed to load"
+                )
 
         tools_dict = await get_tools(
             request,
@@ -2726,43 +2400,751 @@ def _should_handle_nonstreaming_response_in_agentic_loop(
     return isinstance(response, dict) and "choices" in response
 
 
-def _nonstreaming_round_length_error(res: dict) -> str | None:
-    choices = res.get("choices") if isinstance(res, dict) else None
-    if not choices:
-        return None
-    choice = choices[0] or {}
-    if choice.get("finish_reason") != "length":
-        return None
-    message = choice.get("message") or {}
-    if message.get("tool_calls") or message.get("content"):
-        return None
-    return (
-        "Model reached the completion token limit before producing final text "
-        "or a tool call. Increase the output token limit or lower reasoning effort."
+# ---------------------------------------------------------------------------
+# Per-round tool execution (hoisted out of the agentic round loop, where
+# _execute_tool_call used to be re-defined EVERY round; 2026-08-02
+# de-spaghettification). All former closure captures are explicit keyword
+# parameters; the round loop binds them via functools.partial at the same
+# point the def used to sit.
+# ---------------------------------------------------------------------------
+async def _execute_one_tool_call(
+    tool_call,
+    *,
+    request,
+    metadata,
+    model,
+    user,
+    tools,
+    event_emitter,
+    event_caller,
+    response_handler_task,
+):
+    tool_call_id = tool_call.get("id", "")
+    tool_function_name = tool_call.get("function", {}).get(
+        "name", ""
+    )
+    # Pin the tool_call_id for this branch of the gather so
+    # the tool callable can look it up via
+    # `current_tool_call_id_var.get()` (used by the subagent
+    # tool to wire its subagent_id back to the right
+    # parent tool call).
+    current_tool_call_id_var.set(tool_call_id)
+    current_tool_parent_task_var.set(response_handler_task)
+    tool_args = tool_call.get("function", {}).get("arguments", "{}")
+
+    tool_function_params = parse_tool_call_arguments(tool_args)
+    if not tool_function_params and str(
+        tool_args or "{}"
+    ).strip() not in {
+        "",
+        "{}",
+    }:
+        log.error(f"Error parsing tool call arguments: {tool_args}")
+
+    # Mutate the original tool call response params as they are passed back to the passed
+    # back to the LLM via the content blocks. If they are in a json block and are invalid json,
+    # this can cause downstream LLM integrations to fail (e.g. bedrock gateway) where response
+    # params are not valid json.
+    # Main case so far is no args = "" = invalid json.
+    log.debug(
+        f"Parsed args from {tool_args} to {tool_function_params}"
+    )
+    tool_call.setdefault("function", {})["arguments"] = json.dumps(
+        tool_function_params
+    )
+
+    tool_result = None
+    tool = None
+    tool_type = None
+    direct_tool = False
+    # Set when the tool callable raises; surfaced on the result
+    # entry so the collapsed tool-call row shows an error.
+    tool_exec_error = None
+    # Container `bash` bookkeeping: when this call turns out to
+    # be the container's bash tool we stamp the wall clock just
+    # before it runs, so afterwards we can report exactly the
+    # outputs/ files IT touched (and point at the reference doc
+    # for their type). Initialized here so the post-processing
+    # block below is safe on every other tool path.
+    _is_container_bash = False
+    _bash_t0 = 0.0
+
+    if tool_function_name in tools:
+        tool = tools[tool_function_name]
+        spec = tool.get("spec", {})
+
+        tool_type = tool.get("type", "")
+        direct_tool = tool.get("direct", False)
+
+        try:
+            allowed_params = (
+                spec.get("parameters", {})
+                .get("properties", {})
+                .keys()
+            )
+
+            tool_function_params = {
+                k: v
+                for k, v in tool_function_params.items()
+                if k in allowed_params
+            }
+
+            if direct_tool:
+                tool_result = await event_caller(
+                    {
+                        "type": "execute:tool",
+                        "data": {
+                            "id": str(uuid4()),
+                            "name": tool_function_name,
+                            "params": tool_function_params,
+                            "server": tool.get("server", {}),
+                            "session_id": metadata.get(
+                                "session_id", None
+                            ),
+                        },
+                    }
+                )
+
+            else:
+                tool_function = tool["callable"]
+                # Live browser progress: while a browser_*
+                # MCP call on the container server runs (it
+                # blocks here, possibly for many seconds),
+                # shadow it with a poller that reads the
+                # daemon's live.jpg/state.json host-side and
+                # pushes frames + status to the UI. Cancelled
+                # the instant the call returns. Best-effort:
+                # never let it affect the tool result.
+                _browser_poller = None
+                try:
+                    _tmeta = tool.get("metadata", {}) or {}
+                    _container_id = _normalize_container_server_id(
+                        str(
+                            getattr(
+                                request.app.state.config,
+                                "CONTAINER_MCP_SERVER_ID",
+                                "",
+                            )
+                            or ""
+                        )
+                    )
+                    _is_browser_tool = (
+                        tool.get("type") == "mcp"
+                        and _container_id
+                        and _normalize_container_server_id(
+                            str(_tmeta.get("server_id", ""))
+                        )
+                        == _container_id
+                        and str(
+                            _tmeta.get("original_name", "")
+                        ).startswith("browser_")
+                    )
+                    # Same identity test as the browser tools,
+                    # for `bash`: stamp the clock so the
+                    # post-call hook can report only the
+                    # outputs/ files this command wrote.
+                    _is_container_bash = bool(
+                        tool.get("type") == "mcp"
+                        and _container_id
+                        and _normalize_container_server_id(
+                            str(_tmeta.get("server_id", ""))
+                        )
+                        == _container_id
+                        and str(_tmeta.get("original_name", ""))
+                        == "bash"
+                    )
+                    if _is_container_bash:
+                        _bash_t0 = time.time()
+                    if _is_browser_tool:
+                        _data_root = str(
+                            getattr(
+                                request.app.state.config,
+                                "CONTAINER_DATA_ROOT",
+                                "",
+                            )
+                            or ""
+                        )
+                        # The daemon writes live.jpg/state.json
+                        # under the workspace keyed by the SAME
+                        # chat_id the container header carries.
+                        # For a subagent that is the PARENT chat
+                        # (container_workspace_chat_id), not the
+                        # subagent's own chat_id — otherwise the
+                        # poller reads an empty dir and the live
+                        # view never updates during subagent
+                        # browsing. For a normal chat the key is
+                        # absent and this falls back to chat_id,
+                        # so main-loop behavior is unchanged.
+                        _poller_chat_id = metadata.get(
+                            "container_workspace_chat_id"
+                        ) or metadata.get("chat_id")
+                        if _data_root and _poller_chat_id:
+                            _browser_poller = asyncio.create_task(
+                                browser_progress_poller(
+                                    data_root=_data_root,
+                                    chat_id=_poller_chat_id,
+                                    message_id=metadata.get(
+                                        "message_id"
+                                    ),
+                                    session_id=metadata.get(
+                                        "session_id"
+                                    ),
+                                    event_emitter=event_emitter,
+                                    # The per-AGENT browser tab
+                                    # this call drives. Parent =>
+                                    # "main" (browser_session
+                                    # absent); subagent => its
+                                    # subagent_id (set in
+                                    # _subagent_container_shared_context).
+                                    # The poller reads that one
+                                    # session's live files and
+                                    # tags frames with it so the
+                                    # UI groups tabs correctly.
+                                    session=metadata.get(
+                                        "browser_session"
+                                    )
+                                    or "main",
+                                )
+                            )
+                except Exception:
+                    _browser_poller = None
+                try:
+                    tool_result = await tool_function(
+                        **tool_function_params
+                    )
+                finally:
+                    if _browser_poller is not None:
+                        _browser_poller.cancel()
+                        # Await the poller's terminal emit so
+                        # the final frame + terminal (done)
+                        # status land BEFORE the next tool
+                        # call's poller starts — otherwise a
+                        # late "Loaded" could race ahead of
+                        # the next "Navigating", and pollers
+                        # could pile up across calls. The
+                        # poller swallows its own cancel and
+                        # returns, so this just drains it;
+                        # bounded so a wedged emit can't stall
+                        # the turn.
+                        try:
+                            await asyncio.wait_for(
+                                _browser_poller, timeout=2.0
+                            )
+                        except (asyncio.TimeoutError, Exception):
+                            # Swallow the poller's own
+                            # timeout/errors. CancelledError
+                            # (BaseException) is intentionally
+                            # NOT caught so an outer cancel of
+                            # the tool call still propagates.
+                            pass
+
+        except Exception as e:
+            tool_result = str(e)
+            # A raised tool exception is an error the UI
+            # should surface on the collapsed row, not just
+            # bury inside the result content. process_tool_result
+            # may still enrich this (e.g. _owui_meta), so seed
+            # a generic error and let it override the reason.
+            tool_exec_error = str(e)
+    else:
+        # Model emitted a tool name we don't have
+        # registered for this turn. Most common cause:
+        # a saved chat is being replayed and the model
+        # parrots back an old tool name (pre-rename, or
+        # from an MCP server that's been removed). The
+        # request continues with an empty result -- the
+        # model usually adapts -- but log it so this is
+        # debuggable instead of silently degrading.
+        log.warning(
+            "Tool call for unknown function %r; " "known tools: %s",
+            tool_function_name,
+            sorted(tools.keys()),
+        )
+
+    try:
+        (
+            tool_result,
+            tool_result_files,
+            tool_result_embeds,
+            tool_result_vision_attachments,
+            tool_result_meta,
+        ) = await process_tool_result(
+            request,
+            tool_function_name,
+            tool_result,
+            tool_type,
+            direct_tool,
+            metadata,
+            user,
+            model,
+        )
+    except Exception as e:
+        # Post-processing a tool result (image persistence,
+        # embed/UI unwrapping, JSON shaping) must NEVER tear
+        # down the turn or a subagent. The tool itself already
+        # ran (this is exactly what killed the gyms research
+        # chat: a browser_snapshot succeeded, but persisting its
+        # PNG raised and the whole parent turn + 5 subagents
+        # died). Degrade to a usable error result so the loop
+        # proceeds with a per-call error row.
+        log.exception(
+            "process_tool_result failed for tool %r; degrading "
+            "to an error result so the turn can continue",
+            tool_function_name,
+        )
+        tool_result = (
+            f"Tool '{tool_function_name}' ran but its result "
+            f"could not be processed: {e}"
+        )
+        tool_result_files = []
+        tool_result_embeds = []
+        tool_result_vision_attachments = []
+        tool_result_meta = {
+            "error": True,
+            "error_reason": "result post-processing failed",
+        }
+
+    # Container bash: tell the model what landed in outputs/ and
+    # which reference doc covers those file types. This rides on
+    # the tool RESULT, not the system prompt -- results are
+    # appended to the conversation and never rewritten, so it is
+    # prompt-cache safe. (The live outputs listing used to sit in
+    # messages[0], where every produced file invalidated the whole
+    # conversation's cached prefix.) Best-effort and guarded on a
+    # string result: never let this affect the tool outcome.
+    if _is_container_bash and isinstance(tool_result, str):
+        try:
+            _suffix = await asyncio.to_thread(
+                build_bash_result_suffix,
+                str(
+                    getattr(
+                        request.app.state.config,
+                        "CONTAINER_DATA_ROOT",
+                        "",
+                    )
+                    or ""
+                ),
+                metadata.get("container_workspace_chat_id")
+                or metadata.get("chat_id"),
+                _bash_t0,
+            )
+            if _suffix:
+                tool_result = f"{tool_result}\n{_suffix}"
+        except Exception:
+            log.debug(
+                "container bash result suffix failed", exc_info=True
+            )
+
+    # Fold a raised-exception error into the structured meta so
+    # the UI shows the error row. An explicit _owui_meta reason
+    # (e.g. from a web tool) takes precedence over the generic
+    # exception string.
+    if tool_exec_error is not None:
+        tool_result_meta = tool_result_meta or {}
+        tool_result_meta["error"] = True
+        tool_result_meta.setdefault("error_reason", tool_exec_error)
+    tool_result_meta = tool_result_meta or {}
+
+    # If the tool was a subagent_launch / subagent_continue,
+    # the tool callable stamped its subagent_id into
+    # `request.state.subagent_id_by_tool_call` keyed by
+    # tool_call_id. Surface it on the result entry so
+    # serialize_content_blocks can render a subagent block
+    # rather than the generic tool_calls collapsible, and
+    # so the saved chat row carries the link to the
+    # subagent chat after reload.
+    subagent_id_for_call = None
+    try:
+        subagent_id_for_call = getattr(
+            request.state, "subagent_id_by_tool_call", {}
+        ).get(tool_call_id)
+    except Exception:
+        subagent_id_for_call = None
+
+    return {
+        "tool_call_id": tool_call_id,
+        "content": tool_result or "",
+        **(
+            {"files": tool_result_files}
+            if tool_result_files
+            else {}
+        ),
+        **(
+            {"embeds": tool_result_embeds}
+            if tool_result_embeds
+            else {}
+        ),
+        **(
+            {"vision_attachments": tool_result_vision_attachments}
+            if tool_result_vision_attachments
+            else {}
+        ),
+        **(
+            {"subagent_id": subagent_id_for_call}
+            if subagent_id_for_call
+            else {}
+        ),
+        **(
+            {"error": True} if tool_result_meta.get("error") else {}
+        ),
+        **(
+            {"error_reason": tool_result_meta["error_reason"]}
+            if tool_result_meta.get("error_reason")
+            else {}
+        ),
+        **(
+            {"notice": tool_result_meta["notice"]}
+            if tool_result_meta.get("notice")
+            else {}
+        ),
+    }
+
+
+def _tool_result_event_data(message_id: str, slim_result: dict) -> dict:
+    """Wire payload for one finished tool call (`tool_call:result`).
+
+    Only keys the client can act on are sent — a slim result carries the body
+    by reference (`result_ref`/`size`/`sha256`) rather than inline, and the
+    optional metadata keys are omitted when empty so the batching layer has
+    less to coalesce.
+    """
+    optional = (
+        "result_ref",
+        "size",
+        "sha256",
+        "summary",
+        "files",
+        "embeds",
+        "subagent_id",
+        "error_reason",
+        "notice",
+    )
+    return {
+        "message_id": message_id,
+        "tool_call_id": slim_result.get("tool_call_id"),
+        "result": slim_result.get("content"),
+        **({"result_lazy": True} if slim_result.get("result_lazy") else {}),
+        **({"error": True} if slim_result.get("error") else {}),
+        **{
+            key: slim_result[key]
+            for key in optional
+            if slim_result.get(key) not in (None, "", [], {})
+        },
+    }
+
+
+def _tool_call_is_parallelizable(tool_call, tools):
+    name = tool_call.get("function", {}).get("name", "")
+    tool = tools.get(name)
+    return bool(
+        tool
+        and tool.get("metadata", {}).get("parallelizable", False)
     )
 
 
-def _visible_reasoning_from_details(reasoning_details: Any) -> str:
-    if not isinstance(reasoning_details, list):
-        return ""
+def _tool_result_for_failed_call(tool_call, exc, *, request):
+    """Build a non-empty error tool-result so one failed/cancelled
+    parallel tool call doesn't abandon the whole round. The model
+    sees the error for THAT call and can proceed with its siblings'
+    results (or retry)."""
+    tcid = (
+        tool_call.get("id", "")
+        if isinstance(tool_call, dict)
+        else ""
+    )
+    name = (
+        tool_call.get("function", {}).get("name", "")
+        if isinstance(tool_call, dict)
+        else ""
+    )
+    if isinstance(exc, asyncio.CancelledError):
+        # Do not claim "timed out" here. A child CancelledError
+        # means this one parallel tool/subagent was interrupted;
+        # the parent task itself was NOT cancelling (checked just
+        # below), and SUBAGENT_RUN_TIMEOUT may be disabled. The old
+        # "cancelled or timed out" wording made normal interrupted
+        # child tasks look like a configured timeout or user stop.
+        msg = "was interrupted before it returned"
+        error_reason = "interrupted"
+    elif isinstance(exc, asyncio.TimeoutError):
+        msg = "timed out before it returned"
+        error_reason = "timed out"
+    else:
+        msg = f"failed: {exc}"
+        error_reason = "failed"
+    subagent_id_for_call = None
+    try:
+        subagent_id_for_call = getattr(
+            request.state, "subagent_id_by_tool_call", {}
+        ).get(tcid)
+    except Exception:
+        subagent_id_for_call = None
+    return {
+        "tool_call_id": tcid,
+        "content": f"Tool '{name}' {msg}.",
+        "error": True,
+        "error_reason": error_reason,
+        **(
+            {"subagent_id": subagent_id_for_call}
+            if subagent_id_for_call
+            else {}
+        ),
+    }
 
-    parts: list[str] = []
-    for item in reasoning_details:
-        if not isinstance(item, dict):
-            continue
-        for key in ("summary", "text"):
-            value = item.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value.strip())
-    return "\n\n".join(parts).strip()
 
+# Post-turn background tasks (title/tags/follow-ups...), hoisted out of
+# _process_chat_response_impl (2026-08-02 de-spaghettification); former
+# closure captures are explicit keyword parameters.
+async def _run_background_tasks(
+    *, request, form_data, metadata, user, event_emitter, tasks
+):
+    message = None
+    messages = []
 
-async def _visible_nonstreaming_reasoning(message: dict) -> str:
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        value = message.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return _visible_reasoning_from_details(message.get("reasoning_details"))
+    if "chat_id" in metadata and not metadata["chat_id"].startswith("local:"):
+        messages_map = await Chats.get_messages_map_by_chat_id(metadata["chat_id"])
+        message = messages_map.get(metadata["message_id"]) if messages_map else None
+
+        message_list = get_message_list(messages_map, metadata["message_id"])
+
+        # Remove details tags and files from the messages.
+        # as get_message_list creates a new list, it does not affect
+        # the original messages outside of this handler
+
+        messages = []
+        for message in message_list:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        content = item["text"]
+                        break
+
+            if isinstance(content, str):
+                content = re.sub(
+                    r"<details\b[^>]*>.*?<\/details>|!\[.*?\]\(.*?\)",
+                    "",
+                    content,
+                    flags=re.S | re.I,
+                ).strip()
+
+            messages.append(
+                {
+                    **message,
+                    "role": message.get(
+                        "role", "assistant"
+                    ),  # Safe fallback for missing role
+                    "content": content,
+                }
+            )
+    else:
+        # Local temp chat, get the model and message from the form_data
+        message = get_last_user_message_item(form_data.get("messages", []))
+        messages = form_data.get("messages", [])
+        if message:
+            message["model"] = form_data.get("model")
+
+    if message and "model" in message:
+        if tasks and messages:
+            if (
+                TASKS.FOLLOW_UP_GENERATION in tasks
+                and tasks[TASKS.FOLLOW_UP_GENERATION]
+            ):
+                res = await generate_follow_ups(
+                    request,
+                    {
+                        "model": message["model"],
+                        "messages": messages,
+                        "message_id": metadata["message_id"],
+                        "chat_id": metadata["chat_id"],
+                    },
+                    user,
+                )
+
+                # Default to [] so that EVERY requested follow-up generation
+                # emits exactly one event below — including when
+                # generate_follow_ups returns a non-dict JSONResponse
+                # (follow-ups disabled mid-flight, or the follow-up task model
+                # call itself errored). Without the unconditional emit the
+                # client's reserved follow-up space would be held open forever.
+                follow_ups = []
+                if res and isinstance(res, dict):
+                    if len(res.get("choices", [])) == 1:
+                        response_message = res.get("choices", [])[0].get(
+                            "message", {}
+                        )
+
+                        follow_ups_string = response_message.get(
+                            "content"
+                        ) or response_message.get("reasoning_content", "")
+                    else:
+                        follow_ups_string = ""
+
+                    # Tolerate a reply with no / garbled JSON object. find("{")
+                    # returns -1 when absent; the old naive slice then produced
+                    # "" and json.loads raised, silently swallowing the result.
+                    brace_start = follow_ups_string.find("{")
+                    brace_end = follow_ups_string.rfind("}")
+                    if brace_start != -1 and brace_end > brace_start:
+                        try:
+                            follow_ups = (
+                                json.loads(
+                                    follow_ups_string[brace_start : brace_end + 1]
+                                ).get("follow_ups", [])
+                                or []
+                            )
+                        except Exception:
+                            follow_ups = []
+
+                # Always emit — even an empty list — so the client can resolve
+                # its "follow-up pending" state and release the reserved space
+                # instead of leaving an empty gap above the input.
+                await event_emitter(
+                    {
+                        "type": "chat:message:follow_ups",
+                        "data": {
+                            "follow_ups": follow_ups,
+                        },
+                    }
+                )
+
+                if follow_ups and not metadata.get("chat_id", "").startswith(
+                    "local:"
+                ):
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        {
+                            "followUps": follow_ups,
+                        },
+                        return_model=False,
+                    )
+
+            if not metadata.get("chat_id", "").startswith(
+                "local:"
+            ):  # Only update titles and tags for non-temp chats
+                if (
+                    TASKS.TITLE_GENERATION in tasks
+                    and tasks[TASKS.TITLE_GENERATION]
+                ):
+                    user_message = get_last_user_message(messages)
+                    if user_message and len(user_message) > 100:
+                        user_message = user_message[:100] + "..."
+
+                    if tasks[TASKS.TITLE_GENERATION]:
+
+                        res = await generate_title(
+                            request,
+                            {
+                                "model": message["model"],
+                                "messages": messages,
+                                "chat_id": metadata["chat_id"],
+                            },
+                            user,
+                        )
+
+                        if res and isinstance(res, dict):
+                            if len(res.get("choices", [])) == 1:
+                                response_message = res.get("choices", [])[0].get(
+                                    "message", {}
+                                )
+
+                                title_string = (
+                                    response_message.get("content")
+                                    or response_message.get(
+                                        "reasoning_content",
+                                    )
+                                    or message.get("content", user_message)
+                                )
+                            else:
+                                title_string = ""
+
+                            title_string = title_string[
+                                title_string.find("{") : title_string.rfind("}") + 1
+                            ]
+
+                            try:
+                                title = json.loads(title_string).get(
+                                    "title", user_message
+                                )
+                            except Exception as e:
+                                title = ""
+
+                            if not title:
+                                title = messages[0].get("content", user_message)
+
+                            await Chats.update_chat_title_by_id(
+                                metadata["chat_id"], title
+                            )
+
+                            await event_emitter(
+                                {
+                                    "type": "chat:title",
+                                    "data": await _chat_title_event_payload(
+                                        metadata["chat_id"], title
+                                    ),
+                                }
+                            )
+                    elif len(messages) == 2:
+                        title = messages[0].get("content", user_message)
+
+                        await Chats.update_chat_title_by_id(
+                            metadata["chat_id"], title
+                        )
+
+                        await event_emitter(
+                            {
+                                "type": "chat:title",
+                                "data": await _chat_title_event_payload(
+                                    metadata["chat_id"], title
+                                ),
+                            }
+                        )
+
+                if TASKS.TAGS_GENERATION in tasks and tasks[TASKS.TAGS_GENERATION]:
+                    res = await generate_chat_tags(
+                        request,
+                        {
+                            "model": message["model"],
+                            "messages": messages,
+                            "chat_id": metadata["chat_id"],
+                        },
+                        user,
+                    )
+
+                    if res and isinstance(res, dict):
+                        if len(res.get("choices", [])) == 1:
+                            response_message = res.get("choices", [])[0].get(
+                                "message", {}
+                            )
+
+                            tags_string = response_message.get(
+                                "content"
+                            ) or response_message.get("reasoning_content", "")
+                        else:
+                            tags_string = ""
+
+                        tags_string = tags_string[
+                            tags_string.find("{") : tags_string.rfind("}") + 1
+                        ]
+
+                        try:
+                            tags = json.loads(tags_string).get("tags", [])
+                            await Chats.update_chat_tags_by_id(
+                                metadata["chat_id"], tags, user
+                            )
+
+                            await event_emitter(
+                                {
+                                    "type": "chat:tags",
+                                    "data": {
+                                        "id": metadata["chat_id"],
+                                        "tags": tags,
+                                    },
+                                }
+                            )
+                        except Exception as e:
+                            pass
 
 
 async def process_chat_response(
@@ -2801,253 +3183,47 @@ async def process_chat_response(
 async def _process_chat_response_impl(
     request, response, form_data, user, metadata, model, events, tasks
 ):
-    async def background_tasks_handler():
-        message = None
-        messages = []
+    generation_operation_released = False
 
-        if "chat_id" in metadata and not metadata["chat_id"].startswith("local:"):
-            messages_map = await Chats.get_messages_map_by_chat_id(metadata["chat_id"])
-            message = messages_map.get(metadata["message_id"]) if messages_map else None
+    async def _release_completed_generation_operation() -> None:
+        """End provider ownership before attempting the next queued turn.
 
-            message_list = get_message_list(messages_map, metadata["message_id"])
+        A task remains alive for a few final bookkeeping instructions after its
+        response is durably complete. Releasing at this explicit terminal
+        boundary lets the queue atomically claim the next turn without treating
+        the finishing task as concurrent work. For multi-model turns, each
+        sibling releases only itself; the shared turn lease remains until the
+        last sibling completes.
+        """
+        nonlocal generation_operation_released
+        if generation_operation_released:
+            return
+        operation = metadata.get("generation_operation")
+        if not isinstance(operation, dict):
+            return
+        if str(operation.get("chat_id") or "") != str(
+            metadata.get("chat_id") or ""
+        ) or str(operation.get("message_id") or "") != str(
+            metadata.get("message_id") or ""
+        ):
+            return
+        from open_webui.tasks import unregister_generation_operation
 
-            # Remove details tags and files from the messages.
-            # as get_message_list creates a new list, it does not affect
-            # the original messages outside of this handler
+        await unregister_generation_operation(
+            getattr(request.app.state, "redis", None), operation
+        )
+        generation_operation_released = True
 
-            messages = []
-            for message in message_list:
-                content = message.get("content", "")
-                if isinstance(content, list):
-                    for item in content:
-                        if item.get("type") == "text":
-                            content = item["text"]
-                            break
-
-                if isinstance(content, str):
-                    content = re.sub(
-                        r"<details\b[^>]*>.*?<\/details>|!\[.*?\]\(.*?\)",
-                        "",
-                        content,
-                        flags=re.S | re.I,
-                    ).strip()
-
-                messages.append(
-                    {
-                        **message,
-                        "role": message.get(
-                            "role", "assistant"
-                        ),  # Safe fallback for missing role
-                        "content": content,
-                    }
-                )
-        else:
-            # Local temp chat, get the model and message from the form_data
-            message = get_last_user_message_item(form_data.get("messages", []))
-            messages = form_data.get("messages", [])
-            if message:
-                message["model"] = form_data.get("model")
-
-        if message and "model" in message:
-            if tasks and messages:
-                if (
-                    TASKS.FOLLOW_UP_GENERATION in tasks
-                    and tasks[TASKS.FOLLOW_UP_GENERATION]
-                ):
-                    res = await generate_follow_ups(
-                        request,
-                        {
-                            "model": message["model"],
-                            "messages": messages,
-                            "message_id": metadata["message_id"],
-                            "chat_id": metadata["chat_id"],
-                        },
-                        user,
-                    )
-
-                    if res and isinstance(res, dict):
-                        if len(res.get("choices", [])) == 1:
-                            response_message = res.get("choices", [])[0].get(
-                                "message", {}
-                            )
-
-                            follow_ups_string = response_message.get(
-                                "content"
-                            ) or response_message.get("reasoning_content", "")
-                        else:
-                            follow_ups_string = ""
-
-                        follow_ups_string = follow_ups_string[
-                            follow_ups_string.find("{") : follow_ups_string.rfind("}")
-                            + 1
-                        ]
-
-                        try:
-                            follow_ups = json.loads(follow_ups_string).get(
-                                "follow_ups", []
-                            )
-                            await event_emitter(
-                                {
-                                    "type": "chat:message:follow_ups",
-                                    "data": {
-                                        "follow_ups": follow_ups,
-                                    },
-                                }
-                            )
-
-                            if not metadata.get("chat_id", "").startswith("local:"):
-                                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                                    metadata["chat_id"],
-                                    metadata["message_id"],
-                                    {
-                                        "followUps": follow_ups,
-                                    }, return_model=False
-                                )
-
-                        except Exception as e:
-                            pass
-
-                if not metadata.get("chat_id", "").startswith(
-                    "local:"
-                ):  # Only update titles and tags for non-temp chats
-                    if (
-                        TASKS.TITLE_GENERATION in tasks
-                        and tasks[TASKS.TITLE_GENERATION]
-                    ):
-                        user_message = get_last_user_message(messages)
-                        if user_message and len(user_message) > 100:
-                            user_message = user_message[:100] + "..."
-
-                        if tasks[TASKS.TITLE_GENERATION]:
-
-                            res = await generate_title(
-                                request,
-                                {
-                                    "model": message["model"],
-                                    "messages": messages,
-                                    "chat_id": metadata["chat_id"],
-                                },
-                                user,
-                            )
-
-                            if res and isinstance(res, dict):
-                                if len(res.get("choices", [])) == 1:
-                                    response_message = res.get("choices", [])[0].get(
-                                        "message", {}
-                                    )
-
-                                    title_string = (
-                                        response_message.get("content")
-                                        or response_message.get(
-                                            "reasoning_content",
-                                        )
-                                        or message.get("content", user_message)
-                                    )
-                                else:
-                                    title_string = ""
-
-                                title_string = title_string[
-                                    title_string.find("{") : title_string.rfind("}") + 1
-                                ]
-
-                                try:
-                                    title = json.loads(title_string).get(
-                                        "title", user_message
-                                    )
-                                except Exception as e:
-                                    title = ""
-
-                                if not title:
-                                    title = messages[0].get("content", user_message)
-
-                                await Chats.update_chat_title_by_id(
-                                    metadata["chat_id"], title
-                                )
-
-                                await event_emitter(
-                                    {
-                                        "type": "chat:title",
-                                        "data": await _chat_title_event_payload(
-                                            metadata["chat_id"], title
-                                        ),
-                                    }
-                                )
-                        elif len(messages) == 2:
-                            title = messages[0].get("content", user_message)
-
-                            await Chats.update_chat_title_by_id(metadata["chat_id"], title)
-
-                            await event_emitter(
-                                {
-                                    "type": "chat:title",
-                                    "data": await _chat_title_event_payload(
-                                        metadata["chat_id"], title
-                                    ),
-                                }
-                            )
-
-                    if TASKS.TAGS_GENERATION in tasks and tasks[TASKS.TAGS_GENERATION]:
-                        res = await generate_chat_tags(
-                            request,
-                            {
-                                "model": message["model"],
-                                "messages": messages,
-                                "chat_id": metadata["chat_id"],
-                            },
-                            user,
-                        )
-
-                        if res and isinstance(res, dict):
-                            if len(res.get("choices", [])) == 1:
-                                response_message = res.get("choices", [])[0].get(
-                                    "message", {}
-                                )
-
-                                tags_string = response_message.get(
-                                    "content"
-                                ) or response_message.get("reasoning_content", "")
-                            else:
-                                tags_string = ""
-
-                            tags_string = tags_string[
-                                tags_string.find("{") : tags_string.rfind("}") + 1
-                            ]
-
-                            try:
-                                tags = json.loads(tags_string).get("tags", [])
-                                await Chats.update_chat_tags_by_id(
-                                    metadata["chat_id"], tags, user
-                                )
-
-                                await event_emitter(
-                                    {
-                                        "type": "chat:tags",
-                                        "data": {
-                                            "id": metadata["chat_id"],
-                                            "tags": tags,
-                                        },
-                                    }
-                                )
-                            except Exception as e:
-                                pass
 
     event_emitter = None
     event_caller = None
 
-    # Build the socket emitter/caller when we have a chat+message to target AND
-    # either a real originating socket session OR this is a headless run (the
-    # autonomous queue drain, which has no session_id by design). For a headless
-    # run `get_event_emitter` with session_id=None fans out to ALL of the user's
-    # tabs (USER_POOL) and `_wrap_event_emitter_v21` still registers stream state
-    # for reattach — so a drained generation streams + persists + is recoverable
-    # exactly like a session-bearing one.
-    if (
-        "chat_id" in metadata
-        and metadata["chat_id"]
-        and "message_id" in metadata
-        and metadata["message_id"]
-        and (metadata.get("session_id") or metadata.get("headless"))
-    ):
+    # Saved-chat event/persistence plumbing does not depend on a live origin
+    # socket. With no session, the emitter fans out to the user's available tabs
+    # and v2.1 stream state remains replayable; interactive callbacks use the
+    # non-blocking headless caller below. Local/direct requests still require a
+    # real session (or an explicitly headless run).
+    if should_attach_chat_event_transport(metadata):
         # Subagent runs install custom emitter/caller in metadata so the inner
         # pipeline's events get forwarded to the parent UI as
         # `chat:subagent:update` events (see utils/subagent.py). For normal
@@ -3081,6 +3257,51 @@ async def _process_chat_response_impl(
     # the event_emitter/response_data check below (including the empty-response
     # case) so no non-streaming completion can leave the queue stuck.
     _ns_finalized = {"done": False}
+    _ns_terminal = {"committed": False, "errored": False}
+
+    async def _commit_nonstreaming_error(error: Any) -> None:
+        """Persist an explicit terminal failure before exposing it to clients."""
+
+        if _ns_terminal["committed"]:
+            return
+        error_payload = _provider_error_payload(error)
+        if not error_payload.get("content"):
+            error_payload = {
+                "content": "The model request ended before a response could be saved."
+            }
+
+        if (
+            metadata.get("chat_id")
+            and metadata.get("message_id")
+            and not str(metadata.get("chat_id", "")).startswith("local:")
+        ):
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                metadata["chat_id"],
+                metadata["message_id"],
+                {
+                    "role": "assistant",
+                    "generation_id": metadata.get("generation_id"),
+                    "turn_id": metadata.get("turn_id"),
+                    "error": error_payload,
+                    "done": True,
+                },
+                return_model=False,
+            )
+            if STREAM_PROTOCOL_VERSION == "v2.1":
+                set_stream_state(
+                    metadata["message_id"],
+                    {"status": "error", "error": error_payload},
+                )
+
+        _ns_terminal["committed"] = True
+        _ns_terminal["errored"] = True
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "chat:message:error",
+                    "data": {"error": error_payload},
+                }
+            )
 
     async def _finalize_nonstreaming_queue(errored: bool):
         if _ns_finalized["done"]:
@@ -3090,6 +3311,13 @@ async def _process_chat_response_impl(
             return
         if str(metadata.get("chat_id", "")).startswith("local:"):
             return
+        if not _ns_terminal["committed"]:
+            await _commit_nonstreaming_error(
+                "The model returned no response content."
+                if not errored
+                else "The model request failed before its response was saved."
+            )
+        errored = _ns_terminal["errored"]
         # Settle the v2.1 stream store so a reloaded/zero-tab client sees a terminal
         # state (not a perpetual "in_progress" cursor on the headless placeholder
         # registered before the generation).
@@ -3102,16 +3330,6 @@ async def _process_chat_response_impl(
                 clear_stream_state(metadata["message_id"])
             except Exception:
                 log.exception("non-streaming stream-state settle failed")
-        if not errored:
-            try:
-                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    metadata["chat_id"],
-                    metadata["message_id"],
-                    {"done": True},
-                    return_model=False,
-                )
-            except Exception:
-                log.exception("non-streaming done:true persist failed")
         if errored:
             # Genuine error → PAUSE the queue (clear only our own marker).
             try:
@@ -3130,6 +3348,7 @@ async def _process_chat_response_impl(
             try:
                 from open_webui.utils.chat_queue import maybe_drain_queue
 
+                await _release_completed_generation_operation()
                 await maybe_drain_queue(
                     request.app,
                     user,
@@ -3139,14 +3358,19 @@ async def _process_chat_response_impl(
             except Exception:
                 log.exception("queue drain after non-streaming completion failed")
 
-    agentic_nonstreaming_response = _should_handle_nonstreaming_response_in_agentic_loop(
-        response, form_data, metadata
+    agentic_nonstreaming_response = (
+        _should_handle_nonstreaming_response_in_agentic_loop(
+            response, form_data, metadata
+        )
     )
     if agentic_nonstreaming_response and not (event_emitter and event_caller):
         agentic_nonstreaming_response = False
 
     # Non-streaming response
-    if not isinstance(response, StreamingResponse) and not agentic_nonstreaming_response:
+    if (
+        not isinstance(response, StreamingResponse)
+        and not agentic_nonstreaming_response
+    ):
         # First, extract and process reasoning content for ALL non-streaming responses
         # This must happen before the event_emitter check to ensure API responses include reasoning
         response_data = None
@@ -3207,105 +3431,43 @@ async def _process_chat_response_impl(
         if event_emitter and response_data:
             try:
                 if "error" in response_data:
-                    error = response_data.get("error")
-
-                    if isinstance(error, dict):
-                        error = error.get("detail", error)
-                    else:
-                        error = str(error)
-
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
-                        {
-                            "error": {"content": error},
-                        }, return_model=False
+                    await _commit_nonstreaming_error(response_data.get("error"))
+                else:
+                    # Get content from message (reasoning already processed earlier).
+                    choices = response_data.get("choices", [])
+                    message_data = (
+                        choices[0].get("message")
+                        if choices and isinstance(choices[0], dict)
+                        else None
                     )
-                    if isinstance(error, str) or isinstance(error, dict):
-                        await event_emitter(
-                            {
-                                "type": "chat:message:error",
-                                "data": {"error": {"content": error}},
-                            }
-                        )
+                    content = (
+                        get_content_from_message(message_data)
+                        if isinstance(message_data, dict)
+                        else None
+                    ) or response_data.get("content", "")
 
-                if "selected_model_id" in response_data:
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
-                        {
-                            "selectedModelId": response_data["selected_model_id"],
-                        }, return_model=False
-                    )
-
-                # Get content from message (reasoning already processed earlier)
-                choices = response_data.get("choices", [])
-                if choices and choices[0].get("message"):
-                    content = response_data["choices"][0]["message"].get("content", "")
-
-                    if content:
-                        # Check for usage data in non-streaming response
+                    if isinstance(content, str) and content:
                         usage = response_data.get("usage", {})
-
-                        await event_emitter(
-                            {
-                                "type": "chat:completion",
-                                "data": response_data,
-                            }
-                        )
-
-                        title = await Chats.get_chat_title_by_id(metadata["chat_id"])
-                        container_output_files = await import_changed_container_outputs(
-                            request, metadata, user, content=content
-                        )
-                        if container_output_files:
-                            await event_emitter(
-                                {
-                                    "type": "files",
-                                    "data": {"files": container_output_files},
-                                }
-                            )
-
-                        # Include usage in the final completion event
-                        completion_data = {
-                            "done": True,
-                            "content": content,
-                            "title": title,
-                        }
-                        if container_output_files:
-                            completion_data["files"] = container_output_files
-                        if usage:
-                            completion_data["usage"] = usage
-                            completion_data["selected_model_id"] = model_id
-
-                        await event_emitter(
-                            {
-                                "type": "chat:completion",
-                                "data": completion_data,
-                            }
-                        )
-
-                        # Save message in the database with reasoning included
+                        content_blocks = text_content_blocks(content)
                         update_data = {
                             "role": "assistant",
                             "content": content,
+                            "content_blocks": content_blocks,
+                            "generation_id": metadata.get("generation_id"),
+                            "turn_id": metadata.get("turn_id"),
+                            "done": True,
                         }
-
-                        if usage:
+                        if "selected_model_id" in response_data:
+                            update_data["selectedModelId"] = response_data[
+                                "selected_model_id"
+                            ]
+                        if usage_has_data(usage):
                             update_data["usage"] = usage
-                        if container_output_files:
-                            current_message = (
-                                await Chats.get_message_by_id_and_message_id(
-                                    metadata["chat_id"], metadata["message_id"]
-                                )
-                                or {}
-                            )
-                            update_data["files"] = current_message.get(
-                                "files", container_output_files
-                            )
 
-                        reasoning_details = response_data["choices"][0]["message"].get(
-                            "reasoning_details"
+                        reasoning_details = (
+                            message_data.get("reasoning_details")
+                            if isinstance(message_data, dict)
+                            else response_data.get("reasoning_details")
                         )
                         if reasoning_details:
                             update_data["reasoning_details"] = reasoning_details
@@ -3316,29 +3478,163 @@ async def _process_chat_response_impl(
                                 reasoning_details
                             ]
 
+                        # ROOT ORDERING INVARIANT: content + done are one durable
+                        # mutation, and it completes before any terminal event or
+                        # fallible analytics/webhook/background side effect. A
+                        # sleeping phone can therefore reconnect at any later
+                        # point and reconstruct the answer from storage.
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
-                            update_data, return_model=False
+                            update_data,
+                            return_model=False,
                         )
+                        _ns_terminal["committed"] = True
+                        _ns_terminal["errored"] = False
+                        if STREAM_PROTOCOL_VERSION == "v2.1":
+                            state_patch = {
+                                "content_blocks": content_blocks,
+                                "status": "done",
+                            }
+                            if usage_has_data(usage):
+                                state_patch["usage"] = usage
+                            if "selected_model_id" in response_data:
+                                state_patch["selected_model_id"] = response_data[
+                                    "selected_model_id"
+                                ]
+                            set_stream_state(metadata["message_id"], state_patch)
 
-                        # Send a webhook notification if the user is not active
-                        if not get_active_status_by_user_id(user.id):
-                            webhook_url = await Users.get_user_webhook_url_by_id(user.id)
-                            if webhook_url:
-                                await post_webhook(
-                                    request.app.state.WEBUI_NAME,
-                                    webhook_url,
-                                    f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content}",
+                        try:
+                            title = await Chats.get_chat_title_by_id(
+                                metadata["chat_id"]
+                            )
+                        except Exception:
+                            title = None
+
+                        try:
+                            container_output_files = (
+                                await import_changed_container_outputs(
+                                    request, metadata, user, content=content
+                                )
+                            )
+                        except Exception:
+                            log.exception(
+                                "non-streaming container output import failed"
+                            )
+                            container_output_files = []
+
+                        if container_output_files:
+                            try:
+                                current_message = (
+                                    await Chats.get_message_by_id_and_message_id(
+                                        metadata["chat_id"], metadata["message_id"]
+                                    )
+                                    or {}
+                                )
+                                await Chats.upsert_message_to_chat_by_id_and_message_id(
+                                    metadata["chat_id"],
+                                    metadata["message_id"],
                                     {
-                                        "action": "chat",
-                                        "message": content,
-                                        "title": title,
-                                        "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
+                                        "files": current_message.get(
+                                            "files", container_output_files
+                                        )
                                     },
+                                    return_model=False,
+                                )
+                                await event_emitter(
+                                    {
+                                        "type": "files",
+                                        "data": {"files": container_output_files},
+                                    }
+                                )
+                            except Exception:
+                                log.exception(
+                                    "non-streaming container output persistence failed"
                                 )
 
-                        await background_tasks_handler()
+                        # Live delivery follows the durable commit. The first event
+                        # carries the provider response shape; the second is the
+                        # terminal projection used by the ordinary chat client.
+                        await event_emitter(
+                            {
+                                "type": "chat:completion",
+                                "data": response_data,
+                            }
+                        )
+                        completion_data = {
+                            "done": True,
+                            "content": content,
+                            "title": title,
+                        }
+                        if container_output_files:
+                            completion_data["files"] = container_output_files
+                        if usage_has_data(usage):
+                            completion_data["usage"] = usage
+                            completion_data["selected_model_id"] = model_id
+                        await event_emitter(
+                            {
+                                "type": "chat:completion",
+                                "data": completion_data,
+                            }
+                        )
+
+                        # These are post-commit side effects. Their failure must
+                        # never turn a successfully stored answer into a blank
+                        # terminal row.
+                        if usage_has_data(usage):
+                            try:
+                                await process_token_usage(
+                                    model_id,
+                                    usage,
+                                    chat_id=_get_token_usage_chat_id(metadata),
+                                    user_id=user.id if user else None,
+                                    source_chat_id=metadata.get("chat_id"),
+                                    message_id=metadata.get("message_id"),
+                                    parent_message_id=metadata.get("parent_message_id"),
+                                    source_type=(
+                                        "subagent"
+                                        if metadata.get("subagent_inner")
+                                        else "chat"
+                                    ),
+                                )
+                            except Exception:
+                                log.exception(
+                                    "non-streaming token usage processing failed"
+                                )
+
+                        try:
+                            if not get_active_status_by_user_id(user.id):
+                                webhook_url = await Users.get_user_webhook_url_by_id(
+                                    user.id
+                                )
+                                if webhook_url:
+                                    await post_webhook(
+                                        request.app.state.WEBUI_NAME,
+                                        webhook_url,
+                                        f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content}",
+                                        {
+                                            "action": "chat",
+                                            "message": content,
+                                            "title": title,
+                                            "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
+                                        },
+                                    )
+                        except Exception:
+                            log.exception("non-streaming webhook failed")
+
+                        try:
+                            await _run_background_tasks(
+                            request=request,
+                            form_data=form_data,
+                            metadata=metadata,
+                            user=user,
+                            event_emitter=event_emitter,
+                            tasks=tasks,
+                        )
+                        except Exception:
+                            log.exception(
+                                "non-streaming background task processing failed"
+                            )
 
                 if events and isinstance(events, list):
                     extra_response = {}
@@ -3363,8 +3659,9 @@ async def _process_chat_response_impl(
                     )
 
             except Exception as e:
-                log.debug(f"Error occurred while processing request: {e}")
-                pass
+                log.exception("Error occurred while processing non-streaming response")
+                if not _ns_terminal["committed"]:
+                    await _commit_nonstreaming_error(e)
 
             await _finalize_nonstreaming_queue(
                 isinstance(response_data, dict) and bool(response_data.get("error"))
@@ -3428,266 +3725,17 @@ async def _process_chat_response_impl(
     if event_emitter and event_caller:
         task_id = str(uuid4())  # Create a unique task ID.
 
-        def split_content_and_whitespace(content):
-            content_stripped = content.rstrip()
-            original_whitespace = (
-                content[len(content_stripped) :]
-                if len(content) > len(content_stripped)
-                else ""
-            )
-            return content_stripped, original_whitespace
-
-        def is_opening_code_block(content):
-            backtick_segments = content.split("```")
-            # Even number of segments means the last backticks are opening a new block
-            return len(backtick_segments) > 1 and len(backtick_segments) % 2 == 0
-
         # Handle as a background task
         async def response_handler(response, events):
             nonlocal model_id
+            response_handler_task = asyncio.current_task()
 
-            def serialize_content_blocks(content_blocks, force=False):
-                # Display-only HTML+markdown projection of the structured content_blocks.
-                # The API-bound conversion lives in `blocks_to_api_messages`; this is
-                # purely what the UI's existing Markdown renderer + native <details>
-                # collapsibles consume. Kept for older frontend builds that don't
-                # render directly from content_blocks (post-Task 5 frontends do).
-                #
-                # Hot-path short-circuits (skipped when `force=True`):
-                #
-                # 1) Subagent inner runs never read the projected `content` string —
-                #    `SubagentBlock.svelte` renders the structured `content_blocks`
-                #    array directly. Returning empty here turns the per-chunk O(N)
-                #    walk into O(1), so backend per-stream work scales linearly
-                #    with token count even with many concurrent subagents at 200+
-                #    TPS. The subagent chat row's `content` column ends up empty
-                #    but the row is hidden from the sidebar and re-renders
-                #    correctly from `content_blocks` if the user opens it directly.
-                #
-                # 2) Regular chats with `ENABLE_REALTIME_CHAT_SAVE=False` (the
-                #    default): no per-chunk DB write happens, and modern
-                #    frontends render from `content_blocks` (see
-                #    `ContentRenderer.svelte`'s per-block keyed-each). The
-                #    projected string is only needed once at end-of-stream for
-                #    the canonical DB write + legacy clients + exports — those
-                #    call sites pass `force=True` to bypass this short-circuit.
-                #
-                # When `ENABLE_REALTIME_CHAT_SAVE=True`, every per-chunk call
-                # falls through and computes normally so the per-chunk DB write
-                # at L2836 stores a coherent content column.
-                #
-                # 3) Under STREAM_PROTOCOL_VERSION="v2.1" (B9): the wire
-                #    translator (`_wrap_event_emitter_v21`) drops the `content`
-                #    string entirely and ships `chat:delta` ops derived from
-                #    `content_blocks`. Per-chunk DB writes under v2.1 also skip
-                #    the `content` column (see hot-path upsert below). The
-                #    `content` column converges at end-of-stream via the
-                #    `force=True` call in the success/cancel finalisers, so
-                #    legacy clients, exports, and search indexing still get a
-                #    populated row once streaming completes.
-                if not force:
-                    if metadata.get("subagent_inner"):
-                        return ""
-                    if STREAM_PROTOCOL_VERSION == "v2.1":
-                        return ""
-                    if not ENABLE_REALTIME_CHAT_SAVE:
-                        return ""
-
-                content = ""
-
-                for block in content_blocks:
-                    if block["type"] == "text":
-                        block_content = block["content"].strip()
-                        if block_content:
-                            content = f"{content}{block_content}\n"
-                    elif block["type"] == "tool_calls":
-                        attributes = block.get("attributes", {})
-
-                        tool_calls = block.get("content", [])
-                        results = block.get("results", [])
-
-                        if content and not content.endswith("\n"):
-                            content += "\n"
-
-                        # Look up subagent_id either from the completed result
-                        # (set by `_execute_tool_call` after the tool returns)
-                        # or from the in-flight side channel that the subagent
-                        # tool stamps right at the start of its execution
-                        # (before it blocks on the inner chat). This way, even
-                        # during the long-running window between the parent
-                        # model emitting the tool call and the tool returning,
-                        # serialize_content_blocks renders a subagent block
-                        # instead of a generic "Executing..." tool_call.
-                        inflight_subagent_id_by_tcid = {}
-                        try:
-                            inflight_subagent_id_by_tcid = (
-                                getattr(request.state, "subagent_id_by_tool_call", {})
-                                or {}
-                            )
-                        except Exception:
-                            inflight_subagent_id_by_tcid = {}
-
-                        def _is_subagent_tool(name: str) -> bool:
-                            return name in ("subagent_launch", "subagent_continue")
-
-                        if results:
-
-                            tool_calls_display_content = ""
-                            for tool_call in tool_calls:
-
-                                tool_call_id = tool_call.get("id", "")
-                                tool_name = tool_call.get("function", {}).get(
-                                    "name", ""
-                                )
-                                tool_arguments = tool_call.get("function", {}).get(
-                                    "arguments", ""
-                                )
-
-                                tool_result = None
-                                tool_result_files = None
-                                result_subagent_id = None
-                                result_error = False
-                                result_error_reason = ""
-                                result_notice = ""
-                                for result in results:
-                                    if tool_call_id == result.get("tool_call_id", ""):
-                                        tool_result = result.get("content", None)
-                                        tool_result_files = result.get("files", None)
-                                        result_subagent_id = result.get("subagent_id")
-                                        result_error = bool(result.get("error"))
-                                        result_error_reason = result.get(
-                                            "error_reason", ""
-                                        ) or ""
-                                        result_notice = result.get("notice", "") or ""
-                                        break
-
-                                # Structured error/notice attributes shared by the
-                                # `done="true"` tool_calls writers below. Reload
-                                # parses these back into Collapsible attributes so
-                                # the collapsed row shows the error/notice exactly
-                                # like the live path does.
-                                tool_meta_attrs = (
-                                    (' error="true"' if result_error else "")
-                                    + (
-                                        f' error_reason="{html.escape(str(result_error_reason))}"'
-                                        if result_error_reason
-                                        else ""
-                                    )
-                                    + (
-                                        f' notice="{html.escape(str(result_notice))}"'
-                                        if result_notice
-                                        else ""
-                                    )
-                                )
-
-                                if _is_subagent_tool(tool_name):
-                                    # Subagent block: lives in `subagentLiveStates`
-                                    # keyed by tool_call_id on the frontend; the
-                                    # markdown projection here is just a stub the
-                                    # `Collapsible.svelte` renderer recognises.
-                                    sa_id = (
-                                        result_subagent_id
-                                        or inflight_subagent_id_by_tcid.get(
-                                            tool_call_id
-                                        )
-                                        or ""
-                                    )
-                                    if not sa_id and tool_result is not None:
-                                        # Malformed subagent call: the tool errored
-                                        # BEFORE creating a subagent (e.g. missing
-                                        # name/prompt args), so there is no subagent
-                                        # to render. Emit a normal tool-result stub
-                                        # instead of a subagent stub — otherwise the
-                                        # UI shows a perpetual "Researching…/Subagent
-                                        # is starting up…" for a call that already
-                                        # returned an error.
-                                        tool_result_embeds = result.get("embeds", "")
-                                        tool_calls_display_content = f'{tool_calls_display_content}<details type="tool_calls" done="true" id="{tool_call_id}" name="{tool_name}" arguments="{html.escape(json.dumps(tool_arguments))}" result="{html.escape(json.dumps(tool_result, ensure_ascii=False))}" files="{html.escape(json.dumps(tool_result_files)) if tool_result_files else ""}" embeds="{html.escape(json.dumps(tool_result_embeds))}"{tool_meta_attrs}>\n<summary>Tool Executed</summary>\n</details>\n'
-                                    else:
-                                        done_flag = (
-                                            "true" if tool_result is not None else "false"
-                                        )
-                                        tool_calls_display_content = (
-                                            f"{tool_calls_display_content}"
-                                            f'<details type="subagent_launch" done="{done_flag}" '
-                                            f'tool_call_id="{html.escape(tool_call_id)}" '
-                                            f'id="{html.escape(sa_id)}" '
-                                            f'name="{html.escape(tool_name)}" '
-                                            f'arguments="{html.escape(json.dumps(tool_arguments))}">\n'
-                                            f"<summary>Subagent</summary>\n"
-                                            f"</details>\n"
-                                        )
-                                elif tool_result is not None:
-                                    tool_result_embeds = result.get("embeds", "")
-                                    tool_calls_display_content = f'{tool_calls_display_content}<details type="tool_calls" done="true" id="{tool_call_id}" name="{tool_name}" arguments="{html.escape(json.dumps(tool_arguments))}" result="{html.escape(json.dumps(tool_result, ensure_ascii=False))}" files="{html.escape(json.dumps(tool_result_files)) if tool_result_files else ""}" embeds="{html.escape(json.dumps(tool_result_embeds))}"{tool_meta_attrs}>\n<summary>Tool Executed</summary>\n</details>\n'
-                                else:
-                                    tool_calls_display_content = f'{tool_calls_display_content}<details type="tool_calls" done="false" id="{tool_call_id}" name="{tool_name}" arguments="{html.escape(json.dumps(tool_arguments))}">\n<summary>Executing...</summary>\n</details>\n'
-
-                            content = f"{content}{tool_calls_display_content}"
-                        else:
-                            tool_calls_display_content = ""
-
-                            for tool_call in tool_calls:
-                                tool_call_id = tool_call.get("id", "")
-                                tool_name = tool_call.get("function", {}).get(
-                                    "name", ""
-                                )
-                                tool_arguments = tool_call.get("function", {}).get(
-                                    "arguments", ""
-                                )
-
-                                if _is_subagent_tool(tool_name):
-                                    sa_id = (
-                                        inflight_subagent_id_by_tcid.get(tool_call_id)
-                                        or ""
-                                    )
-                                    tool_calls_display_content = (
-                                        f"{tool_calls_display_content}\n"
-                                        f'<details type="subagent_launch" done="false" '
-                                        f'tool_call_id="{html.escape(tool_call_id)}" '
-                                        f'id="{html.escape(sa_id)}" '
-                                        f'name="{html.escape(tool_name)}" '
-                                        f'arguments="{html.escape(json.dumps(tool_arguments))}">\n'
-                                        f"<summary>Subagent</summary>\n"
-                                        f"</details>\n"
-                                    )
-                                else:
-                                    tool_calls_display_content = f'{tool_calls_display_content}\n<details type="tool_calls" done="false" id="{tool_call_id}" name="{tool_name}" arguments="{html.escape(json.dumps(tool_arguments))}">\n<summary>Executing...</summary>\n</details>\n'
-
-                            content = f"{content}{tool_calls_display_content}"
-
-                    elif block["type"] == "reasoning":
-                        reasoning_display_content = "\n".join(
-                            (f"> {line}" if not line.startswith(">") else line)
-                            for line in block["content"].splitlines()
-                        )
-
-                        reasoning_duration = block.get("duration", None)
-
-                        if content and not content.endswith("\n"):
-                            content += "\n"
-
-                        if reasoning_duration is not None:
-                            content = f'{content}<details type="reasoning" done="true" duration="{reasoning_duration}">\n<summary>Thought for {reasoning_duration} seconds</summary>\n{reasoning_display_content}\n</details>\n'
-                        else:
-                            content = f'{content}<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n{reasoning_display_content}\n</details>\n'
-                    elif block["type"] == "user_steer":
-                        # A mid-task user interjection (steering). Render as a
-                        # labeled blockquote so legacy/export projections read
-                        # naturally; modern frontends render it from the
-                        # structured block via ContentRenderer.
-                        steer_content = str(block.get("content", "")).strip()
-                        if steer_content:
-                            if content and not content.endswith("\n"):
-                                content += "\n"
-                            quoted = "\n".join(
-                                f"> {line}" for line in steer_content.splitlines()
-                            )
-                            content = f"{content}**User:**\n{quoted}\n"
-                    else:
-                        block_content = str(block["content"]).strip()
-                        if block_content:
-                            content = f"{content}{block['type']}: {block_content}\n"
+            # Display projection, hoisted to streaming/serialize.py; bind
+            # this turn's metadata/request once so the 10 call sites below
+            # keep their historical one-arg shape.
+            serialize_content_blocks = partial(
+                _serialize_content_blocks, metadata=metadata, request=request
+            )
 
             message = await Chats.get_message_by_id_and_message_id(
                 metadata["chat_id"], metadata["message_id"]
@@ -3712,6 +3760,10 @@ async def _process_chat_response_impl(
 
             response_usage = None  # Initialize response_usage at the top level
             terminal_error = None
+            # Set by _run_round_with_retry only when every retry for its CURRENT
+            # round has failed. The response-reading branches consume it
+            # immediately to preserve that fact in the canonical error payload.
+            round_retries_exhausted = False
             chunk_count = 0  # Initialize chunk_count at the top level for logging
             # Set by _run_round_with_retry: True when it already folded the round's
             # response into content_blocks (streaming or non-streaming), so the
@@ -3726,20 +3778,96 @@ async def _process_chat_response_impl(
                 if isinstance(message, dict)
                 else {}
             )
+            # Generation-local body ledgers — the correctness backbone for lazy
+            # tool results.
+            #
+            # WHY: the socket store (TOOL_RESULT_BODIES) is shared, capped, and
+            # actively pruned by EXTERNAL actors — finalize / cancel-teardown of a
+            # racing attempt on the SAME message_id calls clear_tool_result_bodies,
+            # the 300s STREAM_DONE_GRACE cleanup wipes a message's bodies, the
+            # per-message/global byte caps evict LRU bodies (with a best-effort disk
+            # spill that can itself fail), and any full store wipe drops everything.
+            # None of those may be allowed to remove a body that the RUNNING
+            # generation still needs to replay to the model on its next round. A
+            # production incident did exactly that: the RAM store was wiped mid-
+            # generation, the next checkpoint then persisted a near-empty
+            # tool_result_bodies map, and the following round raised "Missing tool
+            # result body for ref ...", killing the whole turn.
+            #
+            # So we keep our OWN copy of every body this generation has produced or
+            # seen, immune to those external wipes, and merge it into the outbound
+            # conversion (see _current_tool_result_bodies). The socket store is now
+            # purely a UI-serving cache for correctness purposes — losing it can
+            # only degrade lazy-expansion latency, never the model's context.
+            # Bodies are treated read-only downstream, so we hold references (no
+            # deepcopy — these can be large).
+            generation_tool_result_bodies: dict = {}
+            # Bodies not yet durably merged into the DB row (Layer 2 write-through
+            # retry buffer): populated alongside every store write, drained by the
+            # per-round Chats.merge_message_tool_result_bodies call, and left intact
+            # (to retry next round) whenever that write fails.
+            pending_db_body_merges: dict = {}
             if metadata.get("message_id") and isinstance(
                 persisted_tool_result_bodies, dict
             ):
                 for _tcid, _body in persisted_tool_result_bodies.items():
                     if isinstance(_body, dict):
                         set_tool_result_body(metadata.get("message_id"), _tcid, _body)
+                        # These bodies came FROM the DB row, so they are already
+                        # durable — seed the generation ledger (immunity to a later
+                        # store wipe) but NOT the pending-merge buffer.
+                        generation_tool_result_bodies[str(_tcid)] = _body
 
             # Retry-last-request can pre-seed the assistant row with completed
             # tool-call rounds. Continue streaming from those structured blocks
             # instead of flattening them to a single text block, otherwise v2.1
             # would resend the whole agentic turn instead of just the final
             # post-tool request.
+            #
+            # But resume at the RESUME BOUNDARY, not wherever the dead attempt's
+            # bytes happened to stop. When the row is the wreckage of an attempt
+            # that failed (`is_aborted_attempt`), its trailing prose is about to
+            # be regenerated — and appending onto it is what produced the
+            # five-answers-in-one-block garble, because the stream handler writes
+            # into `content_blocks[-1]` whenever that is a text block. A cleanly
+            # finished row is Continue Response, which deliberately re-opens that
+            # trailing block; never trim it. Mirrors the identical trim applied to
+            # the OUTBOUND payload in `assemble_conversation_from_leaf`, so what
+            # we render and what the model sees agree.
+            aborted_tail_trimmed = False
+            pre_trim_client_blocks = None
+            if (
+                isinstance(existing_content_blocks, list)
+                and existing_content_blocks
+                and is_aborted_attempt(message)
+            ):
+                resumable = resume_boundary_blocks(existing_content_blocks)
+                if resumable is not existing_content_blocks:
+                    aborted_tail_trimmed = True
+                    # What the OPEN TAB is still rendering. It kept the failed
+                    # attempt's blocks on purpose (wiping them blanks the visible
+                    # partial turn), so the mirror has to be seeded with THIS list
+                    # for the first v2.1 diff to come out as a truncation and ship
+                    # the `replace` that removes the stump. Seeding with the
+                    # trimmed list instead would leave the client one block-index
+                    # ahead of the server for the rest of the turn.
+                    pre_trim_client_blocks = copy.deepcopy(existing_content_blocks)
+                    log.info(
+                        "retry resume: dropped %s regenerable trailing block(s) from "
+                        "the previous attempt (chat=%s message=%s)",
+                        len(existing_content_blocks) - len(resumable),
+                        metadata.get("chat_id"),
+                        metadata.get("message_id"),
+                    )
+                    existing_content_blocks = resumable
+
             if isinstance(existing_content_blocks, list) and existing_content_blocks:
                 content_blocks = copy.deepcopy(existing_content_blocks)
+            elif aborted_tail_trimmed:
+                # The trim emptied the list: the dead attempt produced nothing but
+                # prose. Start clean — do NOT fall through to the legacy `content`
+                # seeding below, which would re-seed the very text we just dropped.
+                content_blocks = []
             else:
                 # Only pre-populate a text block when there is already content to carry
                 # forward (e.g. a tool-call continuation).  An empty initial text block
@@ -3757,95 +3885,21 @@ async def _process_chat_response_impl(
                     else []
                 )
 
-            # ── O(1)-amortized tail accumulation (streaming hot path) ───────
-            # The active text/reasoning block's `content` grows one token per
-            # chunk. `block["content"] += value` per token is a dict-subscript
-            # concat: O(N) per token → O(N^2) per stream, multiple seconds of
-            # pure event-loop block on long responses (the stall). We accumulate
-            # into a `_StreamTextAccumulator` (parts list joined lazily) bound to
-            # the current tail block by identity, folding it back into
-            # `block["content"]` only at boundaries/readers via
-            # `_tail_materialize()`. Defined here in `response_handler` scope (not
-            # inside `stream_body_handler`) so the checkpoint/finalize paths can
-            # materialize the tail before reading content_blocks. `_tail_state`
-            # is a holder because `stream_body_handler` rebinds `content_blocks`
-            # via `nonlocal` each round and the bound block changes.
-            _tail_state = {"acc": None, "block": None}
+            if aborted_tail_trimmed:
+                # The legacy `content` string was read off the same row and is the
+                # projection of the blocks we just dropped. It seeds `content_parts`
+                # below (and through it the plain-text used for the inactive-user
+                # webhook), so leaving it would re-introduce the dead attempt's
+                # answer through the one path that doesn't read content_blocks.
+                content = ""
 
-            def _tail_materialize():
-                """Fold buffered tail text back into its block's `content` so every
-                cold reader (checkpoint, snapshot, serialize, block-boundary logic,
-                finalizers) sees the full string. Cheap, idempotent no-op when
-                nothing is buffered."""
-                acc = _tail_state["acc"]
-                blk = _tail_state["block"]
-                if acc is not None and blk is not None:
-                    blk["content"] = acc.materialize()
-
-            def _tail_bind(block):
-                """Bind the accumulator to `block` (the current tail),
-                materializing any previously-bound block first. Seeds with the
-                block's existing content as already-emitted (the mirror/snapshot
-                already know it — contract of _StreamTextAccumulator)."""
-                if _tail_state["block"] is block and _tail_state["acc"] is not None:
-                    return
-                _tail_materialize()
-                _tail_state["acc"] = _StreamTextAccumulator(
-                    block.get("content", "") or ""
-                )
-                _tail_state["block"] = block
-
-            def _tail_append_text(block, value):
-                """Append a pure-text delta to the tail block in O(len(value))."""
-                if _tail_state["block"] is not block or _tail_state["acc"] is None:
-                    _tail_bind(block)
-                _tail_state["acc"].append(value)
-
-            def _tail_append_reasoning(block, chunk):
-                """Append a reasoning delta, defending against providers that
-                resend cumulative content. Returns new-char count for checkpoint
-                accounting.
-
-                Bounded-suffix merge: for true incremental deltas
-                (len(chunk) < current length) only the last len(chunk) chars are
-                needed to detect a tail overlap — verified byte-identical to a full
-                `_merge_streamed_string` over 14k+ randomized cases. Cumulative
-                resends (len(chunk) >= current length) fall back to the full merge
-                against the materialized string."""
-                if _tail_state["block"] is not block or _tail_state["acc"] is None:
-                    _tail_bind(block)
-                acc = _tail_state["acc"]
-                if not chunk:
-                    return 0
-                cur_len = len(acc)
-                # INVARIANT: _merge_streamed_string(existing, chunk) ALWAYS returns
-                # a string starting with `existing` (proven over 2M randomized
-                # cases — every return path either is `existing`, is `chunk` where
-                # chunk.startswith(existing), or is `existing + <suffix>`). So the
-                # merge can only ever APPEND to what we already have; it never
-                # rewrites a prefix. We rely on that here to compute the appended
-                # tail cheaply.
-                if len(chunk) >= cur_len:
-                    # Possible cumulative resend (provider re-sends the whole
-                    # reasoning so far): the full string is needed to detect how
-                    # much is new.
-                    existing = acc.materialize()
-                    merged = _merge_streamed_string(existing, chunk)
-                    appended = merged[len(existing) :]
-                    if appended:
-                        acc.append(appended)
-                    return len(appended)
-                # True incremental delta: only the last len(chunk) chars of the
-                # current content can overlap the chunk (merge's max overlap is
-                # len(chunk)), so a bounded suffix is sufficient and equivalent to
-                # the full merge — verified byte-identical over 500k cases incl.
-                # repeating patterns.
-                suffix = acc.suffix(len(chunk))
-                merged = _merge_streamed_string(suffix, chunk)
-                appended = merged[len(suffix) :]
-                if appended:
-                    acc.append(appended)
-                return len(appended)
+            # O(1)-amortized tail accumulation for the streaming hot path — see
+            # TailAccumulator in streaming/accumulate.py. Lives in
+            # `response_handler` scope (not inside `stream_body_handler`) so the
+            # checkpoint/finalize paths can materialize the tail before reading
+            # content_blocks; `stream_body_handler` rebinds `content_blocks` via
+            # `nonlocal` each round and the bound block changes with it.
+            tail_acc = TailAccumulator()
 
             # Per-round reasoning_details, in order. Each stream_body_handler
             # invocation appends one entry: the reasoning_details captured during
@@ -3865,6 +3919,12 @@ async def _process_chat_response_impl(
                 if isinstance(existing_reasoning_per_round, list)
                 else []
             )
+            # Seed must be exactly as long as the blocks expand to, or every
+            # later round's reasoning lands on the wrong emission (see the
+            # function's docstring for the retry-seam incident). Same correction
+            # `_run_round_with_retry` applies when it rolls back an unproductive
+            # round.
+            align_reasoning_rounds_to_blocks(round_reasoning_details, content_blocks)
 
             if (
                 STREAM_PROTOCOL_VERSION == "v2.1"
@@ -3881,16 +3941,31 @@ async def _process_chat_response_impl(
                 if metadata.get("message_id"):
                     for _tcid, _body in initial_tool_bodies.items():
                         set_tool_result_body(metadata.get("message_id"), _tcid, _body)
+                        # Freshly split from inline content: hold a wipe-immune copy
+                        # AND queue it for durable write-through (it isn't in the
+                        # slim DB row yet).
+                        generation_tool_result_bodies[str(_tcid)] = _body
+                        pending_db_body_merges[str(_tcid)] = _body
 
             if (
                 STREAM_PROTOCOL_VERSION == "v2.1"
                 and metadata.get("message_id")
-                and content_blocks
+                # `or aborted_tail_trimmed`: a dead attempt that produced nothing
+                # but prose trims to an EMPTY list, and that emptiness is exactly
+                # what the client has to be told about. Gating on truthy
+                # `content_blocks` would skip the resync and leave the tab showing
+                # a half-sentence for the rest of the turn.
+                and (content_blocks or aborted_tail_trimmed)
             ):
                 initial_v21_blocks = copy.deepcopy(_strip_tool_results(content_blocks))
                 v21_mirror = getattr(event_emitter, "_v21_mirror", None)
                 if v21_mirror is not None:
-                    v21_mirror["blocks"] = initial_v21_blocks
+                    if aborted_tail_trimmed and pre_trim_client_blocks is not None:
+                        v21_mirror["blocks"] = _strip_tool_results(
+                            pre_trim_client_blocks
+                        )
+                    else:
+                        v21_mirror["blocks"] = initial_v21_blocks
                 set_stream_state(
                     metadata["message_id"],
                     {
@@ -3901,11 +3976,23 @@ async def _process_chat_response_impl(
                         # cadence-written RAM content) before the first cadence
                         # snapshot lands. The content here matches the current
                         # version (no deltas emitted yet this round).
-                        "snapshot_version": stream_version_get(
-                            metadata["message_id"]
-                        ),
+                        "snapshot_version": stream_version_get(metadata["message_id"]),
                     },
                 )
+                if aborted_tail_trimmed and v21_mirror is not None:
+                    # Ship the truncation NOW, before the first token of the new
+                    # attempt. `_emit_delta_for_blocks` sees fewer blocks than the
+                    # mirror (seeded above with the client's copy) and falls back
+                    # to a whole-list `replace`, which also resets the mirror to
+                    # the trimmed list. Without this the open tab keeps the stump
+                    # and every later `block_idx` is off by the number of blocks
+                    # we dropped.
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {"content_blocks": content_blocks},
+                        }
+                    )
 
             # Avoid copying the whole growing plain-text response on every SSE
             # chunk. Native provider reasoning fields are rendered from
@@ -3941,40 +4028,90 @@ async def _process_chat_response_impl(
 
             def _current_tool_result_bodies(extra_bodies=None):
                 live_bodies = (
-                    get_tool_result_bodies(
-                        metadata.get("message_id"), deep_copy=False
-                    )
+                    get_tool_result_bodies(metadata.get("message_id"), deep_copy=False)
                     if metadata.get("message_id")
                     else {}
                 )
+                # Layer the generation-local ledger AFTER the (wipe-prone) socket
+                # store so a body this generation produced survives even if the
+                # store lost it. Order matters only for value freshness, not key
+                # coverage — all four layers union by tool_call_id.
                 return _merge_tool_result_body_maps(
                     persisted_tool_result_bodies,
                     live_bodies,
+                    generation_tool_result_bodies,
                     extra_bodies,
                 )
+
+            def _blocks_have_subagent_calls(blocks) -> bool:
+                # Cheap in-memory scan: True iff any tool_calls block contains a
+                # subagent_launch / subagent_continue call. Used to gate the D4
+                # checkpoint pre-reconcile so non-subagent streams pay no extra
+                # DB read on the checkpoint cadence.
+                if not isinstance(blocks, list):
+                    return False
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_calls":
+                        continue
+                    calls = block.get("content")
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        name = (call.get("function") or {}).get("name") or call.get(
+                            "name"
+                        )
+                        if name in (
+                            "subagent_launch",
+                            "subagent_continue",
+                            "subagent_agent_launch",
+                        ):
+                            return True
+                return False
 
             def _build_checkpoint_update(include_legacy_content: bool = False):
                 # Fold any buffered tail text into its block before reading
                 # content_blocks, so the checkpoint/snapshot/persist carries the
                 # full text (the streaming hot path leaves the tail in an
                 # accumulator for O(1) appends).
-                _tail_materialize()
+                tail_acc.materialize()
                 if STREAM_PROTOCOL_VERSION == "v2.1" and not str(
                     metadata.get("chat_id", "")
                 ).startswith("local:"):
                     slim_blocks, split_bodies = split_tool_result_bodies(content_blocks)
+                    # Reasoning text gets the same treatment as tool bodies:
+                    # closed blocks over the inline threshold persist as a
+                    # "Thought for N seconds" stub + a body-map entry, in the
+                    # SAME upsert (stub and body land atomically). The RAM
+                    # stream state / snapshot keeps the full text, so a client
+                    # watching the live stream is unaffected. The bodies are
+                    # re-derived from the in-memory blocks on every checkpoint,
+                    # so no generation ledger entry is needed for them.
+                    #
+                    # Subagent INNER chats are exempt: their rows are only ever
+                    # read wholesale by the parent's transcript card (already
+                    # lazy at the card level via getChatById-on-expand), and
+                    # that card renders reasoning straight from the block —
+                    # stubbing it would blank transcripts, and the subagent
+                    # machinery's observed behavior must not change.
+                    if not metadata.get("subagent_inner"):
+                        slim_blocks, reasoning_bodies = split_reasoning_bodies(
+                            slim_blocks
+                        )
+                        if reasoning_bodies:
+                            split_bodies = {**split_bodies, **reasoning_bodies}
                     tool_result_bodies = _current_tool_result_bodies(split_bodies)
                 else:
                     slim_blocks, tool_result_bodies = content_blocks, {}
-                update_data = {
-                    "content_blocks": slim_blocks,
-                }
+                update_data = {"content_blocks": slim_blocks}
+                if metadata.get("generation_id") and metadata.get("turn_id"):
+                    update_data["generation_id"] = metadata["generation_id"]
+                    update_data["turn_id"] = metadata["turn_id"]
                 if tool_result_bodies:
                     update_data["tool_result_bodies"] = tool_result_bodies
                 if include_legacy_content:
-                    update_data["content"] = serialize_content_blocks(
-                        slim_blocks, force=True
-                    )
+                    update_data["content"] = text_only_content_from_blocks(slim_blocks)
                 if response_usage:
                     update_data["usage"] = response_usage
                 if round_reasoning_details:
@@ -4025,6 +4162,38 @@ async def _process_chat_response_impl(
                     ):
                         return
 
+                # D4: a mid-stream checkpoint builds content_blocks PURELY from the
+                # parent's in-memory list, then upserts it as the message's
+                # content_blocks. If a detached rerun wrote a subagent answer into
+                # the DB (via subagent_runs) that this in-memory list lacks, the
+                # checkpoint would clobber it with an empty/absent result. Mirror the
+                # freshly-read subagent_runs into the in-memory blocks first.
+                # reconcile_block_results_from_runs only FILLS empties (it skips any
+                # result whose content is already non-empty, and lazy refs), so it
+                # never overwrites a real answer. Inlined (not via
+                # _reconcile_subagent_results) so it can be gated by a cheap
+                # in-memory scan — non-subagent streams (the high-TPS hot path)
+                # pay zero extra DB cost per checkpoint.
+                try:
+                    if _blocks_have_subagent_calls(content_blocks):
+                        from open_webui.utils.subagent import (
+                            reconcile_block_results_from_runs,
+                        )
+
+                        _ckpt_msg = (
+                            await Chats.get_message_by_id_and_message_id(
+                                metadata["chat_id"], metadata["message_id"]
+                            )
+                            or {}
+                        )
+                        _ckpt_runs = _ckpt_msg.get("subagent_runs")
+                        if isinstance(_ckpt_runs, dict) and _ckpt_runs:
+                            reconcile_block_results_from_runs(
+                                content_blocks, _ckpt_runs
+                            )
+                except Exception:
+                    log.exception("checkpoint pre-reconcile failed")
+
                 update_data = _build_checkpoint_update(include_legacy_content)
                 await Chats.upsert_message_to_chat_by_id_and_message_id(
                     metadata["chat_id"],
@@ -4034,6 +4203,80 @@ async def _process_chat_response_impl(
                 )
                 last_checkpoint_at = now
                 checkpoint_chars_since = 0
+
+            # Defined BEFORE the try: below (i.e. before the first await of the
+            # response) — the CancelledError teardown references these, and a Stop
+            # can land while the very first round is still streaming. When they
+            # were defined between the first round and the tool loop, an early
+            # cancel hit an unbound closure cell ("cannot access free variable
+            # '_reconcile_subagent_results'"), which killed the teardown before
+            # done=True was persisted and surfaced to the user as a retryable
+            # error instead of a clean stop.
+            async def _reconcile_subagent_results():
+                """Make the canonical content_blocks results authoritative by
+                backfilling any missing/empty subagent tool result from the
+                durable subagent_runs mirror. Cheap, called once per round
+                boundary / at finalize — NOT the per-token hot path. No-op for
+                runs without subagents (the DB read returns no subagent_runs)."""
+                if not metadata.get("chat_id") or not metadata.get("message_id"):
+                    return
+                if str(metadata.get("chat_id", "")).startswith("local:"):
+                    return
+                try:
+                    from open_webui.utils.subagent import (
+                        reconcile_block_results_from_runs,
+                    )
+
+                    msg = (
+                        await Chats.get_message_by_id_and_message_id(
+                            metadata["chat_id"], metadata["message_id"]
+                        )
+                        or {}
+                    )
+                    runs = msg.get("subagent_runs")
+                    if isinstance(runs, dict) and runs:
+                        reconcile_block_results_from_runs(content_blocks, runs)
+                except Exception:
+                    log.exception("subagent result reconciliation failed")
+
+            async def _sweep_subagent_runs(fallback_status="cancelled"):
+                """Finalizer backstop for the invariant 'parent terminal =>
+                every subagent_runs entry terminal'. Flips any straggler
+                'running' entry to a terminal status (prefer 'done' when it has
+                a real result, else fallback). Call BEFORE _reconcile so a
+                newly-'done' straggler's answer gets mirrored into
+                content_blocks. No-op for non-subagent runs."""
+                if not metadata.get("chat_id") or not metadata.get("message_id"):
+                    return
+                if str(metadata.get("chat_id", "")).startswith("local:"):
+                    return
+                try:
+                    from open_webui.utils.subagent import (
+                        sweep_subagent_runs_terminal,
+                    )
+
+                    await sweep_subagent_runs_terminal(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        fallback_status=fallback_status,
+                    )
+                    # ROOT GUARANTEE: now that the durable subagent_runs are
+                    # authoritative, FAN every run's terminal out to all of the
+                    # user's tabs (bypassing the stream-scoped/visibility-gated
+                    # per-update path) so no card is left spinning "Researching…"
+                    # once the parent finalizes — without needing a reload. Runs
+                    # before the parent's own chat:done, so cards resolve first.
+                    from open_webui.utils.subagent import (
+                        broadcast_subagent_terminals,
+                    )
+
+                    await broadcast_subagent_terminals(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        metadata.get("user_id"),
+                    )
+                except Exception:
+                    log.exception("subagent terminal sweep failed")
 
             try:
                 for event in events:
@@ -4050,7 +4293,8 @@ async def _process_chat_response_impl(
                         metadata["message_id"],
                         {
                             **event,
-                        }, return_model=False
+                        },
+                        return_model=False,
                     )
 
                 async def stream_body_handler(response, form_data):
@@ -4104,7 +4348,9 @@ async def _process_chat_response_impl(
                         if _v21_native
                         else None
                     )
-                    _v21_message_id = metadata.get("message_id") if _v21_native else None
+                    _v21_message_id = (
+                        metadata.get("message_id") if _v21_native else None
+                    )
 
                     # Throttled event-loop yield. The per-token awaits on the v2.1
                     # hot path (`_v21_emit_raw` / `event_emitter`) only ENQUEUE into
@@ -4122,6 +4368,10 @@ async def _process_chat_response_impl(
                     # chats' coroutines loop time. Throttled to ~once / 5ms so it
                     # is not a per-token tax.
                     _last_yield_at = time.monotonic()
+                    # Coalescing gate clock: last instant a native text_append was
+                    # actually emitted. Bounds trickle latency (a slow stream still
+                    # flushes within STREAM_TEXT_COALESCE_WINDOW_S).
+                    _last_native_emit_at = time.monotonic()
 
                     async def _maybe_yield(min_interval: float = 0.005):
                         nonlocal _last_yield_at
@@ -4157,7 +4407,7 @@ async def _process_chat_response_impl(
                         nonlocal _snapshot_established
                         if not _v21_message_id:
                             return
-                        _tail_materialize()
+                        tail_acc.materialize()
                         patch = {
                             "content_blocks": _strip_tool_results(content_blocks),
                             "status": "in_progress",
@@ -4199,13 +4449,18 @@ async def _process_chat_response_impl(
                                 snapshot_version=snapshot_version, dirty_from=dirty_from
                             )
 
-                    def _v21_try_native_append():
+                    def _v21_try_native_append(peek: bool = False):
                         """Return (block_idx, appended_text, None) if the tail
                         block is a pure append since the last mirror sync AND no
                         earlier block changed; otherwise None to force a
                         translator-mediated full diff. Uses the accumulator's emit
                         cursor (O(appended)) instead of a full-string startswith
-                        (which was O(N) per token → O(N^2) per stream)."""
+                        (which was O(N) per token → O(N^2) per stream).
+
+                        With `peek=True` the accumulator is NOT consumed: returns
+                        (block_idx, pending_chars) when a native append is possible
+                        (else None). The coalescing gate uses this to decide whether
+                        to hold small per-token appends before assigning a version."""
                         if not _v21_native or not content_blocks:
                             return None
                         mirror_blocks = _v21_mirror.get("blocks") or []
@@ -4226,17 +4481,27 @@ async def _process_chat_response_impl(
                         # The accumulator must be bound to THIS tail; otherwise we
                         # can't trust its emit cursor — defer to the translator,
                         # which diffs the materialized strings.
-                        if _tail_state["acc"] is None or _tail_state["block"] is not tail:
+                        if (
+                            tail_acc.acc is None
+                            or tail_acc.block is not tail
+                        ):
                             return None
-                        appended = _tail_state["acc"].take_appended()
+                        if peek:
+                            pending = tail_acc.acc.pending_len
+                            if not pending:
+                                return None
+                            return tail_idx, pending
+                        appended = tail_acc.acc.take_appended()
                         if not appended:
                             return None
                         return tail_idx, appended, None
 
-
-                    async def flush_pending_delta_data(threshold: int = 0):
+                    async def flush_pending_delta_data(
+                        threshold: int = 0, *, force: bool = False
+                    ):
                         nonlocal delta_count
                         nonlocal last_delta_data
+                        nonlocal _last_native_emit_at
 
                         if delta_count >= threshold and last_delta_data:
                             if event_emitter is None:
@@ -4244,6 +4509,33 @@ async def _process_chat_response_impl(
                                     f"❌ FLUSH ERROR: event_emitter is None! Cannot emit events!"
                                 )
                             else:
+                                # Coalescing gate: for a pure tail-block text append
+                                # (native-eligible), hold small per-token appends
+                                # until MIN_CHARS accumulate OR the coalesce window
+                                # elapses, so N tokens collapse into ONE versioned
+                                # text_append (one version bump — strictly
+                                # contiguous, so the client's version-gap guard never
+                                # trips). Deferring leaves the text in the tail
+                                # accumulator and keeps delta_count/last_delta_data,
+                                # so the next token retries; structural changes
+                                # (native peek is None) and force flushes never defer.
+                                # The RAM snapshot is only ever stamped AFTER a native
+                                # emit here, so held-but-unemitted text is never
+                                # advertised at a stale version (coherence preserved).
+                                if (
+                                    not force
+                                    and _v21_native
+                                    and STREAM_TEXT_COALESCE_MIN_CHARS > 0
+                                    and "content_blocks" in (last_delta_data or {})
+                                ):
+                                    peek = _v21_try_native_append(peek=True)
+                                    if (
+                                        peek is not None
+                                        and peek[1] < STREAM_TEXT_COALESCE_MIN_CHARS
+                                        and (time.monotonic() - _last_native_emit_at)
+                                        < STREAM_TEXT_COALESCE_WINDOW_S
+                                    ):
+                                        return
                                 native = (
                                     _v21_try_native_append()
                                     if _v21_native
@@ -4252,6 +4544,7 @@ async def _process_chat_response_impl(
                                 )
                                 if native is not None:
                                     block_idx, appended, _ = native
+                                    _last_native_emit_at = time.monotonic()
                                     last_native_version = None
                                     for text_chunk in _split_text_by_utf8_bytes(
                                         appended
@@ -4318,7 +4611,7 @@ async def _process_chat_response_impl(
                                     # by prior native flushes) when diffing, so the
                                     # mirror reconciles correctly without a separate
                                     # pass here.
-                                    _tail_materialize()
+                                    tail_acc.materialize()
                                     await event_emitter(
                                         {
                                             "type": "chat:completion",
@@ -4328,8 +4621,8 @@ async def _process_chat_response_impl(
                                     # The translator drained the tail; keep the
                                     # accumulator's emit cursor consistent so a
                                     # subsequent native flush won't re-ship text.
-                                    if _tail_state["acc"] is not None:
-                                        _tail_state["acc"].take_appended()
+                                    if tail_acc.acc is not None:
+                                        tail_acc.acc.take_appended()
                             delta_count = 0
                             last_delta_data = None
 
@@ -4383,7 +4676,8 @@ async def _process_chat_response_impl(
                                         metadata["message_id"],
                                         {
                                             "selectedModelId": model_id,
-                                        }, return_model=False
+                                        },
+                                        return_model=False,
                                     )
                                     await event_emitter(
                                         {
@@ -4397,9 +4691,40 @@ async def _process_chat_response_impl(
                                     # 17421
                                     usage = data.get("usage", {}) or {}
                                     usage.update(data.get("timings", {}))  # llama.cpp
-                                    if usage:
+                                    # Only treat a usage chunk as real if it
+                                    # carries countable tokens/cost. This provider
+                                    # emits zero-filled `usage` on intermediate
+                                    # chunks; without this guard `response_usage`
+                                    # (persisted as the message's final usage) gets
+                                    # clobbered to 0 and a zero live delta is
+                                    # emitted. See usage_has_data().
+                                    if usage_has_data(usage):
+                                        # Reshape the broken "C" gateway blob (top-
+                                        # level reasoning excluded from completion)
+                                        # into canonical shape BEFORE it is emitted,
+                                        # counted, and persisted as meta.usage.
+                                        usage = normalize_provider_usage(usage)
                                         response_usage = (
                                             usage  # Store for final completion event
+                                        )
+                                        # Emit the optimistic per-round op=usage
+                                        # delta BEFORE process_token_usage. The
+                                        # latter writes conversation_token_usage and
+                                        # then pushes the authoritative cumulative
+                                        # totals (chat:token-usage). The frontend's
+                                        # optimistic op=usage path undercounts a
+                                        # multi-round turn, so it must land FIRST and
+                                        # let the authoritative push max-correct it —
+                                        # the reverse order would let the optimistic
+                                        # delta accumulate on top of the already-correct
+                                        # total and overcount.
+                                        await event_emitter(
+                                            {
+                                                "type": "chat:completion",
+                                                "data": {
+                                                    "usage": usage,
+                                                },
+                                            }
                                         )
                                         # Pass chat_id and user_id for analytics tracking
                                         await process_token_usage(
@@ -4418,14 +4743,6 @@ async def _process_chat_response_impl(
                                                 else "chat"
                                             ),
                                         )
-                                        await event_emitter(
-                                            {
-                                                "type": "chat:completion",
-                                                "data": {
-                                                    "usage": usage,
-                                                },
-                                            }
-                                        )
 
                                     # Detect mid-stream errors: OpenRouter
                                     # sends errors with an `error` field at
@@ -4439,10 +4756,32 @@ async def _process_chat_response_impl(
                                         else None
                                     )
                                     if chunk_error or chunk_finish == "error":
-                                        error_payload = chunk_error or {
-                                            "message": "Provider returned an error during streaming."
-                                        }
+                                        # Normalize to the canonical error shape
+                                        # ({"content": str}) HERE, where the raw
+                                        # provider payload enters the pipeline.
+                                        # The live chat:message:error emit, the
+                                        # RAM snapshot, and the terminal DB
+                                        # persist all forward this payload, and
+                                        # the frontend reads error.content — a
+                                        # raw {"message"/"code"} provider shape
+                                        # here rendered a BLANK live error box
+                                        # while a reload showed the real error.
+                                        error_payload = _provider_error_payload(
+                                            chunk_error
+                                            or "Provider returned an error during streaming."
+                                        )
                                         terminal_error = error_payload
+                                        # Log the raw provider error too so
+                                        # fields the extractor drops (code,
+                                        # metadata.raw) are never silently lost.
+                                        log.error(
+                                            "mid-stream provider error "
+                                            f"chat={metadata.get('chat_id')} "
+                                            f"message={metadata.get('message_id')} "
+                                            f"finish={chunk_finish}: "
+                                            f"{error_payload['content']} "
+                                            f"raw={chunk_error!r}"
+                                        )
                                         await event_emitter(
                                             {
                                                 "type": "chat:completion",
@@ -4463,89 +4802,10 @@ async def _process_chat_response_impl(
                                     )
 
                                     if delta_reasoning_details:
-                                        # Merge streaming reasoning_details deltas. Match by
-                                        # (id, type) with a (type, index) fallback for id-less
-                                        # chunks; concat text/data/summary across fragments.
-                                        # See utils/REASONING_DETAILS.md §2 (the wire protocol)
-                                        # and §6 Bug A (why this isn't matched on id alone).
                                         for detail in delta_reasoning_details:
-                                            detail_id = detail.get("id")
-                                            detail_type = detail.get("type")
-                                            detail_idx = detail.get("index", 0)
-
-                                            existing = None
-                                            if detail_id is not None:
-                                                existing = next(
-                                                    (
-                                                        d
-                                                        for d in reasoning_details
-                                                        if d.get("id") == detail_id
-                                                        and d.get("type") == detail_type
-                                                    ),
-                                                    None,
-                                                )
-                                                # Adopt an id-less entry only when the type also
-                                                # matches (covers providers that emit `id` only
-                                                # on a later chunk of the same logical item).
-                                                if existing is None:
-                                                    existing = next(
-                                                        (
-                                                            d
-                                                            for d in reasoning_details
-                                                            if d.get("id") is None
-                                                            and d.get("type")
-                                                            == detail_type
-                                                            and d.get("index")
-                                                            == detail_idx
-                                                        ),
-                                                        None,
-                                                    )
-                                            else:
-                                                existing = next(
-                                                    (
-                                                        d
-                                                        for d in reasoning_details
-                                                        if d.get("type") == detail_type
-                                                        and d.get("index") == detail_idx
-                                                    ),
-                                                    None,
-                                                )
-
-                                            if existing is not None:
-                                                if detail.get("text"):
-                                                    existing["text"] = (
-                                                        _merge_streamed_string(
-                                                            existing.get("text") or "",
-                                                            detail["text"],
-                                                        )
-                                                    )
-                                                if detail.get("data"):
-                                                    existing["data"] = (
-                                                        _merge_streamed_string(
-                                                            existing.get("data") or "",
-                                                            detail["data"],
-                                                        )
-                                                    )
-                                                if detail.get("summary"):
-                                                    existing["summary"] = (
-                                                        _merge_streamed_string(
-                                                            existing.get("summary")
-                                                            or "",
-                                                            detail["summary"],
-                                                        )
-                                                    )
-                                                # `type` is part of the match key and never
-                                                # needs overwriting; `summary` is concat'd above.
-                                                for k in (
-                                                    "id",
-                                                    "signature",
-                                                    "format",
-                                                    "index",
-                                                ):
-                                                    if detail.get(k) is not None:
-                                                        existing[k] = detail[k]
-                                            else:
-                                                reasoning_details.append({**detail})
+                                            _apply_reasoning_detail_delta(
+                                                reasoning_details, detail
+                                            )
 
                                     if delta_tool_calls:
                                         for delta_tool_call in delta_tool_calls:
@@ -4581,7 +4841,7 @@ async def _process_chat_response_impl(
                                                     ].setdefault("arguments", "")
                                                     delta_tool_call["function"][
                                                         "name"
-                                                    ] = _dedupe_repeated_tool_name(
+                                                    ] = dedupe_repeated_tool_name(
                                                         delta_tool_call["function"].get(
                                                             "name", ""
                                                         )
@@ -4605,8 +4865,8 @@ async def _process_chat_response_impl(
                                                             "function"
                                                         ]
                                                         fn["name"] = (
-                                                            _dedupe_repeated_tool_name(
-                                                                merge_streamed_tool_call_field(
+                                                            dedupe_repeated_tool_name(
+                                                                merge_streamed_field(
                                                                     fn.get("name", ""),
                                                                     delta_name,
                                                                 )
@@ -4618,7 +4878,7 @@ async def _process_chat_response_impl(
                                                             "function"
                                                         ]
                                                         fn["arguments"] = (
-                                                            merge_streamed_tool_call_field(
+                                                            merge_streamed_field(
                                                                 fn.get("arguments", ""),
                                                                 delta_arguments,
                                                             )
@@ -4664,7 +4924,7 @@ async def _process_chat_response_impl(
                                         # path leaves the tail in an accumulator).
                                         # Only runs when a reasoning delta arrives,
                                         # so it is not on the pure-text hot path.
-                                        _tail_materialize()
+                                        tail_acc.materialize()
                                         _last_block_type = (
                                             content_blocks[-1]["type"]
                                             if content_blocks
@@ -4706,15 +4966,15 @@ async def _process_chat_response_impl(
                                             # the number of new chars for checkpoint
                                             # accounting. The accumulator keeps
                                             # reasoning_block["content"] lazily
-                                            # materialized; _tail_materialize() at
+                                            # materialized; tail_acc.materialize() at
                                             # boundaries/readers folds it back.
-                                            _reasoning_added = _tail_append_reasoning(
+                                            _reasoning_added = tail_acc.append_reasoning(
                                                 reasoning_block, reasoning_content
                                             )
                                             # v1 reads the tail synchronously below;
                                             # v2.1 keeps it buffered (native emit).
                                             if STREAM_PROTOCOL_VERSION != "v2.1":
-                                                _tail_materialize()
+                                                tail_acc.materialize()
                                             await checkpoint_stream_state(
                                                 char_delta=_reasoning_added
                                             )
@@ -4738,7 +4998,7 @@ async def _process_chat_response_impl(
                                             # Reasoning is closing — fold its buffer
                                             # back so the closed block carries its
                                             # full text for serialize/checkpoint.
-                                            _tail_materialize()
+                                            tail_acc.materialize()
                                             reasoning_block["ended_at"] = time.time()
                                             reasoning_block["duration"] = int(
                                                 reasoning_block["ended_at"]
@@ -4754,7 +5014,24 @@ async def _process_chat_response_impl(
                                             await checkpoint_stream_state(force=True)
 
                                         append_plain_content(value)
-                                        if not content_blocks:
+                                        if (
+                                            not content_blocks
+                                            or content_blocks[-1]["type"] != "text"
+                                        ):
+                                            # Open a fresh text block whenever the tail
+                                            # is not a text block. Normally the loop
+                                            # parks a trailing text("") as the stream
+                                            # target, but a seeded continuation can end
+                                            # on a non-text block — e.g. a user_steer
+                                            # (steering / block-level rewind) whose
+                                            # trailing text("") was stripped by the
+                                            # empty-round cleanup above, or a tool_calls
+                                            # block. Without this guard the answer tokens
+                                            # would be appended INTO that block (the
+                                            # user_steer's text), corrupting it into a
+                                            # fake user turn and losing the answer. The
+                                            # non-streaming path guards this identically
+                                            # (see _consume_nonstreaming_round).
                                             content_blocks.append(
                                                 {
                                                     "type": "text",
@@ -4765,7 +5042,7 @@ async def _process_chat_response_impl(
                                         # O(1) buffered text append (the hot path
                                         # for normal answer streaming). Replaces the
                                         # O(N)-per-token dict-subscript concat.
-                                        _tail_append_text(content_blocks[-1], value)
+                                        tail_acc.append_text(content_blocks[-1], value)
                                         # Under v1 / realtime-save, the tail is read
                                         # synchronously below (DB write + serialize),
                                         # so fold it now. Under v2.1 it stays buffered
@@ -4773,8 +5050,10 @@ async def _process_chat_response_impl(
                                         # materializing per token would restore the
                                         # O(N^2)).
                                         if STREAM_PROTOCOL_VERSION != "v2.1":
-                                            _tail_materialize()
-                                        await checkpoint_stream_state(char_delta=len(value))
+                                            tail_acc.materialize()
+                                        await checkpoint_stream_state(
+                                            char_delta=len(value)
+                                        )
 
                                         if (
                                             ENABLE_REALTIME_CHAT_SAVE
@@ -4816,7 +5095,8 @@ async def _process_chat_response_impl(
                                             await Chats.upsert_message_to_chat_by_id_and_message_id(
                                                 metadata["chat_id"],
                                                 metadata["message_id"],
-                                                update_data, return_model=False
+                                                update_data,
+                                                return_model=False,
                                             )
 
                                         # Regardless of realtime DB writes, the
@@ -4855,11 +5135,13 @@ async def _process_chat_response_impl(
                             else:
                                 log.warning(f"Error parsing SSE chunk: {e}")
                                 continue
-                    await flush_pending_delta_data()
+                    # Terminal flush: force-emit any text the coalescing gate is
+                    # still holding so no tail tokens are stranded at stream end.
+                    await flush_pending_delta_data(force=True)
 
                     # Fold the tail accumulator into its block before the
                     # end-of-stream cleanup reads/strips content_blocks.
-                    _tail_materialize()
+                    tail_acc.materialize()
 
                     if content_blocks:
                         # Clean up the last text block
@@ -4937,14 +5219,14 @@ async def _process_chat_response_impl(
                             content_blocks.append({"type": "text", "content": ""})
                         # Fold any buffered streaming tail first, then a plain
                         # in-place append (the accumulator isn't driving this branch).
-                        _tail_materialize()
+                        tail_acc.materialize()
                         content_blocks[-1]["content"] += msg_content
                         append_plain_content(msg_content)
 
                     res_tool_calls = message.get("tool_calls")
                     length_error = _nonstreaming_round_length_error(res)
                     if length_error:
-                        terminal_error = {"content": length_error}
+                        terminal_error = _provider_error_payload(length_error)
 
                     if res_tool_calls:
                         tool_calls.append(
@@ -4961,8 +5243,23 @@ async def _process_chat_response_impl(
                     )
 
                     usage = res.get("usage", {})
-                    if usage:
+                    if usage_has_data(usage):
+                        # Reshape the broken "C" gateway blob (top-level reasoning
+                        # excluded from completion) into canonical shape before it is
+                        # emitted, counted, and persisted as meta.usage.
+                        usage = normalize_provider_usage(usage)
                         response_usage = usage
+                        # op=usage (optimistic) BEFORE process_token_usage (which
+                        # pushes the authoritative cumulative totals) so the push
+                        # max-corrects the optimistic delta rather than the delta
+                        # accumulating on top of the already-correct total. See the
+                        # matching note in the streaming chunk loop above.
+                        await event_emitter(
+                            {
+                                "type": "chat:completion",
+                                "data": {"usage": usage},
+                            }
+                        )
                         await process_token_usage(
                             model_id,
                             usage,
@@ -4972,16 +5269,8 @@ async def _process_chat_response_impl(
                             message_id=metadata.get("message_id"),
                             parent_message_id=metadata.get("parent_message_id"),
                             source_type=(
-                                "subagent"
-                                if metadata.get("subagent_inner")
-                                else "chat"
+                                "subagent" if metadata.get("subagent_inner") else "chat"
                             ),
-                        )
-                        await event_emitter(
-                            {
-                                "type": "chat:completion",
-                                "data": {"usage": usage},
-                            }
                         )
 
                     await event_emitter(
@@ -4995,23 +5284,31 @@ async def _process_chat_response_impl(
                     )
 
                 async def _run_round_with_retry(resp, fd):
-                    """Run one model round (streaming or non-streaming) and, if it
-                    produced NOTHING usable (no tool calls AND no assistant text)
-                    without erroring, re-issue the SAME request up to
-                    AGENTIC_EMPTY_ROUND_MAX_RETRIES times. Models sometimes end a
-                    turn on a bare reasoning block or an empty completion; without
-                    this the agentic loop just stops with no answer.
+                    """Run one model round (streaming or non-streaming). If the
+                    request FAILS to make progress — no tool calls AND no assistant
+                    text, whether it came back empty, returned only reasoning,
+                    errored mid-stream, or returned an error/unknown shape —
+                    re-issue the SAME request up to AGENTIC_EMPTY_ROUND_MAX_RETRIES
+                    times. Such a round is almost always a transient upstream
+                    failure; retrying recovers it instead of ending the turn with no
+                    answer (the "it researched, then said nothing" bug).
 
-                    Returns the LAST response object. The caller's existing dispatch
-                    (the `if isinstance(res, StreamingResponse) ... elif dict ...
-                    else error` ladder) then runs on it — productive rounds are
-                    already folded in here, so re-folding is suppressed via the
-                    `_round_already_consumed` flag the caller checks.
+                    A PRODUCTIVE round (any tool call OR any answer text) returns
+                    immediately and is NEVER retried — a late hiccup after real
+                    output is kept, not thrown away.
 
-                    NOT retried: provider errors (set terminal_error or return an
-                    error-shaped response) and user cancels (CancelledError
-                    propagates out). Subagents inherit this via the shared loop."""
-                    nonlocal _round_already_consumed
+                    On exhaustion the turn finalizes as a visible ERROR (the last
+                    provider error, or a generic "no response" when the request just
+                    kept coming back empty) — a persistent failure is surfaced, never
+                    a silent blank. Returns the LAST response object for the caller's
+                    dispatch ladder; productive rounds are already folded in here and
+                    re-folding is suppressed via the `_round_already_consumed` flag.
+
+                    NOT retried: a genuine user cancel (CancelledError propagates
+                    out). Subagents inherit this via the shared loop."""
+                    nonlocal _round_already_consumed, terminal_error
+                    nonlocal round_retries_exhausted
+                    round_retries_exhausted = False
                     attempt = 0
                     current = resp
                     while True:
@@ -5032,44 +5329,112 @@ async def _process_chat_response_impl(
                         ):
                             await _consume_nonstreaming_round(current)
                             _round_already_consumed = True
-                        else:
-                            # Error / unknown shape — never retried; hand back so the
-                            # caller's error-reading branch runs.
-                            return current
+                        # else: error / unknown shape — NOT consumed. A failed
+                        # request; falls through to the retry logic below.
 
+                        tool_calls_grew = len(tool_calls) > tc_before
                         produced = (
-                            len(tool_calls) > tc_before
+                            tool_calls_grew
                             or _total_text_block_len(content_blocks) > text_before
                         )
-                        errored = terminal_error is not None and terminal_error is not terminal_before
-                        if (
-                            produced
-                            or errored
-                            or attempt >= AGENTIC_EMPTY_ROUND_MAX_RETRIES
-                        ):
+                        if produced:
+                            # Real progress (a tool call or answer text) — keep it.
+                            # A trailing provider error on a round that produced real
+                            # output is NON-terminal: for a NEW tool call the loop goes
+                            # on to execute it and a later round answers; for ANSWER
+                            # TEXT the answer is already complete and the error is
+                            # post-output noise (e.g. OpenRouter post-stream
+                            # credit/upstream errors that arrive after finish_reason=
+                            # stop). Either way a transient mid/post-stream error must
+                            # not poison the turn and discard the output. Clear an error
+                            # THIS round set whenever the round produced output.
+                            if (
+                                produced
+                                and terminal_error is not None
+                                and terminal_error is not terminal_before
+                            ):
+                                terminal_error = terminal_before
                             return current
 
-                        # Unproductive round with retries left: roll back this
-                        # round's empty residue so the retry starts clean.
-                        #  - materialize + unbind the tail accumulator so it isn't
-                        #    pinned to a block we're about to drop,
-                        #  - truncate any empty/partial blocks this round appended
-                        #    (the v2.1 emitter emits a `replace` to resync the client
-                        #    mirror on the next flush — it tolerates shrink),
-                        #  - trim per-round reasoning bookkeeping so
-                        #    len(round_reasoning_details) == emission count holds
-                        #    (REASONING_DETAILS.md §6 Bug B).
-                        _tail_materialize()
-                        _tail_state["acc"] = None
-                        _tail_state["block"] = None
+                        # DETERMINISTIC non-retryable failure (context window
+                        # exceeded / over-long input / empty max-output truncation):
+                        # re-issuing the SAME request can't recover it, so surface it
+                        # NOW instead of burning AGENTIC_EMPTY_ROUND_MAX_RETRIES
+                        # identical doomed calls (each retry only re-sends the same
+                        # too-large payload). This is the fix for "a research subagent
+                        # ran 20-30 min, then errored 'input exceeds the context
+                        # window'": without it, an overflow that's already terminal got
+                        # retried 5x at the round level AND re-run wholesale by the
+                        # launch/continue/rerun outer loop. The error itself is surfaced
+                        # by the consumed-round terminal_error (length truncation) or by
+                        # the caller's unconsumed-body read (context-window 4xx); we only
+                        # decline to retry. Transient 5xx/429/timeout/connection failures
+                        # match no needle and still retry below.
+                        if _round_already_consumed:
+                            _round_err = (
+                                terminal_error
+                                if terminal_error is not terminal_before
+                                else None
+                            )
+                        else:
+                            _round_err = _safe_error_response_text(current)
+                        if _round_err is not None and _is_nonretryable_provider_error(
+                            _round_err
+                        ):
+                            log.warning(
+                                "non-retryable provider error (context window / "
+                                "over-long input / max-output truncation) — surfacing "
+                                "without retry "
+                                f"chat={metadata.get('chat_id')} "
+                                f"subagent_inner={metadata.get('subagent_inner', False)}"
+                            )
+                            return current
+
+                        if attempt >= AGENTIC_EMPTY_ROUND_MAX_RETRIES:
+                            # Out of retries, still no progress. Never finalize a
+                            # silent blank: if the round was consumed but empty and
+                            # set no error, synthesize one so the turn surfaces a
+                            # failure. A consumed provider error is kept as-is; an
+                            # unconsumed error/unknown shape is left for the caller's
+                            # existing error-reading branch.
+                            round_retries_exhausted = True
+                            if _round_already_consumed:
+                                if terminal_error is None:
+                                    terminal_error = _provider_error_payload(
+                                        (
+                                            "The model returned no response after "
+                                            f"retrying {AGENTIC_EMPTY_ROUND_MAX_RETRIES} "
+                                            "times. Please try again."
+                                        ),
+                                        retries_exhausted=True,
+                                        empty_response=True,
+                                    )
+                                else:
+                                    terminal_error = _provider_error_payload(
+                                        terminal_error,
+                                        retries_exhausted=True,
+                                    )
+                            return current
+
+                        # Unproductive/failed round with retries left: roll back this
+                        # round's residue (empty/partial blocks, per-round reasoning
+                        # bookkeeping — REASONING_DETAILS.md §6 Bug B) AND clear any
+                        # error it set, so the retry starts clean. The v2.1 emitter
+                        # emits a `replace` to resync the client mirror on shrink.
+                        tail_acc.materialize()
+                        tail_acc.acc = None
+                        tail_acc.block = None
                         if blocks_before < len(content_blocks):
                             del content_blocks[blocks_before:]
                         if rrd_before < len(round_reasoning_details):
                             del round_reasoning_details[rrd_before:]
+                        if terminal_error is not terminal_before:
+                            terminal_error = terminal_before
                         attempt += 1
                         log.warning(
-                            "empty model round (no tool calls, no text) — retry "
-                            f"{attempt}/{AGENTIC_EMPTY_ROUND_MAX_RETRIES} "
+                            "unproductive/failed model round (no tool calls, no "
+                            f"answer text) — retry {attempt}/"
+                            f"{AGENTIC_EMPTY_ROUND_MAX_RETRIES} "
                             f"chat={metadata.get('chat_id')} "
                             f"subagent_inner={metadata.get('subagent_inner', False)}"
                         )
@@ -5098,7 +5463,10 @@ async def _process_chat_response_impl(
                                     )
                             except Exception:
                                 error_msg = error_content
-                            terminal_error = {"content": str(error_msg)}
+                            terminal_error = _provider_error_payload(
+                                error_msg,
+                                retries_exhausted=round_retries_exhausted,
+                            )
                             await event_emitter(
                                 {
                                     "type": "chat:message:error",
@@ -5123,33 +5491,351 @@ async def _process_chat_response_impl(
                 )
                 tool_round_count = 0
                 tool_rounds_capped = False
+                # Steer ids already injected as user_steer blocks this turn — so a
+                # silently-failed durable delete can't make the next round re-peek
+                # and re-inject the same steer a second time.
+                delivered_steer_ids: set = set()
 
-                async def _reconcile_subagent_results():
-                    """Make the canonical content_blocks results authoritative by
-                    backfilling any missing/empty subagent tool result from the
-                    durable subagent_runs mirror. Cheap, called once per round
-                    boundary / at finalize — NOT the per-token hot path. No-op for
-                    runs without subagents (the DB read returns no subagent_runs)."""
-                    if not metadata.get("chat_id") or not metadata.get("message_id"):
+                async def _disconnect_tool_clients(clients: Any) -> None:
+                    if not isinstance(clients, dict):
                         return
-                    if str(metadata.get("chat_id", "")).startswith("local:"):
-                        return
-                    try:
-                        from open_webui.utils.subagent import (
-                            reconcile_block_results_from_runs,
-                        )
-
-                        msg = (
-                            await Chats.get_message_by_id_and_message_id(
-                                metadata["chat_id"], metadata["message_id"]
+                    for server_id, client in clients.items():
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            log.exception(
+                                "Live tool refresh cleanup failed for MCP server %r",
+                                server_id,
                             )
-                            or {}
+
+                async def _apply_pending_tool_selection() -> dict | None:
+                    """Resolve and commit the latest selection before a provider round.
+
+                    Resolution happens off to the side. The active metadata/schema
+                    is swapped only after every selected tool loaded successfully,
+                    so a failed addition cannot destroy the still-working current
+                    tool set. If another toggle lands while MCP discovery is
+                    awaiting I/O, discard that intermediate build and resolve the
+                    newer full snapshot before returning.
+                    """
+
+                    redis = getattr(request.app.state, "redis", None)
+                    pending = await pop_pending_tool_selection(redis, task_id)
+                    if not pending:
+                        return None
+
+                    while pending:
+                        desired = normalize_live_tool_selection(pending)
+                        refresh_input_metadata = {
+                            key: value
+                            for key, value in metadata.items()
+                            if key not in {"tools", "mcp_clients"}
+                        }
+                        refresh_input_metadata.update(
+                            {
+                                "_tool_selection_refresh": True,
+                                "tool_ids": desired["tool_ids"],
+                                "tool_servers": copy.deepcopy(
+                                    desired["tool_servers"]
+                                ),
+                                "features": desired["features"],
+                                "live_tool_selection": desired,
+                                "params": {
+                                    **(
+                                        metadata.get("params")
+                                        if isinstance(metadata.get("params"), dict)
+                                        else {}
+                                    ),
+                                    **desired["params"],
+                                    "function_calling": "native",
+                                },
+                            }
                         )
-                        runs = msg.get("subagent_runs")
-                        if isinstance(runs, dict) and runs:
-                            reconcile_block_results_from_runs(content_blocks, runs)
+                        refresh_form_data = {
+                            "model": model_id,
+                            "stream": True,
+                            "messages": copy.deepcopy(
+                                metadata.get("_tool_selection_base_messages")
+                                or form_data.get("messages", [])
+                            ),
+                            "params": desired["params"],
+                            "tool_ids": desired["tool_ids"],
+                            "features": desired["features"],
+                        }
+                        refresh_model = (
+                            request.app.state.MODELS.get(model_id)
+                            if hasattr(request.app.state, "MODELS")
+                            else None
+                        ) or model
+
+                        try:
+                            (
+                                refreshed_form_data,
+                                refreshed_metadata,
+                                _,
+                            ) = await process_chat_payload(
+                                request,
+                                refresh_form_data,
+                                user,
+                                refresh_input_metadata,
+                                refresh_model,
+                            )
+                        except Exception as exc:
+                            # A newer click may have replaced the failed selection
+                            # while this one was loading. Prefer it before surfacing
+                            # an error for an already-obsolete snapshot.
+                            newer = await pop_pending_tool_selection(redis, task_id)
+                            if newer:
+                                await _disconnect_tool_clients(
+                                    refresh_input_metadata.get("mcp_clients")
+                                )
+                                pending = newer
+                                continue
+                            log.exception("Live tool selection refresh failed")
+                            await event_emitter(
+                                {
+                                    "type": "tool-selection:error",
+                                    "data": {
+                                        "operation_id": desired.get("operation_id"),
+                                        "message": str(exc),
+                                        "task_id": task_id,
+                                    },
+                                }
+                            )
+                            return {"applied": False}
+
+                        newer = await pop_pending_tool_selection(redis, task_id)
+                        if newer:
+                            await _disconnect_tool_clients(
+                                refreshed_metadata.get("mcp_clients")
+                            )
+                            pending = newer
+                            continue
+
+                        desired = normalize_live_tool_selection(
+                            refreshed_metadata.get("live_tool_selection") or desired
+                        )
+                        old_clients = metadata.get("mcp_clients") or {}
+                        for key in ("tools", "mcp_clients", "tool_ids", "tool_servers"):
+                            metadata.pop(key, None)
+                        for key in (
+                            "tools",
+                            "mcp_clients",
+                            "tool_ids",
+                            "tool_servers",
+                            "params",
+                        ):
+                            if key in refreshed_metadata:
+                                metadata[key] = refreshed_metadata[key]
+                        metadata["live_tool_selection"] = desired
+
+                        form_data["messages"] = refreshed_form_data.get(
+                            "messages", form_data.get("messages", [])
+                        )
+                        if refreshed_form_data.get("tools"):
+                            form_data["tools"] = refreshed_form_data["tools"]
+                        else:
+                            form_data.pop("tools", None)
+                        if "tool_choice" in refreshed_form_data:
+                            form_data["tool_choice"] = refreshed_form_data["tool_choice"]
+                        else:
+                            form_data.pop("tool_choice", None)
+
+                        # Current-round calls have all completed before this
+                        # boundary, so their old clients are now safe to close.
+                        await _disconnect_tool_clients(old_clients)
+
+                        return {"applied": True, "selection": desired}
+
+                def _round_base_messages() -> list:
+                    """Current `form_data["messages"]` through the pure
+                    `round_base_messages` (see its docstring: continuation bases
+                    end with this message's own partial turn, which every
+                    between-rounds assembly re-carries itself). Shared by the
+                    round loop and the mid-turn compaction planner so both see
+                    the same base."""
+                    return round_base_messages(
+                        form_data["messages"], metadata.get("message_id")
+                    )
+
+                async def _maybe_compact_between_rounds(force: bool = False) -> None:
+                    """Compaction gate for the agentic loop (COMPACTION.md §5).
+
+                    Trigger: the LAST round's ``usage.total_tokens`` reaches
+                    ``COMPACTION_THRESHOLD`` × the model's declared context
+                    window. ``response_usage`` is the right source — it is
+                    plain-ASSIGNED from each usage chunk (never summed across the
+                    tool loop, which is upstream's #27031 bug), so after round N
+                    it holds round N's payload and nothing else.
+
+                    Unknown window ⇒ never auto-compact: ``resolve_context_length``
+                    returns None rather than 0 precisely so this stays decidable.
+
+                    On a hit, the summarizer (the chat's own model, no
+                    ``max_tokens``) writes the narrative, and the anchor is
+                    spliced into ``content_blocks`` immediately after the last
+                    completed ``tool_calls`` block — the one boundary that can
+                    never dangle a ``tool_use``. The next request's conversion in
+                    ``blocks_to_api_messages`` sees the anchor and drops
+                    everything before it.
+
+                    Best-effort throughout: a failure leaves the turn running
+                    uncompacted, where the provider's own context-length error is
+                    what surfaces. It must never be the thing that kills a turn
+                    that is otherwise working.
+                    """
+                    context_length = resolve_context_length(model)
+                    total_tokens = usage_total_tokens(response_usage)
+                    if not force:
+                        # `force` is a `/compact` the user steered into this turn.
+                        # It overrides POLICY only — the feature flag, the
+                        # threshold, and an unresolvable window (that number is
+                        # display-only on the block, so not knowing it is no
+                        # reason to refuse an explicit request).
+                        if not ENABLE_CONVERSATION_COMPACTION:
+                            return
+                        if context_length is None:
+                            return
+                        if not should_compact(
+                            total_tokens, context_length, COMPACTION_THRESHOLD
+                        ):
+                            return
+                    # Anti-thrash: the trigger reads a number measured BEFORE the
+                    # previous cut took effect, so without this the round right
+                    # after a compaction would compact again. Kept under `force`
+                    # too — it is arithmetic, not policy: with nothing after the
+                    # last anchor there is nothing to summarize.
+                    if not has_uncompacted_span(
+                        [{"role": "assistant", "content_blocks": content_blocks}]
+                    ):
+                        if force:
+                            await event_emitter(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "compaction",
+                                        "description": (
+                                            "Nothing to compact — the context was "
+                                            "already compacted"
+                                        ),
+                                        "done": True,
+                                    },
+                                }
+                            )
+                        return
+
+                    # NO progress/completion status for a successful compaction —
+                    # see the matching note in `maybe_compact_at_turn_start`.
+                    # `status` events land in the message's persisted
+                    # `statusHistory`, so the pair "Compacting conversation
+                    # context" / "Compacted N messages" became a permanent second
+                    # copy of what the divider block already says, parked next to
+                    # it forever. The anchor block is the record. A FAILURE still
+                    # emits (below): that is the one outcome no block records.
+                    try:
+                        api_messages = await asyncio.to_thread(
+                            blocks_to_api_messages,
+                            [
+                                *_round_base_messages(),
+                                {
+                                    "role": "assistant",
+                                    "content_blocks": content_blocks,
+                                    "tool_result_bodies": _current_tool_result_bodies(),
+                                },
+                            ],
+                            model_id,
+                        )
+                        new_blocks, block = await compact_content_blocks(
+                            request,
+                            user,
+                            model_id=model_id,
+                            api_messages=api_messages,
+                            content_blocks=content_blocks,
+                            total_tokens=total_tokens,
+                            context_length=context_length,
+                        )
                     except Exception:
-                        log.exception("subagent result reconciliation failed")
+                        log.exception(
+                            "mid-turn compaction failed for chat %s",
+                            metadata.get("chat_id"),
+                        )
+                        await event_emitter(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "compaction",
+                                    "description": (
+                                        "Context compaction failed — continuing "
+                                        "with full history"
+                                    ),
+                                    "done": True,
+                                },
+                            }
+                        )
+                        return
+
+                    # Mutate IN PLACE: `content_blocks` is aliased by the stream
+                    # handler, the checkpointer, and `in_flight_assistant`, all of
+                    # which must see the anchor. Rebinding the name would leave
+                    # every one of them on the pre-cut list.
+                    content_blocks[:] = new_blocks
+
+                    # Record the envelope THIS cut will send. The router-side
+                    # capture deliberately skips an anchor on the in-flight
+                    # message (a whole-list write from there would race this
+                    # stream's own checkpoint), so the mid-turn path stores its
+                    # own — same assembly the next round runs, written into the
+                    # live block so it lands through `checkpoint_stream_state`
+                    # below rather than through a second, competing writer.
+                    try:
+                        post_cut = await asyncio.to_thread(
+                            blocks_to_api_messages,
+                            [
+                                *_round_base_messages(),
+                                {
+                                    "role": "assistant",
+                                    "content_blocks": content_blocks,
+                                    "tool_result_bodies": _current_tool_result_bodies(),
+                                },
+                            ],
+                            model_id,
+                        )
+                        capture = capture_compaction_envelope(post_cut)
+                        if capture is not None:
+                            anchor_index = capture["block_index"]
+                            if 0 <= anchor_index < len(content_blocks):
+                                anchor = content_blocks[anchor_index]
+                                if is_compaction_block(anchor):
+                                    anchor["envelope"] = capture["envelope"]
+                    except Exception:
+                        # Display-only. Never worth failing a compaction that
+                        # otherwise succeeded.
+                        log.exception(
+                            "capturing sent compaction envelope failed for chat %s",
+                            metadata.get("chat_id"),
+                        )
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {
+                                "content": serialize_content_blocks(content_blocks),
+                                "content_blocks": content_blocks,
+                            },
+                        }
+                    )
+                    # Durable before the next provider call: a crash between here
+                    # and the response would otherwise lose the narrative (which
+                    # is generate-once by contract) while keeping the cost.
+                    await checkpoint_stream_state(force=True)
+                    log.info(
+                        "compaction (mid-turn): chat=%s message=%s covers=%s "
+                        "tokens=%s/%s",
+                        metadata.get("chat_id"),
+                        metadata.get("message_id"),
+                        block.get("covers"),
+                        total_tokens,
+                        context_length,
+                    )
 
                 while len(tool_calls) > 0:
 
@@ -5164,6 +5850,34 @@ async def _process_chat_response_impl(
                     else:
                         response_tool_calls = tool_call_item
                         reasoning_details = None
+
+                    # Synthesize a stable id for any tool call the provider streamed
+                    # WITHOUT one (some OpenAI-compatible proxies omit 'id' on tool-call
+                    # deltas). If left empty, current_tool_call_id_var becomes '' and the
+                    # tool result is stored with tool_call_id='' — after which the
+                    # subagent's real answer is permanently unreachable to the parent
+                    # model: every later round and every reload re-emit
+                    # '[No output was produced for this tool call.]' because the result
+                    # row, the by_tool_call recovery map, AND reconcile_block_results all
+                    # key on a non-empty id. Assigning the id HERE (before the call goes
+                    # into content_blocks and before dispatch) keeps it consistent across
+                    # the persisted assistant message, the result row, the pinned
+                    # ContextVar, and reconcile. Mirrors response.py's call_{uuid4}.
+                    if isinstance(response_tool_calls, list):
+                        _seen_tc_ids: set = set()
+                        for _tc in response_tool_calls:
+                            if not isinstance(_tc, dict):
+                                continue
+                            _id = _tc.get("id")
+                            # C24: synthesize for a missing id AND reassign a fresh id
+                            # to any DUPLICATE non-empty id (a misbehaving provider can
+                            # send two distinct calls with the same id). A collision in
+                            # the subagent side-channel (subagent_id_by_tool_call[id])
+                            # otherwise overwrites the first, stranding one card.
+                            if not _id or _id in _seen_tc_ids:
+                                _id = f"call_{str(uuid4())}"
+                                _tc["id"] = _id
+                            _seen_tc_ids.add(_id)
 
                     content_blocks.append(
                         {
@@ -5187,341 +5901,114 @@ async def _process_chat_response_impl(
 
                     tools = metadata.get("tools", {})
 
-                    async def _execute_tool_call(tool_call):
-                        tool_call_id = tool_call.get("id", "")
-                        tool_function_name = tool_call.get("function", {}).get(
-                            "name", ""
-                        )
-                        # Pin the tool_call_id for this branch of the gather so
-                        # the tool callable can look it up via
-                        # `current_tool_call_id_var.get()` (used by the subagent
-                        # tool to wire its subagent_id back to the right
-                        # parent tool call).
-                        current_tool_call_id_var.set(tool_call_id)
-                        tool_args = tool_call.get("function", {}).get("arguments", "{}")
+                    execute_tool_call = partial(
+                        _execute_one_tool_call,
+                        request=request,
+                        metadata=metadata,
+                        model=model,
+                        user=user,
+                        tools=tools,
+                        event_emitter=event_emitter,
+                        event_caller=event_caller,
+                        response_handler_task=response_handler_task,
+                    )
 
-                        tool_function_params = parse_tool_call_arguments(tool_args)
-                        if not tool_function_params and str(
-                            tool_args or "{}"
-                        ).strip() not in {
-                            "",
-                            "{}",
-                        }:
-                            log.error(f"Error parsing tool call arguments: {tool_args}")
 
-                        # Mutate the original tool call response params as they are passed back to the passed
-                        # back to the LLM via the content blocks. If they are in a json block and are invalid json,
-                        # this can cause downstream LLM integrations to fail (e.g. bedrock gateway) where response
-                        # params are not valid json.
-                        # Main case so far is no args = "" = invalid json.
-                        log.debug(
-                            f"Parsed args from {tool_args} to {tool_function_params}"
-                        )
-                        tool_call.setdefault("function", {})["arguments"] = json.dumps(
-                            tool_function_params
-                        )
+                    name_by_id = {
+                        tc.get("id"): tc.get("function", {}).get("name", "")
+                        for tc in response_tool_calls
+                        if isinstance(tc, dict)
+                    }
+                    msg_id = metadata.get("message_id")
+                    allow_lazy_tool_results = (
+                        STREAM_PROTOCOL_VERSION == "v2.1"
+                        and not str(metadata.get("chat_id", "")).startswith("local:")
+                    )
+                    v21_mirror = getattr(event_emitter, "_v21_mirror", None)
+                    emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
+                    can_stream_tool_results = bool(
+                        STREAM_PROTOCOL_VERSION == "v2.1"
+                        and msg_id
+                        and v21_mirror is not None
+                        and emit_raw is not None
+                    )
 
-                        tool_result = None
-                        tool = None
-                        tool_type = None
-                        direct_tool = False
-                        # Set when the tool callable raises; surfaced on the result
-                        # entry so the collapsed tool-call row shows an error.
-                        tool_exec_error = None
+                    tc_block = content_blocks[-1]
+                    results = [None] * len(response_tool_calls)
+                    tc_block["results"] = []
 
-                        if tool_function_name in tools:
-                            tool = tools[tool_function_name]
-                            spec = tool.get("spec", {})
+                    async def land_tool_result(index, result):
+                        """Land ONE finished tool call.
 
-                            tool_type = tool.get("type", "")
-                            direct_tool = tool.get("direct", False)
+                        Tool calls in a round finish at wildly different times (a
+                        cached web_fetch in 200ms next to a 40s subagent), so a
+                        result is slimmed, stored and broadcast the moment ITS call
+                        returns rather than when the round does. The block's
+                        `results` stay in tool-call order and only ever contain
+                        calls that have actually finished, which is also what makes
+                        a mid-round checkpoint (or an interrupted turn) persist the
+                        work that did complete.
+                        """
+                        if not result:
+                            results[index] = result
+                            return result
 
-                            try:
-                                allowed_params = (
-                                    spec.get("parameters", {})
-                                    .get("properties", {})
-                                    .keys()
+                        tc_id = result.get("tool_call_id")
+                        slim_result = result
+                        if allow_lazy_tool_results:
+                            # Keep canonical content_blocks slim: full web bodies
+                            # live in tool_result_bodies and are hydrated only for
+                            # model replay / explicit UI expansion.
+                            slim_result, body_result = _slim_tool_result(
+                                result, name_by_id.get(tc_id, ""), store_body=True
+                            )
+                            if body_result is not None and msg_id and tc_id:
+                                set_tool_result_body(msg_id, tc_id, body_result)
+                                # Newly produced this round: keep a wipe-immune copy
+                                # and queue it for the per-round durable write-
+                                # through below (it isn't in the DB row yet).
+                                generation_tool_result_bodies[str(tc_id)] = body_result
+                                pending_db_body_merges[str(tc_id)] = body_result
+
+                        results[index] = slim_result
+                        tc_block["results"] = [r for r in results if r]
+
+                        if can_stream_tool_results and tc_id:
+                            sent = v21_mirror.setdefault("tool_results_sent", set())
+                            if tc_id not in sent:
+                                set_tool_result(msg_id, tc_id, slim_result)
+                                sent.add(tc_id)
+                                await emit_raw(
+                                    {
+                                        "type": "tool_call:result",
+                                        "data": _tool_result_event_data(
+                                            msg_id, slim_result
+                                        ),
+                                    }
                                 )
-
-                                tool_function_params = {
-                                    k: v
-                                    for k, v in tool_function_params.items()
-                                    if k in allowed_params
+                        elif len(response_tool_calls) > 1:
+                            # No raw v2.1 channel here — a legacy-protocol stream, or
+                            # a subagent's inner turn, whose emitters both learn about
+                            # results by diffing the blocks of a chat:completion. Ship
+                            # one so those surfaces land calls individually too. Not
+                            # worth it for a single call: its landing IS the round end,
+                            # which emits this anyway.
+                            await event_emitter(
+                                {
+                                    "type": "chat:completion",
+                                    "data": {
+                                        "content": serialize_content_blocks(
+                                            content_blocks
+                                        ),
+                                        "content_blocks": content_blocks,
+                                    },
                                 }
-
-                                if direct_tool:
-                                    tool_result = await event_caller(
-                                        {
-                                            "type": "execute:tool",
-                                            "data": {
-                                                "id": str(uuid4()),
-                                                "name": tool_function_name,
-                                                "params": tool_function_params,
-                                                "server": tool.get("server", {}),
-                                                "session_id": metadata.get(
-                                                    "session_id", None
-                                                ),
-                                            },
-                                        }
-                                    )
-
-                                else:
-                                    tool_function = tool["callable"]
-                                    # Live browser progress: while a browser_*
-                                    # MCP call on the container server runs (it
-                                    # blocks here, possibly for many seconds),
-                                    # shadow it with a poller that reads the
-                                    # daemon's live.jpg/state.json host-side and
-                                    # pushes frames + status to the UI. Cancelled
-                                    # the instant the call returns. Best-effort:
-                                    # never let it affect the tool result.
-                                    _browser_poller = None
-                                    try:
-                                        _tmeta = tool.get("metadata", {}) or {}
-                                        _container_id = _normalize_container_server_id(
-                                            str(
-                                                getattr(
-                                                    request.app.state.config,
-                                                    "CONTAINER_MCP_SERVER_ID",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                        )
-                                        _is_browser_tool = (
-                                            tool.get("type") == "mcp"
-                                            and _container_id
-                                            and _normalize_container_server_id(
-                                                str(_tmeta.get("server_id", ""))
-                                            )
-                                            == _container_id
-                                            and str(
-                                                _tmeta.get("original_name", "")
-                                            ).startswith("browser_")
-                                        )
-                                        if _is_browser_tool:
-                                            _data_root = str(
-                                                getattr(
-                                                    request.app.state.config,
-                                                    "CONTAINER_DATA_ROOT",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                            # The daemon writes live.jpg/state.json
-                                            # under the workspace keyed by the SAME
-                                            # chat_id the container header carries.
-                                            # For a subagent that is the PARENT chat
-                                            # (container_workspace_chat_id), not the
-                                            # subagent's own chat_id — otherwise the
-                                            # poller reads an empty dir and the live
-                                            # view never updates during subagent
-                                            # browsing. For a normal chat the key is
-                                            # absent and this falls back to chat_id,
-                                            # so main-loop behavior is unchanged.
-                                            _poller_chat_id = metadata.get(
-                                                "container_workspace_chat_id"
-                                            ) or metadata.get("chat_id")
-                                            if _data_root and _poller_chat_id:
-                                                _browser_poller = asyncio.create_task(
-                                                    browser_progress_poller(
-                                                        data_root=_data_root,
-                                                        chat_id=_poller_chat_id,
-                                                        message_id=metadata.get(
-                                                            "message_id"
-                                                        ),
-                                                        session_id=metadata.get(
-                                                            "session_id"
-                                                        ),
-                                                        event_emitter=event_emitter,
-                                                        # The per-AGENT browser tab
-                                                        # this call drives. Parent =>
-                                                        # "main" (browser_session
-                                                        # absent); subagent => its
-                                                        # subagent_id (set in
-                                                        # _subagent_container_shared_context).
-                                                        # The poller reads that one
-                                                        # session's live files and
-                                                        # tags frames with it so the
-                                                        # UI groups tabs correctly.
-                                                        session=metadata.get(
-                                                            "browser_session"
-                                                        )
-                                                        or "main",
-                                                    )
-                                                )
-                                    except Exception:
-                                        _browser_poller = None
-                                    try:
-                                        tool_result = await tool_function(
-                                            **tool_function_params
-                                        )
-                                    finally:
-                                        if _browser_poller is not None:
-                                            _browser_poller.cancel()
-                                            # Await the poller's terminal emit so
-                                            # the final frame + terminal (done)
-                                            # status land BEFORE the next tool
-                                            # call's poller starts — otherwise a
-                                            # late "Loaded" could race ahead of
-                                            # the next "Navigating", and pollers
-                                            # could pile up across calls. The
-                                            # poller swallows its own cancel and
-                                            # returns, so this just drains it;
-                                            # bounded so a wedged emit can't stall
-                                            # the turn.
-                                            try:
-                                                await asyncio.wait_for(
-                                                    _browser_poller, timeout=2.0
-                                                )
-                                            except (asyncio.TimeoutError, Exception):
-                                                # Swallow the poller's own
-                                                # timeout/errors. CancelledError
-                                                # (BaseException) is intentionally
-                                                # NOT caught so an outer cancel of
-                                                # the tool call still propagates.
-                                                pass
-
-                            except Exception as e:
-                                tool_result = str(e)
-                                # A raised tool exception is an error the UI
-                                # should surface on the collapsed row, not just
-                                # bury inside the result content. process_tool_result
-                                # may still enrich this (e.g. _owui_meta), so seed
-                                # a generic error and let it override the reason.
-                                tool_exec_error = str(e)
-                        else:
-                            # Model emitted a tool name we don't have
-                            # registered for this turn. Most common cause:
-                            # a saved chat is being replayed and the model
-                            # parrots back an old tool name (pre-rename, or
-                            # from an MCP server that's been removed). The
-                            # request continues with an empty result -- the
-                            # model usually adapts -- but log it so this is
-                            # debuggable instead of silently degrading.
-                            log.warning(
-                                "Tool call for unknown function %r; " "known tools: %s",
-                                tool_function_name,
-                                sorted(tools.keys()),
                             )
+                        return slim_result
 
-                        try:
-                            (
-                                tool_result,
-                                tool_result_files,
-                                tool_result_embeds,
-                                tool_result_vision_attachments,
-                                tool_result_meta,
-                            ) = await process_tool_result(
-                                request,
-                                tool_function_name,
-                                tool_result,
-                                tool_type,
-                                direct_tool,
-                                metadata,
-                                user,
-                                model,
-                            )
-                        except Exception as e:
-                            # Post-processing a tool result (image persistence,
-                            # embed/UI unwrapping, JSON shaping) must NEVER tear
-                            # down the turn or a subagent. The tool itself already
-                            # ran (this is exactly what killed the gyms research
-                            # chat: a browser_snapshot succeeded, but persisting its
-                            # PNG raised and the whole parent turn + 5 subagents
-                            # died). Degrade to a usable error result so the loop
-                            # proceeds with a per-call error row.
-                            log.exception(
-                                "process_tool_result failed for tool %r; degrading "
-                                "to an error result so the turn can continue",
-                                tool_function_name,
-                            )
-                            tool_result = (
-                                f"Tool '{tool_function_name}' ran but its result "
-                                f"could not be processed: {e}"
-                            )
-                            tool_result_files = []
-                            tool_result_embeds = []
-                            tool_result_vision_attachments = []
-                            tool_result_meta = {
-                                "error": True,
-                                "error_reason": "result post-processing failed",
-                            }
-
-                        # Fold a raised-exception error into the structured meta so
-                        # the UI shows the error row. An explicit _owui_meta reason
-                        # (e.g. from a web tool) takes precedence over the generic
-                        # exception string.
-                        if tool_exec_error is not None:
-                            tool_result_meta = tool_result_meta or {}
-                            tool_result_meta["error"] = True
-                            tool_result_meta.setdefault(
-                                "error_reason", tool_exec_error
-                            )
-                        tool_result_meta = tool_result_meta or {}
-
-                        # If the tool was a subagent_launch / subagent_continue,
-                        # the tool callable stamped its subagent_id into
-                        # `request.state.subagent_id_by_tool_call` keyed by
-                        # tool_call_id. Surface it on the result entry so
-                        # serialize_content_blocks can render a subagent block
-                        # rather than the generic tool_calls collapsible, and
-                        # so the saved chat row carries the link to the
-                        # subagent chat after reload.
-                        subagent_id_for_call = None
-                        try:
-                            subagent_id_for_call = getattr(
-                                request.state, "subagent_id_by_tool_call", {}
-                            ).get(tool_call_id)
-                        except Exception:
-                            subagent_id_for_call = None
-
-                        return {
-                            "tool_call_id": tool_call_id,
-                            "content": tool_result or "",
-                            **(
-                                {"files": tool_result_files}
-                                if tool_result_files
-                                else {}
-                            ),
-                            **(
-                                {"embeds": tool_result_embeds}
-                                if tool_result_embeds
-                                else {}
-                            ),
-                            **(
-                                {"vision_attachments": tool_result_vision_attachments}
-                                if tool_result_vision_attachments
-                                else {}
-                            ),
-                            **(
-                                {"subagent_id": subagent_id_for_call}
-                                if subagent_id_for_call
-                                else {}
-                            ),
-                            **(
-                                {"error": True}
-                                if tool_result_meta.get("error")
-                                else {}
-                            ),
-                            **(
-                                {"error_reason": tool_result_meta["error_reason"]}
-                                if tool_result_meta.get("error_reason")
-                                else {}
-                            ),
-                            **(
-                                {"notice": tool_result_meta["notice"]}
-                                if tool_result_meta.get("notice")
-                                else {}
-                            ),
-                        }
-
-                    def _is_parallelizable(tool_call):
-                        name = tool_call.get("function", {}).get("name", "")
-                        tool = tools.get(name)
-                        return bool(
-                            tool
-                            and tool.get("metadata", {}).get("parallelizable", False)
+                    async def run_tool_call(index):
+                        return await land_tool_result(
+                            index, await execute_tool_call(response_tool_calls[index])
                         )
 
                     # Group consecutive parallelizable tool calls so they run concurrently
@@ -5530,53 +6017,15 @@ async def _process_chat_response_impl(
                     # it waits until it completes. This keeps state-mutating tools strictly
                     # ordered while letting read-only tools (web_search, web_fetch, ...) run
                     # in parallel. Result order matches the tool_calls input order.
-                    def _result_for_failed_call(tool_call, exc):
-                        """Build a non-empty error tool-result so one failed/cancelled
-                        parallel tool call doesn't abandon the whole round. The model
-                        sees the error for THAT call and can proceed with its siblings'
-                        results (or retry)."""
-                        tcid = tool_call.get("id", "") if isinstance(tool_call, dict) else ""
-                        name = (
-                            tool_call.get("function", {}).get("name", "")
-                            if isinstance(tool_call, dict)
-                            else ""
-                        )
-                        msg = (
-                            "was cancelled or timed out"
-                            if isinstance(exc, asyncio.CancelledError)
-                            else f"failed: {exc}"
-                        )
-                        error_reason = (
-                            "cancelled or timed out"
-                            if isinstance(exc, asyncio.CancelledError)
-                            else "failed"
-                        )
-                        subagent_id_for_call = None
-                        try:
-                            subagent_id_for_call = getattr(
-                                request.state, "subagent_id_by_tool_call", {}
-                            ).get(tcid)
-                        except Exception:
-                            subagent_id_for_call = None
-                        return {
-                            "tool_call_id": tcid,
-                            "content": f"Tool '{name}' {msg}.",
-                            "error": True,
-                            "error_reason": error_reason,
-                            **(
-                                {"subagent_id": subagent_id_for_call}
-                                if subagent_id_for_call
-                                else {}
-                            ),
-                        }
 
-                    results = [None] * len(response_tool_calls)
                     i = 0
                     while i < len(response_tool_calls):
-                        if _is_parallelizable(response_tool_calls[i]):
+                        if _tool_call_is_parallelizable(response_tool_calls[i], tools):
                             j = i
-                            while j < len(response_tool_calls) and _is_parallelizable(
-                                response_tool_calls[j]
+                            while j < len(
+                                response_tool_calls
+                            ) and _tool_call_is_parallelizable(
+                                response_tool_calls[j], tools
                             ):
                                 j += 1
                             # return_exceptions=True so ONE parallel call raising
@@ -5587,10 +6036,7 @@ async def _process_chat_response_impl(
                             # message never finalized and no follow-up request (the
                             # user had to manually type "continue").
                             batch_results = await asyncio.gather(
-                                *[
-                                    _execute_tool_call(response_tool_calls[k])
-                                    for k in range(i, j)
-                                ],
+                                *[run_tool_call(k) for k in range(i, j)],
                                 return_exceptions=True,
                             )
                             # A GENUINE user-stop cancels the parent task itself.
@@ -5610,9 +6056,13 @@ async def _process_chat_response_impl(
                                             "parallel tool call cancelled in isolation "
                                             "(not a user stop) — converting to an error "
                                             "result so the round can proceed: %s",
-                                            failed_call.get("function", {}).get("name", "")
-                                            if isinstance(failed_call, dict)
-                                            else failed_call,
+                                            (
+                                                failed_call.get("function", {}).get(
+                                                    "name", ""
+                                                )
+                                                if isinstance(failed_call, dict)
+                                                else failed_call
+                                            ),
                                         )
                                     else:
                                         log.error(
@@ -5620,49 +6070,23 @@ async def _process_chat_response_impl(
                                             result,
                                             exc_info=result,
                                         )
-                                    results[i + offset] = _result_for_failed_call(
-                                        failed_call, result
+                                    # The failure only becomes a result here, so
+                                    # this is the moment it lands — same path as a
+                                    # call that returned normally.
+                                    await land_tool_result(
+                                        i + offset,
+                                        _tool_result_for_failed_call(
+                                            failed_call, result, request=request
+                                        ),
                                     )
-                                else:
-                                    results[i + offset] = result
                             i = j
                         else:
-                            results[i] = await _execute_tool_call(
-                                response_tool_calls[i]
-                            )
+                            await run_tool_call(i)
                             i += 1
 
-                    name_by_id = {
-                        tc.get("id"): tc.get("function", {}).get("name", "")
-                        for tc in response_tool_calls
-                        if isinstance(tc, dict)
-                    }
-                    msg_id = metadata.get("message_id")
-                    slim_results = []
-                    allow_lazy_tool_results = (
-                        STREAM_PROTOCOL_VERSION == "v2.1"
-                        and not str(metadata.get("chat_id", "")).startswith("local:")
-                    )
-                    if allow_lazy_tool_results:
-                        for r in results:
-                            if not r:
-                                slim_results.append(r)
-                                continue
-                            tc_id = r.get("tool_call_id")
-                            slim_result, body_result = _slim_tool_result(
-                                r, name_by_id.get(tc_id, ""), store_body=True
-                            )
-                            if body_result is not None and msg_id and tc_id:
-                                set_tool_result_body(msg_id, tc_id, body_result)
-                            slim_results.append(slim_result)
-                    else:
-                        slim_results = results
-
-                    # Under v2.1, keep canonical content_blocks slim after tool
-                    # execution. Full web bodies live in tool_result_bodies and
-                    # are hydrated only for model replay / explicit UI expansion.
-                    tc_block = content_blocks[-1]
-                    tc_block["results"] = slim_results
+                    # Every result was slimmed, stored and broadcast as its call
+                    # landed; the round only has to close the block over them.
+                    tc_block["results"] = [r for r in results if r]
                     if (
                         tc_block.get("started_at") is not None
                         and tc_block.get("ended_at") is None
@@ -5678,98 +6102,6 @@ async def _process_chat_response_impl(
                         }
                     )
 
-                    if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
-                        msg_id = metadata["message_id"]
-                        v21_mirror = getattr(event_emitter, "_v21_mirror", None)
-                        emit_raw = getattr(event_emitter, "_emit_raw_primary", None)
-                        if v21_mirror is not None and emit_raw is not None:
-                            sent = v21_mirror.setdefault("tool_results_sent", set())
-                            for slim_result in slim_results:
-                                if not slim_result:
-                                    continue
-                                tc_id = slim_result.get("tool_call_id")
-                                if not tc_id or tc_id in sent:
-                                    continue
-                                set_tool_result(msg_id, tc_id, slim_result)
-                                sent.add(tc_id)
-                                await emit_raw(
-                                    {
-                                        "type": "tool_call:result",
-                                        "data": {
-                                            "message_id": msg_id,
-                                            "tool_call_id": tc_id,
-                                            "result": slim_result.get("content"),
-                                            **(
-                                                {
-                                                    "result_ref": slim_result[
-                                                        "result_ref"
-                                                    ]
-                                                }
-                                                if slim_result.get("result_ref")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"result_lazy": True}
-                                                if slim_result.get("result_lazy")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"size": slim_result["size"]}
-                                                if slim_result.get("size") is not None
-                                                else {}
-                                            ),
-                                            **(
-                                                {"sha256": slim_result["sha256"]}
-                                                if slim_result.get("sha256")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"summary": slim_result["summary"]}
-                                                if slim_result.get("summary")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"files": slim_result["files"]}
-                                                if slim_result.get("files")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"embeds": slim_result["embeds"]}
-                                                if slim_result.get("embeds")
-                                                else {}
-                                            ),
-                                            **(
-                                                {
-                                                    "subagent_id": slim_result[
-                                                        "subagent_id"
-                                                    ]
-                                                }
-                                                if slim_result.get("subagent_id")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"error": True}
-                                                if slim_result.get("error")
-                                                else {}
-                                            ),
-                                            **(
-                                                {
-                                                    "error_reason": slim_result[
-                                                        "error_reason"
-                                                    ]
-                                                }
-                                                if slim_result.get("error_reason")
-                                                else {}
-                                            ),
-                                            **(
-                                                {"notice": slim_result["notice"]}
-                                                if slim_result.get("notice")
-                                                else {}
-                                            ),
-                                        },
-                                    }
-                                )
-
                     await event_emitter(
                         {
                             "type": "chat:completion",
@@ -5780,6 +6112,43 @@ async def _process_chat_response_impl(
                         }
                     )
                     await checkpoint_stream_state(force=True)
+
+                    # Layer 2 — per-round DB write-through (the durability layer).
+                    # Before this existed, a large tool body was only persisted at
+                    # the coarse checkpoint / final save, so a server restart or a
+                    # socket-store wipe mid-turn lost every body accumulated so far
+                    # and the NEXT round raised "Missing tool result body for ref
+                    # ...". Merge this round's newly produced bodies straight into
+                    # the durable row now (targeted jsonb union — never reserializes
+                    # the rest of meta). On failure the batch stays in
+                    # pending_db_body_merges and is retried next round; the terminal
+                    # persist (union semantics) is the last-resort carrier.
+                    if (
+                        allow_lazy_tool_results
+                        and metadata.get("chat_id")
+                        and msg_id
+                        and not str(metadata.get("chat_id", "")).startswith("local:")
+                        and pending_db_body_merges
+                    ):
+                        try:
+                            # merge_message_tool_result_bodies swallows its own
+                            # exceptions and returns False on failure — only a
+                            # True return may drain the retry buffer, otherwise a
+                            # transient DB failure would silently drop the batch.
+                            if await Chats.merge_message_tool_result_bodies(
+                                metadata["chat_id"], msg_id, pending_db_body_merges
+                            ):
+                                pending_db_body_merges.clear()
+                            else:
+                                log.error(
+                                    "per-round tool_result_bodies write-through "
+                                    "failed (will retry next round)"
+                                )
+                        except Exception:
+                            log.exception(
+                                "per-round tool_result_bodies write-through failed "
+                                "(will retry next round)"
+                            )
 
                     try:
                         # Check for pending model switch
@@ -5840,6 +6209,11 @@ async def _process_chat_response_impl(
                         # its final answer with no further tools) stay in the queue
                         # and fall through to the post-completion drain as a normal
                         # follow-up generation. Best-effort: never break the loop.
+                        consumed_steer_ids: list[str] = []
+                        # Armed by a `/compact` steer just below; read by the
+                        # compaction gate immediately after. Per-round: the
+                        # command applies to the boundary the user asked at.
+                        compact_requested = False
                         if (
                             metadata.get("chat_id")
                             and not metadata.get("subagent_inner")
@@ -5851,9 +6225,24 @@ async def _process_chat_response_impl(
                                     broadcast_queue_state,
                                 )
 
-                                steer_items = await Chats.pop_steer_items_by_id(
-                                    metadata["chat_id"]
-                                )
+                                # PEEK (non-destructive), then delete only the
+                                # steers we actually inject — and only AFTER they're
+                                # checkpointed into content_blocks (below). Skip ids
+                                # already delivered this turn (a prior round whose
+                                # durable delete silently failed) so we never inject
+                                # the same steer twice. Steers with no id can't be
+                                # tracked/deleted safely, so they're left for the
+                                # post-completion drain (delivered as a follow-up).
+                                steer_items = [
+                                    s
+                                    for s in await Chats.peek_steer_items_by_id(
+                                        metadata["chat_id"]
+                                    )
+                                    if isinstance(s, dict)
+                                    and s.get("id")
+                                    and s.get("id") not in delivered_steer_ids
+                                ]
+                                consumed_steer_ids = [s.get("id") for s in steer_items]
                                 steer_blocks = []
                                 for steer_item in steer_items:
                                     steer_text = (
@@ -5861,6 +6250,18 @@ async def _process_chat_response_impl(
                                         or steer_item.get("prompt")
                                         or ""
                                     ).strip()
+                                    if is_compact_command(steer_text):
+                                        # `/compact` is a command, not something
+                                        # to say to the model: it must NOT become
+                                        # a user_steer block (which would put the
+                                        # literal text in the transcript and in
+                                        # the next request). It is still consumed
+                                        # like any other steer — same dedupe, same
+                                        # deferred delete — and arms the gate a
+                                        # few lines below, which is already the
+                                        # safe cut point for this round.
+                                        compact_requested = True
+                                        continue
                                     if steer_text:
                                         steer_blocks.append(
                                             {
@@ -5904,17 +6305,56 @@ async def _process_chat_response_impl(
                                         }
                                     )
                                     await checkpoint_stream_state(force=True)
-                                    # Shrink the chip strip on every tab now that
-                                    # the steer items left the queue.
-                                    await broadcast_queue_state(
-                                        metadata.get("user_id"),
-                                        metadata["chat_id"],
-                                    )
+
+                                # The steer is now durably part of THIS turn's
+                                # content_blocks (it will be persisted whether
+                                # the round succeeds, errors, or is cancelled).
+                                # So remove it from the queue NOW — deferring to
+                                # after the model call would leave it queued if a
+                                # Stop/error landed mid-call, and clear_draining
+                                # would then downgrade it to after_final → the
+                                # same steer both in the message AND re-queued as
+                                # a duplicate follow-up. Mark delivered first so a
+                                # silent delete failure can't re-inject it.
+                                #
+                                # Keyed on CONSUMED, not on `steer_blocks`: a
+                                # `/compact` steer produces no block, and leaving
+                                # it queued would re-arm the gate every round
+                                # (compacting forever) and finally drain as a
+                                # follow-up turn whose prompt is the literal
+                                # "/compact".
+                                if consumed_steer_ids:
+                                    delivered_steer_ids.update(consumed_steer_ids)
+                                    try:
+                                        await Chats.remove_steer_items_by_ids(
+                                            metadata["chat_id"], consumed_steer_ids
+                                        )
+                                        await broadcast_queue_state(
+                                            metadata.get("user_id"),
+                                            metadata["chat_id"],
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            "steer consume failed for chat %s",
+                                            metadata.get("chat_id"),
+                                        )
+                                    consumed_steer_ids = []
                             except Exception:
                                 log.exception(
                                     "steer injection failed for chat %s",
                                     metadata.get("chat_id"),
                                 )
+
+                        # Conversation compaction, mid-turn half of the gate.
+                        # COMPACTION.md §5: one gate evaluated before EVERY model
+                        # request, not just at turn boundaries — this is
+                        # OpenHands' shape, and it is also the only design that
+                        # helps a single long research turn, which message-
+                        # boundary compaction cannot touch. Runs here, at the
+                        # last quiet point before the next provider call, after
+                        # the steer/tool-selection drains so the anchor lands
+                        # over the FINAL block layout of this round.
+                        await _maybe_compact_between_rounds(force=compact_requested)
 
                         in_flight_assistant: dict = {
                             "role": "assistant",
@@ -5925,6 +6365,34 @@ async def _process_chat_response_impl(
                         # the next model round sees every subagent's real output rather
                         # than the "[No output...]" placeholder.
                         await _reconcile_subagent_results()
+                        # Mirror the blessed PERSISTED path (utils/chat.py): carry the
+                        # durable subagent_runs answer mirror onto the between-rounds
+                        # assistant so blocks_to_api_messages/_expand_assistant can
+                        # recover a slimmed/empty subagent result from
+                        # subagent_runs.final_text. Without this the live between-rounds
+                        # round can feed the model "[No output...]" for a subagent whose
+                        # tool_result_bodies write was lost.
+                        if (
+                            metadata.get("chat_id")
+                            and metadata.get("message_id")
+                            and not str(metadata.get("chat_id", "")).startswith(
+                                "local:"
+                            )
+                        ):
+                            try:
+                                _msg = (
+                                    await Chats.get_message_by_id_and_message_id(
+                                        metadata["chat_id"], metadata["message_id"]
+                                    )
+                                    or {}
+                                )
+                                _runs = _msg.get("subagent_runs")
+                                if isinstance(_runs, dict) and _runs:
+                                    in_flight_assistant["subagent_runs"] = _runs
+                            except Exception:
+                                log.exception(
+                                    "subagent_runs forward to in_flight_assistant failed"
+                                )
                         tool_result_bodies = _current_tool_result_bodies()
                         if tool_result_bodies:
                             in_flight_assistant["tool_result_bodies"] = (
@@ -5935,12 +6403,110 @@ async def _process_chat_response_impl(
                                 round_reasoning_details
                             )
 
+                        # Live tool selection is the final asynchronous boundary
+                        # before constructing and issuing the next provider
+                        # request. Drain until quiet: an update can be acknowledged
+                        # while MCP discovery, steering, reconciliation, or the UI
+                        # event for an earlier update is awaiting I/O. Once the
+                        # final empty check returns, no await remains before the
+                        # provider call below.
+                        selection_before_boundary = normalize_live_tool_selection(
+                            metadata.get("live_tool_selection") or {}
+                        )
+                        applied_selection = None
+                        applied_since_publish = False
+                        tool_selection_change_index = None
+                        while True:
+                            tool_selection_outcome = (
+                                await _apply_pending_tool_selection()
+                            )
+                            if tool_selection_outcome is not None:
+                                if not tool_selection_outcome.get("applied"):
+                                    continue
+                                applied_selection = tool_selection_outcome.get(
+                                    "selection"
+                                )
+                                applied_since_publish = True
+                                continue
+                            if not applied_since_publish:
+                                break
+
+                            tool_selection_change = (
+                                build_tool_selection_change_block(
+                                    selection_before_boundary, applied_selection
+                                )
+                                if applied_selection is not None
+                                else None
+                            )
+                            await event_emitter(
+                                {
+                                    "type": "tool-selection:applied",
+                                    "data": {
+                                        "operation_id": applied_selection.get(
+                                            "operation_id"
+                                        ),
+                                        "task_id": task_id,
+                                        "added": (tool_selection_change or {}).get(
+                                            "added", []
+                                        ),
+                                        "removed": (tool_selection_change or {}).get(
+                                            "removed", []
+                                        ),
+                                    },
+                                }
+                            )
+
+                            content_blocks_changed = False
+                            if tool_selection_change_index is not None:
+                                if tool_selection_change:
+                                    content_blocks[tool_selection_change_index] = (
+                                        tool_selection_change
+                                    )
+                                else:
+                                    content_blocks.pop(tool_selection_change_index)
+                                    tool_selection_change_index = None
+                                content_blocks_changed = True
+                            elif tool_selection_change:
+                                trailing = None
+                                if (
+                                    content_blocks
+                                    and content_blocks[-1].get("type") == "text"
+                                    and not (
+                                        content_blocks[-1].get("content") or ""
+                                    ).strip()
+                                ):
+                                    trailing = content_blocks.pop()
+                                tool_selection_change_index = len(content_blocks)
+                                content_blocks.append(tool_selection_change)
+                                content_blocks.append(
+                                    trailing
+                                    if trailing is not None
+                                    else {"type": "text", "content": ""}
+                                )
+                                content_blocks_changed = True
+
+                            if content_blocks_changed:
+                                await event_emitter(
+                                    {
+                                        "type": "chat:completion",
+                                        "data": {
+                                            "content": serialize_content_blocks(
+                                                content_blocks
+                                            ),
+                                            "content_blocks": content_blocks,
+                                        },
+                                    }
+                                )
+                                await checkpoint_stream_state(force=True)
+
+                            applied_since_publish = False
+
                         new_form_data = {
                             **form_data,
                             "model": model_id,
                             "stream": True,
                             "messages": [
-                                *form_data["messages"],
+                                *_round_base_messages(),
                                 in_flight_assistant,
                             ],
                         }
@@ -5972,12 +6538,14 @@ async def _process_chat_response_impl(
                                 },
                             ]
 
+                        _round_response = await generate_chat_completion(
+                            request,
+                            new_form_data,
+                            user,
+                        )
+
                         res = await _run_round_with_retry(
-                            await generate_chat_completion(
-                                request,
-                                new_form_data,
-                                user,
-                            ),
+                            _round_response,
                             new_form_data,
                         )
 
@@ -6013,16 +6581,29 @@ async def _process_chat_response_impl(
                                     except:
                                         error_msg = error_content
 
+                                    # Surface this as a terminal error so the turn
+                                    # finalizes VISIBLY (the terminal-error path
+                                    # persists error + sweeps subagents) rather than
+                                    # falling through to the clean finalizer with
+                                    # done:true despite the error we just emitted.
+                                    terminal_error = _provider_error_payload(
+                                        error_msg,
+                                        retries_exhausted=round_retries_exhausted,
+                                    )
                                     await event_emitter(
                                         {
                                             "type": "chat:message:error",
-                                            "data": {
-                                                "error": {"content": str(error_msg)}
-                                            },
+                                            "data": {"error": terminal_error},
                                         }
                                     )
                             except Exception as read_err:
                                 log.error(f"Could not read error response: {read_err}")
+                            if terminal_error is None:
+                                # No readable body — still finalize visibly.
+                                terminal_error = _provider_error_payload(
+                                    None,
+                                    retries_exhausted=round_retries_exhausted,
+                                )
                             break
                     except Exception as e:
                         log.exception(f"Error in tool loop: {e}")
@@ -6036,18 +6617,71 @@ async def _process_chat_response_impl(
                         break
 
                 if terminal_error is not None:
-                    error_content = (
-                        terminal_error.get("content")
-                        if isinstance(terminal_error, dict)
-                        else str(terminal_error)
-                    )
-                    _finalize_open_agentic_block(content_blocks)
+                    # Every terminal_error assignment site normalizes to the
+                    # canonical {"content": str} shape at entry; the extractor
+                    # here tolerates a raw string or an empty content so a
+                    # malformed payload still surfaces the fallback below
+                    # instead of a blank "bricked" errored message.
+                    error_content = _provider_error_text(terminal_error)
+                    if not error_content:
+                        error_content = (
+                            "The model request failed and could not be recovered."
+                        )
+                    # Defensive: a stringified DB/driver exception can embed the
+                    # offending content; strip any raw NUL so re-persisting the
+                    # error (and the RAM snapshot / socket event below, which
+                    # bypass the DB sanitizer) can never re-trigger the failure.
+                    if isinstance(error_content, str) and "\x00" in error_content:
+                        error_content = error_content.replace("\x00", "")
+                    # B2: a terminal tool-loop error also finalizes the parent —
+                    # flip stragglers terminal ('error', or 'done' if finished) and
+                    # mirror finished answers so no subagent is left "Researching…".
+                    await _sweep_subagent_runs("error")
+                    await _reconcile_subagent_results()
+                    # Same dangling-clock fix as the cancel teardown: an error
+                    # that lands while the model is still thinking leaves the
+                    # reasoning block open, and `duration == null` is the ONLY
+                    # thing the UI reads to choose between "Thought for N seconds"
+                    # and a spinning "Thinking…". Close it AND tell the tab — the
+                    # persist below is durable but silent, so without the emit the
+                    # spinner runs under the error box until a reload.
+                    if _finalize_open_agentic_blocks(content_blocks):
+                        try:
+                            await event_emitter(
+                                {
+                                    "type": "chat:completion",
+                                    "data": {"content_blocks": content_blocks},
+                                }
+                            )
+                        except Exception:
+                            log.exception("terminal-error open-block emit failed")
                     update_data = _build_checkpoint_update(include_legacy_content=True)
-                    update_data["error"] = {"content": error_content}
+                    # Keep the structured retry-exhaustion/context code. The old
+                    # content-only write erased the distinction the subagent
+                    # lifecycle needs for a safe model handoff.
+                    error_payload = _provider_error_payload(terminal_error)
+                    if "\x00" in error_payload["content"]:
+                        error_payload["content"] = error_payload["content"].replace(
+                            "\x00", ""
+                        )
+                    update_data["error"] = error_payload
+                    # An errored turn is TERMINAL, so say so durably. Without this
+                    # the row lands in the one state that is not a state — carrying
+                    # an error AND `done: false` — which reads to every reconcile
+                    # path (chat open, reconnect, the queue sweeper, exports, the
+                    # subagent handoff) as "still generating". The client papered
+                    # over it per-load with `inactiveAssistantTerminalPatch`, so the
+                    # same message healed itself on every open and any path that
+                    # read the raw row disagreed with the one that healed it. This
+                    # is the same terminal shape the success finaliser writes and
+                    # the same one the client's local patch synthesizes:
+                    # `{done: true, error: {...}}`.
+                    update_data["done"] = True
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        update_data, return_model=False
+                        update_data,
+                        return_model=False,
                     )
                     if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
                         # Push full final content into the RAM snapshot alongside
@@ -6060,7 +6694,7 @@ async def _process_chat_response_impl(
                             {
                                 "content_blocks": _strip_tool_results(content_blocks),
                                 "status": "error",
-                                "error": {"content": error_content},
+                                "error": error_payload,
                                 "snapshot_version": stream_version_get(
                                     metadata["message_id"]
                                 ),
@@ -6089,10 +6723,15 @@ async def _process_chat_response_impl(
                 title = await Chats.get_chat_title_by_id(metadata["chat_id"])
                 # Canonical end-of-stream persist: ensure the tail accumulator is
                 # folded into content_blocks before serialize/split.
-                _tail_materialize()
+                tail_acc.materialize()
                 # Make the durable record authoritative: backfill any subagent
                 # result that finished but never made it into content_blocks, so a
                 # reload / fresh client / the next turn all see complete results.
+                # B2: sweep first so a straggler 'running' run (terminal write lost
+                # under teardown) is flipped terminal, THEN reconcile mirrors any
+                # newly-'done' run's answer into content_blocks. Invariant: a
+                # finalized parent never leaves a subagent stuck "Researching…".
+                await _sweep_subagent_runs("cancelled")
                 await _reconcile_subagent_results()
                 if STREAM_PROTOCOL_VERSION == "v2.1" and not str(
                     metadata.get("chat_id", "")
@@ -6102,9 +6741,34 @@ async def _process_chat_response_impl(
                     )
                     for _tcid, _body in final_split_bodies.items():
                         set_tool_result_body(metadata.get("message_id"), _tcid, _body)
+                        # Keep a wipe-immune copy so the terminal persist below
+                        # (which reads _current_tool_result_bodies) can never miss a
+                        # body just because the socket store dropped it. No pending-
+                        # merge queue entry: the final upsert right below carries
+                        # these durably (with union + prune).
+                        generation_tool_result_bodies[str(_tcid)] = _body
                 else:
                     final_slim_blocks = content_blocks
-                final_content = serialize_content_blocks(final_slim_blocks, force=True)
+                # Belt to the totality contract's braces. This projection is
+                # DISPLAY-ONLY (it feeds the terminal socket emit and the
+                # container-output importer; the durable `content` column comes
+                # from `text_only_content_from_blocks` in the checkpoint builder).
+                # It sits upstream of the persist that writes `done: True`, so a
+                # raise here used to discard an answer that had already fully
+                # streamed. Never again: degrade to the plain-text projection and
+                # finish the turn.
+                try:
+                    final_content = serialize_content_blocks(
+                        final_slim_blocks, force=True
+                    )
+                except Exception:
+                    log.exception(
+                        "legacy content projection failed for chat %s message %s — "
+                        "falling back to the plain-text projection",
+                        metadata.get("chat_id"),
+                        metadata.get("message_id"),
+                    )
+                    final_content = text_only_content_from_blocks(final_slim_blocks)
 
                 container_output_files = await import_changed_container_outputs(
                     request,
@@ -6163,10 +6827,18 @@ async def _process_chat_response_impl(
                             "files", container_output_files
                         )
 
+                    # Terminal persist: opt into GC of the accumulate-only
+                    # tool_result_bodies map. Union persistence never shrinks it
+                    # mid-turn (that monotonicity is the whole anti-corruption
+                    # guarantee), so the ONLY safe place to drop bodies no longer
+                    # referenced by the final content_blocks is right here, once the
+                    # turn is definitively done.
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        update_data, return_model=False
+                        update_data,
+                        return_model=False,
+                        prune_tool_result_bodies=True,
                     )
                     if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
                         clear_tool_result_bodies(metadata["message_id"])
@@ -6177,7 +6849,8 @@ async def _process_chat_response_impl(
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        {"usage": response_usage}, return_model=False
+                        {"usage": response_usage},
+                        return_model=False,
                     )
 
                 # Send a webhook notification if the user is not active.
@@ -6298,11 +6971,9 @@ async def _process_chat_response_impl(
                         }
                     )
 
-                # B12: outlet filters run server-side at the tail of the
-                # stream. The frontend used to POST /api/chat/completed for
-                # this; that route is now a no-op shim. If a filter mutates
-                # content, the helper persists it and emits a catch-up event
-                # so the frontend mirror updates.
+                # Outlet filters run once at the authoritative server-side tail
+                # of the stream. Mutations are persisted and emitted so the
+                # frontend mirror converges on the stored result.
                 try:
                     await run_outlet_filters_on_completed_stream(
                         request=request,
@@ -6319,7 +6990,25 @@ async def _process_chat_response_impl(
                 except Exception as e:
                     log.exception(f"Outlet filter run failed: {e}")
 
-                await background_tasks_handler()
+                # The turn is OVER here: the response is persisted, `chat:done`
+                # has been emitted, and the outlet filters have committed their
+                # last mutations. Release the chat-turn lease now, before the
+                # background handler — title, tag and follow-up generation are
+                # separate LLM round-trips that take seconds, and holding the
+                # lease across them rejected the user's very next message with
+                # 409 `chat_generation_in_progress`. From the client's point of
+                # view the answer had finished, so the send simply failed for no
+                # visible reason. Idempotent: the drain below re-calls this.
+                await _release_completed_generation_operation()
+
+                await _run_background_tasks(
+                            request=request,
+                            form_data=form_data,
+                            metadata=metadata,
+                            user=user,
+                            event_emitter=event_emitter,
+                            tasks=tasks,
+                        )
 
                 # Autonomous queue drain: this generation finished CLEANLY, so
                 # start the next queued follow-up (if any) server-side. Runs only
@@ -6328,9 +7017,28 @@ async def _process_chat_response_impl(
                 # queue. Best-effort: a drain failure must never break the
                 # generation that just succeeded.
                 if metadata.get("chat_id") and metadata.get("message_id"):
+                    # Belt-and-suspenders: ensure every steer we delivered this
+                    # turn is gone from the queue BEFORE draining. The per-round
+                    # delete is best-effort (remove_steer_items_by_ids swallows a DB
+                    # error and returns None), so a failed delete could leave a
+                    # delivered steer queued; since the drain PREFERS steers, it
+                    # would re-pop and regenerate it as a duplicate follow-up turn.
+                    # This final purge closes that. Kept in its own try so it can
+                    # never break the drain that follows.
+                    try:
+                        if delivered_steer_ids:
+                            await Chats.remove_steer_items_by_ids(
+                                metadata["chat_id"], list(delivered_steer_ids)
+                            )
+                    except Exception:
+                        log.exception(
+                            "final delivered-steer purge failed for chat %s",
+                            metadata.get("chat_id"),
+                        )
                     try:
                         from open_webui.utils.chat_queue import maybe_drain_queue
 
+                        await _release_completed_generation_operation()
                         await maybe_drain_queue(
                             request.app,
                             user,
@@ -6341,88 +7049,186 @@ async def _process_chat_response_impl(
                         log.exception("queue drain after clean completion failed")
             except asyncio.CancelledError:
                 log.warning("Task was cancelled!")
-                await event_emitter({"type": "chat:tasks:cancel"})
 
-                # Stop pressed mid-stream: PAUSE the queue. Clear only THIS
-                # generation's draining marker so a queued follow-up that was
-                # already started isn't disturbed; the user resumes manually.
-                # clear_draining also downgrades any pending STEER items to
-                # after_final (their target response is over — see clear_draining).
-                if metadata.get("chat_id") and metadata.get("message_id"):
+                async def _cancel_teardown():
+                    # ALL authoritative terminal cleanup for a Stop, in one coroutine
+                    # so it can be shielded as a unit (see the shield-and-re-await
+                    # loop below). A 2nd CancelledError must not truncate any of this.
+                    #
+                    # Every step is failure-isolated: no matter what breaks earlier
+                    # in the teardown, the terminal done=True upsert at the bottom
+                    # must run — a Stop that leaves the message not-done reads to
+                    # every reconcile path as a failed request and gets auto-retried,
+                    # which is exactly what a Stop must never do.
+                    # Close any block the Stop caught mid-flight and PUSH it,
+                    # before the cancel event. The teardown below already stamps
+                    # ended_at/duration for the DB and the RAM snapshot, but a
+                    # durable value nobody is told about is invisible: the tab
+                    # that pressed Stop keeps `duration == null` on the open
+                    # reasoning block and spins "Thinking…" until a reload. It is
+                    # also the one tab the cancel handler deliberately does NOT
+                    # re-snapshot (its own view is treated as authoritative), so
+                    # nothing else was ever going to correct it.
+                    #
+                    # Ordering matters: `chat:tasks:cancel` flips the message
+                    # terminal client-side, so the content has to land first.
                     try:
-                        from open_webui.utils.chat_queue import clear_draining
+                        tail_acc.materialize()
+                        if _finalize_open_agentic_blocks(content_blocks):
+                            await event_emitter(
+                                {
+                                    "type": "chat:completion",
+                                    "data": {"content_blocks": content_blocks},
+                                }
+                            )
+                    except Exception:
+                        log.exception("cancel open-block finalize/emit failed")
 
-                        await clear_draining(
-                            getattr(request.app.state, "redis", None),
-                            metadata["chat_id"],
-                            finished_response_id=metadata.get("message_id"),
-                            user_id=metadata.get("user_id"),
+                    try:
+                        await event_emitter({"type": "chat:tasks:cancel"})
+                    except Exception:
+                        log.exception("chat:tasks:cancel emit failed")
+
+                    # Stop pressed mid-stream: PAUSE the queue. Clear only THIS
+                    # generation's draining marker so a queued follow-up that was
+                    # already started isn't disturbed; the user resumes manually.
+                    if metadata.get("chat_id") and metadata.get("message_id"):
+                        try:
+                            from open_webui.utils.chat_queue import clear_draining
+
+                            await clear_draining(
+                                getattr(request.app.state, "redis", None),
+                                metadata["chat_id"],
+                                finished_response_id=metadata.get("message_id"),
+                                user_id=metadata.get("user_id"),
+                            )
+                        except Exception:
+                            log.exception("queue clear_draining on cancel failed")
+
+                    if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
+                        # Fold the tail buffer + push the FULL final content into the
+                        # RAM snapshot before flipping to "cancelled", so a reload
+                        # racing this terminal transition sees the complete partial
+                        # response (not the cadence snapshot, which can lag).
+                        try:
+                            tail_acc.materialize()
+                            _finalize_open_agentic_blocks(content_blocks)
+                            set_stream_state(
+                                metadata["message_id"],
+                                {
+                                    "content_blocks": _strip_tool_results(
+                                        content_blocks
+                                    ),
+                                    "status": "cancelled",
+                                    "snapshot_version": stream_version_get(
+                                        metadata["message_id"]
+                                    ),
+                                },
+                            )
+                            stream_version_flush(metadata["message_id"])
+                            clear_stream_state(metadata["message_id"])
+                        except Exception:
+                            log.exception("cancel RAM-snapshot finalize failed")
+
+                    # C22: ALWAYS run the subagent sweep/reconcile/broadcast and the
+                    # terminal done write on cancel, regardless of stream protocol or
+                    # realtime-save — matching the unconditional sweep in the clean and
+                    # error finalizers. Previously this was gated behind
+                    # `v2.1 or not ENABLE_REALTIME_CHAT_SAVE`, so a Stop under the
+                    # supported v1 + ENABLE_REALTIME_CHAT_SAVE=True combo left any
+                    # non-terminal subagent stuck 'running' and the parent message
+                    # never marked done.
+                    update_data = {}
+                    try:
+                        tail_acc.materialize()
+                        # Match the clean/error finalizers: terminalize any run
+                        # whose per-child cancellation write was interrupted,
+                        # then broadcast that durable truth before reconciling
+                        # completed answers into the parent's tool results.
+                        await _sweep_subagent_runs("cancelled")
+                        await _reconcile_subagent_results()
+                        _finalize_open_agentic_blocks(content_blocks)
+                        update_data = _build_checkpoint_update(
+                            include_legacy_content=True
                         )
                     except Exception:
-                        log.exception("queue clear_draining on cancel failed")
-
-                if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
-                    # Fold the tail buffer and push the FULL final content into the
-                    # RAM snapshot before flipping to "cancelled", so a reload that
-                    # races this terminal transition sees the complete partial
-                    # response (not the cadence snapshot, which can lag by up to
-                    # SNAPSHOT_CHAR_DELTA). Stamp snapshot_version to the live wire
-                    # version (content now includes everything emitted).
-                    _tail_materialize()
-                    _finalize_open_agentic_block(content_blocks)
-                    set_stream_state(
-                        metadata["message_id"],
-                        {
-                            "content_blocks": _strip_tool_results(content_blocks),
-                            "status": "cancelled",
-                            "snapshot_version": stream_version_get(
-                                metadata["message_id"]
-                            ),
-                        },
-                    )
-                    stream_version_flush(metadata["message_id"])
-                    clear_stream_state(metadata["message_id"])
-
-                if STREAM_PROTOCOL_VERSION == "v2.1" or not ENABLE_REALTIME_CHAT_SAVE:
-                    # Save message in the database
-                    _tail_materialize()
-                    # Backfill any subagent result that finished and stamped its
-                    # final_text into subagent_runs but never made it into
-                    # content_blocks[].results — on a Stop mid-fan-out the
-                    # post-gather `tc_block["results"] = slim_results` write never
-                    # ran, so without this the cancel save persists a results-less
-                    # tool block and the finished subagents' answers are lost (and
-                    # the parent's next turn sees "[No output...]"). The clean
-                    # finalizer already does this; the cancel path must too.
-                    await _reconcile_subagent_results()
-                    _finalize_open_agentic_block(content_blocks)
-                    update_data = _build_checkpoint_update(include_legacy_content=True)
-                    # Mark the message TERMINAL so its chat (the subagent's own
-                    # hidden chat, or a regular chat) doesn't render as perpetually
-                    # generating after a cancel. The frontend treats a message as
-                    # finished on `done || error`; without this a cancelled subagent
-                    # opened directly shows a forever-spinning, never-"stopped" turn
-                    # even though it is terminal. (The clean-completion path sets the
-                    # same flag.)
+                        log.exception("cancel content finalize failed")
+                    # Mark the message TERMINAL so its chat doesn't render as
+                    # perpetually generating after a cancel. Written even when the
+                    # content finalize above failed (partial content is already
+                    # checkpointed; a stranded not-done message is worse).
                     update_data["done"] = True
 
+                    # Record USER intent here, at the one point that knows this run
+                    # really was cancelled. The Stop endpoint's own marker refuses
+                    # already-`done` rows (so a Stop racing a clean finish can't
+                    # mislabel a complete answer), which leaves the very fast Stop —
+                    # latched before the assistant row existed — with nobody to
+                    # write it. Gated on the durable cancellation latch so a
+                    # shutdown / chat-delete cancellation is not reported as a user
+                    # Stop.
+                    try:
+                        _redis = getattr(request.app.state, "redis", None)
+                        if metadata.get("chat_id") and (
+                            await is_generation_cancelled(
+                                _redis,
+                                metadata.get("chat_id"),
+                                metadata.get("generation_id"),
+                            )
+                            or await is_generation_turn_cancelled(
+                                _redis,
+                                metadata.get("chat_id"),
+                                metadata.get("turn_id"),
+                            )
+                        ):
+                            update_data["userStopped"] = True
+                    except Exception:
+                        log.exception("cancel userStopped classification failed")
+
+                    # Terminal (cancel) persist: same GC opt-in as the clean
+                    # finalizer — this is a definitive end-of-turn write, so it is
+                    # safe to prune tool_result_bodies down to the refs the final
+                    # content_blocks still point at.
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        update_data, return_model=False
+                        update_data,
+                        return_model=False,
+                        prune_tool_result_bodies=True,
                     )
                     if STREAM_PROTOCOL_VERSION == "v2.1" and metadata.get("message_id"):
-                        clear_tool_result_bodies(metadata["message_id"])
+                        try:
+                            clear_tool_result_bodies(metadata["message_id"])
+                        except Exception:
+                            log.exception("cancel tool-result-body clear failed")
 
-                # Re-raise after cleanup. Catching CancelledError to persist the
-                # partial response is fine, but the cancellation MUST propagate so
-                # the task actually unwinds and exits. Swallowing it leaves the task
-                # "alive" inside anyio's cancel scope, which then reschedules
-                # _deliver_cancellation via loop.call_soon every tick FOREVER —
-                # pinning a CPU core at idle until the process restarts. (Confirmed
-                # by py-spy: ~78% of CPU in _deliver_cancellation with no app frames,
-                # reproducing at idle after a Stop/disconnect.) The subagent cancel
-                # handlers already re-raise for the same reason.
+                # SHIELD-AND-RE-AWAIT: a Stop can be delivered MORE THAN ONCE (two
+                # clicks; delete-chat firing several stop commands). A bare
+                # asyncio.shield is NOT enough — when the outer await is re-cancelled
+                # it re-raises immediately, leaving the detached teardown unfinished
+                # (verified). Loop, swallowing re-cancels, until the shielded teardown
+                # actually COMPLETES, so a double-cancel can never truncate the
+                # terminal writes (sweep / done=True / cancel emit) and strand
+                # subagent cards 'running' forever.
+                _td = asyncio.ensure_future(_cancel_teardown())
+                while not _td.done():
+                    try:
+                        await asyncio.shield(_td)
+                    except asyncio.CancelledError:
+                        if _td.done():
+                            break
+                        continue  # re-cancel during teardown — keep awaiting it
+                if not _td.cancelled() and _td.exception() is not None:
+                    log.error(
+                        "cancel teardown failed: %r",
+                        _td.exception(),
+                        exc_info=_td.exception(),
+                    )
+
+                # Re-raise so the cancellation propagates and the task unwinds/exits.
+                # Swallowing it leaves the task alive in anyio's cancel scope,
+                # rescheduling _deliver_cancellation every tick forever (py-spy:
+                # ~78% CPU at idle). The teardown above is already complete.
                 raise
 
             if getattr(response, "background", None) is not None:

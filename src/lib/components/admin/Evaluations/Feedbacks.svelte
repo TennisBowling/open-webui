@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/utils/toast';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
@@ -26,13 +26,12 @@
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { config } from '$lib/stores';
 
-	export let feedbacks = [];
+	let { feedbacks = $bindable([]) } = $props();
 
-	let page = 1;
-	$: paginatedFeedbacks = sortedFeedbacks.slice((page - 1) * 10, page * 10);
+	let page = $state(1);
 
-	let orderBy: string = 'updated_at';
-	let direction: 'asc' | 'desc' = 'desc';
+	let orderBy: string = $state('updated_at');
+	let direction: 'asc' | 'desc' = $state('desc');
 
 	type Feedback = {
 		id: string;
@@ -71,33 +70,8 @@
 		page = 1;
 	}
 
-	$: sortedFeedbacks = [...feedbacks].sort((a, b) => {
-		let aVal, bVal;
-
-		switch (orderBy) {
-			case 'user':
-				aVal = a.user?.name || '';
-				bVal = b.user?.name || '';
-				return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-			case 'model_id':
-				aVal = a.data.model_id || '';
-				bVal = b.data.model_id || '';
-				return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-			case 'rating':
-				aVal = a.data.rating;
-				bVal = b.data.rating;
-				return direction === 'asc' ? aVal - bVal : bVal - aVal;
-			case 'updated_at':
-				aVal = a.updated_at;
-				bVal = b.updated_at;
-				return direction === 'asc' ? aVal - bVal : bVal - aVal;
-			default:
-				return 0;
-		}
-	});
-
-	let showFeedbackModal = false;
-	let selectedFeedback = null;
+	let showFeedbackModal = $state(false);
+	let selectedFeedback = $state(null);
 
 	const openFeedbackModal = (feedback) => {
 		showFeedbackModal = true;
@@ -165,6 +139,33 @@
 			saveAs(blob, `feedback-history-export-${Date.now()}.json`);
 		}
 	};
+	let sortedFeedbacks = $derived(
+		[...feedbacks].sort((a, b) => {
+			let aVal, bVal;
+
+			switch (orderBy) {
+				case 'user':
+					aVal = a.user?.name || '';
+					bVal = b.user?.name || '';
+					return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+				case 'model_id':
+					aVal = a.data.model_id || '';
+					bVal = b.data.model_id || '';
+					return direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+				case 'rating':
+					aVal = a.data.rating;
+					bVal = b.data.rating;
+					return direction === 'asc' ? aVal - bVal : bVal - aVal;
+				case 'updated_at':
+					aVal = a.updated_at;
+					bVal = b.updated_at;
+					return direction === 'asc' ? aVal - bVal : bVal - aVal;
+				default:
+					return 0;
+			}
+		})
+	);
+	let paginatedFeedbacks = $derived(sortedFeedbacks.slice((page - 1) * 10, page * 10));
 </script>
 
 <FeedbackModal bind:show={showFeedbackModal} {selectedFeedback} onClose={closeFeedbackModal} />
@@ -173,7 +174,7 @@
 	<div class="flex md:self-center text-lg font-medium px-0.5">
 		{$i18n.t('Feedback History')}
 
-		<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850" />
+		<div class="flex self-center w-[1px] h-6 mx-2.5 bg-gray-50 dark:bg-gray-850"></div>
 
 		<span class="text-lg font-medium text-gray-500 dark:text-gray-300">{feedbacks.length}</span>
 	</div>
@@ -183,7 +184,7 @@
 			<Tooltip content={$i18n.t('Export')}>
 				<button
 					class=" p-2 rounded-xl hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center space-x-1"
-					on:click={() => {
+					onclick={() => {
 						exportHandler();
 					}}
 				>
@@ -206,7 +207,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none w-3"
-						on:click={() => setSortKey('user')}
+						onclick={() => setSortKey('user')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('User')}
@@ -229,7 +230,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 cursor-pointer select-none"
-						on:click={() => setSortKey('model_id')}
+						onclick={() => setSortKey('model_id')}
 					>
 						<div class="flex gap-1.5 items-center">
 							{$i18n.t('Models')}
@@ -252,7 +253,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 text-right cursor-pointer select-none w-fit"
-						on:click={() => setSortKey('rating')}
+						onclick={() => setSortKey('rating')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('Result')}
@@ -275,7 +276,7 @@
 					<th
 						scope="col"
 						class="px-2.5 py-2 text-right cursor-pointer select-none w-0"
-						on:click={() => setSortKey('updated_at')}
+						onclick={() => setSortKey('updated_at')}
 					>
 						<div class="flex gap-1.5 items-center justify-end">
 							{$i18n.t('Updated At')}
@@ -302,7 +303,7 @@
 				{#each paginatedFeedbacks as feedback (feedback.id)}
 					<tr
 						class="bg-white dark:bg-gray-900 dark:border-gray-850 text-xs cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-850/50 transition"
-						on:click={() => openFeedbackModal(feedback)}
+						onclick={() => openFeedbackModal(feedback)}
 					>
 						<td class=" py-0.5 text-right font-semibold">
 							<div class="flex justify-center">
@@ -354,7 +355,7 @@
 							<td class="px-3 py-1 text-right font-medium text-gray-900 dark:text-white w-max">
 								<div class=" flex justify-end">
 									{#if feedback?.data?.rating.toString() === '1'}
-										<Badge type="info" content={$i18n.t('Won')} />
+										<Badge type="success" content={$i18n.t('Won')} />
 									{:else if feedback?.data?.rating.toString() === '0'}
 										<Badge type="muted" content={$i18n.t('Draw')} />
 									{:else if feedback?.data?.rating.toString() === '-1'}
@@ -368,14 +369,14 @@
 							{dayjs(feedback.updated_at * 1000).fromNow()}
 						</td>
 
-						<td class=" px-3 py-1 text-right font-semibold" on:click={(e) => e.stopPropagation()}>
+						<td class=" px-3 py-1 text-right font-semibold" onclick={(e) => e.stopPropagation()}>
 							<FeedbackMenu
-								on:delete={(e) => {
+								ondelete={(e) => {
 									deleteFeedbackHandler(feedback.id);
 								}}
 							>
 								<button
-									class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+									class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-850 rounded-xl"
 								>
 									<EllipsisHorizontal />
 								</button>
@@ -402,7 +403,7 @@
 			>
 				<button
 					class="flex text-xs items-center px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
-					on:click={async () => {
+					onclick={async () => {
 						shareHandler();
 					}}
 				>
