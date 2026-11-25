@@ -105,6 +105,11 @@ class _Entry:
         self.on_event = on_event
         self.on_subscriptions = on_subscriptions
         self.queue: asyncio.Queue[_Request] = asyncio.Queue()
+        # Shared by every turn that ensure()s this key: always await it through
+        # asyncio.shield(). A bare await lets one cancelled waiter (a Stop during
+        # the child's initialize) cancel the future itself, after which every
+        # later ensure() raises CancelledError at once and each turn reports
+        # "The model request was interrupted" until the backend restarts.
         self.ready = asyncio.get_running_loop().create_future()
         # Why the actor ended (exception), for supervisor logs.
         self.exit_reason: Optional[BaseException] = None
@@ -276,7 +281,7 @@ class PersistentMCPManager:
                     # ``ensure`` deliberately reuses a healthy entry, so retain
                     # the configuration that actually created that entry too.
                     self._connect_kwargs.setdefault(key, entry.connect_kwargs)
-            await entry.ready
+            await asyncio.shield(entry.ready)
             return proxy
 
     async def request(self, key: str, method: str, *args, **kwargs):
@@ -311,7 +316,7 @@ class PersistentMCPManager:
             if entry is None or entry.task.done():
                 return None
             proxy = self._proxy(key)
-        await entry.ready
+        await asyncio.shield(entry.ready)
         return proxy
 
     async def stop(self, key: str):
@@ -336,7 +341,7 @@ class PersistentMCPManager:
         async with lifecycle_lock:
             replacement = _Entry(key, connect_kwargs, self._on_event, self._on_subscriptions)
             try:
-                await replacement.ready
+                await asyncio.shield(replacement.ready)
             except BaseException:
                 await replacement.stop()
                 raise
@@ -473,7 +478,7 @@ class PersistentMCPManager:
                     self._entries[key] = entry
             state = self._retry.setdefault(key, [0, RESTART_BACKOFF_BASE_SECONDS, 0.0])
             try:
-                await entry.ready
+                await asyncio.shield(entry.ready)
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
