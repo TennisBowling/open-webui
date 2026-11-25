@@ -2,8 +2,9 @@
 
 CAM serves a server the agent started in a chat's sandbox at its own origin,
 ``<port>-<id>.<CAM_PREVIEW_DOMAIN>``, and lets a browser in only through a
-single-use ticket. This router is the authorization layer: the chat's owner
-(or an admin) may open that chat's previews. The returned ``open_url`` carries
+single-use ticket. This router is the authorization layer: the chat's
+participants (owner or editor of a shared chat, or an admin) may open that
+chat's previews. The returned ``open_url`` carries
 the ticket; the browser navigates to it and lands on the page.
 """
 
@@ -15,11 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from open_webui.env import SRC_LOG_LEVELS
-from open_webui.routers.network import (
-    _WRITE_TIMEOUT_SECONDS,
-    _cam,
-    _require_chat_access,
-)
+from open_webui.models.chats import Chats
+from open_webui.routers.network import _WRITE_TIMEOUT_SECONDS, _cam
 from open_webui.utils.auth import get_verified_user
 
 log = logging.getLogger(__name__)
@@ -34,6 +32,17 @@ class OpenForm(BaseModel):
 
 class CreateForm(OpenForm):
     port: int = Field(ge=1, le=65535)
+
+
+async def _require_chat_access(chat_id: str, user) -> None:
+    """Owner or editor (or an admin); 404 otherwise so foreign ids are not
+    confirmed. Not network.py's owner-only gate: an editor drives the same
+    sandbox, so it may open the servers its own turns start. Viewers have no
+    preview UI (read-only) and stay out."""
+    if user.role == "admin":
+        return
+    if not await Chats.user_can_write_chat(chat_id, user.id):
+        raise HTTPException(status_code=404, detail="Chat not found")
 
 
 async def _preview_chat(request: Request, preview_id: str, user) -> str:
